@@ -171,7 +171,7 @@ func fixedArity(k Kind) int {
 // zero-valued operand slots; the ID comes only from g.NewID() and the
 // PassOrigin is stamped from origin.
 func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
-	b := &Base{id: g.NewID(), kind: k, loc: Loc{PassOrigin: origin}}
+	b := &Base{id: g.NewID(), kind: k, loc: Loc{PassOrigin: origin}, graph: g}
 	var n nodeImpl
 	switch k {
 	case KindConst:

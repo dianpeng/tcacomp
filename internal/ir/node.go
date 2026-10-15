@@ -1,5 +1,7 @@
 package ir
 
+import "slices"
+
 // Span is a source location range. It is the zero value throughout Phase 1:
 // there is no frontend yet, so nodes carry no source spans (IR-06).
 type Span struct {
@@ -27,8 +29,9 @@ type Base struct {
 	kind          Kind
 	loc           Loc
 	lastTouchedBy string
-	firstUse      *Use // head of this def's intrusive use-list (D-16)
-	erased        bool // tombstone set by Erase; IDs are never reused (IR-05)
+	firstUse      *Use  // head of this def's intrusive use-list (D-16)
+	erased        bool  // tombstone set by Erase; IDs are never reused (IR-05)
+	graph         *Graph // owning graph, set at construction; lets Erase unlink from the block
 }
 
 // BasePtr returns the shared cell, implementing Node.
@@ -117,8 +120,8 @@ type Block struct {
 	statements []*Statement
 }
 
-// Statements returns the block's statements in insertion order.
-func (b *Block) Statements() []*Statement { return b.statements }
+// Statements returns a copy of the block's statements in insertion order.
+func (b *Block) Statements() []*Statement { return append([]*Statement(nil), b.statements...) }
 
 // Graph is one kernel/function's IR: a name, the kernel I/O symbols, and the
 // single basic block (IR-02). Node and statement IDs come only from NewID:
@@ -154,7 +157,8 @@ func (g *Graph) Block() *Block { return g.block }
 type nodeImpl interface {
 	Node
 	forEachOperand(fn func(*Use)) // visit each operand slot in canonical order
-	addSlot() *Use                // append one operand slot and return it
+	addSlot() *Use               // append one operand slot and return it
+	removeSlot(u *Use) bool      // drop u's slot from the operand storage
 }
 
 // operandList is embedded by every concrete node type to provide the
@@ -172,4 +176,14 @@ func (l *operandList) forEachOperand(fn func(*Use)) {
 func (l *operandList) addSlot() *Use {
 	l.ops = append(l.ops, Use{})
 	return &l.ops[len(l.ops)-1]
+}
+
+func (l *operandList) removeSlot(u *Use) bool {
+	for i := range l.ops {
+		if &l.ops[i] == u {
+			l.ops = slices.Delete(l.ops, i, i+1)
+			return true
+		}
+	}
+	return false
 }
