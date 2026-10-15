@@ -46,8 +46,8 @@ Phases validate this pipeline in stages: Phase 2 runs codegen alone on canonical
 
 Plans:
 - [x] 01-01-PLAN.md — IR core — SSADef/SSAUse/SSAVar with use-def/def-use chains, single-BB CFG, versioned stable `Kind` enum, choke-point mutation API (SetDef/AddUse/RemoveUse/ReplaceAllUsesWith/Erase), stable integer node IDs, `Loc{frontend span, pass origin}` on every node
-- [ ] 01-02-PLAN.md — Legality windows + verifier framework (per-pass declared invariants, rich diagnostics) + pass manager (preconditions, instrumentation callbacks, conservative analysis cache) + `internal/flags` + `internal/analysis` skeleton
-- [ ] 01-03-PLAN.md — Tooling backbone — `internal/diagnostic` (severity model), `internal/log`, Graphviz emission, canonical deterministic IR printer, golden-test harness, `--dump-after`/`--dump-graphviz`/`--pass-timing` flags
+- [x] 01-02-PLAN.md — Legality windows + verifier framework (per-pass declared invariants, rich diagnostics) + pass manager (preconditions, instrumentation callbacks, conservative analysis cache) + `internal/flags` + `internal/analysis` skeleton
+- [x] 01-03-PLAN.md — Tooling backbone — `internal/diagnostic` (severity model), `internal/log`, Graphviz emission, canonical deterministic IR printer, golden-test harness, `--dump-after`/`--dump-graphviz`/`--pass-timing` flags
 - [ ] 01-04-PLAN.md — `pkg/` elaborator/graph-builder API (the parser's future target) + `matmul_scale` oracle graph + determinism byte-compare test
 - [ ] 01-05-PLAN.md — Wire real dump emitters (`ir.Print`, `EmitDot`) into `pass.IRDump` via `pkg.DefaultInstrumentations` — closes TOOL-06 dump flags
 
