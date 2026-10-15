@@ -88,7 +88,7 @@ Each task was committed atomically:
 4. **Task 3: Choke-point mutation + verifier — RED tests** - `d26858d` (test)
 5. **Task 3: Choke-point mutation + verifier — implementation** - `a006864` (feat)
 
-**Plan metadata:** `5be8bc7` (docs: complete plan)
+**Plan metadata:** `a1c18c3` (docs: complete plan)
 
 _Note: TDD tasks have two commits each (test → feat) per the tdd execution flow._
 
