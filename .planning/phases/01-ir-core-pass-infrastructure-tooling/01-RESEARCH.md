@@ -528,27 +528,31 @@ graph, err := b.Build() // eager checks at every call; full verifier runs in Bui
 
 **All other claims in this research are VERIFIED (toolchain `go doc`/`$GOROOT` reads) or CITED (fetched official docs: MLIR PassManagement, MLIR DialectConversion, LLVM ProgrammersManual, LLVM opt CommandGuide, Graphviz DOT lang spec, Go spec, gofmt_test.go).**
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **`--dump-after` filtering granularity.** TOOL-06 names the flag but not its value shape.
    - What we know: MLIR supports both `-mlir-print-ir-after-all` and `-mlir-print-ir-after=<list>` (verified).
    - What's unclear: whether Phase 1 wants boolean-all (simpler) or name-filtered (one flag, two uses).
    - Recommendation: implement name-filtered (`--dump-after=all` default-off) — trivially more code, matches the verified MLIR precedent, and `--dump-graphviz`/`--pass-timing` follow the same shape.
+   - **RESOLVED:** name-filtered, settled in plan 01-02 Task 1 (`flags.F.DumpAfter string` accepting "all" or a comma-list, plus `DumpGraphviz`/`PassTiming` bools); real emitters wired in plan 01-05.
 
 2. **Golden harness package name/location.**
    - What we know: must be one package with the single `flag.Bool` registration (Pitfall 7); D-14 says "one generic golden harness".
    - What's unclear: `internal/golden` vs inside Phase 2's `internal/testutil` (which CLAUDE.md reserves for the e2e driver).
    - Recommendation: `internal/golden` now; `testutil` composes it in Phase 2.
+   - **RESOLVED:** `internal/golden` — skeleton in plan 01-01 Task 1, implementation in plan 01-03 Task 2.
 
 3. **Statement-ID policy under future split/merge passes (D-04).**
    - What we know: D-04 requires `statement #N` stable across passes so diffs track a statement; Phase 1 has no split/merge passes.
    - What's unclear: what happens in Phase 4 when loop-merge nests statements or effect-linearize rewrites chains.
    - Recommendation: Phase 1 assigns IDs at construction (builder) and preserves them under in-place mutation; document now that passes which split a statement derive child IDs as `#N.M` — decide the exact scheme in Phase 4 planning when the passes exist. Flagging so D-04's contract is written down before it bites.
+   - **RESOLVED (Phase-1 scope):** IDs are per-graph monotonic from `Graph.NewID()`, assigned at construction via the exported constructors (`AddStatement`, plan 01-01 Task 2) and never reused (`Erase` tombstones); D-04 statement headers pinned by the printer (plan 01-03 Task 2). The `#N.M` child-ID scheme for split/merge passes remains deferred to Phase 4 planning as recommended.
 
 4. **Where `Loc.PassOrigin` gets displayed.**
    - What we know: D-03 pins locs out of the default print; D-17 stamps `LastTouchedBy` on nodes; PASS-06 requires it in verifier diagnostics.
    - What's unclear: whether `--dump-after` verbose mode shows it inline (`loc("pass=reduce-lower")` style) or only verifier output carries it.
    - Recommendation: verifier diagnostics always carry it; printer verbose mode shows it — decide when wiring TOOL-06 flags in plan 01-03 (either is defensible; pick one and pin in goldens' verbose-mode tests).
+   - **RESOLVED:** both, non-exclusively — verifier diagnostics always carry LastTouchedBy (plan 01-01 verify.go, PASS-06), and the printer's `PrintOptions.Verbose` shows pass-origin annotations (plan 01-03 Task 2); Phase 1 goldens pin the minimal default (D-03) so no golden carries locs.
 
 ## Environment Availability
 

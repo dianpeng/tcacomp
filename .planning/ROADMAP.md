@@ -41,7 +41,7 @@ Phases validate this pipeline in stages: Phase 2 runs codegen alone on canonical
   3. The pass manager runs ordered pipelines and rejects out-of-order ones by enforced preconditions (e.g. reduce-lower before iter-lower); verify-after-every-pass, IR dumps, and pass timing run as PM callbacks, not inside passes, with a `--verify-each=0` escape hatch.
   4. Node-family legality windows per pipeline stage (MLIR-style) reject out-of-window IR after every pass, and the PM rejects unknown node `Kind`s.
   5. The builder API constructs the flagship `matmul_scale` graph programmatically; Graphviz `.dot` dumps render any pipeline stage; diagnostics emit error/warning/remark with source spans.
-**Plans**: 4 plans
+**Plans**: 5 plans
 **Research flag**: `/gsd-research-phase` worthwhile before planning — legality-window API shape (MEDIUM-confidence applied design judgment, no off-the-shelf precedent) and the mutation-API surface detail.
 
 Plans:
@@ -49,6 +49,7 @@ Plans:
 - [ ] 01-02-PLAN.md — Legality windows + verifier framework (per-pass declared invariants, rich diagnostics) + pass manager (preconditions, instrumentation callbacks, conservative analysis cache) + `internal/flags` + `internal/analysis` skeleton
 - [ ] 01-03-PLAN.md — Tooling backbone — `internal/diagnostic` (severity model), `internal/log`, Graphviz emission, canonical deterministic IR printer, golden-test harness, `--dump-after`/`--dump-graphviz`/`--pass-timing` flags
 - [ ] 01-04-PLAN.md — `pkg/` elaborator/graph-builder API (the parser's future target) + `matmul_scale` oracle graph + determinism byte-compare test
+- [ ] 01-05-PLAN.md — Wire real dump emitters (`ir.Print`, `EmitDot`) into `pass.IRDump` via `pkg.DefaultInstrumentations` — closes TOOL-06 dump flags
 
 ### Phase 2: Naive Codegen, Runtime & e2e Harness
 **Goal**: A correct end-to-end compiler on a deliberately sequential skeleton — generated CUDA C++, C++20 runtime, host launch stubs, and a Go e2e driver that compiles, runs on the A6000, and checks against a CPU reference — achieving the project's core-value gate.
