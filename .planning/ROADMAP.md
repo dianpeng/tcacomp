@@ -45,10 +45,10 @@ Phases validate this pipeline in stages: Phase 2 runs codegen alone on canonical
 **Research flag**: `/gsd-research-phase` worthwhile before planning — legality-window API shape (MEDIUM-confidence applied design judgment, no off-the-shelf precedent) and the mutation-API surface detail.
 
 Plans:
-- [ ] 01-01: IR core — SSADef/SSAUse/SSAVar with use-def/def-use chains, single-BB CFG, versioned stable `Kind` enum, choke-point mutation API (SetDef/AddUse/RemoveUse/ReplaceAllUsesWith/Erase), stable integer node IDs, `Loc{frontend span, pass origin}` on every node
-- [ ] 01-02: Legality windows + verifier framework (per-pass declared invariants, rich diagnostics) + pass manager (preconditions, instrumentation callbacks, conservative analysis cache) + `internal/flags` + `internal/analysis` skeleton
-- [ ] 01-03: Tooling backbone — `internal/diagnostic` (severity model), `internal/log`, Graphviz emission, canonical deterministic IR printer, golden-test harness, `--dump-after`/`--dump-graphviz`/`--pass-timing` flags
-- [ ] 01-04: `pkg/` elaborator/graph-builder API (the parser's future target) + `matmul_scale` oracle graph + determinism byte-compare test
+- [ ] 01-01-PLAN.md — IR core — SSADef/SSAUse/SSAVar with use-def/def-use chains, single-BB CFG, versioned stable `Kind` enum, choke-point mutation API (SetDef/AddUse/RemoveUse/ReplaceAllUsesWith/Erase), stable integer node IDs, `Loc{frontend span, pass origin}` on every node
+- [ ] 01-02-PLAN.md — Legality windows + verifier framework (per-pass declared invariants, rich diagnostics) + pass manager (preconditions, instrumentation callbacks, conservative analysis cache) + `internal/flags` + `internal/analysis` skeleton
+- [ ] 01-03-PLAN.md — Tooling backbone — `internal/diagnostic` (severity model), `internal/log`, Graphviz emission, canonical deterministic IR printer, golden-test harness, `--dump-after`/`--dump-graphviz`/`--pass-timing` flags
+- [ ] 01-04-PLAN.md — `pkg/` elaborator/graph-builder API (the parser's future target) + `matmul_scale` oracle graph + determinism byte-compare test
 
 ### Phase 2: Naive Codegen, Runtime & e2e Harness
 **Goal**: A correct end-to-end compiler on a deliberately sequential skeleton — generated CUDA C++, C++20 runtime, host launch stubs, and a Go e2e driver that compiles, runs on the A6000, and checks against a CPU reference — achieving the project's core-value gate.
