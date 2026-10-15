@@ -1,0 +1,376 @@
+package ir
+
+// This file is the exported graph-construction surface: the ONLY way to
+// create graphs, params, statements, and nodes from outside package ir
+// (pkg/ builder, pass tests, visualization tests). Construction is exempt
+// from MutContext (RESEARCH Pattern 2) but records PassOrigin so verifier
+// diagnostics are meaningful from birth (D-17).
+//
+// Constructors deliberately do NOT validate kinds or operands: kind
+// acceptance is the legality window's job (IR-03) and operand wiring is the
+// verifier's job (PASS-06). This lets cross-package tests construct
+// out-of-window or unwired graphs to prove rejection.
+
+// Lambda is the payload of map/reduce stage nodes: lambda(l, r): <body>.
+// It is a record, not a Kind.
+type Lambda struct {
+	Params []Param
+	Body   Node
+}
+
+// Access is a structural tensor access: lhs[@m][@n].
+type Access struct {
+	Tensor Param
+	Axes   []Param
+}
+
+// Concrete node types (D-15: Go interface families with a shared embedded
+// *Base). Every operand edge is a Use slot in the node's operandList; the
+// kind lives in Base. Payload fields are set once by the typed constructors
+// and are immutable after construction.
+
+type constNode struct {
+	*Base
+	operandList
+	typ *Type
+	val float64
+}
+
+func (*constNode) scalarExprNode() {}
+
+type paramRefNode struct {
+	*Base
+	operandList
+	param Param
+}
+
+func (*paramRefNode) scalarExprNode() {}
+
+type binOpNode struct {
+	*Base
+	operandList
+	op BinOpCode
+}
+
+func (*binOpNode) scalarExprNode() {}
+
+type unaryOpNode struct {
+	*Base
+	operandList
+	op UnaryOpCode
+}
+
+func (*unaryOpNode) scalarExprNode() {}
+
+// selectNode: ops = [cond, a, b].
+type selectNode struct {
+	*Base
+	operandList
+}
+
+func (*selectNode) scalarExprNode() {}
+
+// castNode: ops = [x].
+type castNode struct {
+	*Base
+	operandList
+	typ *Type
+}
+
+func (*castNode) scalarExprNode() {}
+
+// callNode: ops = args.
+type callNode struct {
+	*Base
+	operandList
+	name string
+}
+
+func (*callNode) scalarExprNode() {}
+
+// iterNode: abstract induction variable; ops = [init, step]; dim/bound are params.
+type iterNode struct {
+	*Base
+	operandList
+	dim   Param
+	bound Param
+}
+
+// iterClusterNode: abstract compound header; ops = [body]; dims are params.
+type iterClusterNode struct {
+	*Base
+	operandList
+	dims []Param
+}
+
+// mapNode: abstract map stage; ops = operand values (piped input first);
+// lam/as are payload records.
+type mapNode struct {
+	*Base
+	operandList
+	lam Lambda
+	as  []Param
+}
+
+func (n *mapNode) forEachLambda(fn func(*Lambda)) { fn(&n.lam) }
+
+// reduceNode: abstract reduce stage; ops = [init, piped]; combiner is payload.
+type reduceNode struct {
+	*Base
+	operandList
+	combiner Lambda
+}
+
+func (n *reduceNode) forEachLambda(fn func(*Lambda)) { fn(&n.combiner) }
+
+// storeNode: abstract store; ops = [value]; target is payload.
+type storeNode struct {
+	*Base
+	operandList
+	target Access
+}
+
+// returnNode: abstract kernel return; ops = [value].
+type returnNode struct {
+	*Base
+	operandList
+}
+
+// rawNode is the generic fallback for KindInvalid and any kind without a
+// dedicated struct (including kinds >= KindEnd constructed by rejection
+// tests). Its operand count is exactly the constructor's operand count.
+type rawNode struct {
+	*Base
+	operandList
+}
+
+// lambdaBearer is implemented by nodes carrying Lambda payloads; the
+// verifier walks lambda bodies as graph edges alongside operand uses.
+type lambdaBearer interface {
+	forEachLambda(fn func(*Lambda))
+}
+
+// fixedArity returns the operand-slot count for fixed-arity kinds, or -1
+// for variadic kinds (call, map) and the raw fallback.
+func fixedArity(k Kind) int {
+	switch k {
+	case KindConst, KindParam:
+		return 0
+	case KindUnaryOp, KindIterCluster, KindCast, KindStore, KindReturn:
+		return 1
+	case KindIter, KindBinOp, KindReduce:
+		return 2
+	case KindSelect:
+		return 3
+	default:
+		return -1 // KindCall, KindMap, raw/unknown kinds: variadic
+	}
+}
+
+// allocNode creates the concrete node for kind k with exactly nSlots
+// zero-valued operand slots; the ID comes only from g.NewID() and the
+// PassOrigin is stamped from origin.
+func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
+	b := &Base{id: g.NewID(), kind: k, loc: Loc{PassOrigin: origin}}
+	var n nodeImpl
+	switch k {
+	case KindConst:
+		n = &constNode{Base: b}
+	case KindParam:
+		n = &paramRefNode{Base: b}
+	case KindBinOp:
+		n = &binOpNode{Base: b}
+	case KindUnaryOp:
+		n = &unaryOpNode{Base: b}
+	case KindSelect:
+		n = &selectNode{Base: b}
+	case KindCast:
+		n = &castNode{Base: b}
+	case KindCall:
+		n = &callNode{Base: b}
+	case KindIter:
+		n = &iterNode{Base: b}
+	case KindIterCluster:
+		n = &iterClusterNode{Base: b}
+	case KindMap:
+		n = &mapNode{Base: b}
+	case KindReduce:
+		n = &reduceNode{Base: b}
+	case KindStore:
+		n = &storeNode{Base: b}
+	case KindReturn:
+		n = &returnNode{Base: b}
+	default:
+		n = &rawNode{Base: b}
+	}
+	for i := 0; i < nSlots; i++ {
+		n.addSlot()
+	}
+	return n
+}
+
+// slotsOf collects a node's operand slots in canonical order.
+func slotsOf(n nodeImpl) []*Use {
+	var s []*Use
+	n.forEachOperand(func(u *Use) { s = append(s, u) })
+	return s
+}
+
+// wireOperands sets each operand slot's Val/User and splices it into the
+// def's intrusive use-list, exactly as the AddUse choke point does. A nil
+// operand leaves the slot unwired (Val == nil) for the verifier to flag;
+// operands beyond a fixed-arity kind's slot count are ignored.
+func wireOperands(n nodeImpl, operands ...Node) {
+	slots := slotsOf(n)
+	for i, val := range operands {
+		if i >= len(slots) {
+			return
+		}
+		u := slots[i]
+		u.Val = val
+		u.User = n
+		if val != nil {
+			linkIntoDef(val.BasePtr(), u)
+		}
+	}
+}
+
+// NewGraph creates an empty named graph holding exactly one basic block.
+func NewGraph(name string) *Graph {
+	return &Graph{name: name, block: &Block{}, nextID: 1}
+}
+
+// AddDimParam appends a dim parameter (a runtime shape symbol) to the graph.
+func (g *Graph) AddDimParam(name string) Param {
+	p := Param{name: name, role: roleDim}
+	g.params = append(g.params, p)
+	return p
+}
+
+// AddTensorParam appends a tensor parameter of the given interned type.
+func (g *Graph) AddTensorParam(name string, t *Type) Param {
+	p := Param{name: name, typ: t, role: roleTensor}
+	g.params = append(g.params, p)
+	return p
+}
+
+// AddScalarParam appends a scalar parameter of the given interned type.
+func (g *Graph) AddScalarParam(name string, t *Type) Param {
+	p := Param{name: name, typ: t, role: roleScalar}
+	g.params = append(g.params, p)
+	return p
+}
+
+// AddStatement appends a statement binding rhs to the graph's single block;
+// the statement ID comes from g.NewID() (D-04).
+func (g *Graph) AddStatement(rhs Value) *Statement {
+	s := &Statement{id: g.NewID(), rhs: rhs}
+	g.block.statements = append(g.block.statements, s)
+	return s
+}
+
+// NewNode is the low-level constructor: it creates a node of ANY kind —
+// including KindInvalid and kinds >= KindEnd — with operands wired as Uses.
+// It deliberately performs no kind or operand validation (see file comment).
+func (g *Graph) NewNode(k Kind, origin string, operands ...Node) Node {
+	arity := fixedArity(k)
+	nSlots := arity
+	if nSlots < 0 {
+		nSlots = len(operands)
+	}
+	n := g.allocNode(k, origin, nSlots)
+	wireOperands(n, operands...)
+	return n
+}
+
+// NewConst creates a typed scalar constant node.
+func (g *Graph) NewConst(origin string, t *Type, v float64) Node {
+	n := g.NewNode(KindConst, origin).(*constNode)
+	n.typ, n.val = t, v
+	return n
+}
+
+// NewParamRef creates a scalar lambda-parameter reference node.
+func (g *Graph) NewParamRef(origin string, p Param) Node {
+	n := g.NewNode(KindParam, origin).(*paramRefNode)
+	n.param = p
+	return n
+}
+
+// NewBinOp creates a binary scalar expression node with operands a, b.
+func (g *Graph) NewBinOp(origin string, op BinOpCode, a, b Node) Node {
+	n := g.NewNode(KindBinOp, origin, a, b).(*binOpNode)
+	n.op = op
+	return n
+}
+
+// NewUnaryOp creates a unary scalar expression node with operand x.
+func (g *Graph) NewUnaryOp(origin string, op UnaryOpCode, x Node) Node {
+	n := g.NewNode(KindUnaryOp, origin, x).(*unaryOpNode)
+	n.op = op
+	return n
+}
+
+// NewSelect creates a typed conditional (cond ? a : b) node.
+func (g *Graph) NewSelect(origin string, cond, a, b Node) Node {
+	return g.NewNode(KindSelect, origin, cond, a, b)
+}
+
+// NewCast creates an explicit cast-to-t node with operand x.
+func (g *Graph) NewCast(origin string, t *Type, x Node) Node {
+	n := g.NewNode(KindCast, origin, x).(*castNode)
+	n.typ = t
+	return n
+}
+
+// NewCall creates a registered pure builtin call node with the given args.
+func (g *Graph) NewCall(origin string, name string, args ...Node) Node {
+	n := g.NewNode(KindCall, origin, args...).(*callNode)
+	n.name = name
+	return n
+}
+
+// NewIterCluster creates an abstract compound iteration header over dims
+// with body as its single operand.
+func (g *Graph) NewIterCluster(origin string, dims []Param, body Node) Node {
+	n := g.NewNode(KindIterCluster, origin, body).(*iterClusterNode)
+	n.dims = append([]Param(nil), dims...)
+	return n
+}
+
+// NewIter creates an abstract induction-variable node over dim, bounded by
+// bound, with init and step operands.
+func (g *Graph) NewIter(origin string, dim Param, bound Param, init, step Node) Node {
+	n := g.NewNode(KindIter, origin, init, step).(*iterNode)
+	n.dim, n.bound = dim, bound
+	return n
+}
+
+// NewMap creates an abstract map stage over operand values ops, with lambda
+// lam and explicit result-axis order as.
+func (g *Graph) NewMap(origin string, ops []Node, lam Lambda, as []Param) Node {
+	n := g.NewNode(KindMap, origin, ops...).(*mapNode)
+	n.lam, n.as = lam, append([]Param(nil), as...)
+	return n
+}
+
+// NewReduce creates an abstract reduce stage with init and piped operands
+// and combiner lambda.
+func (g *Graph) NewReduce(origin string, init Node, piped Node, combiner Lambda) Node {
+	n := g.NewNode(KindReduce, origin, init, piped).(*reduceNode)
+	n.combiner = combiner
+	return n
+}
+
+// NewStore creates an abstract structural store node writing value through
+// the target access.
+func (g *Graph) NewStore(origin string, target Access, value Node) Node {
+	n := g.NewNode(KindStore, origin, value).(*storeNode)
+	n.target = target
+	return n
+}
+
+// NewReturn creates an abstract kernel-return node with the returned value.
+func (g *Graph) NewReturn(origin string, value Node) Node {
+	return g.NewNode(KindReturn, origin, value)
+}

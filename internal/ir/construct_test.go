@@ -63,7 +63,7 @@ func TestNodeIdentity(t *testing.T) {
 		c2 := g.NewConst("ctor", f32, 2.0)
 		sum := g.NewBinOp("ctor", BinOpAdd, c1, c2)
 		stmt := g.AddStatement(sum)
-		return []uint64{c1.ID(), c2.ID(), sum.ID(), stmt.ID()}
+		return []uint64{c1.BasePtr().ID(), c2.BasePtr().ID(), sum.BasePtr().ID(), stmt.ID()}
 	}
 
 	ids1, ids2 := build(), build()
@@ -82,7 +82,7 @@ func TestNodeIdentity(t *testing.T) {
 }
 
 func TestUseListBasics(t *testing.T) {
-	g, c1, c2, sum, _ := newTestGraph(t)
+	_, c1, c2, sum, _ := newTestGraph(t)
 
 	uses := UsesOf(c1)
 	if len(uses) != 1 {

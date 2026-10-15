@@ -31,12 +31,12 @@ func TestConstructSurface(t *testing.T) {
 		sum := g.NewBinOp("ctor", ir.BinOpAdd, c1, c2)
 		stmt := g.AddStatement(sum)
 
-		ids := []uint64{c1.ID(), c2.ID(), sum.ID(), stmt.ID()}
+		ids := []uint64{c1.BasePtr().ID(), c2.BasePtr().ID(), sum.BasePtr().ID(), stmt.ID()}
 		return g, ids
 	}
 
 	g1, ids1 := build()
-	g2, ids2 := build()
+	_, ids2 := build()
 
 	want := []uint64{1, 2, 3, 4}
 	for i := range want {
@@ -52,7 +52,7 @@ func TestConstructSurface(t *testing.T) {
 	if stmts[0].ID() != ids1[3] {
 		t.Fatal("statement ID must come from the same per-graph monotonic counter")
 	}
-	if stmts[0].RHS().ID() != ids1[2] {
+	if stmts[0].RHS().BasePtr().ID() != ids1[2] {
 		t.Fatal("statement RHS must be the constructed binop")
 	}
 	if g1.Block() != g1.Block() {
