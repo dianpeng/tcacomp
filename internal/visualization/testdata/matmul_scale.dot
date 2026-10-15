@@ -1,10 +1,10 @@
 digraph dot_test {
   subgraph cluster_6 {
     label="statement #6";
-    n4 [label="iter(@m) -> map(lhs, lambda(v): v) as (@m)"];
+    n4 [label="iter(@m) -> map(lhs[@m], lambda(v): v) as (@m)"];
     n5 [label="store(%output[@m], %0)"];
-    n3 [label="map(lhs, lambda(v): v) as (@m)"];
-    n1 [label="lhs"];
+    n3 [label="map(lhs[@m], lambda(v): v) as (@m)"];
+    n1 [label="lhs[@m]"];
     n2 [label="v"];
     n3 -> n4;
     n4 -> n5;

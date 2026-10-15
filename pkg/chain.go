@@ -32,6 +32,7 @@ import (
 type chain struct {
 	b     *Builder
 	id    uint64   // reserved statement ID (ir.ReserveStatementID)
+	retID uint64   // reserved return-statement ID, consumed by a new output
 	stage string   // rung reached, for diagnostics
 	iters []Dim    // root iteration-cluster dims (nil once the root map is built)
 	live  []Dim    // axes live at the pipe, in the current as-order
@@ -253,7 +254,7 @@ func (c *chain) buildReduce(init Expr, fn func(acc, v Expr) Expr) (ir.Node, *ir.
 		return nil, nil, fmt.Errorf("reduce: homogeneous reducer violated (tca.md §4.2): combiner returns %s, want %s",
 			typeName(body.typ), typeName(T))
 	}
-	node := c.b.g.NewReduce(origin, init.node, c.pipe, ir.Lambda{Params: []ir.Param{acc, now}, Body: body.node})
+	node := c.b.g.NewReduce(origin, init.materialize(), c.pipe, ir.Lambda{Params: []ir.Param{acc, now}, Body: body.materialize()})
 	c.live = append([]Dim(nil), c.live[:len(c.live)-1]...)
 	return node, T, nil
 }
@@ -336,7 +337,7 @@ func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
 	node := c.b.g.NewStore(origin, ir.Access{Tensor: t.param, Axes: params}, c.pipe)
 	c.b.g.AddStatementAs(c.id, node)
 	c.b.chain = nil
-	c.b.noteOutput(t, node)
+	c.b.noteOutput(t, node, c.retID)
 	return &Stored{c: c}, nil
 }
 
@@ -412,7 +413,7 @@ func (ra *RootAs) As(dims ...Dim) *MidChain {
 	if err := c.pending(); err == nil {
 		c.deferErr(c.checkAsPermutation(dims, "root map"))
 	}
-	mapNode := c.b.g.NewMap(origin, ra.opNodes, ir.Lambda{Params: ra.params, Body: ra.body.node}, dimParams(dims))
+	mapNode := c.b.g.NewMap(origin, ra.opNodes, ir.Lambda{Params: ra.params, Body: ra.body.materialize()}, dimParams(dims))
 	ic := c.b.g.NewIterCluster(origin, dimParams(c.iters), mapNode)
 	c.pipe = ic
 	c.elem = ra.body.typ
@@ -519,7 +520,7 @@ func (am *AfterMap) As(dims ...Dim) *Tail {
 	ops := make([]ir.Node, 0, len(am.opNodes)+1)
 	ops = append(ops, c.pipe)
 	ops = append(ops, am.opNodes...)
-	mapNode := c.b.g.NewMap(origin, ops, ir.Lambda{Params: am.params, Body: am.body.node}, dimParams(dims))
+	mapNode := c.b.g.NewMap(origin, ops, ir.Lambda{Params: am.params, Body: am.body.materialize()}, dimParams(dims))
 	ic := c.b.g.NewIterCluster(origin, nil, mapNode)
 	c.pipe = ic
 	c.elem = am.body.typ

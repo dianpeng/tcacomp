@@ -2,8 +2,10 @@ package pkg
 
 import (
 	"fmt"
+	"io"
 
 	"tcacomp/internal/ir"
+	"tcacomp/internal/pass"
 )
 
 // This file is the public builder root (FE-01, D-08): typed first-class
@@ -186,7 +188,10 @@ func (b *Builder) Tensor(name string, elem ir.ElemType, dims ...Dim) Tensor {
 
 // ScalarParam declares an explicit scalar dependency and returns its typed
 // expression handle. The [scale] capture of syntax.md §6.1 becomes an SSA
-// operand of the expression graph through this reference.
+// operand of the expression graph through this reference. The handle is
+// lazy: its paramRef node materializes on first use (see Expr.materialize)
+// so scalar declarations never consume graph IDs ahead of the
+// statement-ID reservation in Stmt.
 func (b *Builder) ScalarParam(name string, t ir.ElemType) Expr {
 	if b.final {
 		b.noteDeclErr(fmt.Errorf("scalar %s: builder already finalized by Build", name))
@@ -197,26 +202,62 @@ func (b *Builder) ScalarParam(name string, t ir.ElemType) Expr {
 	typ := ir.InternScalar(t)
 	p := b.g.AddScalarParam(name, typ)
 	b.scalars[name] = t
-	return Expr{b: b, node: b.g.NewParamRef(origin, p), typ: typ}
+	return Expr{b: b, scalar: p, typ: typ}
 }
 
 // Stmt starts a new statement chain and returns its first typestate rung.
-// The statement's ID is reserved now — before its chain nodes exist — so the
-// canonical print shows dense statement numbers (see ir.ReserveStatementID).
-// Starting a new chain abandons any unfinished one; Build rejects a builder
-// left with an unfinished chain.
+// Two IDs are reserved now — the statement's and its return statement's —
+// before any of the chain's nodes exist, so the canonical print shows dense
+// statement numbers (see ir.ReserveStatementID): the doc-pinned oracle
+// expects `statement #1` for the chain and `statement #2` for the return.
+// The return ID is consumed only if the chain stores a new output tensor;
+// otherwise it stays unused (IDs may skip). Starting a new chain abandons
+// any unfinished one; Build rejects a builder left with an unfinished chain.
 func (b *Builder) Stmt() *StmtIter {
 	if b.final {
 		b.noteDeclErr(fmt.Errorf("stmt: builder already finalized by Build"))
 	}
-	b.chain = &chain{b: b, id: b.g.ReserveStatementID()}
+	id := b.g.ReserveStatementID()
+	retID := b.g.ReserveStatementID()
+	b.chain = &chain{b: b, id: id, retID: retID}
 	return &StmtIter{c: b.chain}
 }
 
-// noteOutput records a store to t as an output binding. The first store of a
-// new output reserves its return-statement ID; later stores to the same
-// tensor update the binding the return reads (last store wins).
-func (b *Builder) noteOutput(t Tensor, store ir.Node) {
+// Build finalizes the graph and returns it, verified exclusively through
+// the normal pass-manager path (D-10): the kernel `return` statement for
+// each declared output binding is emitted first (statement IDs continue the
+// reserved construction order), then a pass.Manager with an EMPTY pass list
+// carrying the VerifyEach instrumentation runs the graph. VerifyEach's
+// AfterPipeline hook runs the graph verifier even with zero passes and
+// Manager.Run surfaces its error, so Build returns verification failures as
+// Build errors — never a half-built graph, and never by calling the
+// verifier directly from pkg (that would bypass the single authoritative
+// path).
+func (b *Builder) Build() (*ir.Graph, error) {
+	if err := b.declErr; err != nil {
+		return nil, err
+	}
+	if b.chain != nil {
+		return nil, fmt.Errorf("build: statement chain (reserved statement id %d) was never stored", b.chain.id)
+	}
+	b.final = true
+	for _, o := range b.outputs {
+		ret := b.g.NewReturn(origin, o.store)
+		b.g.AddStatementAs(o.retID, ret)
+	}
+	pm := pass.NewManager(nil)
+	pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
+	if err := pm.Run(b.g); err != nil {
+		return nil, err
+	}
+	return b.g, nil
+}
+
+// noteOutput records a store to t as an output binding, consuming the
+// chain's reserved return-statement ID. Later stores to the same tensor
+// update the binding the return reads (last store wins) without consuming
+// another ID.
+func (b *Builder) noteOutput(t Tensor, store ir.Node, retID uint64) {
 	name := t.param.Name()
 	for i := range b.outputs {
 		if b.outputs[i].tensor.Name() == name {
@@ -224,5 +265,5 @@ func (b *Builder) noteOutput(t Tensor, store ir.Node) {
 			return
 		}
 	}
-	b.outputs = append(b.outputs, output{tensor: t.param, store: store, retID: b.g.ReserveStatementID()})
+	b.outputs = append(b.outputs, output{tensor: t.param, store: store, retID: retID})
 }

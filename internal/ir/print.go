@@ -301,7 +301,11 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		}
 		b.WriteString(") -> ")
 		if body := opAt(t, 0); body != nil {
-			b.WriteString(r.stageText(body, nil))
+			// The iteration cluster is transparent for piping: a value
+			// piped THROUGH an iter() wrapper is still the previous stage
+			// (doc §2.6), so the body sees prev — this is what renders
+			// `iter() -> map(%0, ...)` for a fused piped map.
+			b.WriteString(r.stageText(body, prev))
 		}
 		return b.String()
 	case *mapNode:
@@ -367,6 +371,20 @@ func (r *renderer) value(n Node) string {
 	case *constNode:
 		return FormatConst(t.val)
 	case *paramRefNode:
+		// A reference to a tensor param IS the structural access: with no
+		// separate access node kind in the v0 suite, the axes render from
+		// the tensor type's dims (lhs[@m][@n]); scalar params and lambda
+		// params render bare (scale, v). The builder enforces that the
+		// bound axes match these dims positionally, so the printed form is
+		// faithful.
+		if pt := t.param.Type(); pt != nil && !pt.IsScalar() {
+			var b strings.Builder
+			b.WriteString(t.param.Name())
+			for _, d := range pt.Dims() {
+				b.WriteString("[@" + d.Name + "]")
+			}
+			return b.String()
+		}
 		return t.param.Name() // lambda params and captured kernel scalars both render bare
 	case *binOpNode:
 		return r.binExpr(t)

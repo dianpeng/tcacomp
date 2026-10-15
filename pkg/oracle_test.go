@@ -68,8 +68,8 @@ func TestMatmulScaleGolden(t *testing.T) {
 //   - (a) Build() runs the completed oracle through pass.NewManager(nil) —
 //     an EMPTY pass list — carrying the VerifyEach instrumentation, and
 //     returns nil: verification executed because VerifyEach.AfterPipeline
-//     runs a final ir.Verify even with zero passes and Manager.Run returns
-//     its error.
+//     runs a final verification pass even with zero passes and Manager.Run
+//     returns its error.
 //   - (b) the same PM path over a hand-built graph with an unwired operand
 //     (which the ir constructors deliberately allow) returns a non-nil
 //     error, so the single authoritative path is non-vacuous.
@@ -79,7 +79,7 @@ func TestBuildVerifiesThroughPM(t *testing.T) {
 		m := b.Dim("m", 0)
 		n := b.Dim("n", 0)
 		lhs := b.Tensor("lhs", ir.TF32, m, n)
-		out := b.Tensor("output", ir.TF32, m, n)
+		out := b.Tensor("output", ir.TF32, m) // reduce over the last as axis @n leaves @m live
 		root, err := b.Stmt().Iter(m, n).
 			Map([]pkg.Operand{pkg.At(lhs, m, n)},
 				func(l pkg.Expr) pkg.Expr { return l })
@@ -91,7 +91,7 @@ func TestBuildVerifiesThroughPM(t *testing.T) {
 		if err != nil {
 			t.Fatalf("setup reduce: %v", err)
 		}
-		if _, err := ar.Store(out, m, n); err != nil {
+		if _, err := ar.Store(out, m); err != nil {
 			t.Fatalf("setup store: %v", err)
 		}
 		graph, err := b.Build()

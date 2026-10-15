@@ -22,11 +22,32 @@ import (
 // Expr is a typed scalar-expression handle (D-09). It carries its builder,
 // its IR node, and its interned type, so the Go type system plus the recorded
 // type catch misuse at the call site instead of in a later pass.
+//
+// A scalar-param handle (ScalarParam) is LAZY: it carries the param and
+// materializes its paramRef node on first use. Declaration order must never
+// consume graph IDs ahead of the statement-ID reservation in Stmt — the
+// doc-pinned oracle print expects `statement #1` even though `scale` is
+// declared before Stmt. Each use materializes one paramRef (SSA-duplicated
+// references; dedup is a later pass's job); the use-site order is
+// deterministic, so prints stay byte-stable.
 type Expr struct {
-	b    *Builder
-	node ir.Node
-	typ  *ir.Type
-	err  error // first deferred type error; surfaced by the chain rungs
+	b      *Builder
+	node   ir.Node // eager node (operators, literals, lambda params)
+	scalar ir.Param
+	typ    *ir.Type
+	err    error // first deferred type error; surfaced by the chain rungs
+}
+
+// materialize returns e's IR node, creating the paramRef for a lazy scalar
+// handle. Poisoned exprs return nil; operators return early on err.
+func (e Expr) materialize() ir.Node {
+	if e.node != nil {
+		return e.node
+	}
+	if e.scalar.Name() == "" || e.b == nil {
+		return nil
+	}
+	return e.b.g.NewParamRef(origin, e.scalar)
 }
 
 // ok reports whether e is error-free.
@@ -136,7 +157,7 @@ func (b *Builder) typedBinOp(op ir.BinOpCode, x, y Expr, class string) Expr {
 	default:
 		return b.bad(fmt.Errorf("%s: unknown operand class %q", op, class))
 	}
-	return Expr{b: b, node: b.g.NewBinOp(origin, op, x.node, y.node), typ: result}
+	return Expr{b: b, node: b.g.NewBinOp(origin, op, x.materialize(), y.materialize()), typ: result}
 }
 
 // Binary arithmetic, same-type operands, result of that type (§6.2).
@@ -191,7 +212,7 @@ func (b *Builder) typedUnary(op ir.UnaryOpCode, x Expr, class string) Expr {
 	default:
 		return b.bad(fmt.Errorf("%s: unknown operand class %q", op, class))
 	}
-	return Expr{b: b, node: b.g.NewUnaryOp(origin, op, x.node), typ: x.typ}
+	return Expr{b: b, node: b.g.NewUnaryOp(origin, op, x.materialize()), typ: x.typ}
 }
 
 // Neg/Pos are arithmetic; Not is Boolean; BitsNot is integer (§6.2/§7.6).
@@ -246,7 +267,7 @@ func Select(cond, a, b Expr) Expr {
 		return a.b.bad(fmt.Errorf("select: branches must have identical types, got %s vs %s",
 			typeName(a.typ), typeName(b.typ)))
 	}
-	return Expr{b: a.b, node: a.b.g.NewSelect(origin, cond.node, a.node, b.node), typ: a.typ}
+	return Expr{b: a.b, node: a.b.g.NewSelect(origin, cond.materialize(), a.materialize(), b.materialize()), typ: a.typ}
 }
 
 // Cast is the explicit conversion to a named scalar type (§6.2: explicit
@@ -266,7 +287,7 @@ func Cast(e Expr, t ir.ElemType) Expr {
 	if e.typ.Elem() == t {
 		return e.b.bad(fmt.Errorf("cast: redundant cast to %s", t))
 	}
-	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.node), typ: target}
+	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.materialize()), typ: target}
 }
 
 // pureBuiltins is the v0 pure scalar-builtin registry (syntax.md §6.4):
@@ -305,7 +326,7 @@ func Call(name string, args ...Expr) (Expr, error) {
 		if a.typ != f32 {
 			return Expr{}, fmt.Errorf("call %s: argument %d must be f32, got %s", name, i, typeName(a.typ))
 		}
-		nodes[i] = a.node
+		nodes[i] = a.materialize()
 	}
 	return Expr{b: b, node: b.g.NewCall(origin, name, nodes...), typ: f32}, nil
 }
