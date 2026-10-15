@@ -116,6 +116,17 @@ func OperandsOf(n Node) []Node {
 	return out
 }
 
+// LambdaBodies returns the body roots of n's lambda payloads (map/reduce
+// stages) — the IR's single non-Use graph edge kind, walked as an edge by
+// the verifier and rendered as a def-to-user edge by DOT emission (D-05).
+func LambdaBodies(n Node) []Node {
+	var out []Node
+	if lb, ok := n.(lambdaBearer); ok {
+		lb.forEachLambda(func(lam *Lambda) { out = append(out, lam.Body) })
+	}
+	return out
+}
+
 // StmtNodes returns stmt's value nodes in canonical print order: chain
 // stages producer-first, then per stage the operand subtrees depth-first
 // (operand slots in order, lambda bodies included), every node exactly once.

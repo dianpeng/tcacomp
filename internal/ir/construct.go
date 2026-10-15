@@ -290,6 +290,14 @@ func (g *Graph) NewConst(origin string, t *Type, v float64) Node {
 	return n
 }
 
+// NewLambdaParam creates a lambda-parameter symbol: the named, typed
+// placeholder for a map/reduce lambda argument (lambda(l, r): ...). Lambda
+// params are NOT kernel I/O — they are not registered in the graph's param
+// list and carry no kernel role.
+func NewLambdaParam(name string, t *Type) Param {
+	return Param{name: name, typ: t}
+}
+
 // NewParamRef creates a scalar lambda-parameter reference node.
 func (g *Graph) NewParamRef(origin string, p Param) Node {
 	n := g.NewNode(KindParam, origin).(*paramRefNode)
