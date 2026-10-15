@@ -264,7 +264,7 @@ func (g *Graph) AddScalarParam(name string, t *Type) Param {
 // AddStatement appends a statement binding rhs to the graph's single block;
 // the statement ID comes from g.NewID() (D-04).
 func (g *Graph) AddStatement(rhs Value) *Statement {
-	s := &Statement{id: g.NewID(), rhs: rhs}
+	s := &Statement{id: g.NewID(), graph: g, rhs: rhs}
 	g.block.statements = append(g.block.statements, s)
 	return s
 }
@@ -288,6 +288,14 @@ func (g *Graph) NewConst(origin string, t *Type, v float64) Node {
 	n := g.NewNode(KindConst, origin).(*constNode)
 	n.typ, n.val = t, v
 	return n
+}
+
+// NewLambdaParam creates a lambda-parameter symbol: the named, typed
+// placeholder for a map/reduce lambda argument (lambda(l, r): ...). Lambda
+// params are NOT kernel I/O — they are not registered in the graph's param
+// list and carry no kernel role.
+func NewLambdaParam(name string, t *Type) Param {
+	return Param{name: name, typ: t}
 }
 
 // NewParamRef creates a scalar lambda-parameter reference node.
