@@ -269,6 +269,29 @@ func (g *Graph) AddStatement(rhs Value) *Statement {
 	return s
 }
 
+// ReserveStatementID returns the graph's next monotonic ID and advances the
+// counter, letting a builder pin a statement's ID before the statement's RHS
+// nodes exist. The doc-pinned oracle prints dense statement numbers
+// (`statement #1`, `#2`), but a fluent builder constructs the statement's
+// chain nodes before it appends the statement, which would otherwise push
+// statement IDs behind every chain node. Reservation moves the allocation to
+// chain-entry time; IDs still come only from the graph's monotonic counter
+// (IR-05) and must be consumed by AddStatementAs in append order.
+func (g *Graph) ReserveStatementID() uint64 {
+	id := g.nextID
+	g.nextID++
+	return id
+}
+
+// AddStatementAs appends a statement carrying a builder-reserved ID (see
+// ReserveStatementID). Unlike AddStatement the ID is not drawn at append
+// time; the statement still joins the block in append order.
+func (g *Graph) AddStatementAs(id uint64, rhs Value) *Statement {
+	s := &Statement{id: id, graph: g, rhs: rhs}
+	g.block.statements = append(g.block.statements, s)
+	return s
+}
+
 // NewNode is the low-level constructor: it creates a node of ANY kind —
 // including KindInvalid and kinds >= KindEnd — with operands wired as Uses.
 // It deliberately performs no kind or operand validation (see file comment).
