@@ -343,6 +343,8 @@ Typing rules:
 
 Numeric corner cases, supported cast pairs, and builtin behavior are defined by the shared frontend/IR expression registry. This frontend must not introduce a second, inconsistent numerical policy. In particular, it does not promise that out-of-range float-to-integer conversion is safe.
 
+**Numerical policy (pinned for v0).** Scalar floating-point evaluation follows IEEE 754 semantics per operation: no fast-math, no flush-to-zero (`ftz`), and no silent precision reduction of any kind (in particular no TF32 or tensor-core down-conversion). FMA contraction (`a * b + c` contracting to a single rounding) is **permitted by default** and applied only per operation, never as part of a wider reassociation; a user who needs the exact unfused rounding can obtain it in the generated code (the compiler's e2e verification lane compiles with `--fmad=false`, and a per-kernel opt-out flag may be added later). For a fixed compiled kernel, execution is deterministic — no atomics and no data-dependent scheduling exist — so run-to-run results are bitwise identical; parallel reductions remain schedule-dependent across *different* compilations as stated in the IR spec.
+
 `&&`, `||`, and `?:` retain C++-style conditional evaluation. An unselected expression is not semantically evaluated. The expression IR must preserve this behavior, for example with lazy select expressions; codegen must not eagerly evaluate a potentially invalid unselected division or conversion.
 
 ### 6.3 Literals
@@ -669,7 +671,7 @@ iter(@i/N) ->
 return %output
 ```
 
-`alpha` is an explicit scalar dependency of the expression graph. Whether multiplication and addition contract into an FMA follows the compiler's numerical policy; users can request a fused operation explicitly with `fmaf`.
+`alpha` is an explicit scalar dependency of the expression graph. Whether multiplication and addition contract into an FMA follows the pinned numerical policy of [Section 6.2](#62-expressions-and-typing): contraction is permitted per operation unless the kernel opts out; users can request a fused operation explicitly with `fmaf`.
 
 ### 9.2 Bias broadcasting and ReLU
 

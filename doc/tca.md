@@ -288,6 +288,8 @@ reduce(init=0.0f, lambda(acc: f32, now: f32): acc + now)
 
 A cast produces a value of its explicitly named target type. Operators and builtin calls are checked against their typing rules; inference must determine every expression's type unambiguously, otherwise compilation fails. Conversions are represented explicitly rather than silently changing the reduction's numerical policy.
 
+Numerical policy is pinned in the frontend spec: IEEE 754 per-operation semantics, FMA contraction permitted by default and documented per operation, no flush-to-zero, no silent precision reduction, no fast-math. For a fixed compiled kernel, execution is deterministic (no atomics, fixed schedule); parallel reductions remain schedule-dependent across different compilations as stated in [Section 2.5](#25-functions).
+
 The initializer and combiner determine the reducer accumulator/result type. Low-precision values can be cast to `f32` before reduction, and a fused map can cast the result to the output type. In v0 every reducer is **homogeneous**: the input element type, the initializer type, both combiner parameter types, and the result type are one and the same scalar type. Mixed-type combiners are deferred; when added they must have a declared, type-checked signature.
 
 ### 4.3 Bounds and Lambda Invocation
