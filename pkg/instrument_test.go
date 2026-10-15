@@ -2,6 +2,7 @@ package pkg_test
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -49,14 +50,16 @@ func setVerifyEach(t *testing.T, v bool) {
 	t.Cleanup(func() { flags.F.VerifyEach = old })
 }
 
-// constSumGraph builds the minimal verifiable graph: one statement whose
-// root is `1.0 + 2.0` over two typed constants.
-func constSumGraph() *ir.Graph {
+// returnSumGraph builds the minimal verifiable graph: one statement,
+// `return 1.0 + 2.0` over two typed constants. The return stage root is
+// what makes the printer render real content (a bare scalar-expr root
+// prints only the statement header — chainOf walks stages only).
+func returnSumGraph() *ir.Graph {
 	g := ir.NewGraph("t")
 	f32 := ir.InternScalar(ir.TF32)
 	sum := g.NewBinOp("test", ir.BinOpAdd,
 		g.NewConst("test", f32, 1), g.NewConst("test", f32, 2))
-	g.AddStatement(sum)
+	g.AddStatement(g.NewReturn("test", sum))
 	return g
 }
 
@@ -71,27 +74,40 @@ func runNop(t *testing.T, g *ir.Graph, ins ...pass.Instrumentation) error {
 
 // TestInstrumentationsRealDumpOutput (TOOL-06) asserts that the standard
 // instrumentation set emits REAL dump content end-to-end through Manager.Run:
-// text dumps route through ir.Print (a `statement #1` header, not the
-// "no text emitter wired" placeholder) and graphviz dumps through
+// text dumps route through ir.Print (a real statement header, not the
+// unwired-emitter placeholder line) and graphviz dumps through
 // visualization.EmitDot (`digraph ` + `subgraph cluster_` lines, not the
 // placeholder).
 func TestInstrumentationsRealDumpOutput(t *testing.T) {
 	t.Run("text dump", func(t *testing.T) {
 		setDumpAfter(t, "all")
 		setDumpGraphviz(t, false)
+		g := returnSumGraph()
 		var buf bytes.Buffer
-		if err := runNop(t, constSumGraph(), pkg.DefaultInstrumentations(&buf)...); err != nil {
+		if err := runNop(t, g, pkg.DefaultInstrumentations(&buf)...); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 		out := buf.String()
 		if !strings.Contains(out, "// ---- after nop ----") {
 			t.Errorf("dump missing pass header: %q", out)
 		}
-		if !strings.Contains(out, "statement #1") {
-			t.Errorf("dump missing real ir.Print content (statement #1): %q", out)
+		// The statement header number comes from the graph's single
+		// monotonic ID counter shared with node IDs (IR-05), so assert it
+		// dynamically rather than as a literal: the load-bearing check is
+		// that REAL ir.Print content follows the header — the statement's
+		// stage text `return 1.0 + 2.0` — never the placeholder comment.
+		stmtID := g.Block().Statements()[0].ID()
+		if !strings.Contains(out, fmt.Sprintf("statement #%d:", stmtID)) {
+			t.Errorf("dump missing real ir.Print statement header: %q", out)
 		}
-		if strings.Contains(out, "no text emitter wired") {
-			t.Errorf("dump contains placeholder text — TextEmitter not wired: %q", out)
+		if !strings.Contains(out, "return 1.0 + 2.0") {
+			t.Errorf("dump missing real ir.Print stage content: %q", out)
+		}
+		// The placeholder an unwired emitter would print is a comment line
+		// starting "// [ir dump:" (see internal/pass/instrument.go); it must
+		// never appear once DefaultInstrumentations has bound ir.Print.
+		if strings.Contains(out, "// [ir dump:") {
+			t.Errorf("dump contains placeholder line — TextEmitter not wired: %q", out)
 		}
 	})
 
@@ -99,7 +115,7 @@ func TestInstrumentationsRealDumpOutput(t *testing.T) {
 		setDumpAfter(t, "all")
 		setDumpGraphviz(t, true)
 		var buf bytes.Buffer
-		if err := runNop(t, constSumGraph(), pkg.DefaultInstrumentations(&buf)...); err != nil {
+		if err := runNop(t, returnSumGraph(), pkg.DefaultInstrumentations(&buf)...); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 		out := buf.String()
@@ -109,8 +125,10 @@ func TestInstrumentationsRealDumpOutput(t *testing.T) {
 		if !strings.Contains(out, "subgraph cluster_") {
 			t.Errorf("dot dump missing statement cluster: %q", out)
 		}
-		if strings.Contains(out, "no dot emitter wired") {
-			t.Errorf("dot dump contains placeholder text — DotEmitter not wired: %q", out)
+		// The unwired-emitter placeholder is a "// [dot dump:" comment line;
+		// it must never appear once EmitDot is bound.
+		if strings.Contains(out, "// [dot dump:") {
+			t.Errorf("dot dump contains placeholder line — DotEmitter not wired: %q", out)
 		}
 	})
 }
@@ -161,7 +179,7 @@ func TestDefaultInstrumentationsComposition(t *testing.T) {
 		setDumpAfter(t, "all")
 		setPassTiming(t, true)
 		var buf bytes.Buffer
-		if err := runNop(t, constSumGraph(), pkg.DefaultInstrumentations(&buf)...); err != nil {
+		if err := runNop(t, returnSumGraph(), pkg.DefaultInstrumentations(&buf)...); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 		out := buf.String()
