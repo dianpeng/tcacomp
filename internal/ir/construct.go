@@ -264,7 +264,7 @@ func (g *Graph) AddScalarParam(name string, t *Type) Param {
 // AddStatement appends a statement binding rhs to the graph's single block;
 // the statement ID comes from g.NewID() (D-04).
 func (g *Graph) AddStatement(rhs Value) *Statement {
-	s := &Statement{id: g.NewID(), rhs: rhs}
+	s := &Statement{id: g.NewID(), graph: g, rhs: rhs}
 	g.block.statements = append(g.block.statements, s)
 	return s
 }

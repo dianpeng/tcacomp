@@ -100,9 +100,10 @@ func (p Param) Type() *Type { return p.typ }
 // an immutable SSA binding of a value-producing RHS. The ID is stable across
 // passes so pass-to-pass diffs can track a statement (D-04).
 type Statement struct {
-	id  uint64
-	def SSADef // reserved SSA-name cell; nil until a pass wires it
-	rhs Value
+	id    uint64
+	graph *Graph // owning graph, set at construction; lets the printer detect statement-chain boundaries
+	def   SSADef // reserved SSA-name cell; nil until a pass wires it
+	rhs   Value
 }
 
 // ID returns the statement's stable per-graph integer ID.
