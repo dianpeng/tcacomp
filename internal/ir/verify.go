@@ -102,6 +102,11 @@ func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
 				"erased node is still reachable from the block"))
 		}
+		if nb.surplus > 0 {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("node constructed with %d surplus operands (arity %d)",
+					nb.surplus, fixedArity(nb.kind))))
+		}
 		slot := 0
 		asImpl(n).forEachOperand(func(u *Use) {
 			switch {

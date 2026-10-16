@@ -31,6 +31,7 @@ type Base struct {
 	lastTouchedBy string
 	firstUse      *Use  // head of this def's intrusive use-list (D-16)
 	erased        bool  // tombstone set by Erase; IDs are never reused (IR-05)
+	surplus       int   // operands supplied beyond the fixed-arity slot count at construction; the verifier flags > 0 (fail-closed, WR-01)
 	graph         *Graph // owning graph, set at construction; lets Erase unlink from the block
 }
 

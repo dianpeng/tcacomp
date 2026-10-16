@@ -218,13 +218,18 @@ func slotsOf(n nodeImpl) []*Use {
 
 // wireOperands sets each operand slot's Val/User and splices it into the
 // def's intrusive use-list, exactly as the AddUse choke point does. A nil
-// operand leaves the slot unwired (Val == nil) for the verifier to flag;
-// operands beyond a fixed-arity kind's slot count are ignored.
-func wireOperands(n nodeImpl, operands ...Node) {
+// operand leaves the slot unwired (Val == nil) for the verifier to flag.
+// Operands beyond a fixed-arity kind's slot count are NOT wired, but they are
+// COUNTED and returned as the surplus so NewNode can record them: silent
+// drops are fail-open, and construction in this design is fail-closed — the
+// verifier flags any surplus under the use-def invariant (WR-01).
+func wireOperands(n nodeImpl, operands ...Node) int {
 	slots := slotsOf(n)
+	surplus := 0
 	for i, val := range operands {
 		if i >= len(slots) {
-			return
+			surplus++
+			continue
 		}
 		u := slots[i]
 		u.Val = val
@@ -233,6 +238,7 @@ func wireOperands(n nodeImpl, operands ...Node) {
 			linkIntoDef(val.BasePtr(), u)
 		}
 	}
+	return surplus
 }
 
 // NewGraph creates an empty named graph holding exactly one basic block.
@@ -294,7 +300,10 @@ func (g *Graph) AddStatementAs(id uint64, rhs Value) *Statement {
 
 // NewNode is the low-level constructor: it creates a node of ANY kind —
 // including KindInvalid and kinds >= KindEnd — with operands wired as Uses.
-// It deliberately performs no kind or operand validation (see file comment).
+// It deliberately performs no kind validation (see file comment), but
+// operands supplied beyond a fixed-arity kind's slot count are recorded as
+// surplus on the node so the verifier can reject the graph (fail-closed,
+// WR-01); variadic kinds (call, map) and the raw fallback wire every operand.
 func (g *Graph) NewNode(k Kind, origin string, operands ...Node) Node {
 	arity := fixedArity(k)
 	nSlots := arity
@@ -302,7 +311,11 @@ func (g *Graph) NewNode(k Kind, origin string, operands ...Node) Node {
 		nSlots = len(operands)
 	}
 	n := g.allocNode(k, origin, nSlots)
-	wireOperands(n, operands...)
+	if arity >= 0 {
+		n.BasePtr().surplus = wireOperands(n, operands...)
+	} else {
+		wireOperands(n, operands...)
+	}
 	return n
 }
 

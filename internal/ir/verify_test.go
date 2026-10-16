@@ -47,6 +47,47 @@ func TestVerifierCatchesCorruption(t *testing.T) {
 	}
 }
 
+func TestVerifierFlagsSurplusOperands(t *testing.T) {
+	g := NewGraph("surplus")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+
+	// A third operand of a fixed-arity binop cannot be wired, but the
+	// construction deliberately does not fail: instead the surplus is
+	// recorded and the verifier flags it (fail-closed, WR-01 — never a
+	// silent drop).
+	x := g.NewNode(KindBinOp, "ctor", a, b, a)
+	g.AddStatement(x)
+
+	if got := len(x.(*binOpNode).ops); got != 2 {
+		t.Fatalf("binop wired %d slots, want exactly 2 (surplus never wired)", got)
+	}
+	vs := Verify(g)
+	found := false
+	for _, v := range vs {
+		if v.NodeID == x.BasePtr().ID() && v.Invariant == "use-def" && strings.Contains(v.Msg, "surplus") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verifier must flag the surplus operands, got %v", vs)
+	}
+
+	// Sanity: the exact-arity construction next to it stays clean.
+	y := g.NewNode(KindBinOp, "ctor", a, b)
+	g.AddStatement(y)
+	foundY := false
+	for _, v := range Verify(g) {
+		if v.NodeID == y.BasePtr().ID() {
+			foundY = true
+		}
+	}
+	if foundY {
+		t.Fatal("exact-arity construction must not be flagged")
+	}
+}
+
 func TestVerifierFlagsUnwiredOperand(t *testing.T) {
 	g := NewGraph("unwired")
 	f32 := InternScalar(TF32)
