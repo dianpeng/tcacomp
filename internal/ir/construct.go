@@ -25,7 +25,7 @@ type Access struct {
 }
 
 // Concrete node types (D-15: Go interface families with a shared embedded
-// *Base). Every operand edge is a Use slot in the node's operandList; the
+// *Base). Every operand edge is an SSAUse slot in the node's operandList; the
 // kind lives in Base. Payload fields are set once by the typed constructors
 // and are immutable after construction.
 
@@ -241,8 +241,8 @@ func wireOperands(n nodeImpl, operands ...Node) int {
 			surplus++
 			continue
 		}
-		if val == nil {
-			continue // leave the zero handle
+		if val == nil || val.BasePtr().ssa == nil {
+			continue // leave the zero handle (foreign nodes without a var stay unwired)
 		}
 		rec := val.BasePtr().ssa.addRef(n)
 		n.setSlot(i, SSAUse{rec: rec})

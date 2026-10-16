@@ -14,11 +14,11 @@ func TestVerifierCatchesCorruption(t *testing.T) {
 	x := g.NewBinOp("ctor", BinOpAdd, d1, d1)
 	g.AddStatement(x)
 
-	// Corrupt ONE direction of the chain by hand (white-box): point x's
-	// first operand at d2 WITHOUT splicing the use into d2's use-list.
+	// Corrupt ONE direction of the chain by hand (white-box): retarget x's
+	// first operand record at d2 WITHOUT moving it into d2's ref list.
 	// The use-def side now claims d2; the def-use side knows nothing.
 	xn := x.(*binOpNode)
-	xn.ops[0].Val = d2
+	xn.ops[0].rec.def = d2.BasePtr().ssa
 
 	// Stamp the corrupted node through a legal choke point so the
 	// diagnostic can name the last-touched-by pass structurally (D-17).

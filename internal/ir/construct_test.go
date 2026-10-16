@@ -91,21 +91,21 @@ func TestUseListBasics(t *testing.T) {
 	if DefOf(uses[0]) != Node(c1) {
 		t.Fatal("DefOf must return the def a use points at")
 	}
-	if uses[0].User != Node(sum) {
-		t.Fatal("use back-pointer must name the owning node")
-	}
-
-	// Two operand slots on one user: both link into c-def lists, most
-	// recently linked first (LLVM prepend discipline).
+	// Two operand slots on one user: both link into the def vars' ref lists
+	// in append (link) order.
 	bin := sum.(*binOpNode)
 	if len(bin.ops) != 2 {
 		t.Fatalf("binop has %d operand slots, want 2", len(bin.ops))
 	}
 	if u := UsesOf(c1); u[0] != bin.ops[0] {
-		t.Fatal("c1's use-list head must be the binop's first operand slot")
+		t.Fatal("c1's ref list head must be the binop's first operand slot")
 	}
 	if u := UsesOf(c2); u[0] != bin.ops[1] {
-		t.Fatal("c2's use-list head must be the binop's second operand slot")
+		t.Fatal("c2's ref list head must be the binop's second operand slot")
+	}
+	// The record's user back-pointer must name the owning node.
+	if UsesOf(c1)[0].rec.user != Node(sum) {
+		t.Fatal("use back-pointer must name the owning node")
 	}
 
 	// Snapshot safety: mutating the returned slice must not touch the chain.

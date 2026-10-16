@@ -26,8 +26,8 @@ func (v Violation) String() string {
 
 // Invariant names for the two chain directions checked on every graph.
 const (
-	invUseDef = "use-def" // every Use points at a live def of a known kind
-	invDefUse = "def-use" // every def's use-list matches the uses pointing at it
+	invUseDef = "use-def" // every operand handle resolves to a live def of a known kind
+	invDefUse = "def-use" // every def's ref list matches the operand slots that own its records
 )
 
 // Verify runs both chain-consistency checkers over g and returns every
@@ -73,11 +73,13 @@ func asImpl(n Node) nodeImpl {
 }
 
 // walkCheckUseDef walks the graph from the block's statements, checking the
-// use-def direction at every node: each operand Use must point at a non-nil,
-// live (not tombstoned) def of a kind < KindEnd. It returns the visited
-// nodes in walk order for the def-use pass. Lambda bodies are walked as
-// edges alongside operand uses. The walk is iterative with a visited set, so
-// malformed (cyclic) graphs cannot blow the stack (T-1-01-02).
+// use-def direction at every node: each operand slot's handle must resolve to
+// a live (not tombstoned) def of a kind < KindEnd. Zero handles and unwired
+// records report the construction-time "nil def" message; killed records are
+// the handle model's new corruption class, flagged by slot. It returns the
+// visited nodes in walk order for the def-use pass. Lambda bodies are walked
+// as edges alongside operand uses. The walk is iterative with a visited set,
+// so malformed (cyclic) graphs cannot blow the stack (T-1.1-02).
 func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 	seen := make(map[Node]bool)
 	var queue []Node
@@ -89,7 +91,9 @@ func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 		queue = append(queue, n)
 	}
 	for _, s := range g.block.statements {
-		enqueue(s.def)
+		if !s.def.IsInvalid() {
+			enqueue(s.def.SSA().Node())
+		}
 		enqueue(s.rhs)
 	}
 	var nodes []Node
@@ -108,22 +112,38 @@ func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 					nb.surplus, fixedArity(nb.kind))))
 		}
 		slot := 0
-		asImpl(n).forEachOperand(func(u *Use) {
-			switch {
-			case u.Val == nil:
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
-			case u.Val.BasePtr().erased:
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("operand slot %d points at erased node %d", slot, u.Val.BasePtr().id)))
-			case u.Val.KindOf() == KindInvalid || u.Val.KindOf() >= KindEnd:
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("operand slot %d points at node %d of unknown kind %d",
-						slot, u.Val.BasePtr().id, u.Val.KindOf())))
-			}
-			enqueue(u.Val)
-			slot++
-		})
+		if impl := asImpl(n); impl != nil {
+			impl.forEachOperand(func(u SSAUse) {
+				var def Node
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					def = u.rec.def.node
+				}
+				switch {
+				case u.rec == nil || (u.rec.def == nil && !u.rec.killed):
+					// zero handle, or a record unwired by SetDef(_, nil):
+					// the same message construction-time unwired slots report
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
+				case u.rec.killed:
+					// the handle model's new corruption class: a removed
+					// record still referenced from a live slot
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("operand slot %d holds a killed use record (removed but still referenced)", slot)))
+				case def == nil:
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
+				case def.BasePtr().erased:
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("operand slot %d points at erased node %d", slot, def.BasePtr().id)))
+				case def.KindOf() == KindInvalid || def.KindOf() >= KindEnd:
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("operand slot %d points at node %d of unknown kind %d",
+							slot, def.BasePtr().id, def.KindOf())))
+				}
+				enqueue(def)
+				slot++
+			})
+		}
 		if lb, ok := n.(lambdaBearer); ok {
 			lb.forEachLambda(func(lam *Lambda) { enqueue(lam.Body) })
 		}
@@ -132,41 +152,58 @@ func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 }
 
 // checkDefUse checks the def-use direction for every visited node: the
-// node's intrusive use-list must contain exactly the Use records whose Val
-// points back at it. Over-links (a listed use pointing elsewhere, or a
-// listed use no operand slot owns) and under-links (an operand use missing
+// node's SSAVar ref list must contain exactly the records whose slots point
+// back at it. Over-links (a listed record pointing elsewhere, or a listed
+// record no operand slot owns) and under-links (an operand record missing
 // from the def's list) are both reported — corrupting either direction is
 // caught by this walk.
 func checkDefUse(nodes []Node, vs *[]Violation) {
-	expected := make(map[Node][]*Use)
+	expected := make(map[*SSAVar][]*ssaRefRecord)
 	for _, n := range nodes {
-		asImpl(n).forEachOperand(func(u *Use) {
-			if u.Val != nil {
-				expected[u.Val] = append(expected[u.Val], u)
-			}
-		})
+		if impl := asImpl(n); impl != nil {
+			impl.forEachOperand(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					expected[u.rec.def] = append(expected[u.rec.def], u.rec)
+				}
+			})
+		}
 	}
 	for _, n := range nodes {
 		nb := n.BasePtr()
-		found := make(map[*Use]bool, len(expected[n]))
-		for u := nb.firstUse; u != nil; u = u.next {
-			if u.Val != n {
-				*vs = append(*vs, nodeViolation(u.User, invDefUse,
+		v := nb.ssa
+		if v == nil {
+			continue // a foreign node without a var has no ref list to check
+		}
+		found := make(map[*ssaRefRecord]bool, len(expected[v]))
+		for _, r := range v.refs {
+			if r == nil || r.killed {
+				continue
+			}
+			if r.def != v {
+				*vs = append(*vs, nodeViolation(r.user, invDefUse,
 					fmt.Sprintf("use-list of node %d contains a use pointing at node %s instead",
-						nb.id, nodeIDStr(u.Val))))
-			} else if !slices.Contains(expected[n], u) {
-				*vs = append(*vs, nodeViolation(u.User, invDefUse,
+						nb.id, nodeIDStr(varNode(r.def)))))
+			} else if !slices.Contains(expected[v], r) {
+				*vs = append(*vs, nodeViolation(r.user, invDefUse,
 					fmt.Sprintf("use-list of node %d contains a use that no operand slot owns",
 						nb.id)))
 			}
-			found[u] = true
+			found[r] = true
 		}
-		for _, u := range expected[n] {
-			if !found[u] {
-				*vs = append(*vs, nodeViolation(u.User, invDefUse,
+		for _, r := range expected[v] {
+			if !found[r] {
+				*vs = append(*vs, nodeViolation(r.user, invDefUse,
 					fmt.Sprintf("operand use of node %d is missing from node %d's use-list",
 						nb.id, nb.id)))
 			}
 		}
 	}
+}
+
+// varNode resolves a var's owning node, nil-safely.
+func varNode(v *SSAVar) Node {
+	if v == nil {
+		return nil
+	}
+	return v.node
 }

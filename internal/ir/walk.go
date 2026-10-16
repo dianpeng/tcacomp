@@ -25,7 +25,9 @@ func Visit(g *Graph, visit func(Node)) {
 		queue = append(queue, n)
 	}
 	for _, s := range g.block.statements {
-		enqueue(s.def)
+		if !s.def.IsInvalid() {
+			enqueue(s.def.SSA().Node())
+		}
 		enqueue(s.rhs)
 	}
 	for len(queue) > 0 {
@@ -33,7 +35,11 @@ func Visit(g *Graph, visit func(Node)) {
 		queue = queue[1:]
 		visit(n)
 		if impl := asImpl(n); impl != nil {
-			impl.forEachOperand(func(u *Use) { enqueue(u.Val) })
+			impl.forEachOperand(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					enqueue(u.rec.def.node)
+				}
+			})
 		}
 		if lb, ok := n.(lambdaBearer); ok {
 			lb.forEachLambda(func(lam *Lambda) { enqueue(lam.Body) })

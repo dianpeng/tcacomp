@@ -136,12 +136,13 @@ func ComputeNumbering(g *Graph) *Numbering {
 }
 
 // OperandsOf returns n's operand defs in canonical slot order; unwired slots
-// yield nil entries. It is the exported face of the operand-slot walk shared
-// by the printer, the numbering pass, and DOT edge emission (D-05).
+// (zero handles) yield nil entries. It is the exported face of the
+// operand-slot walk shared by the printer, the numbering pass, and DOT edge
+// emission (D-05).
 func OperandsOf(n Node) []Node {
 	var out []Node
 	if impl := asImpl(n); impl != nil {
-		impl.forEachOperand(func(u *Use) { out = append(out, u.Val) })
+		impl.forEachOperand(func(u SSAUse) { out = append(out, u.Def()) })
 	}
 	return out
 }
