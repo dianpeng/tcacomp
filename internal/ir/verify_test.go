@@ -23,7 +23,7 @@ func TestVerifierCatchesCorruption(t *testing.T) {
 	// Stamp the corrupted node through a legal choke point so the
 	// diagnostic can name the last-touched-by pass structurally (D-17).
 	ctx := &MutContext{Pass: "test-corrupt"}
-	if err := ctx.SetDef(&xn.ops[1], d1); err != nil {
+	if err := ctx.SetDef(xn.ops[1], d1); err != nil {
 		t.Fatalf("SetDef: %v", err)
 	}
 

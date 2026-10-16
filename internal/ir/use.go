@@ -1,9 +1,11 @@
 package ir
 
 // Use is one operand slot: a single SSA use record in the intrusive
-// use-list of the def it points at (IR-01, D-16). The record lives inside
-// the user node's operand storage; its prev/next links thread it into the
-// def's list, and its back-pointers name both ends of the edge.
+// use-list of the def it points at (IR-01, D-16). The record is heap-allocated
+// per slot and referenced BY POINTER from the user node's operand storage
+// (operandList.ops), so its address is stable across slot growth and removal;
+// its prev/next links thread it into the def's list, and its back-pointers
+// name both ends of the edge.
 type Use struct {
 	Val        Node // the def this operand currently points to (nil if unwired)
 	User       Node // back-pointer to the owning node

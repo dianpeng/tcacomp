@@ -71,6 +71,55 @@ func TestUseChain(t *testing.T) {
 	}
 }
 
+// TestAddUseKeepsChainsConsistent exercises AddUse on a node whose ops slice
+// is exactly at capacity after construction (len 2, cap 2): the append inside
+// addSlot reallocates, and every *Use handed out earlier — embedded in the
+// defs' use-lists and held by callers — must stay valid (CR-01).
+func TestAddUseKeepsChainsConsistent(t *testing.T) {
+	g := NewGraph("adduse")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
+	g.AddStatement(sum)
+	c := g.NewConst("ctor", f32, 3.0)
+
+	ctx := &MutContext{Pass: "test-adduse"}
+	u := ctx.AddUse(sum, c)
+	if u == nil {
+		t.Fatal("AddUse must return the new slot")
+	}
+	if u.Val != c || u.User != sum {
+		t.Fatal("the new slot must be wired to its def and user")
+	}
+	uses := UsesOf(c)
+	if len(uses) != 1 || uses[0] != u {
+		t.Fatalf("c's use-list must hold exactly the new use, got %v", uses)
+	}
+	if got := UsesOf(a); len(got) != 1 || got[0].User != sum {
+		t.Fatalf("a's use-list corrupted by the reallocating append: %v", got)
+	}
+	if got := UsesOf(b); len(got) != 1 || got[0].User != sum {
+		t.Fatalf("b's use-list corrupted by the reallocating append: %v", got)
+	}
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("chains inconsistent after AddUse past capacity: %v", vs)
+	}
+
+	// Same hazard on a variadic node grown repeatedly past capacity.
+	call := g.NewCall("ctor", "f", a, b)
+	g.AddStatement(call)
+	for i := 0; i < 8; i++ {
+		ctx.AddUse(call, c)
+	}
+	if got, want := len(call.(*callNode).ops), 10; got != want {
+		t.Fatalf("call has %d operand slots, want %d", got, want)
+	}
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("chains inconsistent after growing call past capacity: %v", vs)
+	}
+}
+
 func TestRauwGuards(t *testing.T) {
 	g := NewGraph("guards")
 	f32 := InternScalar(TF32)

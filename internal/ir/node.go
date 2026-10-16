@@ -163,26 +163,32 @@ type nodeImpl interface {
 }
 
 // operandList is embedded by every concrete node type to provide the
-// operand-slot half of nodeImpl uniformly.
+// operand-slot half of nodeImpl uniformly. The slice stores *Use POINTERS,
+// never Use records by value: every def's intrusive use-list and every public
+// API (UsesOf, DefOf, MutContext) hands out *Use pointers that must remain
+// stable for the node's whole lifetime. Append growth and slot removal then
+// only move pointers — the records themselves (and their prev/next links)
+// never move and never dangle (CR-01/CR-02).
 type operandList struct {
-	ops []Use // one Use per operand, in canonical operand order
+	ops []*Use // one *Use per operand, in canonical operand order
 }
 
 func (l *operandList) forEachOperand(fn func(*Use)) {
-	for i := range l.ops {
-		fn(&l.ops[i])
+	for _, u := range l.ops {
+		fn(u)
 	}
 }
 
 func (l *operandList) addSlot() *Use {
-	l.ops = append(l.ops, Use{})
-	return &l.ops[len(l.ops)-1]
+	u := &Use{}
+	l.ops = append(l.ops, u) // reallocation moves pointers, not the records
+	return u
 }
 
 func (l *operandList) removeSlot(u *Use) bool {
-	for i := range l.ops {
-		if &l.ops[i] == u {
-			l.ops = slices.Delete(l.ops, i, i+1)
+	for i, s := range l.ops {
+		if s == u {
+			l.ops = slices.Delete(l.ops, i, i+1) // drops a pointer; the record stays valid
 			return true
 		}
 	}

@@ -101,10 +101,10 @@ func TestUseListBasics(t *testing.T) {
 	if len(bin.ops) != 2 {
 		t.Fatalf("binop has %d operand slots, want 2", len(bin.ops))
 	}
-	if u := UsesOf(c1); u[0] != &bin.ops[0] {
+	if u := UsesOf(c1); u[0] != bin.ops[0] {
 		t.Fatal("c1's use-list head must be the binop's first operand slot")
 	}
-	if u := UsesOf(c2); u[0] != &bin.ops[1] {
+	if u := UsesOf(c2); u[0] != bin.ops[1] {
 		t.Fatal("c2's use-list head must be the binop's second operand slot")
 	}
 
