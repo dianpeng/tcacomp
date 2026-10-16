@@ -101,7 +101,7 @@ func TestFormatConst(t *testing.T) {
 func TestConstTextTyped(t *testing.T) {
 	g := NewGraph("consttext")
 	cases := []struct {
-		typ  *Type
+		typ  Type
 		v    float64
 		want string
 	}{
@@ -119,7 +119,7 @@ func TestConstTextTyped(t *testing.T) {
 	for _, c := range cases {
 		n := g.NewConst("test", c.typ, c.v)
 		if got := constText(n.(*constNode)); got != c.want {
-			t.Errorf("constText(%s %v) = %q, want %q", c.typ.Elem(), c.v, got, c.want)
+			t.Errorf("constText(%s %v) = %q, want %q", c.typ.(*NumericType).Elem(), c.v, got, c.want)
 		}
 	}
 

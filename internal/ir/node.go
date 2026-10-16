@@ -87,7 +87,7 @@ const (
 // are immutable after creation and are owned by the Graph's param list.
 type Param struct {
 	name string
-	typ  *Type // nil for dim params (dims are not typed values in v0)
+	typ  Type // nil for dim params (dims are not typed values in v0)
 	role paramRole
 }
 
@@ -95,7 +95,7 @@ type Param struct {
 func (p Param) Name() string { return p.name }
 
 // Type returns the parameter's interned type; nil for dim parameters.
-func (p Param) Type() *Type { return p.typ }
+func (p Param) Type() Type { return p.typ }
 
 // Statement is one ordered entry in the kernel's single basic block (IR-02):
 // an immutable SSA binding of a value-producing RHS. The ID is stable across

@@ -71,14 +71,15 @@ func FormatConst(v float64) string {
 // full integer precision — float32's 24-bit mantissa would otherwise collapse
 // distinct i32/u32 values (e.g. 2147483647 vs 2147483600) to identical text
 // (WR-02) — bools print as true/false, and the float family keeps
-// FormatConst's shortest-round-trip f32 spelling. A nil type falls back to
-// the float spelling so the printer stays deterministic on malformed nodes
-// (the verifier owns their rejection).
+// FormatConst's shortest-round-trip f32 spelling. A nil or non-numeric type
+// falls back to the float spelling so the printer stays deterministic on
+// malformed nodes (the verifier owns their rejection).
 func constText(t *constNode) string {
-	if t.typ == nil {
+	nt, ok := t.typ.(*NumericType)
+	if !ok {
 		return FormatConst(t.val)
 	}
-	switch t.typ.Elem() {
+	switch nt.Elem() {
 	case TI8, TI16, TI32:
 		return strconv.FormatInt(int64(t.val), 10)
 	case TU8, TU16, TU32:
@@ -406,7 +407,7 @@ func (r *renderer) value(n Node) string {
 		// params render bare (scale, v). The builder enforces that the
 		// bound axes match these dims positionally, so the printed form is
 		// faithful.
-		if pt := t.param.Type(); pt != nil && !pt.IsScalar() {
+		if pt, ok := t.param.Type().(*NumericType); ok && !pt.IsScalar() {
 			var b strings.Builder
 			b.WriteString(t.param.Name())
 			for _, d := range pt.Dims() {
@@ -491,17 +492,21 @@ func accessText(a Access) string {
 }
 
 // typeText renders an interned type for cast annotations. Casts are scalar
-// in v0; tensor spellings are best-effort for diagnostics.
-func typeText(t *Type) string {
-	if t == nil {
+// in v0; tensor spellings are best-effort for diagnostics. A nil or
+// non-numeric type renders as `?` (deterministic; the verifier owns
+// rejection) — the printer's numeric paths are never touched by future
+// non-numeric Type components.
+func typeText(t Type) string {
+	nt, ok := t.(*NumericType)
+	if !ok {
 		return "?"
 	}
-	if t.IsScalar() {
-		return t.Elem().String()
+	if nt.IsScalar() {
+		return nt.Elem().String()
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "tensor<dtype=%s, shape=[", t.Elem())
-	for i, d := range t.Dims() {
+	fmt.Fprintf(&b, "tensor<dtype=%s, shape=[", nt.Elem())
+	for i, d := range nt.Dims() {
 		if i > 0 {
 			b.WriteString(", ")
 		}

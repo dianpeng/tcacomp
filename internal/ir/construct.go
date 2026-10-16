@@ -32,7 +32,7 @@ type Access struct {
 type constNode struct {
 	*Base
 	operandList
-	typ *Type
+	typ Type
 	val float64
 }
 
@@ -74,7 +74,7 @@ func (*selectNode) scalarExprNode() {}
 type castNode struct {
 	*Base
 	operandList
-	typ *Type
+	typ Type
 }
 
 func (*castNode) scalarExprNode() {}
@@ -254,14 +254,14 @@ func (g *Graph) AddDimParam(name string) Param {
 }
 
 // AddTensorParam appends a tensor parameter of the given interned type.
-func (g *Graph) AddTensorParam(name string, t *Type) Param {
+func (g *Graph) AddTensorParam(name string, t Type) Param {
 	p := Param{name: name, typ: t, role: roleTensor}
 	g.params = append(g.params, p)
 	return p
 }
 
 // AddScalarParam appends a scalar parameter of the given interned type.
-func (g *Graph) AddScalarParam(name string, t *Type) Param {
+func (g *Graph) AddScalarParam(name string, t Type) Param {
 	p := Param{name: name, typ: t, role: roleScalar}
 	g.params = append(g.params, p)
 	return p
@@ -320,7 +320,7 @@ func (g *Graph) NewNode(k Kind, origin string, operands ...Node) Node {
 }
 
 // NewConst creates a typed scalar constant node.
-func (g *Graph) NewConst(origin string, t *Type, v float64) Node {
+func (g *Graph) NewConst(origin string, t Type, v float64) Node {
 	n := g.NewNode(KindConst, origin).(*constNode)
 	n.typ, n.val = t, v
 	return n
@@ -330,7 +330,7 @@ func (g *Graph) NewConst(origin string, t *Type, v float64) Node {
 // placeholder for a map/reduce lambda argument (lambda(l, r): ...). Lambda
 // params are NOT kernel I/O — they are not registered in the graph's param
 // list and carry no kernel role.
-func NewLambdaParam(name string, t *Type) Param {
+func NewLambdaParam(name string, t Type) Param {
 	return Param{name: name, typ: t}
 }
 
@@ -361,7 +361,7 @@ func (g *Graph) NewSelect(origin string, cond, a, b Node) Node {
 }
 
 // NewCast creates an explicit cast-to-t node with operand x.
-func (g *Graph) NewCast(origin string, t *Type, x Node) Node {
+func (g *Graph) NewCast(origin string, t Type, x Node) Node {
 	n := g.NewNode(KindCast, origin, x).(*castNode)
 	n.typ = t
 	return n
