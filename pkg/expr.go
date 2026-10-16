@@ -34,7 +34,7 @@ type Expr struct {
 	b      *Builder
 	node   ir.Node // eager node (operators, literals, lambda params)
 	scalar ir.Param
-	typ    *ir.Type
+	typ    ir.Type
 	err    error // first deferred type error; surfaced by the chain rungs
 }
 
@@ -66,15 +66,28 @@ func firstErr(exprs ...Expr) error {
 	return nil
 }
 
+// numericOf asserts the numeric type component behind an ir.Type (directive 1
+// assertion pattern). A nil Type or any future non-numeric component yields
+// nil; every elem/dim access in this package routes through this one helper
+// so no inline assertions scatter across the rungs.
+func numericOf(t ir.Type) *ir.NumericType {
+	nt, _ := t.(*ir.NumericType)
+	return nt
+}
+
 // typeName renders an interned type for diagnostics.
-func typeName(t *ir.Type) string {
+func typeName(t ir.Type) string {
 	if t == nil {
 		return "<nil>"
 	}
-	if t.IsScalar() {
-		return t.Elem().String()
+	nt := numericOf(t)
+	if nt == nil {
+		return "?"
 	}
-	return "tensor<" + t.Elem().String() + ">"
+	if nt.IsScalar() {
+		return nt.Elem().String()
+	}
+	return "tensor<" + nt.Elem().String() + ">"
 }
 
 func isIntElem(e ir.ElemType) bool {
@@ -95,20 +108,23 @@ func isFloatElem(e ir.ElemType) bool {
 
 // Operand type classes per syntax.md §6.2. All Exprs are scalar by
 // construction; the scalar check is defensive against future handle leaks.
-func isIntType(t *ir.Type) bool {
-	return t != nil && t.IsScalar() && isIntElem(t.Elem())
+func isIntType(t ir.Type) bool {
+	nt := numericOf(t)
+	return nt != nil && nt.IsScalar() && isIntElem(nt.Elem())
 }
 
-func isFloatType(t *ir.Type) bool {
-	return t != nil && t.IsScalar() && isFloatElem(t.Elem())
+func isFloatType(t ir.Type) bool {
+	nt := numericOf(t)
+	return nt != nil && nt.IsScalar() && isFloatElem(nt.Elem())
 }
 
-func isArithType(t *ir.Type) bool { return isIntType(t) || isFloatType(t) }
+func isArithType(t ir.Type) bool { return isIntType(t) || isFloatType(t) }
 
 func isArithElem(e ir.ElemType) bool { return isIntElem(e) || isFloatElem(e) }
 
-func isBoolType(t *ir.Type) bool {
-	return t != nil && t.IsScalar() && t.Elem() == ir.TBool
+func isBoolType(t ir.Type) bool {
+	nt := numericOf(t)
+	return nt != nil && nt.IsScalar() && nt.Elem() == ir.TBool
 }
 
 // Operand class names for diagnostics.
@@ -133,7 +149,7 @@ func (b *Builder) typedBinOp(op ir.BinOpCode, x, y Expr, class string) Expr {
 		return b.bad(fmt.Errorf("%s: operand types differ (%s vs %s); implicit promotions are not supported (syntax.md §6.2)",
 			op, typeName(x.typ), typeName(y.typ)))
 	}
-	var result *ir.Type
+	var result ir.Type
 	switch class {
 	case classArith:
 		if !isArithType(x.typ) {
@@ -284,7 +300,7 @@ func Cast(e Expr, t ir.ElemType) Expr {
 		return e.b.bad(fmt.Errorf("cast: pair %s -> %s is not in the v0 cast registry (arithmetic-to-arithmetic only)",
 			typeName(e.typ), t))
 	}
-	if e.typ.Elem() == t {
+	if nt := numericOf(e.typ); nt != nil && nt.Elem() == t {
 		return e.b.bad(fmt.Errorf("cast: redundant cast to %s", t))
 	}
 	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.materialize()), typ: target}

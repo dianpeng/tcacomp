@@ -36,8 +36,8 @@ type chain struct {
 	stage string   // rung reached, for diagnostics
 	iters []Dim    // root iteration-cluster dims (nil once the root map is built)
 	live  []Dim    // axes live at the pipe, in the current as-order
-	pipe  ir.Node  // the pipe's stage node
-	elem  *ir.Type // the pipe's scalar element type
+	pipe  ir.Node // the pipe's stage node
+	elem  ir.Type // the pipe's scalar element type
 	err   error    // first deferred validation error (rung or declaration)
 }
 
@@ -147,7 +147,7 @@ func coerceMapFn(fn any, want int) (mapFn, error) {
 
 // checkOperand validates one structural tensor access and returns its
 // paramRef node plus the tensor's scalar element type.
-func (c *chain) checkOperand(op Operand) (ir.Node, *ir.Type, error) {
+func (c *chain) checkOperand(op Operand) (ir.Node, ir.Type, error) {
 	t := op.t
 	if t.b != c.b || !c.b.tensorDeclared(t.param.Name()) {
 		return nil, nil, fmt.Errorf("map: tensor %q is not declared in this builder", t.param.Name())
@@ -186,7 +186,7 @@ func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.
 	if err != nil {
 		return nil, nil, Expr{}, err
 	}
-	elems := make([]*ir.Type, 0, want)
+	elems := make([]ir.Type, 0, want)
 	if piped {
 		elems = append(elems, c.elem)
 	}
@@ -222,7 +222,7 @@ func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.
 // initializer, the piped element type, both combiner parameter types, and
 // the combiner result are one and the same scalar type), constructs the
 // reduce stage over the current pipe, and drops the reduced-away live axis.
-func (c *chain) buildReduce(init Expr, fn func(acc, v Expr) Expr) (ir.Node, *ir.Type, error) {
+func (c *chain) buildReduce(init Expr, fn func(acc, v Expr) Expr) (ir.Node, ir.Type, error) {
 	if fn == nil {
 		return nil, nil, fmt.Errorf("reduce: nil combiner")
 	}
