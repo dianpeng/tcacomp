@@ -130,11 +130,16 @@ type storeNode struct {
 	target Access
 }
 
-// returnNode: abstract kernel return; ops = [value].
+// returnNode: abstract kernel return; ops = [value]. Return is the none
+// Value (directive 2): it satisfies Value so it can sit in a statement RHS
+// slot, and IsNone() reports that it binds no SSA name.
 type returnNode struct {
 	*Base
 	operandList
 }
+
+// IsNone reports the none Value semantics of the return root.
+func (*returnNode) IsNone() bool { return true }
 
 // rawNode is the generic fallback for KindInvalid and any kind without a
 // dedicated struct (including kinds >= KindEnd constructed by rejection
@@ -169,7 +174,9 @@ func fixedArity(k Kind) int {
 
 // allocNode creates the concrete node for kind k with exactly nSlots
 // zero-valued operand slots; the ID comes only from g.NewID() and the
-// PassOrigin is stamped from origin.
+// PassOrigin is stamped from origin. Every node gets its SSAVar at
+// allocation (1:1, ID == node ID — IR-05's single NewID source, so statement
+// numbering can never drift from the node IDs).
 func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 	b := &Base{id: g.NewID(), kind: k, loc: Loc{PassOrigin: origin}, graph: g}
 	var n nodeImpl
@@ -203,40 +210,42 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 	default:
 		n = &rawNode{Base: b}
 	}
+	def, _ := n.(Value) // total for in-repo nodes: every concrete node embeds *Base
+	b.ssa = &SSAVar{id: b.id, node: n, define: def}
 	for i := 0; i < nSlots; i++ {
 		n.addSlot()
 	}
 	return n
 }
 
-// slotsOf collects a node's operand slots in canonical order.
-func slotsOf(n nodeImpl) []*Use {
-	var s []*Use
-	n.forEachOperand(func(u *Use) { s = append(s, u) })
-	return s
+// slotCount returns the node's operand-slot count.
+func slotCount(n nodeImpl) int {
+	count := 0
+	n.forEachOperand(func(SSAUse) { count++ })
+	return count
 }
 
-// wireOperands sets each operand slot's Val/User and splices it into the
-// def's intrusive use-list, exactly as the AddUse choke point does. A nil
-// operand leaves the slot unwired (Val == nil) for the verifier to flag.
-// Operands beyond a fixed-arity kind's slot count are NOT wired, but they are
-// COUNTED and returned as the surplus so NewNode can record them: silent
-// drops are fail-open, and construction in this design is fail-closed — the
-// verifier flags any surplus under the use-def invariant (WR-01).
+// wireOperands wires each operand into its slot as an SSAUse handle over a
+// fresh ref record in the def's SSAVar, exactly as the AddUse choke point
+// does. A nil operand leaves the slot a zero handle (unwired) for the
+// verifier to flag. Operands beyond a fixed-arity kind's slot count are NOT
+// wired, but they are COUNTED and returned as the surplus so NewNode can
+// record them: silent drops are fail-open, and construction in this design
+// is fail-closed — the verifier flags any surplus under the use-def
+// invariant (WR-01).
 func wireOperands(n nodeImpl, operands ...Node) int {
-	slots := slotsOf(n)
+	slots := slotCount(n)
 	surplus := 0
 	for i, val := range operands {
-		if i >= len(slots) {
+		if i >= slots {
 			surplus++
 			continue
 		}
-		u := slots[i]
-		u.Val = val
-		u.User = n
-		if val != nil {
-			linkIntoDef(val.BasePtr(), u)
+		if val == nil {
+			continue // leave the zero handle
 		}
+		rec := val.BasePtr().ssa.addRef(n)
+		n.setSlot(i, SSAUse{rec: rec})
 	}
 	return surplus
 }
@@ -268,8 +277,10 @@ func (g *Graph) AddScalarParam(name string, t Type) Param {
 }
 
 // AddStatement appends a statement binding rhs to the graph's single block;
-// the statement ID comes from g.NewID() (D-04).
-func (g *Graph) AddStatement(rhs Value) *Statement {
+// the statement ID comes from g.NewID() (D-04). The rhs stays Node-typed —
+// see the Statement contract in node.go for why (the Value classification
+// lives in Statement.Value()).
+func (g *Graph) AddStatement(rhs Node) *Statement {
 	s := &Statement{id: g.NewID(), graph: g, rhs: rhs}
 	g.block.statements = append(g.block.statements, s)
 	return s
@@ -292,7 +303,7 @@ func (g *Graph) ReserveStatementID() uint64 {
 // AddStatementAs appends a statement carrying a builder-reserved ID (see
 // ReserveStatementID). Unlike AddStatement the ID is not drawn at append
 // time; the statement still joins the block in append order.
-func (g *Graph) AddStatementAs(id uint64, rhs Value) *Statement {
+func (g *Graph) AddStatementAs(id uint64, rhs Node) *Statement {
 	s := &Statement{id: id, graph: g, rhs: rhs}
 	g.block.statements = append(g.block.statements, s)
 	return s
