@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 1 context gathered
-last_updated: "2026-10-15T16:01:49.824Z"
-last_activity: 2026-10-15 -- Phase 01 execution started
+stopped_at: Phase 01.1 plan 01 complete, awaiting verification
+last_updated: "2026-10-16T02:10:00.000Z"
+last_activity: 2026-10-16 -- Phase 01.1 (IR architecture refinement) executed; 6/6 tasks, 12 commits
 progress:
-  total_phases: 5
+  total_phases: 6
   completed_phases: 0
-  total_plans: 5
-  completed_plans: 0
-  percent: 0
+  total_plans: 6
+  completed_plans: 1
+  percent: 17
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-15)
 
 **Core value:** `matmul_scale` (and the other documented example kernels) compiles end-to-end and runs correctly on the target GPU with numerical results matching a CPU reference — frontend source → TCA IR → optimization passes → CUDA C++ + runtime, in one automated flow.
-**Current focus:** Phase 01 — ir-core-pass-infrastructure-tooling
+**Current focus:** Phase 01.1 — ir-architecture-refinement (verification next), then Phase 02
 
 ## Current Position
 
-Phase: 01 (ir-core-pass-infrastructure-tooling) — EXECUTING
-Plan: 1 of 5
-Status: Executing Phase 01
-Last activity: 2026-10-15 -- Phase 01 execution started
+Phase: 01.1 (ir-architecture-refinement-extensible-type-interface-numeric) — EXECUTED, AWAITING VERIFICATION
+Plan: 1 of 1
+Status: Phase 01.1 plan complete (all phase gates green); verifier next
+Last activity: 2026-10-16 -- Phase 01.1 executed (12 commits, goldens byte-identical)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 10%
 
 ## Performance Metrics
 

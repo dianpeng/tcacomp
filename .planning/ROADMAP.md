@@ -53,13 +53,13 @@ Plans:
 
 ### Phase 01.1: IR architecture refinement — extensible Type interface (NumericType), SSAUse/SSADef/SSAVar handle redesign, visitor-pattern graph walk (INSERTED)
 
-**Goal:** [Urgent work - to be planned]
-**Requirements**: TBD
+**Goal**: Refine the Phase-01 IR core per user design feedback — `Type` becomes an extensible interface with `NumericType` as the tensor/scalar implementation (tuple/struct land later as new implementations), the SSA model moves to value-type `SSADef`/`SSAUse` handles over a shared `SSAVar` pointee (mutations propagate to all copies; invariants enforced at the choke points), and the trivial `ir.Visit` becomes a visitor-pattern `Walk` with descend/skip/stop control — all with goldens byte-identical and the full gate suite green.
+**Requirements**: IR-01, IR-03, IR-04, IR-05, PASS-06, TOOL-03, TOOL-04, FE-01, VER-08
 **Depends on:** Phase 1
-**Plans:** 0 plans
+**Plans:** 1/1 plans complete
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 01.1 to break down)
+- [x] 01.1-01-PLAN.md — Type interface + NumericType interning; SSAVar handle model (ssa.go, use.go deleted) with handle-based choke points and two-direction verifier; visitor Walk with VisitResult control; ir/pkg interface polish (completed 2026-10-16)
 
 ### Phase 2: Naive Codegen, Runtime & e2e Harness
 **Goal**: A correct end-to-end compiler on a deliberately sequential skeleton — generated CUDA C++, C++20 runtime, host launch stubs, and a Go e2e driver that compiles, runs on the A6000, and checks against a CPU reference — achieving the project's core-value gate.
