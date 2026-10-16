@@ -50,18 +50,47 @@ func PrintOpts(g *Graph, o PrintOptions) string {
 	return b.String()
 }
 
-// FormatConst is the single owner of the canonical constant spelling
-// (Pitfall 9): strconv.FormatFloat shortest-round-trip at float32 precision
-// (locale-independent), with `.0` appended when the result carries no radix
-// point or exponent so integers print as `0.0`, never `0` or `0f` — IR text
-// is algebra notation, not frontend source. The committed goldens tripwire
-// any shortest-round-trip drift across Go versions.
+// FormatConst is the single owner of the canonical FLOAT-family constant
+// spelling (Pitfall 9): strconv.FormatFloat shortest-round-trip at float32
+// precision (locale-independent), with `.0` appended when the result carries
+// no radix point or exponent so integers-valued floats print as `0.0`,
+// never `0` or `0f` — IR text is algebra notation, not frontend source. The
+// committed goldens tripwire any shortest-round-trip drift across Go versions.
+// Integer- and bool-typed constants render through constText instead, at full
+// precision (WR-02).
 func FormatConst(v float64) string {
 	s := strconv.FormatFloat(v, 'g', -1, 32)
 	if !strings.ContainsAny(s, ".eE") {
 		s += ".0"
 	}
 	return s
+}
+
+// constText renders one const node's value with type-faithful spelling. The
+// node already carries its interned type; integer-typed constants print at
+// full integer precision — float32's 24-bit mantissa would otherwise collapse
+// distinct i32/u32 values (e.g. 2147483647 vs 2147483600) to identical text
+// (WR-02) — bools print as true/false, and the float family keeps
+// FormatConst's shortest-round-trip f32 spelling. A nil type falls back to
+// the float spelling so the printer stays deterministic on malformed nodes
+// (the verifier owns their rejection).
+func constText(t *constNode) string {
+	if t.typ == nil {
+		return FormatConst(t.val)
+	}
+	switch t.typ.Elem() {
+	case TI8, TI16, TI32:
+		return strconv.FormatInt(int64(t.val), 10)
+	case TU8, TU16, TU32:
+		return strconv.FormatUint(uint64(t.val), 10)
+	case TBool:
+		if t.val != 0 {
+			return "true"
+		}
+		return "false"
+	default: // f16/bf16/f32 and any future float type
+		return FormatConst(t.val)
+	}
 }
 
 // Numbering is the SSA definition-order numbering of a graph: value-producing
@@ -369,7 +398,7 @@ func (r *renderer) value(n Node) string {
 	}
 	switch t := n.(type) {
 	case *constNode:
-		return FormatConst(t.val)
+		return constText(t)
 	case *paramRefNode:
 		// A reference to a tensor param IS the structural access: with no
 		// separate access node kind in the v0 suite, the axes render from

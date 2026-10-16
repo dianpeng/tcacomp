@@ -93,6 +93,48 @@ func TestFormatConst(t *testing.T) {
 	}
 }
 
+// TestConstTextTyped pins the type-faithful constant spelling (WR-02):
+// integer-typed constants must print at full integer precision — float32's
+// 24-bit mantissa would otherwise collapse distinct values (2147483647 vs
+// 2147483600) to identical text — bools as true/false, floats keeping
+// FormatConst's spelling.
+func TestConstTextTyped(t *testing.T) {
+	g := NewGraph("consttext")
+	cases := []struct {
+		typ  *Type
+		v    float64
+		want string
+	}{
+		{InternScalar(TI32), 2147483647, "2147483647"},
+		{InternScalar(TI32), 2147483600, "2147483600"}, // collides with the above at f32 precision
+		{InternScalar(TI32), -16777217, "-16777217"},
+		{InternScalar(TU32), 4294967295, "4294967295"},
+		{InternScalar(TI8), -128, "-128"},
+		{InternScalar(TU8), 255, "255"},
+		{InternScalar(TBool), 1, "true"},
+		{InternScalar(TBool), 0, "false"},
+		{InternScalar(TF32), 0, "0.0"},
+		{InternScalar(TF32), 1.5, "1.5"},
+	}
+	for _, c := range cases {
+		n := g.NewConst("test", c.typ, c.v)
+		if got := constText(n.(*constNode)); got != c.want {
+			t.Errorf("constText(%s %v) = %q, want %q", c.typ.Elem(), c.v, got, c.want)
+		}
+	}
+
+	// Distinct large i32 constants must render distinctly in full prints
+	// (bare scalar statements print no chain; route through a return stage).
+	a := g.NewConst("test", InternScalar(TI32), 2147483647)
+	b := g.NewConst("test", InternScalar(TI32), 2147483600)
+	sum := g.NewBinOp("test", BinOpAdd, a, b)
+	g.AddStatement(g.NewReturn("test", sum))
+	p := Print(g)
+	if !strings.Contains(p, "return 2147483647 + 2147483600") {
+		t.Fatalf("integer constants printed lossily:\n%s", p)
+	}
+}
+
 func TestGoldenHarness(t *testing.T) {
 	path := filepath.Join("testdata", "golden_smoke.txt")
 	want, err := os.ReadFile(path)
