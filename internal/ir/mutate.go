@@ -62,7 +62,10 @@ func (ctx *MutContext) AddUse(user Node, val Node) *Use {
 
 // RemoveUse detaches u from its def's use-list and drops u's slot from the
 // user's operand storage. The use is fully removed from both directions of
-// the chain.
+// the chain. u's back-pointers are cleared BEFORE the slot disappears: with
+// pointer-valued slot storage the record stays address-stable, but clearing
+// first keeps the operation well-ordered even if removeSlot is overridden
+// (CR-02).
 func (ctx *MutContext) RemoveUse(u *Use) {
 	if u == nil {
 		return
@@ -71,11 +74,11 @@ func (ctx *MutContext) RemoveUse(u *Use) {
 	if u.Val != nil {
 		unlinkFromDef(u.Val.BasePtr(), u)
 	}
+	u.Val, u.User = nil, nil // clear BEFORE the slot disappears
 	if impl, ok := user.(nodeImpl); ok {
 		impl.removeSlot(u)
 	}
 	ctx.stamp(user)
-	u.Val, u.User = nil, nil
 }
 
 // ReplaceAllUsesWith splices every use of old onto newVal in O(uses),

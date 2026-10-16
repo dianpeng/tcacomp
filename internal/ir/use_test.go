@@ -71,6 +71,64 @@ func TestUseChain(t *testing.T) {
 	}
 }
 
+// TestRemoveUseEachSlotPosition removes each operand slot of a fully-wired
+// three-operand select, one graph per position. Slot removal must drop only
+// the targeted record: surviving operands keep their DefOf wiring, defs'
+// use-lists lose exactly the removed use, and Verify stays clean (CR-02 —
+// the middle-slot case is the one that used to nil out the WRONG record).
+func TestRemoveUseEachSlotPosition(t *testing.T) {
+	defs := func(ops []*Use) []Node {
+		out := make([]Node, len(ops))
+		for i, u := range ops {
+			out[i] = u.Val
+		}
+		return out
+	}
+
+	for pos := 0; pos < 3; pos++ {
+		g := NewGraph("removeuse")
+		f32 := InternScalar(TF32)
+		a := g.NewConst("ctor", f32, 1.0)
+		b := g.NewConst("ctor", f32, 2.0)
+		c := g.NewConst("ctor", f32, 3.0)
+		sel := g.NewSelect("ctor", a, b, c)
+		g.AddStatement(sel)
+
+		ctx := &MutContext{Pass: "test-removeuse"}
+		sn := sel.(*selectNode)
+		removed := sn.ops[pos]
+		wantSurvivors := defs(sn.ops)
+
+		ctx.RemoveUse(removed)
+
+		if got := len(sn.ops); got != 2 {
+			t.Fatalf("pos %d: select has %d slots after RemoveUse, want 2", pos, got)
+		}
+		if removed.Val != nil || removed.User != nil {
+			t.Fatalf("pos %d: removed use must be fully detached, got Val=%v User=%v",
+				pos, removed.Val, removed.User)
+		}
+		// The surviving slots in order must be the original minus pos.
+		wantSurvivors = append(wantSurvivors[:pos], wantSurvivors[pos+1:]...)
+		gotSurvivors := defs(sn.ops)
+		for i := range wantSurvivors {
+			if gotSurvivors[i] != wantSurvivors[i] {
+				t.Fatalf("pos %d: surviving slot %d points at the wrong def", pos, i)
+			}
+		}
+		// Every surviving def's use-list still holds exactly its select use.
+		for i, d := range gotSurvivors {
+			uses := UsesOf(d)
+			if len(uses) != 1 || uses[0] != sn.ops[i] {
+				t.Fatalf("pos %d: def %d has uses %v, want exactly its surviving slot", pos, i, uses)
+			}
+		}
+		if vs := Verify(g); len(vs) != 0 {
+			t.Fatalf("pos %d: chains inconsistent after RemoveUse: %v", pos, vs)
+		}
+	}
+}
+
 // TestAddUseKeepsChainsConsistent exercises AddUse on a node whose ops slice
 // is exactly at capacity after construction (len 2, cap 2): the append inside
 // addSlot reallocates, and every *Use handed out earlier — embedded in the
