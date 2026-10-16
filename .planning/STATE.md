@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-16 -- Phase 01.1 verified; IR handle/type/visitor refactor complete
+last_activity: 2026-10-16 - Completed quick task 261016-mpu: Refactor phase 1 IR from AST-style to SSA/CFG optimizing-compiler IR
 progress:
   total_phases: 6
   completed_phases: 1
@@ -78,6 +78,12 @@ None yet.
 - REQUIREMENTS.md header counted 57 v1 requirements; actual count is 63. Coverage block corrected during roadmap creation (all 63 mapped).
 - Research flags for planning: Phase 1 legality-window API shape (MEDIUM confidence); Phase 2 CUDA 12.2 header verification (`__pipeline_*` signatures, C++20-subset corners).
 - Doc-pinned policy gaps to close in-plan: FP/tolerance policy (Phase 2), ownership-predicate representation (Phase 3 design discussion), 64 KB budget padded-size interpretation (Phase 4).
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 261016-mpu | Refactor phase 1 IR from AST-style to SSA/CFG optimizing-compiler IR per doc/review/phase1_1.md | 2026-10-16 | c470396 | [261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss](./quick/261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss/) |
 
 ## Session Continuity
 
