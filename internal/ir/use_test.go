@@ -239,6 +239,40 @@ func TestAddUseKeepsChainsConsistent(t *testing.T) {
 	}
 }
 
+// TestRauwPropagatesThroughCopies pins the ref-record indirection across a
+// whole-chain move: a handle snapshot taken BEFORE RAUW must resolve to the
+// new def afterwards, because RAUW rewires the records the handles point at.
+func TestRauwPropagatesThroughCopies(t *testing.T) {
+	g := NewGraph("rauw-copies")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
+	g.AddStatement(sum)
+	c := g.NewConst("ctor", f32, 3.0)
+
+	ctx := &MutContext{Pass: "test-rauw-copies"}
+	before := UsesOf(b) // snapshot of live handles, taken before the mutation
+	if len(before) != 1 {
+		t.Fatalf("b has %d uses, want 1", len(before))
+	}
+	if err := ctx.ReplaceAllUsesWith(b, c); err != nil {
+		t.Fatalf("RAUW: %v", err)
+	}
+	if before[0].Def() != c {
+		t.Fatal("a handle copy taken before RAUW must resolve to the new def (record indirection)")
+	}
+	if got := UsesOf(c); len(got) != 1 || got[0].Def() != c {
+		t.Fatalf("c must own the relocated record, got %v", got)
+	}
+	if got := sum.(*binOpNode).ops[1].Def(); got != c {
+		t.Fatal("the operand slot must see the new def after RAUW")
+	}
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("chains inconsistent after RAUW: %v", vs)
+	}
+}
+
 func TestRauwGuards(t *testing.T) {
 	g := NewGraph("guards")
 	f32 := InternScalar(TF32)

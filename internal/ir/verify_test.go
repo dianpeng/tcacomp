@@ -110,3 +110,58 @@ func TestVerifierFlagsUnwiredOperand(t *testing.T) {
 		t.Fatalf("verifier must flag the nil-def operand slot, got %v", vs)
 	}
 }
+
+// TestVerifierFlagsKilledUse: a killed ref record still referenced from an
+// operand slot is the new use-def corruption class of the handle model
+// (directive 2: killed states are representable but checkable). The
+// diagnostic must name the node and the slot.
+func TestVerifierFlagsKilledUse(t *testing.T) {
+	g := NewGraph("killed")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
+	g.AddStatement(sum)
+
+	// White-box corruption: kill slot 1's record in place — no choke point —
+	// as if a pass had detached it without dropping the slot.
+	sum.(*binOpNode).ops[1].rec.killed = true
+
+	vs := Verify(g)
+	found := false
+	for _, v := range vs {
+		if v.NodeID == sum.BasePtr().ID() && v.Invariant == "use-def" &&
+			strings.Contains(v.Msg, "killed") && strings.Contains(v.Msg, "slot 1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verifier must flag the killed record by node and slot, got %v", vs)
+	}
+}
+
+// TestVerifierFlagsZeroHandleSlot: a zero handle sitting in an operand slot
+// (white-box) must report the SAME "nil def (unwired operand)" message as a
+// construction-time unwired slot (D-6 boundary contract).
+func TestVerifierFlagsZeroHandleSlot(t *testing.T) {
+	g := NewGraph("zerohandle")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
+	g.AddStatement(sum)
+
+	sum.(*binOpNode).ops[1] = SSAUse{} // white-box: clear the handle
+
+	vs := Verify(g)
+	found := false
+	for _, v := range vs {
+		if v.NodeID == sum.BasePtr().ID() && v.Invariant == "use-def" &&
+			strings.Contains(v.Msg, "nil def (unwired operand)") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verifier must flag the zero-handle slot as an unwired operand, got %v", vs)
+	}
+}
