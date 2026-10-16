@@ -111,7 +111,10 @@ func TestWalkSkipChildrenPrunes(t *testing.T) {
 		}
 		return Descend
 	}))
-	want := []uint64{3, 7, 6, 5} // sum, map, body, paramRef — a and b unreachable now
+	// sum's a/b subtree is pruned, but b is ALSO the map's operand and a
+	// appears in the lambda body — they remain reachable via the map, so
+	// SkipChildren prunes exactly the skipped edge, not the nodes globally.
+	want := []uint64{3, 7, 2, 6, 5, 1} // sum, map, b, body, paramRef, a
 	if got := walkIDs(order); !equalIDs(got, want) {
 		t.Fatalf("SkipChildren must prune the subtree, visited %v, want %v", got, want)
 	}

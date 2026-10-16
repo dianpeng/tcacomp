@@ -72,83 +72,71 @@ func asImpl(n Node) nodeImpl {
 	return impl
 }
 
-// walkCheckUseDef walks the graph from the block's statements, checking the
-// use-def direction at every node: each operand slot's handle must resolve to
-// a live (not tombstoned) def of a kind < KindEnd. Zero handles and unwired
-// records report the construction-time "nil def" message; killed records are
-// the handle model's new corruption class, flagged by slot. It returns the
-// visited nodes in walk order for the def-use pass. Lambda bodies are walked
-// as edges alongside operand uses. The walk is iterative with a visited set,
-// so malformed (cyclic) graphs cannot blow the stack (T-1.1-02).
+// walkCheckUseDef walks the graph from the block's statements (via Walk,
+// directive 3), checking the use-def direction at every node: each operand
+// slot's handle must resolve to a live (not tombstoned) def of a kind <
+// KindEnd. Zero handles and unwired records report the construction-time
+// "nil def" message; killed records are the handle model's new corruption
+// class, flagged by slot. It returns the visited nodes in walk order for the
+// def-use pass. Lambda bodies are walked as edges alongside operand uses.
 func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
-	seen := make(map[Node]bool)
-	var queue []Node
-	enqueue := func(n Node) {
-		if n == nil || seen[n] {
-			return
-		}
-		seen[n] = true
-		queue = append(queue, n)
-	}
-	for _, s := range g.block.statements {
-		if !s.def.IsInvalid() {
-			enqueue(s.def.SSA().Node())
-		}
-		enqueue(s.rhs)
-	}
 	var nodes []Node
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
+	Walk(g, VisitorFunc(func(n Node) VisitResult {
 		nodes = append(nodes, n)
-		nb := n.BasePtr()
-		if nb.erased {
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				"erased node is still reachable from the block"))
-		}
-		if nb.surplus > 0 {
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("node constructed with %d surplus operands (arity %d)",
-					nb.surplus, fixedArity(nb.kind))))
-		}
-		slot := 0
-		if impl := asImpl(n); impl != nil {
-			impl.forEachOperand(func(u SSAUse) {
-				var def Node
-				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
-					def = u.rec.def.node
-				}
-				switch {
-				case u.rec == nil || (u.rec.def == nil && !u.rec.killed):
-					// zero handle, or a record unwired by SetDef(_, nil):
-					// the same message construction-time unwired slots report
-					*vs = append(*vs, nodeViolation(n, invUseDef,
-						fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
-				case u.rec.killed:
-					// the handle model's new corruption class: a removed
-					// record still referenced from a live slot
-					*vs = append(*vs, nodeViolation(n, invUseDef,
-						fmt.Sprintf("operand slot %d holds a killed use record (removed but still referenced)", slot)))
-				case def == nil:
-					*vs = append(*vs, nodeViolation(n, invUseDef,
-						fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
-				case def.BasePtr().erased:
-					*vs = append(*vs, nodeViolation(n, invUseDef,
-						fmt.Sprintf("operand slot %d points at erased node %d", slot, def.BasePtr().id)))
-				case def.KindOf() == KindInvalid || def.KindOf() >= KindEnd:
-					*vs = append(*vs, nodeViolation(n, invUseDef,
-						fmt.Sprintf("operand slot %d points at node %d of unknown kind %d",
-							slot, def.BasePtr().id, def.KindOf())))
-				}
-				enqueue(def)
-				slot++
-			})
-		}
-		if lb, ok := n.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { enqueue(lam.Body) })
-		}
-	}
+		checkNodeUseDef(n, vs)
+		return Descend
+	}))
 	return nodes
+}
+
+// checkNodeUseDef runs the per-node use-def checks for one visited node:
+// erased-reachability, surplus operands (WR-01), and per-slot operand
+// resolution. Kept as a separate function so the walk control stays trivial.
+func checkNodeUseDef(n Node, vs *[]Violation) {
+	nb := n.BasePtr()
+	if nb.erased {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			"erased node is still reachable from the block"))
+	}
+	if nb.surplus > 0 {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("node constructed with %d surplus operands (arity %d)",
+				nb.surplus, fixedArity(nb.kind))))
+	}
+	impl := asImpl(n) // foreign nodes get no operand checks, not a panic
+	if impl == nil {
+		return
+	}
+	slot := 0
+	impl.forEachOperand(func(u SSAUse) {
+		var def Node
+		if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+			def = u.rec.def.node
+		}
+		switch {
+		case u.rec == nil || (u.rec.def == nil && !u.rec.killed):
+			// zero handle, or a record unwired by SetDef(_, nil): the same
+			// message construction-time unwired slots report
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
+		case u.rec.killed:
+			// the handle model's new corruption class: a removed record
+			// still referenced from a live slot
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("operand slot %d holds a killed use record (removed but still referenced)", slot)))
+		case def == nil:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
+		case def.BasePtr().erased:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("operand slot %d points at erased node %d", slot, def.BasePtr().id)))
+		case def.KindOf() == KindInvalid || def.KindOf() >= KindEnd:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("operand slot %d points at node %d of unknown kind %d",
+					slot, def.BasePtr().id, def.KindOf())))
+		}
+		slot++
+	})
 }
 
 // checkDefUse checks the def-use direction for every visited node: the

@@ -57,11 +57,12 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	}
 	built := cleanOracle()
 	var binopID uint64
-	ir.Visit(built, func(n ir.Node) {
+	ir.Walk(built, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
 		if n.KindOf() == ir.KindBinOp {
 			binopID = n.BasePtr().ID()
 		}
-	})
+		return ir.Descend
+	}))
 	pm = pass.NewManager([]pass.Pass{&stubPass{id: "noop", produces: pass.StageLinearized}})
 	err = pm.Run(built)
 	if err == nil {

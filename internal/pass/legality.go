@@ -104,18 +104,16 @@ func WindowFor(s Stage) *LegalityWindow {
 }
 
 // checkLegality walks every node in g in deterministic order (BB statement
-// order, operand order — via ir.Visit, never map iteration) and checks each
+// order, operand order — via ir.Walk, never map iteration) and checks each
 // node's Kind against the window for stage s. A Kind is rejected iff it is
 // KindInvalid, >= KindEnd, or has NO entry in the window's Actions map.
 // Kinds with an entry pass when Legal, fail with the pinned message when
-// Illegal, and run their predicate when Dynamic, reporting its error.
+// Illegal, and run their predicate when Dynamic, reporting its error. The
+// walk stops at the first violation (ir.Stop) — the first error wins.
 func checkLegality(s Stage, g *ir.Graph) error {
 	w := WindowFor(s)
 	var first error
-	ir.Visit(g, func(n ir.Node) {
-		if first != nil {
-			return
-		}
+	ir.Walk(g, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
 		k := n.KindOf()
 		act, known := w.Actions[k]
 		switch {
@@ -130,13 +128,17 @@ func checkLegality(s Stage, g *ir.Graph) error {
 			if pred == nil {
 				first = fmt.Errorf("stage %s: node %d kind %s dynamic but no predicate registered",
 					s, n.BasePtr().ID(), k)
-				return
+				break
 			}
 			if err := pred(n); err != nil {
 				first = fmt.Errorf("stage %s: node %d kind %s: %w",
 					s, n.BasePtr().ID(), k, err)
 			}
 		}
-	})
+		if first != nil {
+			return ir.Stop
+		}
+		return ir.Descend
+	}))
 	return first
 }
