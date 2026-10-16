@@ -55,6 +55,10 @@ Progress: [░░░░░░░░░░] 0%
 
 ## Accumulated Context
 
+### Roadmap Evolution
+
+- Phase 01.1 inserted after Phase 1: IR architecture refinement — extensible Type interface (NumericType), SSAUse/SSADef/SSAVar handle redesign, visitor-pattern graph walk (URGENT; user feedback from IR construction pass review, 2026-10-16)
+
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.

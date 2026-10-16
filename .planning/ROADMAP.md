@@ -51,6 +51,16 @@ Plans:
 - [x] 01-04-PLAN.md — `pkg/` elaborator/graph-builder API (the parser's future target) + `matmul_scale` oracle graph + determinism byte-compare test
 - [x] 01-05-PLAN.md — Wire real dump emitters (`ir.Print`, `EmitDot`) into `pass.IRDump` via `pkg.DefaultInstrumentations` — closes TOOL-06 dump flags
 
+### Phase 01.1: IR architecture refinement — extensible Type interface (NumericType), SSAUse/SSADef/SSAVar handle redesign, visitor-pattern graph walk (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 1
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 01.1 to break down)
+
 ### Phase 2: Naive Codegen, Runtime & e2e Harness
 **Goal**: A correct end-to-end compiler on a deliberately sequential skeleton — generated CUDA C++, C++20 runtime, host launch stubs, and a Go e2e driver that compiles, runs on the A6000, and checks against a CPU reference — achieving the project's core-value gate.
 **Depends on**: Phase 1
