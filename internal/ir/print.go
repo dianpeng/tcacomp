@@ -240,6 +240,9 @@ func (r *renderer) printChain(b *strings.Builder, s *Statement) {
 }
 
 // isStage reports whether n can occupy a chained stage position.
+// Extensibility note (Phase 01.1 audit): kinds absent from this list are
+// NOT stages — a future stage kind must be added here explicitly, and the
+// golden bytes will catch any emission drift immediately.
 func isStage(n Node) bool {
 	if n == nil {
 		return false
