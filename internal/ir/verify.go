@@ -90,8 +90,12 @@ func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 }
 
 // checkNodeUseDef runs the per-node use-def checks for one visited node:
-// erased-reachability, surplus operands (WR-01), and per-slot operand
-// resolution. Kept as a separate function so the walk control stays trivial.
+// erased-reachability, surplus operands (WR-01), per-slot operand
+// resolution, and per-use payload resolution (parameter references,
+// iteration dims/bounds, lambda params, as-orders, store targets — review
+// P1R-01 makes every reference an SSAUse, so the use-def invariant covers
+// payload uses exactly like operand slots). Kept as a separate function so
+// the walk control stays trivial.
 func checkNodeUseDef(n Node, vs *[]Violation) {
 	nb := n.BasePtr()
 	if nb.erased {
@@ -109,34 +113,50 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 	}
 	slot := 0
 	impl.forEachOperand(func(u SSAUse) {
-		var def Node
-		if u.rec != nil && !u.rec.killed && u.rec.def != nil {
-			def = u.rec.def.node
-		}
-		switch {
-		case u.rec == nil || (u.rec.def == nil && !u.rec.killed):
-			// zero handle, or a record unwired by SetDef(_, nil): the same
-			// message construction-time unwired slots report
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
-		case u.rec.killed:
-			// the handle model's new corruption class: a removed record
-			// still referenced from a live slot
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("operand slot %d holds a killed use record (removed but still referenced)", slot)))
-		case def == nil:
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("operand slot %d has nil def (unwired operand)", slot)))
-		case def.BasePtr().erased:
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("operand slot %d points at erased node %d", slot, def.BasePtr().id)))
-		case def.KindOf() == KindInvalid || def.KindOf() >= KindEnd:
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("operand slot %d points at node %d of unknown kind %d",
-					slot, def.BasePtr().id, def.KindOf())))
-		}
+		checkOneUse(n, u, fmt.Sprintf("operand slot %d", slot), vs)
 		slot++
 	})
+	if pb, ok := n.(payloadBearer); ok {
+		idx := 0
+		pb.forEachPayloadUse(func(u SSAUse) {
+			checkOneUse(n, u, fmt.Sprintf("payload use %d", idx), vs)
+			idx++
+		})
+	}
+}
+
+// checkOneUse applies the use-def resolution checks to one use (operand slot
+// or payload use): zero handles and unwired records report the
+// construction-time "nil def" message; killed records are the handle model's
+// corruption class; erased or unknown-kind defs are flagged. Nil-safe
+// throughout.
+func checkOneUse(n Node, u SSAUse, where string, vs *[]Violation) {
+	var def Node
+	if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+		def = u.rec.def.node
+	}
+	switch {
+	case u.rec == nil || (u.rec.def == nil && !u.rec.killed):
+		// zero handle, or a record unwired by SetDef(_, nil): the same
+		// message construction-time unwired slots report
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s has nil def (unwired operand)", where)))
+	case u.rec.killed:
+		// the handle model's corruption class: a removed record
+		// still referenced from a live slot
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s holds a killed use record (removed but still referenced)", where)))
+	case def == nil:
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s has nil def (unwired operand)", where)))
+	case def.BasePtr().erased:
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s points at erased node %d", where, def.BasePtr().id)))
+	case def.KindOf() == KindInvalid || def.KindOf() >= KindEnd:
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s points at node %d of unknown kind %d",
+				where, def.BasePtr().id, def.KindOf())))
+	}
 }
 
 // checkDefUse checks the def-use direction for every visited node: the
@@ -150,6 +170,13 @@ func checkDefUse(nodes []Node, vs *[]Violation) {
 	for _, n := range nodes {
 		if impl := asImpl(n); impl != nil {
 			impl.forEachOperand(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					expected[u.rec.def] = append(expected[u.rec.def], u.rec)
+				}
+			})
+		}
+		if pb, ok := n.(payloadBearer); ok {
+			pb.forEachPayloadUse(func(u SSAUse) {
 				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
 					expected[u.rec.def] = append(expected[u.rec.def], u.rec)
 				}

@@ -26,6 +26,7 @@ const (
 	KindSelect                  // scalar-expr: typed conditional ?:
 	KindCast                    // scalar-expr: explicit cast to named type
 	KindCall                    // scalar-expr: registered pure builtin call
+	KindInputParam              // graph-owned kernel/lambda input parameter (SSA def; name is debug-only)
 	KindEnd                     // sentinel: all kinds < KindEnd
 )
 
@@ -60,6 +61,8 @@ func (k Kind) String() string {
 		return "cast"
 	case KindCall:
 		return "call"
+	case KindInputParam:
+		return "inputparam"
 	case KindEnd:
 		return "end"
 	default:

@@ -29,10 +29,11 @@ type Base struct {
 	kind          Kind
 	loc           Loc
 	lastTouchedBy string
-	ssa           *SSAVar // this node's SSA cell; allocated at construction (1:1, ID == node ID)
-	erased        bool    // tombstone set by Erase; IDs are never reused (IR-05)
-	surplus       int     // operands supplied beyond the fixed-arity slot count at construction; the verifier flags > 0 (fail-closed, WR-01)
-	graph         *Graph  // owning graph, set at construction; lets Erase unlink from the block
+	ssa           *SSAVar    // this node's SSA cell; allocated at construction (1:1, ID == node ID)
+	erased        bool       // tombstone set by Erase; IDs are never reused (IR-05)
+	surplus       int        // operands supplied beyond the fixed-arity slot count at construction; the verifier flags > 0 (fail-closed, WR-01)
+	graph         *Graph     // owning graph, set at construction; lets Erase unlink from the block
+	stmt          *Statement // the statement whose RHS root this node is, nil for non-root nodes; lets Erase unlink in O(1)
 }
 
 // BasePtr returns the shared cell, implementing Node.
@@ -81,81 +82,29 @@ type Value interface {
 // every node kind; only returnNode overrides it (true).
 func (b *Base) IsNone() bool { return false }
 
-// paramRole discriminates kernel I/O symbols.
-type paramRole int
+// ParamRole discriminates InputParam nodes. Kernel roles (RoleDim,
+// RoleTensor, RoleScalar) are owned by the Graph's param list; RoleLambda
+// marks lambda-bound parameters, which are graph-external by design (the
+// review's IR modeling: lambda parameters are InputParams, inlined at
+// lowering).
+type ParamRole int
 
 const (
-	roleDim paramRole = iota
-	roleTensor
-	roleScalar
+	RoleDim    ParamRole = iota // shape dimension (runtime shape symbol; untyped)
+	RoleTensor                  // tensor parameter (interned tensor type)
+	RoleScalar                  // scalar parameter (interned scalar type)
+	RoleLambda                  // lambda-bound parameter (map/reduce lambda argument)
 )
 
-// Param is a kernel I/O symbol: a dim, tensor, or scalar parameter. Params
-// are immutable after creation and are owned by the Graph's param list.
-type Param struct {
-	name string
-	typ  Type // nil for dim params (dims are not typed values in v0)
-	role paramRole
-}
-
-// Name returns the parameter's name.
-func (p Param) Name() string { return p.name }
-
-// Type returns the parameter's interned type; nil for dim parameters.
-func (p Param) Type() Type { return p.typ }
-
-// Statement is one ordered entry in the kernel's single basic block (IR-02):
-// an immutable SSA binding of a value-producing RHS. The ID is stable across
-// passes so pass-to-pass diffs can track a statement (D-04). The def entry
-// point stays Node-typed (not Value-typed): every exported constructor
-// returns Node, which never statically satisfies Value (Node + IsNone), so a
-// Value-typed AddStatement would force casts at six out-of-package call sites
-// and in irx_test — the NoneValue classification lives solely in Value().
-type Statement struct {
-	id    uint64
-	graph *Graph  // owning graph, set at construction; lets the printer detect statement-chain boundaries
-	def   SSADef  // reserved SSA-name handle; zero value = unwired until a pass wires it
-	rhs   Node    // the statement's root node (NOT Value — see the contract note above)
-}
-
-// ID returns the statement's stable per-graph integer ID.
-func (s *Statement) ID() uint64 { return s.id }
-
-// RHS returns the statement's value-producing right-hand side.
-func (s *Statement) RHS() Node { return s.rhs }
-
-// Value returns the statement's RHS viewed as a Value — the single
-// classification accessor for NoneValue semantics. A nil rhs yields a nil
-// Value; otherwise the rhs asserts to Value, which is total for in-repo nodes
-// (every concrete node embeds *Base, promoting IsNone), so there is no panic
-// path (T-1.1-03).
-func (s *Statement) Value() Value {
-	if s.rhs == nil {
-		return nil
-	}
-	return s.rhs.(Value)
-}
-
-// Def returns the statement's SSA-name handle; IsInvalid reports whether it
-// is still unwired.
-func (s *Statement) Def() SSADef { return s.def }
-
-// Block is the kernel's single basic block (IR-02): an ordered statement
-// list. v0 has no control flow, so a Graph holds exactly one Block.
-type Block struct {
-	statements []*Statement
-}
-
-// Statements returns a copy of the block's statements in insertion order.
-func (b *Block) Statements() []*Statement { return append([]*Statement(nil), b.statements...) }
-
-// Graph is one kernel/function's IR: a name, the kernel I/O symbols, and the
-// single basic block (IR-02). Node and statement IDs come only from NewID:
-// per-graph monotonic, starting at 1, never reused even across Erase (IR-05).
+// Graph is one kernel/function's IR: a name, the kernel input-parameter
+// nodes, and a single-block CFG (IR-02). Node and statement IDs come only
+// from NewID: per-graph monotonic, starting at 1, never reused even across
+// Erase (IR-05). Every reference anywhere in the graph is an SSAUse; every
+// definition is an SSADef — names survive only as InputParam debug payload.
 type Graph struct {
 	name   string
-	params []Param
-	block  *Block
+	params []Node // InputParam nodes (kernel roles only), in declaration order
+	cfg    *CFG
 	nextID uint64 // next ID to hand out; monotonic
 }
 
@@ -170,11 +119,16 @@ func (g *Graph) NewID() uint64 {
 // Name returns the graph's name.
 func (g *Graph) Name() string { return g.name }
 
-// Params returns a copy of the graph's kernel I/O symbols in declaration order.
-func (g *Graph) Params() []Param { return append([]Param(nil), g.params...) }
+// Params returns a copy of the graph's kernel input-parameter nodes in
+// declaration order. There is deliberately NO name→param lookup: names are
+// debug payload, and resolution happens at construction time (review P1R-01).
+func (g *Graph) Params() []Node { return append([]Node(nil), g.params...) }
 
-// Block returns the graph's single basic block.
-func (g *Graph) Block() *Block { return g.block }
+// Block returns the CFG's entry basic block — the graph's single block in v0.
+func (g *Graph) Block() *BasicBlock { return g.cfg.entry }
+
+// CFG returns the graph's control-flow graph (exactly one block in v0).
+func (g *Graph) CFG() *CFG { return g.cfg }
 
 // nodeImpl is the internal interface every concrete node type satisfies:
 // the public Node surface plus operand-slot access for chain maintenance.

@@ -35,20 +35,23 @@ func TestSingleBlock(t *testing.T) {
 	mul := g.NewBinOp("ctor", BinOpMul, add, c)
 	s2 := g.AddStatement(mul)
 
-	stmts := g.Block().Statements()
-	if len(stmts) != 2 {
-		t.Fatalf("expected 2 statements, got %d", len(stmts))
+	// The block stores statements in an intrusive list: iteration is
+	// First/Next, and insertion order is iteration order (IR-02).
+	if g.Block().First() != s1 || g.Block().Last() != s2 {
+		t.Fatal("block head/tail must be the first/last appended statements")
 	}
-	// Insertion order is iteration order (IR-02).
-	if stmts[0] != s1 || stmts[1] != s2 {
+	if s1.Next() != s2 || s2.Prev() != s1 {
 		t.Fatal("statements do not iterate in insertion order")
 	}
-	// Each statement's RHS is its value-producing node.
-	if stmts[0].RHS() != Node(add) {
-		t.Fatalf("s1 RHS = %v, want the add node", stmts[0].RHS())
+	if s1.Prev() != nil || s2.Next() != nil {
+		t.Fatal("list boundaries must read nil")
 	}
-	if stmts[1].RHS() != Node(mul) {
-		t.Fatalf("s2 RHS = %v, want the mul node", stmts[1].RHS())
+	// Each statement's RHS is its value-producing node.
+	if s1.RHS() != Node(add) {
+		t.Fatalf("s1 RHS = %v, want the add node", s1.RHS())
+	}
+	if s2.RHS() != Node(mul) {
+		t.Fatalf("s2 RHS = %v, want the mul node", s2.RHS())
 	}
 }
 
@@ -127,9 +130,9 @@ func TestStatementValueNone(t *testing.T) {
 	v := g.NewConst("ctor", f32, 1.0)
 
 	// A store root produces the stored value (doc §2.5): NOT a none Value.
-	m := g.AddDimParam("m")
-	out := g.AddTensorParam("out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	st := g.NewStore("ctor", Access{Tensor: out, Axes: []Param{m}}, v)
+	m := g.NewInputParam("ctor", RoleDim, "m", nil)
+	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
+	st := g.NewStore("ctor", out, []Node{m}, v)
 	sStore := g.AddStatement(st)
 	if sStore.Value().IsNone() {
 		t.Fatal("store root must produce a real Value (it returns the stored value, doc §2.5)")

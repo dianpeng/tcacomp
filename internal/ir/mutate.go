@@ -147,18 +147,13 @@ func (ctx *MutContext) Erase(n Node) error {
 		})
 	}
 	if g := n.BasePtr().graph; g != nil {
-		nv := n.BasePtr().ssa
-		kept := g.block.statements[:0]
-		for _, s := range g.block.statements {
-			if s.rhs == n || (!s.def.IsInvalid() && s.def.SSA() == nv) {
-				continue
-			}
-			kept = append(kept, s)
+		// O(1) unlink through the statement's intrusive list links (review
+		// P1R-02): the node's stmt back-pointer names its statement directly,
+		// no scan of the block's statements.
+		if s := n.BasePtr().stmt; s != nil {
+			g.cfg.entry.Remove(s)
+			n.BasePtr().stmt = nil
 		}
-		for i := len(kept); i < len(g.block.statements); i++ {
-			g.block.statements[i] = nil
-		}
-		g.block.statements = kept
 	}
 	n.BasePtr().erased = true
 	ctx.stamp(n)

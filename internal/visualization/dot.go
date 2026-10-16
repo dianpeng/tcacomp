@@ -30,7 +30,7 @@ func EmitDot(w io.Writer, g *ir.Graph) error {
 	bw := bufio.NewWriter(w)
 	num := ir.ComputeNumbering(g)
 	fmt.Fprintf(bw, "digraph %s {\n", g.Name())
-	for _, stmt := range g.Block().Statements() {
+	for stmt := g.Block().First(); stmt != nil; stmt = stmt.Next() {
 		fmt.Fprintf(bw, "  subgraph cluster_%d {\n", stmt.ID())
 		fmt.Fprintf(bw, "    label=\"statement #%d\";\n", stmt.ID())
 		nodes := ir.StmtNodes(stmt)

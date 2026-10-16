@@ -40,10 +40,12 @@ func PrintOpts(g *Graph, o PrintOptions) string {
 	}
 	r := &renderer{num: ComputeNumbering(g), opts: o}
 	var b strings.Builder
-	for i, s := range g.block.statements {
-		if i > 0 {
+	first := true
+	for s := g.cfg.entry.head; s != nil; s = s.next {
+		if !first {
 			b.WriteString("\n")
 		}
+		first = false
 		fmt.Fprintf(&b, "statement #%d:\n", s.id)
 		r.printChain(&b, s)
 	}
@@ -124,7 +126,7 @@ func ComputeNumbering(g *Graph) *Numbering {
 		return t
 	}
 	next := 0
-	for _, s := range g.block.statements {
+	for s := g.cfg.entry.head; s != nil; s = s.next {
 		for _, n := range StmtNodes(s) {
 			if !t.has(n) {
 				t.byBase[n.BasePtr()] = next
@@ -280,8 +282,8 @@ func chainOf(s *Statement) []Node {
 	if s == nil || s.rhs == nil {
 		return nil
 	}
-	rhsOf := make(map[*Base]bool, len(s.graph.block.statements))
-	for _, o := range s.graph.block.statements {
+	rhsOf := make(map[*Base]bool)
+	for o := s.graph.cfg.entry.head; o != nil; o = o.next {
 		if o.rhs != nil {
 			rhsOf[o.rhs.BasePtr()] = true
 		}
@@ -318,6 +320,28 @@ func opAt(n Node, i int) Node {
 	return ops[i]
 }
 
+// paramNameOf resolves a payload use to its InputParam's debug name. A
+// zero/killed use or a def that is not an InputParam renders a deterministic
+// placeholder — the verifier owns rejecting such graphs (review P1R-01:
+// names are debug payload only, never resolution state).
+func paramNameOf(u SSAUse) string {
+	ip, ok := u.Def().(*inputParamNode)
+	if !ok {
+		return "?"
+	}
+	return ip.name
+}
+
+// inputParamType returns the interned type carried by the InputParam n
+// resolves to, or nil for any other node kind.
+func inputParamType(n Node) (Type, bool) {
+	ip, ok := n.(*inputParamNode)
+	if !ok {
+		return nil, false
+	}
+	return ip.typ, true
+}
+
 // stageText renders one chain stage. prev is the preceding stage in the
 // chain (nil for the first); when the stage's pipe-bound input is prev, it
 // renders as the stage-local `%0` (doc §2.6 pipe semantics — `%0` is
@@ -331,7 +355,7 @@ func (r *renderer) stageText(n Node, prev Node) string {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString("@" + d.Name())
+			b.WriteString("@" + paramNameOf(d))
 		}
 		b.WriteString(") -> ")
 		if body := opAt(t, 0); body != nil {
@@ -358,7 +382,7 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(", ")
 		b.WriteString(r.lambda(t.lam))
 		b.WriteString(")")
-		b.WriteString(asClause(t.as))
+		b.WriteString(r.asClause(t.as))
 		return b.String()
 	case *reduceNode:
 		var b strings.Builder
@@ -377,7 +401,7 @@ func (r *renderer) stageText(n Node, prev Node) string {
 	case *storeNode:
 		var b strings.Builder
 		b.WriteString("store(")
-		b.WriteString(accessText(t.target))
+		b.WriteString(r.accessText(t.target))
 		b.WriteString(", ")
 		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
 			b.WriteString("%0")
@@ -408,18 +432,21 @@ func (r *renderer) value(n Node) string {
 		// A reference to a tensor param IS the structural access: with no
 		// separate access node kind in the v0 suite, the axes render from
 		// the tensor type's dims (lhs[@m][@n]); scalar params and lambda
-		// params render bare (scale, v). The builder enforces that the
-		// bound axes match these dims positionally, so the printed form is
-		// faithful.
-		if pt, ok := t.param.Type().(*NumericType); ok && !pt.IsScalar() {
-			var b strings.Builder
-			b.WriteString(t.param.Name())
-			for _, d := range pt.Dims() {
-				b.WriteString("[@" + d.Name + "]")
+		// params render bare (scale, v). The name comes from the use's
+		// def node's debug payload — never from resolution state.
+		if typ, ok := inputParamType(t.use.Def()); ok {
+			if pt, ok := typ.(*NumericType); ok && !pt.IsScalar() {
+				if ip, ok := t.use.Def().(*inputParamNode); ok {
+					var b strings.Builder
+					b.WriteString(ip.name)
+					for _, d := range pt.Dims() {
+						b.WriteString("[@" + d.Name + "]")
+					}
+					return b.String()
+				}
 			}
-			return b.String()
 		}
-		return t.param.Name() // lambda params and captured kernel scalars both render bare
+		return paramNameOf(t.use) // lambda params and captured kernel scalars both render bare
 	case *binOpNode:
 		return r.binExpr(t)
 	case *unaryOpNode:
@@ -441,13 +468,13 @@ func (r *renderer) value(n Node) string {
 		b.WriteString(")")
 		return b.String()
 	case *iterNode:
-		s := "@" + t.dim.Name()
-		if b := t.bound.Name(); b != "" {
-			s += "/" + b // bounded induction variable, doc §2.3
+		s := "@" + paramNameOf(t.dimUse)
+		if t.boundUse.Def() != nil {
+			s += "/" + paramNameOf(t.boundUse) // bounded induction variable, doc §2.3
 		}
 		return s
 	case *storeNode:
-		return "%" + t.target.Tensor.Name() // store returns the stored value (doc §2.5)
+		return "%" + paramNameOf(t.target.tensorUse) // store returns the stored value (doc §2.5)
 	default:
 		if num, ok := r.num.Num(n); ok {
 			return fmt.Sprintf("%%%d", num)
@@ -460,11 +487,11 @@ func (r *renderer) value(n Node) string {
 func (r *renderer) lambda(l Lambda) string {
 	var b strings.Builder
 	b.WriteString("lambda(")
-	for i, p := range l.Params {
+	for i, p := range l.params {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(p.Name())
+		b.WriteString(paramNameOf(p))
 	}
 	b.WriteString("): ")
 	b.WriteString(r.value(l.Body))
@@ -472,25 +499,25 @@ func (r *renderer) lambda(l Lambda) string {
 }
 
 // asClause renders the mandatory output-order clause: ` as (@m, @k)`.
-func asClause(as []Param) string {
+func (r *renderer) asClause(as []SSAUse) string {
 	var b strings.Builder
 	b.WriteString(" as (")
-	for i, p := range as {
+	for i, u := range as {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("@" + p.Name())
+		b.WriteString("@" + paramNameOf(u))
 	}
 	b.WriteString(")")
 	return b.String()
 }
 
 // accessText renders a structural store access: `%output[@m][@k]`.
-func accessText(a Access) string {
+func (r *renderer) accessText(a access) string {
 	var b strings.Builder
-	b.WriteString("%" + a.Tensor.Name())
-	for _, ax := range a.Axes {
-		b.WriteString("[@" + ax.Name() + "]")
+	b.WriteString("%" + paramNameOf(a.tensorUse))
+	for _, ax := range a.axes {
+		b.WriteString("[@" + paramNameOf(ax) + "]")
 	}
 	return b.String()
 }

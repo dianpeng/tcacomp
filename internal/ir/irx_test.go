@@ -13,14 +13,11 @@ func TestConstructSurface(t *testing.T) {
 	build := func() (*ir.Graph, []uint64) {
 		g := ir.NewGraph("surface")
 		f32 := ir.InternScalar(ir.TF32)
-		m := g.AddDimParam("m")
-		lhs := g.AddTensorParam("lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
-		scale := g.AddScalarParam("scale", f32)
-		if m.Name() != "m" || lhs.Name() != "lhs" || scale.Name() != "scale" {
-			t.Fatal("param names must round-trip through the exported surface")
-		}
-		if lhs.Type() != ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}) {
-			t.Fatal("interned tensor types must be pointer-identical (D-18)")
+		m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+		lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+		scale := g.NewInputParam("ctor", ir.RoleScalar, "scale", f32)
+		if len(g.Params()) != 3 {
+			t.Fatal("kernel params must be graph-owned InputParam nodes")
 		}
 
 		c1 := g.NewConst("ctor", f32, 1.0)
@@ -31,28 +28,30 @@ func TestConstructSurface(t *testing.T) {
 		sum := g.NewBinOp("ctor", ir.BinOpAdd, c1, c2)
 		stmt := g.AddStatement(sum)
 
-		ids := []uint64{c1.BasePtr().ID(), c2.BasePtr().ID(), sum.BasePtr().ID(), stmt.ID()}
+		// InputParams are real nodes with real IDs, allocated from the same
+		// monotonic counter (IR-05).
+		ids := []uint64{m.BasePtr().ID(), lhs.BasePtr().ID(), scale.BasePtr().ID(),
+			c1.BasePtr().ID(), c2.BasePtr().ID(), sum.BasePtr().ID(), stmt.ID()}
 		return g, ids
 	}
 
 	g1, ids1 := build()
 	_, ids2 := build()
 
-	want := []uint64{1, 2, 3, 4}
+	want := []uint64{1, 2, 3, 4, 5, 6, 7}
 	for i := range want {
 		if ids1[i] != want[i] || ids2[i] != want[i] {
 			t.Fatalf("node IDs = %v / %v, want %v per graph", ids1, ids2, want)
 		}
 	}
 
-	stmts := g1.Block().Statements()
-	if len(stmts) != 1 {
-		t.Fatalf("surface graph has %d statements, want 1", len(stmts))
+	if g1.Block().First() != g1.Block().Last() {
+		t.Fatal("surface graph must hold exactly one statement")
 	}
-	if stmts[0].ID() != ids1[3] {
+	if g1.Block().First().ID() != ids1[6] {
 		t.Fatal("statement ID must come from the same per-graph monotonic counter")
 	}
-	if stmts[0].RHS().BasePtr().ID() != ids1[2] {
+	if g1.Block().First().RHS().BasePtr().ID() != ids1[5] {
 		t.Fatal("statement RHS must be the constructed binop")
 	}
 	if g1.Block() != g1.Block() {
