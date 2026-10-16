@@ -14,6 +14,11 @@ import (
 // — construction exemption, RESEARCH Pattern 2) with origin "builder" so
 // Loc.PassOrigin / LastTouchedBy are meaningful from birth (D-17).
 //
+// The builder's declaration maps are the on-the-fly symbol resolution the
+// Phase-1 review mandates: a handle carries its RESOLVED InputParam node, so
+// a freshly built graph contains zero name-keyed references — every use site
+// materializes its own SSAUse record against the node (review P1R-01/03).
+//
 // Eager checks (D-10): declaration-time violations (duplicate names, negative
 // extents) and chain-rung violations (arity, axis coverage, homogeneous
 // reducers, structural subscripts) return errors at the call site. The
@@ -29,8 +34,8 @@ const origin = "builder"
 // the eager checks instead of corrupting the graph.
 type Builder struct {
 	g       *ir.Graph
-	dims    map[string]Dim
-	tensors map[string]Tensor
+	dims    map[string]Dim     // declaration-time symbol table: dim name -> handle
+	tensors map[string]Tensor  // declaration-time symbol table: tensor name -> handle
 	scalars map[string]ir.ElemType
 	outputs []output // kernel output bindings, in first-store order
 	chain   *chain   // statement chain under construction, nil when none
@@ -38,40 +43,47 @@ type Builder struct {
 	declErr error    // first declaration-time violation (recorded, deferred)
 }
 
-// output is one declared kernel output binding: the tensor, the store node
-// feeding its return, and the reserved return-statement ID.
+// output is one declared kernel output binding: the tensor name (debug
+// payload; the graph's identity for the tensor is the store's target use),
+// the store node feeding its return, and the reserved return-statement ID.
 type output struct {
-	tensor ir.Param
-	store  ir.Node
-	retID  uint64
+	name  string
+	store ir.Node
+	retID uint64
 }
 
 // Dim is a first-class handle for a declared shape dimension (D-08). Extent
 // 0 means dynamic/symbolic (the canonical print shows a bare @name); a
-// positive extent is a compile-time constant.
+// positive extent is a compile-time constant. The handle carries the
+// resolved InputParam node — the dim's SSA def — plus its declared name for
+// diagnostics (names are debug payload only, review P1R-01).
 type Dim struct {
 	b      *Builder
-	param  ir.Param
+	node   ir.Node // resolved InputParam node (role RoleDim); the dim's SSADef
+	name   string  // declared name, debug payload
 	extent int
 }
 
 // Name returns the dimension's declared name.
-func (d Dim) Name() string { return d.param.Name() }
+func (d Dim) Name() string { return d.name }
 
 // Extent returns the declared extent; 0 means dynamic.
 func (d Dim) Extent() int { return d.extent }
 
 // Tensor is a first-class handle for a declared tensor parameter (D-08):
-// the kernel I/O symbol plus its ordered shape dims.
+// the kernel I/O symbol plus its ordered shape dims. The handle carries the
+// resolved InputParam node (the tensor's SSA def) and its declared name for
+// diagnostics.
 type Tensor struct {
 	b     *Builder
-	param ir.Param
+	node  ir.Node // resolved InputParam node (role RoleTensor)
+	name  string
 	dims  []Dim
 	elem  ir.ElemType
 }
 
 // Name returns the tensor's declared name.
-func (t Tensor) Name() string { return t.param.Name() }
+func (t Tensor) Name() string { return t.name }
 
 // Elem returns the tensor's element type.
 func (t Tensor) Elem() ir.ElemType { return t.elem }
@@ -131,8 +143,8 @@ func (b *Builder) tensorDeclared(name string) bool {
 // checkDim validates a dim handle: it must belong to this builder and be
 // declared.
 func (b *Builder) checkDim(d Dim, what string) error {
-	if d.b != b || !b.dimDeclared(d.param.Name()) {
-		return fmt.Errorf("%s: dim @%q is not declared in this builder", what, d.param.Name())
+	if d.b != b || !b.dimDeclared(d.name) {
+		return fmt.Errorf("%s: dim @%q is not declared in this builder", what, d.name)
 	}
 	return nil
 }
@@ -151,7 +163,7 @@ func (b *Builder) Dim(name string, extent int) Dim {
 	if _, taken := b.dims[name]; taken {
 		b.noteDeclErr(fmt.Errorf("dim %s: already declared", name))
 	}
-	d := Dim{b: b, param: b.g.AddDimParam(name), extent: extent}
+	d := Dim{b: b, node: b.g.NewInputParam(origin, ir.RoleDim, name, nil), name: name, extent: extent}
 	b.dims[name] = d
 	return d
 }
@@ -181,7 +193,7 @@ func (b *Builder) Tensor(name string, elem ir.ElemType, dims ...Dim) Tensor {
 		refs[i] = ref
 		tdims[i] = d
 	}
-	t := Tensor{b: b, param: b.g.AddTensorParam(name, ir.InternTensor(elem, refs)), dims: tdims, elem: elem}
+	t := Tensor{b: b, node: b.g.NewInputParam(origin, ir.RoleTensor, name, ir.InternTensor(elem, refs)), name: name, dims: tdims, elem: elem}
 	b.tensors[name] = t
 	return t
 }
@@ -200,9 +212,8 @@ func (b *Builder) ScalarParam(name string, t ir.ElemType) Expr {
 		b.noteDeclErr(fmt.Errorf("scalar %s: already declared", name))
 	}
 	typ := ir.InternScalar(t)
-	p := b.g.AddScalarParam(name, typ)
 	b.scalars[name] = t
-	return Expr{b: b, scalar: p, typ: typ}
+	return Expr{b: b, scalar: b.g.NewInputParam(origin, ir.RoleScalar, name, typ), typ: typ}
 }
 
 // Stmt starts a new statement chain and returns its first typestate rung.
@@ -226,13 +237,14 @@ func (b *Builder) Stmt() *StmtIter {
 // Build finalizes the graph and returns it, verified exclusively through
 // the normal pass-manager path (D-10): the kernel `return` statement for
 // each declared output binding is emitted first (statement IDs continue the
-// reserved construction order), then a pass.Manager with an EMPTY pass list
-// carrying the VerifyEach instrumentation runs the graph. VerifyEach's
-// AfterPipeline hook runs the graph verifier even with zero passes and
-// Manager.Run surfaces its error, so Build returns verification failures as
-// Build errors — never a half-built graph, and never by calling the
-// verifier directly from pkg (that would bypass the single authoritative
-// path).
+// reserved construction order), the building-phase DCE runs (review P1R-08:
+// dead side-effect-free statements are marked and wiped before any pass
+// sees the graph), then a pass.Manager with an EMPTY pass list carrying the
+// VerifyEach instrumentation runs the graph. VerifyEach's AfterPipeline hook
+// runs the graph verifier even with zero passes and Manager.Run surfaces its
+// error, so Build returns verification failures as Build errors — never a
+// half-built graph, and never by calling the verifier directly from pkg
+// (that would bypass the single authoritative path).
 func (b *Builder) Build() (*ir.Graph, error) {
 	if err := b.declErr; err != nil {
 		return nil, err
@@ -244,6 +256,9 @@ func (b *Builder) Build() (*ir.Graph, error) {
 	for _, o := range b.outputs {
 		ret := b.g.NewReturn(origin, o.store)
 		b.g.AddStatementAs(o.retID, ret)
+	}
+	if err := ir.BuildingDCE(b.g); err != nil {
+		return nil, err
 	}
 	pm := pass.NewManager(nil)
 	pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
@@ -258,12 +273,11 @@ func (b *Builder) Build() (*ir.Graph, error) {
 // update the binding the return reads (last store wins) without consuming
 // another ID.
 func (b *Builder) noteOutput(t Tensor, store ir.Node, retID uint64) {
-	name := t.param.Name()
 	for i := range b.outputs {
-		if b.outputs[i].tensor.Name() == name {
+		if b.outputs[i].name == t.name {
 			b.outputs[i].store = store
 			return
 		}
 	}
-	b.outputs = append(b.outputs, output{tensor: t.param, store: store, retID: retID})
+	b.outputs = append(b.outputs, output{name: t.name, store: store, retID: retID})
 }

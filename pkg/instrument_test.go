@@ -96,7 +96,7 @@ func TestInstrumentationsRealDumpOutput(t *testing.T) {
 		// dynamically rather than as a literal: the load-bearing check is
 		// that REAL ir.Print content follows the header — the statement's
 		// stage text `return 1.0 + 2.0` — never the placeholder comment.
-		stmtID := g.Block().Statements()[0].ID()
+		stmtID := g.Block().First().ID()
 		if !strings.Contains(out, fmt.Sprintf("statement #%d:", stmtID)) {
 			t.Errorf("dump missing real ir.Print statement header: %q", out)
 		}

@@ -67,12 +67,15 @@ func (c *chain) liveIndex(name string) int {
 	return -1
 }
 
-func dimParams(dims []Dim) []ir.Param {
-	ps := make([]ir.Param, len(dims))
+// dimNodes resolves the dims' InputParam nodes in order — the on-the-fly
+// resolution is a field read on the handle (the symbol table lookup happened
+// at declaration).
+func dimNodes(dims []Dim) []ir.Node {
+	ns := make([]ir.Node, len(dims))
 	for i, d := range dims {
-		ps[i] = d.param
+		ns[i] = d.node
 	}
-	return ps
+	return ns
 }
 
 // Lambda-parameter name tables: a lone parameter is v, two are l, r; longer
@@ -149,27 +152,27 @@ func coerceMapFn(fn any, want int) (mapFn, error) {
 // paramRef node plus the tensor's scalar element type.
 func (c *chain) checkOperand(op Operand) (ir.Node, ir.Type, error) {
 	t := op.t
-	if t.b != c.b || !c.b.tensorDeclared(t.param.Name()) {
-		return nil, nil, fmt.Errorf("map: tensor %q is not declared in this builder", t.param.Name())
+	if t.b != c.b || !c.b.tensorDeclared(t.name) {
+		return nil, nil, fmt.Errorf("map: tensor %q is not declared in this builder", t.name)
 	}
 	if len(op.axes) != len(t.dims) {
 		return nil, nil, fmt.Errorf("map: operand %s has %d subscripts for rank %d (structural indexing, syntax.md §4.1)",
-			t.param.Name(), len(op.axes), len(t.dims))
+			t.name, len(op.axes), len(t.dims))
 	}
 	for i, ax := range op.axes {
-		if err := c.b.checkDim(ax, "map operand "+t.param.Name()); err != nil {
+		if err := c.b.checkDim(ax, "map operand "+t.name); err != nil {
 			return nil, nil, err
 		}
 		if ax.Name() != t.dims[i].Name() {
 			return nil, nil, fmt.Errorf("map: operand %s subscript %d binds @%s, but dim %d of %s is @%s (structural indexing binds subscripts positionally)",
-				t.param.Name(), i, ax.Name(), i, t.param.Name(), t.dims[i].Name())
+				t.name, i, ax.Name(), i, t.name, t.dims[i].Name())
 		}
 		if c.liveIndex(ax.Name()) < 0 {
 			return nil, nil, fmt.Errorf("map: operand %s binds @%s, which is not a live axis at this point of the chain",
-				t.param.Name(), ax.Name())
+				t.name, ax.Name())
 		}
 	}
-	return c.b.g.NewParamRef(origin, t.param), ir.InternScalar(t.elem), nil
+	return c.b.g.NewParamRef(origin, t.node), ir.InternScalar(t.elem), nil
 }
 
 // buildMapLambda validates the operands and the lambda, then invokes it with
@@ -177,7 +180,7 @@ func (c *chain) checkOperand(op Operand) (ir.Node, ir.Type, error) {
 // the incoming pipe is lambda argument 0 and the operands follow (§5.2).
 // The map NODE is not constructed here — its `as` clause only exists at the
 // following As rung; RootAs/AfterMap hold the pieces until then.
-func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.Node, params []ir.Param, body Expr, err error) {
+func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.Node, params []ir.Node, body Expr, err error) {
 	want := len(ops)
 	if piped {
 		want++
@@ -198,14 +201,14 @@ func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.
 		opNodes = append(opNodes, node)
 		elems = append(elems, elem)
 	}
-	params = make([]ir.Param, want)
+	params = make([]ir.Node, want)
 	args := make([]Expr, want)
 	for i := range params {
 		name, err := mapParamName(piped, i, want)
 		if err != nil {
 			return nil, nil, Expr{}, err
 		}
-		params[i] = ir.NewLambdaParam(name, elems[i])
+		params[i] = c.b.g.NewLambdaInputParam(origin, name, elems[i])
 		args[i] = Expr{b: c.b, node: c.b.g.NewParamRef(origin, params[i]), typ: elems[i]}
 	}
 	body = mf.call(args)
@@ -240,8 +243,8 @@ func (c *chain) buildReduce(init Expr, fn func(acc, v Expr) Expr) (ir.Node, ir.T
 		return nil, nil, fmt.Errorf("reduce: homogeneous reducer violated (tca.md §4.2): init has type %s, the piped value has element type %s",
 			typeName(init.typ), typeName(T))
 	}
-	acc := ir.NewLambdaParam("acc", T)
-	now := ir.NewLambdaParam("now", T)
+	acc := c.b.g.NewLambdaInputParam(origin, "acc", T)
+	now := c.b.g.NewLambdaInputParam(origin, "now", T)
 	body := fn(Expr{b: c.b, node: c.b.g.NewParamRef(origin, acc), typ: T},
 		Expr{b: c.b, node: c.b.g.NewParamRef(origin, now), typ: T})
 	if body.err != nil {
@@ -254,7 +257,7 @@ func (c *chain) buildReduce(init Expr, fn func(acc, v Expr) Expr) (ir.Node, ir.T
 		return nil, nil, fmt.Errorf("reduce: homogeneous reducer violated (tca.md §4.2): combiner returns %s, want %s",
 			typeName(body.typ), typeName(T))
 	}
-	node := c.b.g.NewReduce(origin, init.materialize(), c.pipe, ir.Lambda{Params: []ir.Param{acc, now}, Body: body.materialize()})
+	node := c.b.g.NewReduce(origin, init.materialize(), c.pipe, ir.NewLambda([]ir.Node{acc, now}, body.materialize()))
 	c.live = append([]Dim(nil), c.live[:len(c.live)-1]...)
 	return node, T, nil
 }
@@ -314,13 +317,12 @@ func (c *chain) checkAsExact(dims []Dim, what string) error {
 // axis must be live (the store executes at iteration points), and index i
 // binds the tensor's dim i.
 func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
-	if t.b != c.b || !c.b.tensorDeclared(t.param.Name()) {
-		return nil, fmt.Errorf("store: tensor %q is not declared in this builder", t.param.Name())
+	if t.b != c.b || !c.b.tensorDeclared(t.name) {
+		return nil, fmt.Errorf("store: tensor %q is not declared in this builder", t.name)
 	}
 	if len(axes) != len(t.dims) {
 		return nil, fmt.Errorf("store: %s has rank %d, got %d index axes", t.Name(), len(t.dims), len(axes))
 	}
-	params := make([]ir.Param, len(axes))
 	for i, ax := range axes {
 		if err := c.b.checkDim(ax, "store "+t.Name()); err != nil {
 			return nil, err
@@ -332,9 +334,8 @@ func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
 		if c.liveIndex(ax.Name()) < 0 {
 			return nil, fmt.Errorf("store: @%s is not a live axis at this point of the chain", ax.Name())
 		}
-		params[i] = ax.param
 	}
-	node := c.b.g.NewStore(origin, ir.Access{Tensor: t.param, Axes: params}, c.pipe)
+	node := c.b.g.NewStore(origin, t.node, dimNodes(axes), c.pipe)
 	c.b.g.AddStatementAs(c.id, node)
 	c.b.chain = nil
 	c.b.noteOutput(t, node, c.retID)
@@ -399,7 +400,7 @@ func (rm *RootMap) Map(ops []Operand, fn any) (*RootAs, error) {
 type RootAs struct {
 	c       *chain
 	opNodes []ir.Node
-	params  []ir.Param
+	params  []ir.Node
 	body    Expr
 }
 
@@ -413,8 +414,8 @@ func (ra *RootAs) As(dims ...Dim) *MidChain {
 	if err := c.pending(); err == nil {
 		c.deferErr(c.checkAsPermutation(dims, "root map"))
 	}
-	mapNode := c.b.g.NewMap(origin, ra.opNodes, ir.Lambda{Params: ra.params, Body: ra.body.materialize()}, dimParams(dims))
-	ic := c.b.g.NewIterCluster(origin, dimParams(c.iters), mapNode)
+	mapNode := c.b.g.NewMap(origin, ra.opNodes, ir.NewLambda(ra.params, ra.body.materialize()), dimNodes(dims))
+	ic := c.b.g.NewIterCluster(origin, dimNodes(c.iters), mapNode)
 	c.pipe = ic
 	c.elem = ra.body.typ
 	c.live = append([]Dim(nil), dims...)
@@ -503,7 +504,7 @@ func (ar *AfterReduce) Store(t Tensor, axes ...Dim) (*Stored, error) {
 type AfterMap struct {
 	c       *chain
 	opNodes []ir.Node
-	params  []ir.Param
+	params  []ir.Node
 	body    Expr
 }
 
@@ -520,7 +521,7 @@ func (am *AfterMap) As(dims ...Dim) *Tail {
 	ops := make([]ir.Node, 0, len(am.opNodes)+1)
 	ops = append(ops, c.pipe)
 	ops = append(ops, am.opNodes...)
-	mapNode := c.b.g.NewMap(origin, ops, ir.Lambda{Params: am.params, Body: am.body.materialize()}, dimParams(dims))
+	mapNode := c.b.g.NewMap(origin, ops, ir.NewLambda(am.params, am.body.materialize()), dimNodes(dims))
 	ic := c.b.g.NewIterCluster(origin, nil, mapNode)
 	c.pipe = ic
 	c.elem = am.body.typ

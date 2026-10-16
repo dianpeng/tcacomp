@@ -14,12 +14,12 @@ import (
 func cleanOracle() *ir.Graph {
 	g := ir.NewGraph("clean")
 	f32 := ir.InternScalar(ir.TF32)
-	tensor := g.AddTensorParam("A", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	tensor := g.NewInputParam("test", ir.RoleTensor, "A", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	c1 := g.NewConst("test", f32, 1)
 	c2 := g.NewConst("test", f32, 2)
 	sum := g.NewBinOp("test", ir.BinOpAdd, c1, c2)
 	g.AddStatement(sum)
-	g.AddStatement(g.NewStore("test", ir.Access{Tensor: tensor}, sum))
+	g.AddStatement(g.NewStore("test", tensor, nil, sum))
 	g.AddStatement(g.NewReturn("test", sum))
 	return g
 }
@@ -56,10 +56,10 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 		t.Fatalf("WindowFor(StageLinearized) must be a fail-closed empty window, got %+v", unset)
 	}
 	built := cleanOracle()
-	var binopID uint64
+	var paramID uint64
 	ir.Walk(built, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
-		if n.KindOf() == ir.KindBinOp {
-			binopID = n.BasePtr().ID()
+		if n.KindOf() == ir.KindInputParam {
+			paramID = n.BasePtr().ID()
 		}
 		return ir.Descend
 	}))
@@ -68,7 +68,9 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	if err == nil {
 		t.Fatal("known kind at unset stage: expected fail-closed legality error, got nil")
 	}
-	for _, want := range []string{"stage linearized", fmt.Sprintf("node %d", binopID)} {
+	// Walk roots graph params first, so the tensor InputParam is the first
+	// illegal node the unset stage's window rejects.
+	for _, want := range []string{"stage linearized", fmt.Sprintf("node %d", paramID)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("fail-closed error %q missing %q", err.Error(), want)
 		}
@@ -76,7 +78,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 
 	// The constructed window names every Phase-1 kind Legal explicitly.
 	constructed := pass.WindowFor(pass.StageConstructed)
-	for k := ir.KindIter; k <= ir.KindCall; k++ {
+	for k := ir.KindIter; k <= ir.KindInputParam; k++ {
 		if constructed.Actions[k] != pass.Legal {
 			t.Errorf("StageConstructed window missing explicit Legal entry for %s", k)
 		}

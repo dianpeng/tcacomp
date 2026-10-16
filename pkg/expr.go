@@ -23,17 +23,18 @@ import (
 // its IR node, and its interned type, so the Go type system plus the recorded
 // type catch misuse at the call site instead of in a later pass.
 //
-// A scalar-param handle (ScalarParam) is LAZY: it carries the param and
-// materializes its paramRef node on first use. Declaration order must never
-// consume graph IDs ahead of the statement-ID reservation in Stmt — the
-// doc-pinned oracle print expects `statement #1` even though `scale` is
-// declared before Stmt. Each use materializes one paramRef (SSA-duplicated
-// references; dedup is a later pass's job); the use-site order is
-// deterministic, so prints stay byte-stable.
+// A scalar-param handle (ScalarParam) is LAZY: it carries the resolved
+// InputParam node and materializes its paramRef node on first use.
+// Declaration order must never consume graph IDs ahead of the
+// statement-ID reservation in Stmt — the doc-pinned oracle print expects
+// `statement #1` even though `scale` is declared before Stmt. Each use
+// materializes one paramRef (SSA-duplicated references; dedup is a later
+// pass's job); the use-site order is deterministic, so prints stay
+// byte-stable.
 type Expr struct {
 	b      *Builder
 	node   ir.Node // eager node (operators, literals, lambda params)
-	scalar ir.Param
+	scalar ir.Node // lazy: resolved RoleScalar InputParam node; nil for eager exprs
 	typ    ir.Type
 	err    error // first deferred type error; surfaced by the chain rungs
 }
@@ -44,7 +45,7 @@ func (e Expr) materialize() ir.Node {
 	if e.node != nil {
 		return e.node
 	}
-	if e.scalar.Name() == "" || e.b == nil {
+	if e.scalar == nil || e.b == nil {
 		return nil
 	}
 	return e.b.g.NewParamRef(origin, e.scalar)

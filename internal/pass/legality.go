@@ -73,16 +73,17 @@ func init() {
 	windows[StageConstructed] = constructedWindow()
 }
 
-// constructedWindow marks EVERY Phase-1 kind (KindIter..KindCall — the
-// whole abstract and scalar-expr families) explicitly Legal. The entries
-// are written out one by one so a future kind appended before KindEnd is
-// visibly absent here until the window is revised.
+// constructedWindow marks EVERY Phase-1 kind (KindIter..KindInputParam —
+// the whole abstract and scalar-expr families plus graph-owned parameter
+// nodes) explicitly Legal. The entries are written out one by one so a
+// future kind appended before KindEnd is visibly absent here until the
+// window is revised.
 func constructedWindow() *LegalityWindow {
 	w := &LegalityWindow{
 		Actions:    make(map[ir.Kind]LegalityAction),
 		Predicates: make(map[ir.Kind]func(ir.Node) error),
 	}
-	for k := ir.KindIter; k <= ir.KindCall; k++ {
+	for k := ir.KindIter; k <= ir.KindInputParam; k++ {
 		w.Actions[k] = Legal
 	}
 	return w

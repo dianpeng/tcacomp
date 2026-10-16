@@ -13,25 +13,20 @@ import (
 // one statement whose chain is an iteration cluster over a root map (one
 // tensor operand, identity lambda) feeding a store of the same binding.
 // Built exclusively through the ir exported construction surface.
-//
-// Note: a tensor operand is currently referenced via a bare paramRef to the
-// tensor param (`lhs`); the axis-structured access encoding (`lhs[@m]`) is
-// plan 01-04's builder/printer reconciliation, after which this fixture can
-// be rebuilt to match.
 func buildDotGraph() *ir.Graph {
 	g := ir.NewGraph("dot_test")
-	m := g.AddDimParam("m")
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
 	f32 := ir.InternScalar(ir.TF32)
-	lhs := g.AddTensorParam("lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
-	out := g.AddTensorParam("output", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	out := g.NewInputParam("ctor", ir.RoleTensor, "output", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 
-	v := ir.NewLambdaParam("v", f32)
+	v := g.NewLambdaInputParam("dot-test", "v", f32)
 	operand := g.NewParamRef("dot-test", lhs)
 	rootMap := g.NewMap("dot-test", []ir.Node{operand},
-		ir.Lambda{Params: []ir.Param{v}, Body: g.NewParamRef("dot-test", v)},
-		[]ir.Param{m})
-	ic := g.NewIterCluster("dot-test", []ir.Param{m}, rootMap)
-	store := g.NewStore("dot-test", ir.Access{Tensor: out, Axes: []ir.Param{m}}, ic)
+		ir.NewLambda([]ir.Node{v}, g.NewParamRef("dot-test", v)),
+		[]ir.Node{m})
+	ic := g.NewIterCluster("dot-test", []ir.Node{m}, rootMap)
+	store := g.NewStore("dot-test", out, []ir.Node{m}, ic)
 	g.AddStatement(store)
 	return g
 }
