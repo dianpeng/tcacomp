@@ -338,17 +338,17 @@ TCA is an SSA-style IR:
 4. The basic block contains statements. Pure computation (`map`, `reduce`) has no side effects; memory effects are expressed only through `load`/`store` and are ordered explicitly during [Effect Linearization](#56-effect-linearization).
 
 ```
-statement #1:
+statement #8:
   iter(@m, @k, @n) -> map(lhs[@m][@n], rhs[@n][@k], lambda(l, r): l * r) as (@m, @k, @n) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now)                                      |
   iter() -> map(%0, lambda(v): v * scale) as (@m, @k)                                    |
   store(%output[@m][@k], %0)
 
-statement #2:
+statement #9:
   return %output
 ```
 
-This is a map + reduce formulation. `@n` is last in `as`, so it is the reduced dimension and the innermost loop.
+This is a map + reduce formulation. `@n` is last in `as`, so it is the reduced dimension and the innermost loop. (Statement IDs come from the graph's shared node-ID counter: this kernel's seven parameters `@m, @k, @n, lhs, rhs, scale, output` are nodes 1-7, so the statements built from them are #8 and #9.)
 
 ### 5.2 Simplification
 
@@ -358,13 +358,13 @@ This is a map + reduce formulation. `@n` is last in `as`, so it is the reduced d
 - **Canonicalization.** Every iteration is factored from compound form into standard form:
 
 ```
-statement #1:
+statement #8:
   iter(@m) * iter(@k) * iter(@n) -> map(lhs[@m][@n], rhs[@n][@k], lambda(l, r): l * r) as (@m, @k, @n) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now)                                                    |
   iter() -> map(%0, lambda(v): v * scale) as (@m, @k)                                                  |
   store(%output[@m][@k], %0)
 
-statement #2:
+statement #9:
   return %output
 ```
 
@@ -803,3 +803,24 @@ for (int base = 0; base < T; base += blockDim.x) {
   // body runs for all threads; `active` predicates its loads, stores, and Reduce calls
 }
 ```
+
+### 5.13 IR Node Suite
+
+The single-tier IR (Section 5.1) is one module, `internal/ir`, organized into submodule files by node family. Kinds are append-only with a versioned enumeration (`KindVersion`), so existing constants never renumber; the pass manager's legality windows fail closed on kinds no window knows.
+
+| Family | Kinds | Node structs in |
+|--------|-------|-----------------|
+| FamilyScalarExpr | `const`, `param`, `binop`, `unaryop`, `select`, `cast`, `call` | `construct.go` |
+| FamilyAbstract | `iter`, `itercluster`, `map`, `reduce`, `store`, `return`, `inputparam`, and the value-level `dimvar`/`bdimvar` | `construct.go`, `dimvar.go` |
+| FamilyTileOp | `loadtile`, `storetile` | `tile.go` |
+| FamilyLoop | the lowered `for` loop | `loop.go` |
+| FamilyCollective | (reserved for reducer collectives; empty until reduce lowering lands) | — |
+
+The lowered suite is what iteration lowering (Section 5.9) and cache lowering (Section 5.11) produce into the same node suite:
+
+- **`dimvar`** — an induction variable as a value object: operands `[dim, init, step]`, identity is the `(init, step)` tuple, never the name. Printed `@x(init=0, step=1)`.
+- **`bdimvar`** — the bounded form `@x/M` (Section 2.3): operands `[iv(dimvar), max]`.
+- **`loadtile` / `storetile`** — cooperative tile accesses: operands `[tensor, bivs...]` and `[value, tensor, bivs...]`; the tensor operand must resolve to a tensor-typed `InputParam` (the verifier fails closed otherwise).
+- **`forloop`** — the explicit lowered loop: operands `[iv(dimvar), bound, body]`; the body is a single child subgraph root.
+
+**IV/BIV relations** (formal definitions in `doc/optana/induction_variable.md`): two IVs are equal iff their `(init, step)` tuples are equal — the same node, or two constant pairs with equal values; a constant is never equal to a non-constant. A BIV is `((iv tuple), Max)`; two BIVs are equal iff their dimvars are equal AND their maxes are equal. The include relation `A ~> B` holds iff `A.max <= B.max` **for normalized IVs only** (`init=0, step=1` as constants); `~>` is not commutative. Belong is its reverse: `A <~ B` iff `B ~> A`. Any non-normalized IV makes both relations false.

@@ -69,6 +69,16 @@
 //     (chain stages producer-first via pipeInput), golden-pinned — Walk must
 //     never be used where emission order matters.
 //
+//   - Lowered suite (review P1R-04): dimvar/bounded-dimvar (value-object
+//     induction variables, (init, step) tuples with EQ/NE and the
+//     Include/Belong relations of doc/optana/induction_variable.md),
+//     loadtile/storetile (FamilyTileOp; the tensor is an OPERAND slot, the
+//     axes bounded dimvars), and the explicit for-loop (FamilyLoop; ops =
+//     [iv, bound, body]). Kinds are append-only with a versioned Kind
+//     enumeration (IR-03; KindVersion bumps on additions); the verifier's
+//     shape checks fail closed on operand kinds (bdimvar binds a dimvar,
+//     tiles bind a RoleTensor InputParam, for-loops bind a dimvar).
+//
 // Interface-width contract (directive 4): Node has exactly 2 methods
 // (BasePtr, KindOf); Value adds exactly IsNone; Type adds exactly Equal;
 // Visitor adds exactly Visit. New capabilities arrive as new interfaces or

@@ -45,10 +45,16 @@ func BuildingDCE(g *Graph) error {
 }
 
 // isEffectKind reports whether kind k carries an observable side effect in
-// v0. Stores and kernel returns are the only effects; everything else —
-// including loads — is dead-code-eligible when unreferenced.
+// v0. Stores, kernel returns, and tile stores are the only effects;
+// everything else — including loads and loop nests without an effect in
+// their body (caught by hasEffectNode's reachability walk) — is
+// dead-code-eligible when unreferenced.
 func isEffectKind(k Kind) bool {
-	return k == KindStore || k == KindReturn
+	switch k {
+	case KindStore, KindReturn, KindStoreTile:
+		return true
+	}
+	return false
 }
 
 // hasEffectNode reports whether any node reachable from n (operand and

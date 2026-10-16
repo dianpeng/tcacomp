@@ -123,6 +123,48 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 			idx++
 		})
 	}
+	checkNodeShape(n, vs)
+}
+
+// checkNodeShape enforces the per-kind operand-shape invariants of the
+// lowered node suite (review P1R-04), fail-closed: a bounded dimvar binds a
+// dimvar, tile tensor operands bind a RoleTensor InputParam, and a for-loop
+// binds a dimvar. Nil operands are left to the generic use-def slot check.
+func checkNodeShape(n Node, vs *[]Violation) {
+	switch t := n.(type) {
+	case *boundedDimVarNode:
+		if iv := operandAt(t, 0); iv != nil {
+			if _, ok := iv.(*dimVarNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"bounded dimvar operand 0 must be a dimvar"))
+			}
+		}
+	case *loadTileNode:
+		checkTileTensor(n, operandAt(t, 0), vs)
+	case *storeTileNode:
+		checkTileTensor(n, operandAt(t, 1), vs)
+	case *forLoopNode:
+		if iv := operandAt(t, 0); iv != nil {
+			if _, ok := iv.(*dimVarNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"for-loop operand 0 must be a dimvar"))
+			}
+		}
+	}
+}
+
+// checkTileTensor pins a tile node's tensor operand to a RoleTensor
+// InputParam node (the lowered suite promotes the abstract store's payload
+// access into an ordinary operand; the bound must be the parameter itself).
+func checkTileTensor(n Node, tensor Node, vs *[]Violation) {
+	if tensor == nil {
+		return
+	}
+	ip, ok := tensor.(*inputParamNode)
+	if !ok || ip.role != RoleTensor {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			"tile tensor operand must be a RoleTensor InputParam node"))
+	}
 }
 
 // checkOneUse applies the use-def resolution checks to one use (operand slot

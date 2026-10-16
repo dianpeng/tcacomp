@@ -250,7 +250,8 @@ func isStage(n Node) bool {
 		return false
 	}
 	switch n.KindOf() {
-	case KindIterCluster, KindMap, KindReduce, KindStore, KindReturn:
+	case KindIterCluster, KindMap, KindReduce, KindStore, KindReturn,
+		KindLoadTile, KindStoreTile, KindForLoop:
 		return true
 	}
 	return false
@@ -267,6 +268,10 @@ func pipeInput(n Node) Node {
 		next = opAt(n, 0)
 	case KindReduce:
 		next = opAt(n, 1)
+	case KindStoreTile:
+		next = opAt(n, 0) // the stored value
+	case KindForLoop:
+		next = opAt(n, 2) // the body
 	}
 	if isStage(next) {
 		return next
@@ -412,9 +417,58 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		return b.String()
 	case *returnNode:
 		return "return " + r.value(opAt(t, 0))
+	case *loadTileNode:
+		return "loadtile(" + r.tileAccess(t) + ")"
+	case *storeTileNode:
+		var b strings.Builder
+		b.WriteString("storetile(")
+		b.WriteString(r.tileAccess(t))
+		b.WriteString(", ")
+		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
+			b.WriteString("%0")
+		} else {
+			b.WriteString(r.value(val))
+		}
+		b.WriteString(")")
+		return b.String()
+	case *forLoopNode:
+		var b strings.Builder
+		b.WriteString("for(")
+		b.WriteString(r.value(opAt(t, 0)))
+		b.WriteString(" in ")
+		b.WriteString(r.value(opAt(t, 1)))
+		b.WriteString(") ")
+		b.WriteString(r.value(opAt(t, 2)))
+		return b.String()
 	default:
 		return r.value(n)
 	}
+}
+
+// tileAccess renders a tile node's `tensor[@biv][@biv]...` access: the
+// tensor operand's debug name followed by one bounded-dimvar rendering per
+// axis operand (operand 0 for loadtile, operand 1 for storetile onward).
+func (r *renderer) tileAccess(n Node) string {
+	tensorIdx := 0
+	if n.KindOf() == KindStoreTile {
+		tensorIdx = 1
+	}
+	var b strings.Builder
+	if t := operandAt(n, tensorIdx); t != nil {
+		if ip, ok := t.(*inputParamNode); ok {
+			b.WriteString(ip.name)
+		} else {
+			b.WriteString(r.value(t))
+		}
+	} else {
+		b.WriteString("<nil>")
+	}
+	for i := tensorIdx + 1; i < len(OperandsOf(n)); i++ {
+		b.WriteString("[")
+		b.WriteString(r.value(operandAt(n, i)))
+		b.WriteString("]")
+	}
+	return b.String()
 }
 
 // value renders a non-stage-position operand: scalar expressions with
@@ -473,6 +527,19 @@ func (r *renderer) value(n Node) string {
 			s += "/" + paramNameOf(t.boundUse) // bounded induction variable, doc §2.3
 		}
 		return s
+	case *dimVarNode:
+		// Lowered IV: `@x(init=0.0, step=1.0)` — identity is the tuple,
+		// the name is debug payload (doc/optana/induction_variable.md).
+		return "@" + paramNameOf(t.dimUse) +
+			"(init=" + r.value(opAt(t, 0)) + ", step=" + r.value(opAt(t, 1)) + ")"
+	case *boundedDimVarNode:
+		// Bounded IV: `@x/M` — the dimvar's name with its max bound.
+		if iv := opAt(t, 0); iv != nil {
+			if dv, ok := iv.(*dimVarNode); ok {
+				return "@" + paramNameOf(dv.dimUse) + "/" + r.value(opAt(t, 1))
+			}
+		}
+		return "@" + r.value(opAt(t, 0)) + "/" + r.value(opAt(t, 1))
 	case *storeNode:
 		return "%" + paramNameOf(t.target.tensorUse) // store returns the stored value (doc §2.5)
 	default:

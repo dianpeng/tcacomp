@@ -9,7 +9,7 @@ type Kind uint32
 
 // KindVersion is the IR node-kind schema version. Bump when kinds are added
 // (append-only) so downstream consumers can gate on it.
-const KindVersion = 1
+const KindVersion = 2
 
 const (
 	KindInvalid     Kind = iota // unused slot; verifier and legality reject it
@@ -27,6 +27,11 @@ const (
 	KindCast                    // scalar-expr: explicit cast to named type
 	KindCall                    // scalar-expr: registered pure builtin call
 	KindInputParam              // graph-owned kernel/lambda input parameter (SSA def; name is debug-only)
+	KindDimVar                  // lowered: induction variable, an (init, step) value object (doc/optana/induction_variable.md)
+	KindBoundedDimVar           // lowered: dimvar bound to a max — ((iv tuple), Max)
+	KindLoadTile                // lowered: cooperative tile load (tensor, bivs...)
+	KindStoreTile               // lowered: cooperative tile store (value, tensor, bivs...)
+	KindForLoop                 // lowered: explicit loop nest over a bounded dimvar
 	KindEnd                     // sentinel: all kinds < KindEnd
 )
 
@@ -63,6 +68,16 @@ func (k Kind) String() string {
 		return "call"
 	case KindInputParam:
 		return "inputparam"
+	case KindDimVar:
+		return "dimvar"
+	case KindBoundedDimVar:
+		return "bdimvar"
+	case KindLoadTile:
+		return "loadtile"
+	case KindStoreTile:
+		return "storetile"
+	case KindForLoop:
+		return "forloop"
 	case KindEnd:
 		return "end"
 	default:
@@ -70,10 +85,11 @@ func (k Kind) String() string {
 	}
 }
 
-// Family classifies a Kind into its node family (D-15). FamilyLoop,
-// FamilyTileOp, and FamilyCollective exist now — with no member kinds yet —
-// so Phase 3-4 lowering kinds join via new constants without enum surgery
-// (single-tier IR rule).
+// Family classifies a Kind into its node family (D-15). FamilyLoop and
+// FamilyTileOp gained their first members with the Phase 1 lowered suite
+// (forloop; loadtile/storetile); FamilyCollective remains reserved with no
+// member kinds until reduce lowering lands. New Phase 3-4 lowering kinds
+// join via new constants without enum surgery (single-tier IR rule).
 type Family int
 
 const (
@@ -89,10 +105,16 @@ func (k Kind) Family() Family {
 	switch k {
 	case KindConst, KindParam, KindBinOp, KindUnaryOp, KindSelect, KindCast, KindCall:
 		return FamilyScalarExpr
+	case KindLoadTile, KindStoreTile:
+		return FamilyTileOp
+	case KindForLoop:
+		return FamilyLoop
 	default:
 		// KindIter, KindIterCluster, KindMap, KindReduce, KindStore,
-		// KindReturn, and the sentinel values all belong to the abstract
-		// suite constructed in Phase 1.
+		// KindReturn, KindInputParam, KindDimVar, KindBoundedDimVar, and
+		// the sentinel values belong to the abstract suite (the lowered
+		// dimvars are value-level IV objects, doc/optana/
+		// induction_variable.md, not loop-nest structure).
 		return FamilyAbstract
 	}
 }

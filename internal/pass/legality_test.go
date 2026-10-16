@@ -78,7 +78,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 
 	// The constructed window names every Phase-1 kind Legal explicitly.
 	constructed := pass.WindowFor(pass.StageConstructed)
-	for k := ir.KindIter; k <= ir.KindInputParam; k++ {
+	for k := ir.KindIter; k <= ir.KindForLoop; k++ {
 		if constructed.Actions[k] != pass.Legal {
 			t.Errorf("StageConstructed window missing explicit Legal entry for %s", k)
 		}

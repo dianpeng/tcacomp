@@ -264,19 +264,21 @@ type payloadBearer interface {
 }
 
 // fixedArity returns the operand-slot count for fixed-arity kinds, or -1
-// for variadic kinds (call, map) and the raw fallback.
+// for variadic kinds (call, map, loadtile, storetile) and the raw fallback.
 func fixedArity(k Kind) int {
 	switch k {
 	case KindConst, KindParam, KindInputParam:
 		return 0
 	case KindUnaryOp, KindIterCluster, KindCast, KindStore, KindReturn:
 		return 1
-	case KindIter, KindBinOp, KindReduce:
+	case KindIter, KindBinOp, KindReduce, KindDimVar, KindBoundedDimVar:
 		return 2
 	case KindSelect:
 		return 3
+	case KindForLoop:
+		return 3
 	default:
-		return -1 // KindCall, KindMap, raw/unknown kinds: variadic
+		return -1 // KindCall, KindMap, KindLoadTile, KindStoreTile, raw/unknown kinds: variadic
 	}
 }
 
@@ -317,6 +319,16 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &storeNode{Base: b}
 	case KindReturn:
 		n = &returnNode{Base: b}
+	case KindDimVar:
+		n = &dimVarNode{Base: b}
+	case KindBoundedDimVar:
+		n = &boundedDimVarNode{Base: b}
+	case KindLoadTile:
+		n = &loadTileNode{Base: b}
+	case KindStoreTile:
+		n = &storeTileNode{Base: b}
+	case KindForLoop:
+		n = &forLoopNode{Base: b}
 	default:
 		n = &rawNode{Base: b}
 	}
