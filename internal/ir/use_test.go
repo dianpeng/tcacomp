@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+// The tests in this file are written against the handle model (directive 2):
+// SSAUse/SSADef are value-type handles over a per-node SSAVar pointee, and
+// ref-record indirection makes mutations through ANY copy of a handle visible
+// from every other copy. See ssa.go for the data structures.
+
 func TestUseChain(t *testing.T) {
 	g := NewGraph("chain")
 	f32 := InternScalar(TF32)
@@ -27,10 +32,10 @@ func TestUseChain(t *testing.T) {
 	if len(uses) != 1 {
 		t.Fatalf("new def has %d uses, want 1", len(uses))
 	}
-	if uses[0].Val != c || uses[0].User != sum {
-		t.Fatal("RAUW must retarget the use records, not drop them")
+	if uses[0].Def() != c {
+		t.Fatal("RAUW must retarget the use handles, not drop them")
 	}
-	if got := sum.(*binOpNode).ops[1].Val; got != c {
+	if got := sum.(*binOpNode).ops[1].Def(); got != c {
 		t.Fatal("the user's operand slot must see the new def")
 	}
 	if vs := Verify(g); len(vs) != 0 {
@@ -51,13 +56,15 @@ func TestUseChain(t *testing.T) {
 		t.Fatal("IDs must never be reused after Erase (IR-05)")
 	}
 
-	// A lingering Use hand-pointed at the tombstoned node is flagged on
-	// re-verify — the exact corruption class Erase protects against.
+	// A lingering use hand-pointed at the tombstoned node is flagged on
+	// re-verify — the exact corruption class Erase protects against. The
+	// white-box rewire retargets the record's def pointer without moving it
+	// between ref lists, exactly as a leaked pointer would.
 	d := g.NewConst("ctor", f32, 4.0)
 	y := g.NewBinOp("ctor", BinOpMul, a, d)
 	g.AddStatement(y)
 	yn := y.(*binOpNode)
-	yn.ops[1].Val = b // white-box: no relink, as if a pass leaked a pointer
+	yn.ops[1].rec.def = b.BasePtr().ssa
 
 	vs := Verify(g)
 	found := false
@@ -71,16 +78,70 @@ func TestUseChain(t *testing.T) {
 	}
 }
 
+// TestSetDefPropagatesThroughCopies pins the ref-record indirection: SSAUse
+// is a value-type handle, so a copy made BEFORE the mutation must observe the
+// mutation — through the operand slot AND through UsesOf.
+func TestSetDefPropagatesThroughCopies(t *testing.T) {
+	g := NewGraph("copies")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	b := g.NewConst("ctor", f32, 2.0)
+	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
+	g.AddStatement(sum)
+	c := g.NewConst("ctor", f32, 3.0)
+
+	ctx := &MutContext{Pass: "test-setdef"}
+	slot := sum.(*binOpNode).ops[1]
+	copied := slot // value-type handle copy, taken before the mutation
+	if err := ctx.SetDef(copied, c); err != nil {
+		t.Fatalf("SetDef: %v", err)
+	}
+	if slot.Def() != c {
+		t.Fatal("mutation through a handle copy must propagate to every copy (record indirection)")
+	}
+	if got := UsesOf(c); len(got) != 1 || got[0].Def() != c {
+		t.Fatalf("c must own the physically moved record, got %v", got)
+	}
+	if got := UsesOf(b); len(got) != 0 {
+		t.Fatalf("b must have lost the record, got %d uses", len(got))
+	}
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("chains inconsistent after SetDef: %v", vs)
+	}
+
+	// A zero handle is rejected, not a panic (T-1.1-03).
+	if err := ctx.SetDef(SSAUse{}, c); err == nil {
+		t.Fatal("SetDef on a zero handle must return an error")
+	}
+}
+
+// TestZeroHandleNilSafety pins T-1.1-03: every accessor on a zero/nil handle
+// is nil-safe — no panics anywhere.
+func TestZeroHandleNilSafety(t *testing.T) {
+	var d SSADef
+	if !d.IsInvalid() || d.SSA() != nil || d.Define() != nil {
+		t.Fatal("zero SSADef must read as invalid with nil-safe accessors")
+	}
+	var u SSAUse
+	if !u.IsKilled() || u.SSA() != nil || u.Def() != nil {
+		t.Fatal("zero SSAUse must read as killed with nil-safe accessors")
+	}
+	var v *SSAVar
+	if v.ID() != 0 || v.Node() != nil || v.Define() != nil || v.RefSize() != 0 {
+		t.Fatal("nil *SSAVar accessors must be nil-safe")
+	}
+}
+
 // TestRemoveUseEachSlotPosition removes each operand slot of a fully-wired
 // three-operand select, one graph per position. Slot removal must drop only
-// the targeted record: surviving operands keep their DefOf wiring, defs'
-// use-lists lose exactly the removed use, and Verify stays clean (CR-02 —
-// the middle-slot case is the one that used to nil out the WRONG record).
+// the targeted record: surviving operands keep their wiring, defs' ref lists
+// lose exactly the removed record, and Verify stays clean (CR-02 — the
+// middle-slot case is the one that used to nil out the WRONG record).
 func TestRemoveUseEachSlotPosition(t *testing.T) {
-	defs := func(ops []*Use) []Node {
+	defs := func(ops []SSAUse) []Node {
 		out := make([]Node, len(ops))
 		for i, u := range ops {
-			out[i] = u.Val
+			out[i] = u.Def()
 		}
 		return out
 	}
@@ -104,9 +165,8 @@ func TestRemoveUseEachSlotPosition(t *testing.T) {
 		if got := len(sn.ops); got != 2 {
 			t.Fatalf("pos %d: select has %d slots after RemoveUse, want 2", pos, got)
 		}
-		if removed.Val != nil || removed.User != nil {
-			t.Fatalf("pos %d: removed use must be fully detached, got Val=%v User=%v",
-				pos, removed.Val, removed.User)
+		if !removed.IsKilled() {
+			t.Fatalf("pos %d: removed use must read as killed", pos)
 		}
 		// The surviving slots in order must be the original minus pos.
 		wantSurvivors = append(wantSurvivors[:pos], wantSurvivors[pos+1:]...)
@@ -116,7 +176,7 @@ func TestRemoveUseEachSlotPosition(t *testing.T) {
 				t.Fatalf("pos %d: surviving slot %d points at the wrong def", pos, i)
 			}
 		}
-		// Every surviving def's use-list still holds exactly its select use.
+		// Every surviving def's ref list still holds exactly its select use.
 		for i, d := range gotSurvivors {
 			uses := UsesOf(d)
 			if len(uses) != 1 || uses[0] != sn.ops[i] {
@@ -131,8 +191,9 @@ func TestRemoveUseEachSlotPosition(t *testing.T) {
 
 // TestAddUseKeepsChainsConsistent exercises AddUse on a node whose ops slice
 // is exactly at capacity after construction (len 2, cap 2): the append inside
-// addSlot reallocates, and every *Use handed out earlier — embedded in the
-// defs' use-lists and held by callers — must stay valid (CR-01).
+// addSlot reallocates, and every SSAUse handed out earlier — held in operand
+// slots and by callers — must still resolve, because handles point at ref
+// records, never at slice elements (CR-01).
 func TestAddUseKeepsChainsConsistent(t *testing.T) {
 	g := NewGraph("adduse")
 	f32 := InternScalar(TF32)
@@ -144,21 +205,21 @@ func TestAddUseKeepsChainsConsistent(t *testing.T) {
 
 	ctx := &MutContext{Pass: "test-adduse"}
 	u := ctx.AddUse(sum, c)
-	if u == nil {
-		t.Fatal("AddUse must return the new slot")
+	if u.IsKilled() {
+		t.Fatal("AddUse must return a live handle")
 	}
-	if u.Val != c || u.User != sum {
-		t.Fatal("the new slot must be wired to its def and user")
+	if u.Def() != c {
+		t.Fatal("the new slot must be wired to its def")
 	}
 	uses := UsesOf(c)
 	if len(uses) != 1 || uses[0] != u {
-		t.Fatalf("c's use-list must hold exactly the new use, got %v", uses)
+		t.Fatalf("c's ref list must hold exactly the new use, got %v", uses)
 	}
-	if got := UsesOf(a); len(got) != 1 || got[0].User != sum {
-		t.Fatalf("a's use-list corrupted by the reallocating append: %v", got)
+	if got := UsesOf(a); len(got) != 1 || got[0].Def() != a {
+		t.Fatalf("a's ref list corrupted by the reallocating append: %v", got)
 	}
-	if got := UsesOf(b); len(got) != 1 || got[0].User != sum {
-		t.Fatalf("b's use-list corrupted by the reallocating append: %v", got)
+	if got := UsesOf(b); len(got) != 1 || got[0].Def() != b {
+		t.Fatalf("b's ref list corrupted by the reallocating append: %v", got)
 	}
 	if vs := Verify(g); len(vs) != 0 {
 		t.Fatalf("chains inconsistent after AddUse past capacity: %v", vs)
@@ -204,13 +265,13 @@ func TestRauwGuards(t *testing.T) {
 		t.Fatal("Erase with live uses must return an error")
 	}
 	if got := UsesOf(a); len(got) != 1 || got[0] != before[0] {
-		t.Fatal("refused Erase must leave the use-list untouched")
+		t.Fatal("refused Erase must leave the ref list untouched")
 	}
 	if vs := Verify(g); len(vs) != 0 {
 		t.Fatalf("guards corrupted the chains: %v", vs)
 	}
 
-	// Nil operands are rejected, not panics (T-1-01-02).
+	// Nil operands are rejected, not panics (T-1.1-03).
 	if err := ctx.ReplaceAllUsesWith(nil, b); err == nil {
 		t.Fatal("RAUW from nil must return an error")
 	}

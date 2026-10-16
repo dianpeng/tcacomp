@@ -110,8 +110,50 @@ func TestUseListBasics(t *testing.T) {
 
 	// Snapshot safety: mutating the returned slice must not touch the chain.
 	snap := UsesOf(c1)
-	snap[0] = nil
-	if UsesOf(c1)[0] == nil {
+	snap[0] = SSAUse{}
+	if UsesOf(c1)[0] == (SSAUse{}) {
 		t.Fatal("UsesOf must return a snapshot, not live list links")
+	}
+}
+
+// TestStatementValueNone pins the Value interface semantics (directive 2):
+// the return root is the none Value — a Value, but nothing — while every
+// other node kind (store included, doc §2.5) produces a real value. The
+// AddStatement entry points stay Node-typed, so a plain constructor result is
+// accepted without a cast, and Value() is the single classification accessor.
+func TestStatementValueNone(t *testing.T) {
+	g := NewGraph("value-none")
+	f32 := InternScalar(TF32)
+	v := g.NewConst("ctor", f32, 1.0)
+
+	// A store root produces the stored value (doc §2.5): NOT a none Value.
+	m := g.AddDimParam("m")
+	out := g.AddTensorParam("out", InternTensor(TF32, []DimRef{{Name: "m"}}))
+	st := g.NewStore("ctor", Access{Tensor: out, Axes: []Param{m}}, v)
+	sStore := g.AddStatement(st)
+	if sStore.Value().IsNone() {
+		t.Fatal("store root must produce a real Value (it returns the stored value, doc §2.5)")
+	}
+	if Node(sStore.Value()) != sStore.RHS() {
+		t.Fatal("Value() viewed as Node must equal RHS()")
+	}
+
+	// The return root is the none Value: it satisfies Value so it can sit in
+	// a statement RHS slot, and IsNone() reports the none semantics.
+	ret := g.NewReturn("ctor", st)
+	sRet := g.AddStatement(ret)
+	if !sRet.Value().IsNone() {
+		t.Fatal("return root must report IsNone() == true (the none Value)")
+	}
+	if Node(sRet.Value()) != sRet.RHS() {
+		t.Fatal("Value() viewed as Node must equal RHS()")
+	}
+
+	// A plain constructor Node result is accepted without a cast — the
+	// compile-time proof that AddStatement stays Node-typed.
+	bin := g.NewBinOp("ctor", BinOpAdd, v, v)
+	sBin := g.AddStatement(bin)
+	if sBin.Value().IsNone() {
+		t.Fatal("binop root must produce a real Value")
 	}
 }
