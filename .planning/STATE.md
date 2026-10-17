@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-16 - Completed quick task 261016-mpu: Refactor phase 1 IR from AST-style to SSA/CFG optimizing-compiler IR
+last_activity: 2026-10-17 - Completed quick task 261017-vdj: Adapt phase-1 SSA IR to new two-level design (sea-of-nodes L1, scheduled CFG L2) per tinycudaopto skeleton
 progress:
   total_phases: 6
   completed_phases: 1
@@ -84,6 +84,7 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 261016-mpu | Refactor phase 1 IR from AST-style to SSA/CFG optimizing-compiler IR per doc/review/phase1_1.md | 2026-10-16 | c470396 | [261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss](./quick/261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss/) |
+| 261017-vdj | Adapt phase-1 SSA IR to new two-level design (sea-of-nodes L1, scheduled CFG L2) per tinycudaopto skeleton | 2026-10-17 | 1440816 | [261017-vdj-adapt-phase-1-ssa-ir-to-new-two-level-de](./quick/261017-vdj-adapt-phase-1-ssa-ir-to-new-two-level-de/) |
 
 ## Session Continuity
 
