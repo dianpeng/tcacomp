@@ -5,8 +5,8 @@ import "slices"
 // Span is a source location range. It is the zero value throughout Phase 1:
 // there is no frontend yet, so nodes carry no source spans (IR-06).
 type Span struct {
-	File           string
-	Line, Col      int
+	File            string
+	Line, Col       int
 	EndLine, EndCol int
 }
 
@@ -97,15 +97,21 @@ const (
 )
 
 // Graph is one kernel/function's IR: a name, the kernel input-parameter
-// nodes, and a single-block CFG (IR-02). Node and statement IDs come only
-// from NewID: per-graph monotonic, starting at 1, never reused even across
-// Erase (IR-05). Every reference anywhere in the graph is an SSAUse; every
-// definition is an SSADef — names survive only as InputParam debug payload.
+// nodes, and — once Materialize runs (Level 2) — a single-block CFG
+// (IR-02). Between construction and Materialize the graph is a pure sea of
+// nodes: cfg is nil, Block()/CFG() return nil (T-quick-02 nil-safety), and
+// ordering of side effects rides the explicit ImpactBy effect chains (see
+// effect.go). Node and statement IDs come only from NewID: per-graph
+// monotonic, starting at 1, never reused even across Erase (IR-05). Every
+// reference anywhere in the graph is an SSAUse; every definition is an
+// SSADef — names survive only as InputParam debug payload.
 type Graph struct {
-	name   string
-	params []Node // InputParam nodes (kernel roles only), in declaration order
-	cfg    *CFG
-	nextID uint64 // next ID to hand out; monotonic
+	name        string
+	params      []Node // InputParam nodes (kernel roles only), in declaration order
+	cfg         *CFG   // Level 2 only: nil from NewGraph until Materialize
+	nextID      uint64 // next ID to hand out; monotonic
+	nodes       []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
+	effectRoots []Node // effectful nodes (stores, tile stores, returns), in allocation order — Level-1 Walk/Verify/DCE roots
 }
 
 // NewID returns the graph's next monotonic ID. This is the ONLY source of

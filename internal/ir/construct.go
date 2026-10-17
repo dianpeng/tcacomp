@@ -215,20 +215,31 @@ func (n *reduceNode) forEachPayloadUse(fn func(SSAUse)) {
 }
 
 // storeNode: abstract store; ops = [value]; target is a payload access of
-// InputParam uses.
+// InputParam uses; effectIns is the ImpactBy payload — the per-tensor
+// ordering edges wired by the env-aware construction path (effect.go).
 type storeNode struct {
 	*Base
 	operandList
-	target access
+	target    access
+	effectIns []SSAUse
 }
 
-// forEachPayloadUse implements payloadBearer: target tensor, then axes.
+// forEachPayloadUse implements payloadBearer: target tensor, then axes, then
+// the ImpactBy effect inputs — so the verifier's use-def/def-use invariants
+// and Walk treat ordering edges as first-class graph edges in both chain
+// directions with zero new checkers (T-quick-01).
 func (n *storeNode) forEachPayloadUse(fn func(SSAUse)) {
 	fn(n.target.tensorUse)
 	for _, u := range n.target.axes {
 		fn(u)
 	}
+	for _, u := range n.effectIns {
+		fn(u)
+	}
 }
+
+// impactBy implements effectBearer: a copy of the store's ordering edges.
+func (n *storeNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
 
 // returnNode: abstract kernel return; ops = [value]. Return is the none
 // Value (directive 2): it satisfies Value so it can sit in a statement RHS
@@ -336,6 +347,15 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 	b.ssa = &SSAVar{id: b.id, node: n, define: def}
 	for i := 0; i < nSlots; i++ {
 		n.addSlot()
+	}
+	g.nodes = append(g.nodes, n)
+	// Effectful kinds are Level-1 roots the moment they exist: the sea of
+	// nodes has no statement list, so stores, tile stores, and kernel returns
+	// register themselves in allocation order (effect.go) — Walk, Verify, and
+	// Level-1 DCE root there instead of in a basic block.
+	switch k {
+	case KindStore, KindStoreTile, KindReturn:
+		g.effectRoots = append(g.effectRoots, n)
 	}
 	return n
 }

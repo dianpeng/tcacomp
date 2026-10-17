@@ -58,6 +58,20 @@
 //     primitives (replaceDefine/replaceAllReference/record kill) are
 //     unexported, reachable only via those choke points.
 //
+//   - Two-level IR (quick-261017-vdj, tinycudaopto skeleton node.go): the IR
+//     has two forms. Level 1 is a SEA OF NODES: the frontend/builder and all
+//     optimization passes operate on a statement-free graph — data
+//     dependencies are operand SSAUse slots, and the total order of memory
+//     side effects is explicit ImpactBy effect-input edges on stores,
+//     maintained per tensor by a construction-time Env under the restrict-
+//     alias rule (kernel tensors never alias; effect.go). Level 2 is the
+//     scheduled CFG: a single BasicBlock with an intrusive Statement list,
+//     produced ONLY by Materialize (schedule.go) after construction/passes
+//     and before codegen. The cfg.go types are unchanged — only their time
+//     of creation moves. Effectful nodes (stores, tile stores, returns)
+//     register in Graph.effectRoots at allocation; Level-1 Walk roots are
+//     the graph params plus those effect roots, never BB statements.
+//
 //   - Walking: Walk(g, Visitor) is the analysis/checking substrate —
 //     iterative pre-order DFS with a visited set (cyclic-safe), roots in
 //     graph-param order then BB statement order (def then rhs), children in
