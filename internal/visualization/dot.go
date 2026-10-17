@@ -23,9 +23,16 @@ import (
 // use-def records, including the chain pipe inputs the text printer renders
 // as stage-local `%0`. Fully deterministic: statement order, operand order,
 // no map iteration (RESEARCH Pitfall 1).
+//
+// DOT emission is a Level-2 surface: the clusters ARE the statement list, so
+// an unmaterialized graph returns an error instead of a misleading empty
+// digraph (call Materialize first).
 func EmitDot(w io.Writer, g *ir.Graph) error {
 	if g == nil {
 		return nil
+	}
+	if !g.Materialized() {
+		return fmt.Errorf("visualization: graph %q is not materialized", g.Name())
 	}
 	bw := bufio.NewWriter(w)
 	num := ir.ComputeNumbering(g)

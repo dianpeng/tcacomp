@@ -1,8 +1,10 @@
 package ir
 
 // This file is the exported graph-construction surface: the ONLY way to
-// create graphs, params, statements, and nodes from outside package ir
-// (pkg/ builder, pass tests, visualization tests). Construction is exempt
+// create graphs, params, and nodes from outside package ir (pkg/ builder,
+// pass tests, visualization tests). Statements are NOT constructed here —
+// Level 1 is a statement-free sea of nodes; the Level-2 statement list is
+// produced solely by Materialize (schedule.go). Construction is exempt
 // from MutContext (RESEARCH Pattern 2) but records PassOrigin so verifier
 // diagnostics are meaningful from birth (D-17).
 //
@@ -416,11 +418,12 @@ func fixupLambdaUsers(n Node, lam *Lambda) {
 	}
 }
 
-// NewGraph creates an empty named graph holding exactly one basic block.
+// NewGraph creates an empty named graph in its Level-1 form: a pure sea of
+// nodes with NO CFG and no statements. The single-block CFG (Level 2) is
+// produced only by Materialize (schedule.go), after construction and passes
+// and before codegen — Block()/CFG() return nil until then.
 func NewGraph(name string) *Graph {
-	g := &Graph{name: name, nextID: 1}
-	g.cfg = &CFG{entry: &BasicBlock{graph: g}}
-	return g
+	return &Graph{name: name, nextID: 1}
 }
 
 // NewInputParam creates one graph-owned kernel input parameter (dim, tensor,
@@ -445,48 +448,32 @@ func (g *Graph) NewLambdaInputParam(origin, name string, typ Type) Node {
 	return n
 }
 
-// AddStatement appends a statement binding rhs to the graph's single block;
-// the statement ID comes from g.NewID() (D-04). The rhs stays Node-typed —
-// see the Statement contract in cfg.go for why (the Value classification
-// lives in Statement.Value()).
-func (g *Graph) AddStatement(rhs Node) *Statement {
-	s := &Statement{id: g.NewID(), kind: classifyStmt(rhs), rhs: rhs}
-	if rhs != nil {
-		rhs.BasePtr().stmt = s
-		if s.kind == StmtAssign {
-			s.def = SSADef{ssa: rhs.BasePtr().ssa}
-		}
-	}
-	g.cfg.entry.Append(s)
-	return s
-}
-
 // ReserveStatementID returns the graph's next monotonic ID and advances the
 // counter, letting a builder pin a statement's ID before the statement's RHS
-// nodes exist. A fluent builder constructs the statement's chain nodes
-// before it appends the statement, which would otherwise push statement IDs
-// behind every chain node. Reservation moves the allocation to chain-entry
-// time; IDs still come only from the graph's monotonic counter (IR-05) and
-// must be consumed by AddStatementAs in append order.
+// nodes exist. A fluent builder constructs the statement's chain nodes before
+// the statement materializes, which would otherwise push statement IDs behind
+// every chain node. Reservation moves the allocation to chain-entry time; IDs
+// still come only from the graph's monotonic counter (IR-05) and must be
+// consumed by PinStatementID, in construction order.
 func (g *Graph) ReserveStatementID() uint64 {
 	id := g.nextID
 	g.nextID++
 	return id
 }
 
-// AddStatementAs appends a statement carrying a builder-reserved ID (see
-// ReserveStatementID). Unlike AddStatement the ID is not drawn at append
-// time; the statement still joins the block in append order.
-func (g *Graph) AddStatementAs(id uint64, rhs Node) *Statement {
-	s := &Statement{id: id, kind: classifyStmt(rhs), rhs: rhs}
-	if rhs != nil {
-		rhs.BasePtr().stmt = s
-		if s.kind == StmtAssign {
-			s.def = SSADef{ssa: rhs.BasePtr().ssa}
-		}
+// PinStatementID attaches a builder-reserved statement ID (see
+// ReserveStatementID) to root, so Materialize creates root's statement with
+// exactly that ID instead of drawing from the counter. Level 2's statement
+// IDs therefore stay dense across the chain nodes exactly as the pre-scheduler
+// flow produced them, which the committed canonical goldens pin byte-for-byte.
+// Pinning is the ONLY way a statement ID is reserved: Materialize assigns all
+// unpinned roots from the counter in effect-root emission order. A nil root is
+// ignored.
+func (g *Graph) PinStatementID(root Node, id uint64) {
+	if root == nil {
+		return
 	}
-	g.cfg.entry.Append(s)
-	return s
+	root.BasePtr().stmtID = id
 }
 
 // NewNode is the low-level constructor: it creates a node of ANY kind —

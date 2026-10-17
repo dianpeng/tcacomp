@@ -15,12 +15,16 @@
 //     name-keyed references (pkg.Builder's declaration-time symbol tables
 //     are the on-the-fly resolution the review mandates).
 //
-//   - CFG/statements: Graph → CFG (v0: exactly one *BasicBlock) → Statement
-//     intrusive doubly-linked list (head/tail on the block, prev/next on the
-//     statement). Removal of a statement given its pointer is O(1) — no
-//     position search, no slice reindex. Statements classify as StmtAssign
-//     (binds a new local: def wired to the RHS value) or StmtEffect (pure
-//     side-effect op: store to observable memory, kernel return).
+//   - CFG/statements (Level 2 only): Graph → CFG (v0: exactly one
+//     *BasicBlock) → Statement intrusive doubly-linked list (head/tail on the
+//     block, prev/next on the statement). Removal of a statement given its
+//     pointer is O(1) — no position search, no slice reindex. Statements
+//     classify as StmtAssign (binds a new local: def wired to the RHS value)
+//     or StmtEffect (pure side-effect op: store to observable memory, kernel
+//     return). The statement list is produced ONLY by Materialize
+//     (schedule.go) — after construction and passes, before codegen — one
+//     statement per live effect root in registration order; construction
+//     itself creates no statements and Block()/CFG() return nil until then.
 //
 //   - Types: Type is an interface with exactly one method, Equal(Type) bool.
 //     NumericType is the concrete numeric component (unexported elem/dims);
@@ -34,14 +38,13 @@
 //   - Values: Value is a real interface (Node + IsNone). Every concrete node
 //     embeds *Base, which promotes IsNone() == false; returnNode overrides it
 //     to true — the statement root that binds no SSA name ("a none Value is
-//     a Value but just nothing"). AddStatement/AddStatementAs stay Node-typed
-//     on purpose: all exported constructors return Node, which never
-//     statically satisfies Value, so a Value-typed entry point would break
-//     out-of-package callers with no compensating benefit. The
-//     Value/NoneValue classification lives in exactly one place:
-//     Statement.Value(), whose rhs assertion is total for in-repo nodes (no
-//     panic path). Do not re-litigate this without migrating all of those
-//     callers first.
+//     a Value but just nothing"). Statement roots stay Node-typed on purpose:
+//     all exported constructors return Node, which never statically satisfies
+//     Value, so a Value-typed entry point would break out-of-package callers
+//     with no compensating benefit. The Value/NoneValue classification lives
+//     in exactly one place: Statement.Value(), whose rhs assertion is total
+//     for in-repo nodes (no panic path). Do not re-litigate this without
+//     migrating all of those callers first.
 //
 //   - SSA chains: each node owns one SSAVar (allocated 1:1 at node
 //     allocation, ID == node ID). SSADef and SSAUse are value-type HANDLES
@@ -73,15 +76,17 @@
 //     the graph params plus those effect roots, never BB statements.
 //
 //   - Walking: Walk(g, Visitor) is the analysis/checking substrate —
-//     iterative pre-order DFS with a visited set (cyclic-safe), roots in
-//     graph-param order then BB statement order (def then rhs), children in
-//     operand-slot order, then payload uses, then lambda bodies.
-//     VisitResult gives Descend/SkipChildren/Stop control (SkipChildren
-//     prunes exactly the skipped node's subtree; a node reachable by another
-//     edge is still visited). The canonical PRINTER and the dot emitter do
-//     NOT walk this way: their StmtNodes DFS is an emission-order function
-//     (chain stages producer-first via pipeInput), golden-pinned — Walk must
-//     never be used where emission order matters.
+//     iterative pre-order DFS with a visited set (cyclic-safe), roots
+//     LEVEL-AWARE: at Level 1 the graph params (declaration order) plus the
+//     effect roots (allocation order), at Level 2 the params plus the BB
+//     statement order (def then rhs); children in operand-slot order, then
+//     payload uses, then lambda bodies. VisitResult gives
+//     Descend/SkipChildren/Stop control (SkipChildren prunes exactly the
+//     skipped node's subtree; a node reachable by another edge is still
+//     visited). The canonical PRINTER and the dot emitter do NOT walk this
+//     way: their StmtNodes DFS is an emission-order function (chain stages
+//     producer-first via pipeInput), golden-pinned — Walk must never be used
+//     where emission order matters.
 //
 //   - Lowered suite (review P1R-04): dimvar/bounded-dimvar (value-object
 //     induction variables, (init, step) tuples with EQ/NE and the

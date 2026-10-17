@@ -105,7 +105,7 @@ func TestPipelineEndErrorSurfaces(t *testing.T) {
 	setVerifyEach(t, true)
 	broken := ir.NewGraph("broken")
 	bad := broken.NewNode(ir.KindBinOp, "test", nil, nil)
-	broken.AddStatement(bad)
+	broken.NewReturn("test", bad) // effect root: keeps the unwired binop reachable
 
 	ve := pass.NewVerifyEach(io.Discard)
 	pmVerify := pass.NewManager(nil)
@@ -123,7 +123,7 @@ func TestPipelineEndErrorSurfaces(t *testing.T) {
 	f32 := ir.InternScalar(ir.TF32)
 	c1 := clean.NewConst("test", f32, 1)
 	c2 := clean.NewConst("test", f32, 2)
-	clean.AddStatement(clean.NewBinOp("test", ir.BinOpAdd, c1, c2))
+	clean.NewReturn("test", clean.NewBinOp("test", ir.BinOpAdd, c1, c2))
 
 	pmClean := pass.NewManager(nil)
 	pmClean.AddInstrumentation(pass.NewVerifyEach(io.Discard))

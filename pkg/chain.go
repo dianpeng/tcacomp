@@ -31,14 +31,14 @@ import (
 // chain is the state threaded through one statement's rungs.
 type chain struct {
 	b     *Builder
-	id    uint64   // reserved statement ID (ir.ReserveStatementID)
-	retID uint64   // reserved return-statement ID, consumed by a new output
-	stage string   // rung reached, for diagnostics
-	iters []Dim    // root iteration-cluster dims (nil once the root map is built)
-	live  []Dim    // axes live at the pipe, in the current as-order
+	id    uint64  // reserved statement ID, pinned on the store node for Materialize
+	retID uint64  // reserved return-statement ID, consumed by a new output
+	stage string  // rung reached, for diagnostics
+	iters []Dim   // root iteration-cluster dims (nil once the root map is built)
+	live  []Dim   // axes live at the pipe, in the current as-order
 	pipe  ir.Node // the pipe's stage node
 	elem  ir.Type // the pipe's scalar element type
-	err   error    // first deferred validation error (rung or declaration)
+	err   error   // first deferred validation error (rung or declaration)
 }
 
 // deferErr records the first validation error; rungs consult it before
@@ -313,9 +313,14 @@ func (c *chain) checkAsExact(dims []Dim, what string) error {
 	return nil
 }
 
-// store validates a structural store and appends the statement. Every store
+// store validates a structural store and terminates the chain. Every store
 // axis must be live (the store executes at iteration points), and index i
-// binds the tensor's dim i.
+// binds the tensor's dim i. The store is wired into the graph's construction
+// environment (effect.go): ImpactBy chains it after any earlier store to the
+// same tensor, and its reserved statement ID is pinned for Materialize — the
+// Level-2 scheduler emits exactly one statement per effect root in
+// construction order, so the canonical print's statement numbering stays
+// byte-identical to the pre-scheduler flow.
 func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
 	if t.b != c.b || !c.b.tensorDeclared(t.name) {
 		return nil, fmt.Errorf("store: tensor %q is not declared in this builder", t.name)
@@ -335,8 +340,8 @@ func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
 			return nil, fmt.Errorf("store: @%s is not a live axis at this point of the chain", ax.Name())
 		}
 	}
-	node := c.b.g.NewStore(origin, t.node, dimNodes(axes), c.pipe)
-	c.b.g.AddStatementAs(c.id, node)
+	node := c.b.g.NewStoreChained(origin, c.b.env, t.node, dimNodes(axes), c.pipe)
+	c.b.g.PinStatementID(node, c.id)
 	c.b.chain = nil
 	c.b.noteOutput(t, node, c.retID)
 	return &Stored{c: c}, nil

@@ -18,9 +18,10 @@ func cleanOracle() *ir.Graph {
 	c1 := g.NewConst("test", f32, 1)
 	c2 := g.NewConst("test", f32, 2)
 	sum := g.NewBinOp("test", ir.BinOpAdd, c1, c2)
-	g.AddStatement(sum)
-	g.AddStatement(g.NewStore("test", tensor, nil, sum))
-	g.AddStatement(g.NewReturn("test", sum))
+	// The store and return auto-register as effect roots; both reference
+	// sum, so the whole tree is reachable from the Level-1 walk roots.
+	g.NewStore("test", tensor, nil, sum)
+	g.NewReturn("test", sum)
 	return g
 }
 
@@ -29,7 +30,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	// know it, and map presence fails closed.
 	g := ir.NewGraph("bad")
 	bad := g.NewNode(ir.Kind(1<<20), "test")
-	g.AddStatement(bad)
+	g.NewReturn("test", bad)
 	pm := pass.NewManager([]pass.Pass{&stubPass{id: "noop", produces: pass.StageConstructed}})
 	err := pm.Run(g)
 	if err == nil {

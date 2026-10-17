@@ -31,9 +31,11 @@ const (
 )
 
 // Verify runs both chain-consistency checkers over g and returns every
-// violation found, in deterministic order: basic-block statement order,
+// violation found, in deterministic walk order: the level-aware roots (params
+// plus effect roots at Level 1, params plus statement order at Level 2),
 // then per-node operand order — never map iteration (RESEARCH Pitfall 1).
-// A nil or empty result means the chains are consistent.
+// A nil or empty result means the chains are consistent. Verify needs no
+// Materialize: the Level-1 roots cover the whole constructed graph.
 func Verify(g *Graph) []Violation {
 	if g == nil {
 		return nil
@@ -72,9 +74,11 @@ func asImpl(n Node) nodeImpl {
 	return impl
 }
 
-// walkCheckUseDef walks the graph from the block's statements (via Walk,
-// directive 3), checking the use-def direction at every node: each operand
-// slot's handle must resolve to a live (not tombstoned) def of a kind <
+// walkCheckUseDef walks the graph from the level-aware roots (via Walk,
+// directive 3 — params plus effect roots at Level 1, params plus block
+// statements at Level 2), checking the use-def direction at every node: each
+// operand slot's handle must resolve to a live (not tombstoned) def of a kind
+// <
 // KindEnd. Zero handles and unwired records report the construction-time
 // "nil def" message; killed records are the handle model's new corruption
 // class, flagged by slot. It returns the visited nodes in walk order for the
@@ -100,7 +104,7 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 	nb := n.BasePtr()
 	if nb.erased {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			"erased node is still reachable from the block"))
+			"erased node is still reachable from the roots"))
 	}
 	if nb.surplus > 0 {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
@@ -203,13 +207,19 @@ func checkOneUse(n Node, u SSAUse, where string, vs *[]Violation) {
 
 // checkDefUse checks the def-use direction for every visited node: the
 // node's SSAVar ref list must contain exactly the records whose slots point
-// back at it. Over-links (a listed record pointing elsewhere, or a listed
-// record no operand slot owns) and under-links (an operand record missing
-// from the def's list) are both reported — corrupting either direction is
-// caught by this walk.
+// back at it, counting only users the walk actually visited. Over-links (a
+// listed record pointing elsewhere, or a listed record no walked operand
+// slot owns) and under-links (an operand record missing from the def's list)
+// are both reported — corrupting either direction is caught by this walk.
+// Level-1 note: the sea-of-nodes walk roots at the params and effect roots,
+// so a dead-but-not-yet-DCE'd user is unvisited; its records in a live
+// def's ref list are skipped here (they are the unreachable subgraph's
+// bookkeeping, killed when DCE erases the user), not flagged as over-links.
 func checkDefUse(nodes []Node, vs *[]Violation) {
 	expected := make(map[*SSAVar][]*ssaRefRecord)
+	walked := make(map[Node]bool, len(nodes))
 	for _, n := range nodes {
+		walked[n] = true
 		if impl := asImpl(n); impl != nil {
 			impl.forEachOperand(func(u SSAUse) {
 				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
@@ -235,6 +245,9 @@ func checkDefUse(nodes []Node, vs *[]Violation) {
 		for _, r := range v.refs {
 			if r == nil || r.killed {
 				continue
+			}
+			if r.user != nil && !walked[r.user] {
+				continue // unreachable user's record: not part of the verified subgraph
 			}
 			if r.def != v {
 				*vs = append(*vs, nodeViolation(r.user, invDefUse,

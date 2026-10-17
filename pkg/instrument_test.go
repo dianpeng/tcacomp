@@ -51,15 +51,20 @@ func setVerifyEach(t *testing.T, v bool) {
 }
 
 // returnSumGraph builds the minimal verifiable graph: one statement,
-// `return 1.0 + 2.0` over two typed constants. The return stage root is
-// what makes the printer render real content (a bare scalar-expr root
-// prints only the statement header — chainOf walks stages only).
+// `return 1.0 + 2.0` over two typed constants, materialized so the codegen-
+// adjacent dump surfaces (text print, DOT) have a statement list to render.
+// The return stage root is what makes the printer render real content (a
+// bare scalar-expr root prints only the statement header — chainOf walks
+// stages only).
 func returnSumGraph() *ir.Graph {
 	g := ir.NewGraph("t")
 	f32 := ir.InternScalar(ir.TF32)
 	sum := g.NewBinOp("test", ir.BinOpAdd,
 		g.NewConst("test", f32, 1), g.NewConst("test", f32, 2))
-	g.AddStatement(g.NewReturn("test", sum))
+	g.NewReturn("test", sum)
+	if err := g.Materialize(); err != nil {
+		panic(err)
+	}
 	return g
 }
 
@@ -164,7 +169,7 @@ func TestDefaultInstrumentationsComposition(t *testing.T) {
 		setVerifyEach(t, true)
 		var buf bytes.Buffer
 		broken := ir.NewGraph("broken")
-		broken.AddStatement(broken.NewNode(ir.KindBinOp, "test", nil, nil))
+		broken.NewReturn("test", broken.NewNode(ir.KindBinOp, "test", nil, nil))
 		err := runNop(t, broken, pkg.DefaultInstrumentations(&buf)...)
 		if err == nil || !strings.Contains(err.Error(), "pipeline end") {
 			t.Fatalf("verify gate: Run error = %v, want pipeline-end verification failure", err)

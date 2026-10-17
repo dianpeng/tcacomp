@@ -12,7 +12,7 @@ func TestVerifierCatchesCorruption(t *testing.T) {
 	d1 := g.NewConst("ctor", f32, 1.0)
 	d2 := g.NewConst("ctor", f32, 2.0)
 	x := g.NewBinOp("ctor", BinOpAdd, d1, d1)
-	g.AddStatement(x)
+	g.NewReturn("ctor", x)
 
 	// Corrupt ONE direction of the chain by hand (white-box): retarget x's
 	// first operand record at d2 WITHOUT moving it into d2's ref list.
@@ -58,7 +58,7 @@ func TestVerifierFlagsSurplusOperands(t *testing.T) {
 	// recorded and the verifier flags it (fail-closed, WR-01 — never a
 	// silent drop).
 	x := g.NewNode(KindBinOp, "ctor", a, b, a)
-	g.AddStatement(x)
+	g.NewReturn("ctor", x)
 
 	if got := len(x.(*binOpNode).ops); got != 2 {
 		t.Fatalf("binop wired %d slots, want exactly 2 (surplus never wired)", got)
@@ -76,7 +76,7 @@ func TestVerifierFlagsSurplusOperands(t *testing.T) {
 
 	// Sanity: the exact-arity construction next to it stays clean.
 	y := g.NewNode(KindBinOp, "ctor", a, b)
-	g.AddStatement(y)
+	g.NewReturn("ctor", y)
 	foundY := false
 	for _, v := range Verify(g) {
 		if v.NodeID == y.BasePtr().ID() {
@@ -97,7 +97,7 @@ func TestVerifierFlagsUnwiredOperand(t *testing.T) {
 	// unwired slot. This is the violation class plan 01-04's
 	// TestBuildVerifiesThroughPM relies on.
 	x := g.NewNode(KindBinOp, "ctor", a, nil)
-	g.AddStatement(x)
+	g.NewReturn("ctor", x)
 
 	vs := Verify(g)
 	found := false
@@ -121,7 +121,7 @@ func TestVerifierFlagsKilledUse(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 
 	// White-box corruption: kill slot 1's record in place — no choke point —
 	// as if a pass had detached it without dropping the slot.
@@ -149,7 +149,7 @@ func TestVerifierFlagsZeroHandleSlot(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 
 	sum.(*binOpNode).ops[1] = SSAUse{} // white-box: clear the handle
 

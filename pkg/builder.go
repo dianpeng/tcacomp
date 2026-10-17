@@ -34,8 +34,9 @@ const origin = "builder"
 // the eager checks instead of corrupting the graph.
 type Builder struct {
 	g       *ir.Graph
-	dims    map[string]Dim     // declaration-time symbol table: dim name -> handle
-	tensors map[string]Tensor  // declaration-time symbol table: tensor name -> handle
+	env     *ir.Env           // construction-time side-effect environment: one ImpactBy chain per tensor (effect.go)
+	dims    map[string]Dim    // declaration-time symbol table: dim name -> handle
+	tensors map[string]Tensor // declaration-time symbol table: tensor name -> handle
 	scalars map[string]ir.ElemType
 	outputs []output // kernel output bindings, in first-store order
 	chain   *chain   // statement chain under construction, nil when none
@@ -75,11 +76,11 @@ func (d Dim) Extent() int { return d.extent }
 // resolved InputParam node (the tensor's SSA def) and its declared name for
 // diagnostics.
 type Tensor struct {
-	b     *Builder
-	node  ir.Node // resolved InputParam node (role RoleTensor)
-	name  string
-	dims  []Dim
-	elem  ir.ElemType
+	b    *Builder
+	node ir.Node // resolved InputParam node (role RoleTensor)
+	name string
+	dims []Dim
+	elem ir.ElemType
 }
 
 // Name returns the tensor's declared name.
@@ -112,10 +113,13 @@ func At(t Tensor, axes ...Dim) Operand {
 	return Operand{t: t, axes: append([]Dim(nil), axes...)}
 }
 
-// NewBuilder creates an empty kernel builder with the given graph name.
+// NewBuilder creates an empty kernel builder with the given graph name. The
+// graph starts as a Level-1 sea of nodes (no CFG, no statements); Build
+// schedules it into the single-block CFG at the end.
 func NewBuilder(name string) *Builder {
 	return &Builder{
 		g:       ir.NewGraph(name),
+		env:     ir.NewEnv(),
 		dims:    make(map[string]Dim),
 		tensors: make(map[string]Tensor),
 		scalars: make(map[string]ir.ElemType),
@@ -220,10 +224,13 @@ func (b *Builder) ScalarParam(name string, t ir.ElemType) Expr {
 // Two IDs are reserved now — the statement's and its return statement's —
 // before any of the chain's nodes exist, so the canonical print shows dense
 // statement numbers (see ir.ReserveStatementID): the doc-pinned oracle
-// expects `statement #1` for the chain and `statement #2` for the return.
-// The return ID is consumed only if the chain stores a new output tensor;
-// otherwise it stays unused (IDs may skip). Starting a new chain abandons
-// any unfinished one; Build rejects a builder left with an unfinished chain.
+// expects `statement #8` for the chain and `statement #9` for the return
+// (IDs 1-7 are the kernel params, 10+ the chain's nodes — the reservation
+// lands ahead of them). The IDs are pinned on the store/return effect roots
+// (ir.PinStatementID) and consumed by Materialize at Build time. The return
+// ID is consumed only if the chain stores a new output tensor; otherwise it
+// stays unused (IDs may skip). Starting a new chain abandons any unfinished
+// one; Build rejects a builder left with an unfinished chain.
 func (b *Builder) Stmt() *StmtIter {
 	if b.final {
 		b.noteDeclErr(fmt.Errorf("stmt: builder already finalized by Build"))
@@ -235,16 +242,20 @@ func (b *Builder) Stmt() *StmtIter {
 }
 
 // Build finalizes the graph and returns it, verified exclusively through
-// the normal pass-manager path (D-10): the kernel `return` statement for
-// each declared output binding is emitted first (statement IDs continue the
-// reserved construction order), the building-phase DCE runs (review P1R-08:
-// dead side-effect-free statements are marked and wiped before any pass
-// sees the graph), then a pass.Manager with an EMPTY pass list carrying the
-// VerifyEach instrumentation runs the graph. VerifyEach's AfterPipeline hook
-// runs the graph verifier even with zero passes and Manager.Run surfaces its
-// error, so Build returns verification failures as Build errors — never a
-// half-built graph, and never by calling the verifier directly from pkg
-// (that would bypass the single authoritative path).
+// the normal pass-manager path (D-10). The two-level flow
+// (quick-261017-vdj): the kernel `return` node for each declared output
+// binding is emitted and pinned with its reserved statement ID, the
+// building-phase DCE runs over the Level-1 sea (review P1R-08: dead
+// side-effect-free chains are marked and wiped before any pass sees the
+// graph — debris from abandoned chains included), Materialize schedules the
+// sea into the single-block CFG (one statement per live effect root, in
+// construction order), and then a pass.Manager with an EMPTY pass list
+// carrying the VerifyEach instrumentation runs the graph.
+// VerifyEach's AfterPipeline hook runs the graph verifier even with zero
+// passes and Manager.Run surfaces its error, so Build returns verification
+// failures as Build errors — never a half-built graph, and never by calling
+// the verifier directly from pkg (that would bypass the single authoritative
+// path).
 func (b *Builder) Build() (*ir.Graph, error) {
 	if err := b.declErr; err != nil {
 		return nil, err
@@ -255,9 +266,12 @@ func (b *Builder) Build() (*ir.Graph, error) {
 	b.final = true
 	for _, o := range b.outputs {
 		ret := b.g.NewReturn(origin, o.store)
-		b.g.AddStatementAs(o.retID, ret)
+		b.g.PinStatementID(ret, o.retID)
 	}
 	if err := ir.BuildingDCE(b.g); err != nil {
+		return nil, err
+	}
+	if err := b.g.Materialize(); err != nil {
 		return nil, err
 	}
 	pm := pass.NewManager(nil)

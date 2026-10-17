@@ -26,19 +26,25 @@ func TestConstructSurface(t *testing.T) {
 			t.Fatalf("NewNode kind = %v, want const", c2.KindOf())
 		}
 		sum := g.NewBinOp("ctor", ir.BinOpAdd, c1, c2)
-		stmt := g.AddStatement(sum)
+		ret := g.NewReturn("ctor", sum) // effect root: keeps the tree reachable
 
 		// InputParams are real nodes with real IDs, allocated from the same
-		// monotonic counter (IR-05).
+		// monotonic counter (IR-05). Materialize assigns the statement ID from
+		// that counter too (D-04).
+		if err := g.Materialize(); err != nil {
+			t.Fatalf("Materialize: %v", err)
+		}
+		stmt := g.Block().First()
 		ids := []uint64{m.BasePtr().ID(), lhs.BasePtr().ID(), scale.BasePtr().ID(),
 			c1.BasePtr().ID(), c2.BasePtr().ID(), sum.BasePtr().ID(), stmt.ID()}
+		_ = ret
 		return g, ids
 	}
 
 	g1, ids1 := build()
 	_, ids2 := build()
 
-	want := []uint64{1, 2, 3, 4, 5, 6, 7}
+	want := []uint64{1, 2, 3, 4, 5, 6, 8}
 	for i := range want {
 		if ids1[i] != want[i] || ids2[i] != want[i] {
 			t.Fatalf("node IDs = %v / %v, want %v per graph", ids1, ids2, want)
@@ -51,10 +57,10 @@ func TestConstructSurface(t *testing.T) {
 	if g1.Block().First().ID() != ids1[6] {
 		t.Fatal("statement ID must come from the same per-graph monotonic counter")
 	}
-	if g1.Block().First().RHS().BasePtr().ID() != ids1[5] {
-		t.Fatal("statement RHS must be the constructed binop")
+	if g1.Block().First().RHS().BasePtr().ID() != 7 {
+		t.Fatal("statement RHS must be the return node anchoring the constructed binop")
 	}
-	if g1.Block() != g1.Block() {
-		t.Fatal("graph must expose exactly one basic block (IR-02)")
+	if g1.Block() != g1.CFG().Entry() {
+		t.Fatal("graph must expose exactly one basic block through Block and CFG (IR-02)")
 	}
 }

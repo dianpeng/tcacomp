@@ -6,42 +6,124 @@ package ir
 // is overwritten), and wiping them belongs to construction, not to the pass
 // pipeline — passes never see building debris.
 //
-// The model is the review's three steps:
+// The algorithm is LEVEL-AWARE (two-level IR, quick-261017-vdj):
 //
-//  1. MARK: a statement is dead iff it is side-effect-free (no reachable
-//     store/return node — StmtEffect roots are live by classification) and
-//     every use of its root def belongs to a dead statement (uses owned by
-//     unreachable, statement-less nodes keep the statement alive:
-//     fail conservative).
-//  2. PROPAGATE: backward fixpoint — a statement whose root def is used by a
-//     live statement becomes live itself.
-//  3. WIPE: erase every node owned by a dead statement through
-//     MutContext.Erase, consumers before producers (reverse statement order,
-//     reverse StmtNodes order within a statement), skipping nodes that still
-//     carry live uses (shared with a surviving statement). Skipped nodes lose
-//     their dead-side records as the dead users die, so they re-enter the
-//     surviving graph cleanly. Erase unlinks wiped statements from the
-//     intrusive list through the root's back-pointer (O(1), P1R-02).
+//   - Level 1 (before Materialize): a SEA MARK-SWEEP. MARK roots at the
+//     graph's params plus the effect roots (effect.go) and follows operand
+//     slots, payload uses (store targets, iteration dims, lambda params,
+//     ImpactBy effect inputs), and lambda bodies — exactly Walk's child
+//     relation. SWEEP the Graph.nodes allocation registry: a node with zero
+//     live uses and not marked reachable is erased through MutContext.Erase
+//     in allocation-order passes (a pass that erases nothing ends the loop);
+//     killing a dead user frees its def's next pass. Effect roots are mark
+//     seeds, so stores/returns are never erased by construction.
+//   - Level 2 (after Materialize): the review's original three-step
+//     statement model below (mark live statements, backward fixpoint, wipe),
+//     kept unchanged for passes that run after scheduling.
 //
-// Builder-produced graphs share only statement ROOTS across statements, so
-// the wipe is total for them; hand-built raw graphs with non-root sharing
-// are handled conservatively (no corruption, possibly residual statements).
+// Both levels share the conservative Erase discipline: a node with live uses
+// is skipped, never force-erased; cyclic dead clusters where every member
+// keeps one live-looking use survive untouched (no corruption, residual
+// deadness). Builder-produced graphs share only statement ROOTS across
+// statements, so the wipe is total for them.
 
 // BuildingDCE runs building-phase dead-code elimination over g, wiping dead
-// statements in place. It runs BEFORE the pass pipeline (pkg.Builder calls
-// it at Build time), so passes never observe construction debris. A nil
-// graph is a no-op; the returned error reports only genuine mutation
-// failures (Erase on a live-used node is skipped, never an error).
+// nodes in place. It runs BEFORE the pass pipeline (pkg.Builder calls it at
+// Build time, before Materialize), so passes never observe construction
+// debris. The algorithm is level-aware (see file header): a sea mark-sweep at
+// Level 1, the review's statement fixpoint at Level 2. A nil graph is a
+// no-op; the returned error reports only genuine mutation failures (Erase on
+// a live-used node is skipped, never an error).
 func BuildingDCE(g *Graph) error {
 	if g == nil {
 		return nil
 	}
-	dead := markDeadStatements(g)
-	if len(dead) == 0 {
-		return nil
+	if g.materialized || g.cfg != nil {
+		dead := markDeadStatements(g)
+		if len(dead) == 0 {
+			return nil
+		}
+		ctx := &MutContext{Pass: "building-dce"}
+		return wipeDeadStatements(g, dead, ctx)
 	}
+	return buildingDCESea(g)
+}
+
+// buildingDCESea is the Level-1 sweep: mark everything reachable from the
+// params and the effect roots (Walk's child relation — operand slots, payload
+// uses including ImpactBy effect inputs, lambda bodies), then erase every
+// unmarked node that no live use keeps alive, in allocation-order passes:
+// erasing a dead user kills its operand/payload records, freeing its defs for
+// the next pass. A pass that erases nothing ends the loop.
+func buildingDCESea(g *Graph) error {
+	live := markReachable(g)
 	ctx := &MutContext{Pass: "building-dce"}
-	return wipeDeadStatements(g, dead, ctx)
+	erased := make(map[Node]bool)
+	for pass := 0; pass <= len(g.nodes); pass++ {
+		progress := false
+		for _, n := range g.nodes {
+			if n == nil || erased[n] || n.BasePtr().erased || live[n] {
+				continue
+			}
+			if len(UsesOf(n)) > 0 {
+				continue // still referenced: a live user, or one not yet erased
+			}
+			if err := ctx.Erase(n); err != nil {
+				return err
+			}
+			erased[n] = true
+			progress = true
+		}
+		if !progress {
+			break
+		}
+	}
+	return nil
+}
+
+// markReachable returns the set of nodes reachable from the Level-1 roots —
+// the graph's params plus its effect roots — following exactly the child
+// relation Walk uses (operand slots, payload uses, lambda bodies). These
+// nodes are untouchable for the sea sweep: they are live by root status or
+// feed a live node.
+func markReachable(g *Graph) map[Node]bool {
+	live := make(map[Node]bool)
+	var stack []Node
+	push := func(n Node) {
+		if n == nil || live[n] {
+			return
+		}
+		live[n] = true
+		stack = append(stack, n)
+	}
+	for i := len(g.effectRoots) - 1; i >= 0; i-- {
+		push(g.effectRoots[i])
+	}
+	for i := len(g.params) - 1; i >= 0; i-- {
+		push(g.params[i])
+	}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if impl := asImpl(n); impl != nil {
+			impl.forEachOperand(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					push(u.rec.def.node)
+				}
+			})
+		}
+		if pb, ok := n.(payloadBearer); ok {
+			pb.forEachPayloadUse(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					push(u.rec.def.node)
+				}
+			})
+		}
+		if lb, ok := n.(lambdaBearer); ok {
+			lb.forEachLambda(func(lam *Lambda) { push(lam.Body) })
+		}
+	}
+	return live
 }
 
 // isEffectKind reports whether kind k carries an observable side effect in

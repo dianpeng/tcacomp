@@ -16,7 +16,7 @@ func TestUseChain(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 	c := g.NewConst("ctor", f32, 3.0)
 
 	ctx := &MutContext{Pass: "test-rauw"}
@@ -62,7 +62,7 @@ func TestUseChain(t *testing.T) {
 	// between ref lists, exactly as a leaked pointer would.
 	d := g.NewConst("ctor", f32, 4.0)
 	y := g.NewBinOp("ctor", BinOpMul, a, d)
-	g.AddStatement(y)
+	g.NewReturn("ctor", y)
 	yn := y.(*binOpNode)
 	yn.ops[1].rec.def = b.BasePtr().ssa
 
@@ -87,7 +87,7 @@ func TestSetDefPropagatesThroughCopies(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 	c := g.NewConst("ctor", f32, 3.0)
 
 	ctx := &MutContext{Pass: "test-setdef"}
@@ -153,7 +153,7 @@ func TestRemoveUseEachSlotPosition(t *testing.T) {
 		b := g.NewConst("ctor", f32, 2.0)
 		c := g.NewConst("ctor", f32, 3.0)
 		sel := g.NewSelect("ctor", a, b, c)
-		g.AddStatement(sel)
+		g.NewReturn("ctor", sel)
 
 		ctx := &MutContext{Pass: "test-removeuse"}
 		sn := sel.(*selectNode)
@@ -200,7 +200,7 @@ func TestAddUseKeepsChainsConsistent(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 	c := g.NewConst("ctor", f32, 3.0)
 
 	ctx := &MutContext{Pass: "test-adduse"}
@@ -227,7 +227,7 @@ func TestAddUseKeepsChainsConsistent(t *testing.T) {
 
 	// Same hazard on a variadic node grown repeatedly past capacity.
 	call := g.NewCall("ctor", "f", a, b)
-	g.AddStatement(call)
+	g.NewReturn("ctor", call)
 	for i := 0; i < 8; i++ {
 		ctx.AddUse(call, c)
 	}
@@ -248,7 +248,7 @@ func TestRauwPropagatesThroughCopies(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 	c := g.NewConst("ctor", f32, 3.0)
 
 	ctx := &MutContext{Pass: "test-rauw-copies"}
@@ -279,7 +279,7 @@ func TestRauwGuards(t *testing.T) {
 	a := g.NewConst("ctor", f32, 1.0)
 	b := g.NewConst("ctor", f32, 2.0)
 	sum := g.NewBinOp("ctor", BinOpAdd, a, b)
-	g.AddStatement(sum)
+	g.NewReturn("ctor", sum)
 
 	ctx := &MutContext{Pass: "test-guard"}
 

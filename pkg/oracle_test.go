@@ -105,7 +105,7 @@ func TestBuildVerifiesThroughPM(t *testing.T) {
 
 	t.Run("unwiredOperandFailsPMVerification", func(t *testing.T) {
 		bg := ir.NewGraph("bad")
-		bg.AddStatement(bg.NewNode(ir.KindBinOp, "test", nil, nil))
+		bg.NewReturn("test", bg.NewNode(ir.KindBinOp, "test", nil, nil))
 		pm := pass.NewManager(nil)
 		pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
 		if err := pm.Run(bg); err == nil {

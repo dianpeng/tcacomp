@@ -11,9 +11,9 @@ package ir
 //
 //	for s := bb.First(); s != nil; s = s.Next() { ... }
 //
-// Statement identity is stable across passes (D-04): the ID comes from the
-// graph's single monotonic counter at append time (or from a builder-reserved
-// ID, see ReserveStatementID).
+// Statement identity is stable across passes (D-04): the ID comes from
+// the graph's single monotonic counter at Materialize time (or from a
+// builder-reserved ID, see ReserveStatementID).
 
 // CFG is the kernel's control-flow graph. v0: exactly one basic block.
 type CFG struct {
@@ -134,17 +134,18 @@ const (
 // operation (StmtEffect). The ID is stable across passes so pass-to-pass
 // diffs can track a statement (D-04). The def entry point stays Node-typed
 // (not Value-typed): every exported constructor returns Node, which never
-// statically satisfies Value (Node + IsNone), so a Value-typed AddStatement
-// would force casts at out-of-package call sites — the NoneValue
-// classification lives solely in Value().
+// statically satisfies Value (Node + IsNone), so a Value-typed statement
+// entry point would force casts at out-of-package call sites — the NoneValue
+// classification lives solely in Value(). Statements are created only by
+// Materialize (schedule.go).
 type Statement struct {
 	id    uint64
-	graph *Graph      // owning graph, set at link time; lets the printer detect chain boundaries
-	prev  *Statement  // intrusive list links: previous statement in the block (nil at head)
-	next  *Statement  // intrusive list links: next statement in the block (nil at tail)
-	kind  StmtKind    // assign (binds a local) vs pure side-effect
-	def   SSADef      // the statement's SSA-name handle; wired for StmtAssign, zero for StmtEffect
-	rhs   Node        // the statement's root node (NOT Value — see the contract note above)
+	graph *Graph     // owning graph, set at link time; lets the printer detect chain boundaries
+	prev  *Statement // intrusive list links: previous statement in the block (nil at head)
+	next  *Statement // intrusive list links: next statement in the block (nil at tail)
+	kind  StmtKind   // assign (binds a local) vs pure side-effect
+	def   SSADef     // the statement's SSA-name handle; wired for StmtAssign, zero for StmtEffect
+	rhs   Node       // the statement's root node (NOT Value — see the contract note above)
 }
 
 // ID returns the statement's stable per-graph integer ID.

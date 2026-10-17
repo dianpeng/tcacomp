@@ -38,17 +38,21 @@ func buildSmallChain() *Graph {
 	red := g.NewReduce("test", init, ic, NewLambda([]Node{acc, now}, combBody))
 
 	store := g.NewStore("test", out, []Node{m, k}, red)
-	g.AddStatement(store)
-	g.AddStatement(g.NewReturn("test", store))
+	g.NewReturn("test", store) // effect roots: store and return
+	if err := g.Materialize(); err != nil {
+		panic(err)
+	}
 	return g
 }
 
 // smallChainPrint is the exact canonical text of buildSmallChain's graph;
 // it pins the stage notation, the `%0` pipe convention (doc §2.6), the
 // `%name` binding convention, and FormatConst's `0.0` spelling. Statement
-// numbers are #22/#24 because the four kernel params and three lambda params
-// share the graph's monotonic ID counter (IR-05).
-const smallChainPrint = `statement #22:
+// numbers are #23/#24: the 19 nodes (four kernel params, three lambda params,
+// chain stages) share the graph's monotonic ID counter (IR-05), and the
+// return node — an effect root since the scheduler change — takes ID 22
+// before Materialize assigns the statement IDs.
+const smallChainPrint = `statement #23:
   iter(@m, @k) -> map(scale, lambda(v): v * (1.0 + 2.0)) as (@m, @k) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now) |
   store(%output[@m][@k], %0)
@@ -130,7 +134,10 @@ func TestConstTextTyped(t *testing.T) {
 	a := g.NewConst("test", InternScalar(TI32), 2147483647)
 	b := g.NewConst("test", InternScalar(TI32), 2147483600)
 	sum := g.NewBinOp("test", BinOpAdd, a, b)
-	g.AddStatement(g.NewReturn("test", sum))
+	g.NewReturn("test", sum)
+	if err := g.Materialize(); err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
 	p := Print(g)
 	if !strings.Contains(p, "return 2147483647 + 2147483600") {
 		t.Fatalf("integer constants printed lossily:\n%s", p)

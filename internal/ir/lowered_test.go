@@ -117,7 +117,7 @@ func TestLoweredVerifyShapes(t *testing.T) {
 	t.Run("bdimvar rejects non-dimvar iv", func(t *testing.T) {
 		g := NewGraph("s1")
 		bad := g.NewBoundedDimVar("ctor", g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 64))
-		g.AddStatement(bad)
+		g.NewReturn("ctor", bad)
 		assertViolation(t, g, "bounded dimvar operand 0 must be a dimvar")
 	})
 
@@ -127,7 +127,7 @@ func TestLoweredVerifyShapes(t *testing.T) {
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		lt := g.NewLoadTile("ctor", g.NewConst("ctor", f32, 0), bx)
-		g.AddStatement(lt)
+		g.NewReturn("ctor", lt)
 		assertViolation(t, g, "tile tensor operand must be a RoleTensor InputParam")
 	})
 
@@ -137,7 +137,7 @@ func TestLoweredVerifyShapes(t *testing.T) {
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		st := g.NewStoreTile("ctor", g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 0), bx)
-		g.AddStatement(st)
+		g.NewReturn("ctor", st)
 		assertViolation(t, g, "tile tensor operand must be a RoleTensor InputParam")
 	})
 
@@ -145,7 +145,7 @@ func TestLoweredVerifyShapes(t *testing.T) {
 		g := NewGraph("s4")
 		loop := g.NewForLoop("ctor", g.NewConst("ctor", f32, 0),
 			g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 0))
-		g.AddStatement(loop)
+		g.NewReturn("ctor", loop)
 		assertViolation(t, g, "for-loop operand 0 must be a dimvar")
 	})
 }
@@ -178,12 +178,13 @@ func TestLoweredShapesVerifyClean(t *testing.T) {
 	bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 
 	lt := g.NewLoadTile("ctor", lhs, bx)
-	g.AddStatement(lt)
-	st := g.NewStoreTile("ctor", lt, out, bx)
-	g.AddStatement(st)
+	g.NewStoreTile("ctor", lt, out, bx) // auto-registers as an effect root
 
 	if vs := Verify(g); len(vs) != 0 {
 		t.Fatalf("correctly built lowered graph must verify clean: %v", vs)
+	}
+	if err := g.Materialize(); err != nil {
+		t.Fatalf("Materialize: %v", err)
 	}
 
 	p := Print(g)

@@ -122,11 +122,16 @@ func (ctx *MutContext) ReplaceAllUsesWith(old, newVal Node) error {
 	return nil
 }
 
-// Erase removes n from the graph: it detaches all of n's operand uses from
-// their defs' ref lists (killing the records), drops any statement holding n
-// as its def or rhs from the single block, and tombstones n's ID so no later
+// Erase removes n from the graph: it detaches all of n's uses from their
+// defs' ref lists (killing the records) — OPERAND SLOTS and PAYLOAD USES
+// alike (store target accesses, iteration dims/bounds, lambda params,
+// as-orders, ImpactBy effect inputs) — drops any statement holding n as its
+// def or rhs from the single block, and tombstones n's ID so no later
 // allocation can reuse it (IR-05) and the verifier flags any lingering use
-// of it. Erase refuses while any live use of n remains — erasing a def with
+// of it. Payload detachment matters at Level 1: a DCE-erased node must not
+// leave live-looking payload records behind in a kernel param's ref list,
+// or the def-use invariant would flag the param for records no visited node
+// owns. Erase refuses while any live use of n remains — erasing a def with
 // live users would strand dangling operand handles.
 func (ctx *MutContext) Erase(n Node) error {
 	if n == nil {
@@ -135,22 +140,27 @@ func (ctx *MutContext) Erase(n Node) error {
 	if uses := UsesOf(n); len(uses) > 0 {
 		return fmt.Errorf("ir: cannot erase node %d: %d use(s) still point at it", n.BasePtr().id, len(uses))
 	}
+	kill := func(u SSAUse) {
+		if u.rec == nil {
+			return
+		}
+		if def := u.rec.def; def != nil {
+			def.removeRef(u.rec)
+		}
+		u.rec.killed = true
+	}
 	if impl, ok := n.(nodeImpl); ok {
-		impl.forEachOperand(func(u SSAUse) {
-			if u.rec == nil {
-				return
-			}
-			if def := u.rec.def; def != nil {
-				def.removeRef(u.rec)
-			}
-			u.rec.killed = true
-		})
+		impl.forEachOperand(kill)
+	}
+	if pb, ok := n.(payloadBearer); ok {
+		pb.forEachPayloadUse(kill)
 	}
 	if g := n.BasePtr().graph; g != nil {
 		// O(1) unlink through the statement's intrusive list links (review
 		// P1R-02): the node's stmt back-pointer names its statement directly,
-		// no scan of the block's statements.
-		if s := n.BasePtr().stmt; s != nil {
+		// no scan of the block's statements. Pre-Materialize the back-pointer
+		// is nil (statements exist only at Level 2), so the unlink no-ops.
+		if s := n.BasePtr().stmt; s != nil && g.cfg != nil {
 			g.cfg.entry.Remove(s)
 			n.BasePtr().stmt = nil
 		}

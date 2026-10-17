@@ -33,10 +33,16 @@ type PrintOptions struct {
 // blank line between statements, single trailing newline.
 func Print(g *Graph) string { return PrintOpts(g, PrintOptions{}) }
 
-// PrintOpts is Print with explicit options.
+// PrintOpts is Print with explicit options. The printer renders the Level-2
+// scheduled graph: before Materialize there is no statement list to print,
+// so an unmaterialized graph yields a deterministic one-line marker instead
+// of partial content (codegen-adjacent surfaces schedule first).
 func PrintOpts(g *Graph, o PrintOptions) string {
 	if g == nil {
 		return ""
+	}
+	if !g.materialized {
+		return "ir: graph not materialized\n"
 	}
 	r := &renderer{num: ComputeNumbering(g), opts: o}
 	var b strings.Builder
@@ -119,10 +125,12 @@ func (t *Numbering) has(n Node) bool {
 	return ok
 }
 
-// ComputeNumbering computes the deterministic SSA numbering of g.
+// ComputeNumbering computes the deterministic SSA numbering of g. It is a
+// Level-2 operation (numbering walks the materialized statement list); a nil
+// or unmaterialized graph yields an empty numbering.
 func ComputeNumbering(g *Graph) *Numbering {
 	t := &Numbering{byBase: make(map[*Base]int)}
-	if g == nil {
+	if g == nil || g.cfg == nil {
 		return t
 	}
 	next := 0

@@ -54,7 +54,7 @@ func TestInstrumentation(t *testing.T) {
 
 	t.Run("verify-each gate", func(t *testing.T) {
 		broken := ir.NewGraph("broken")
-		broken.AddStatement(broken.NewNode(ir.KindBinOp, "test", nil, nil))
+		broken.NewReturn("test", broken.NewNode(ir.KindBinOp, "test", nil, nil))
 
 		// VerifyEach=false: the instrumentation is inert, even over a graph
 		// whose verification would fail.

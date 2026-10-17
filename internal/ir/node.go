@@ -34,6 +34,7 @@ type Base struct {
 	surplus       int        // operands supplied beyond the fixed-arity slot count at construction; the verifier flags > 0 (fail-closed, WR-01)
 	graph         *Graph     // owning graph, set at construction; lets Erase unlink from the block
 	stmt          *Statement // the statement whose RHS root this node is, nil for non-root nodes; lets Erase unlink in O(1)
+	stmtID        uint64     // builder-pinned statement ID for Materialize (PinStatementID); 0 = Materialize draws from the counter
 }
 
 // BasePtr returns the shared cell, implementing Node.
@@ -106,12 +107,13 @@ const (
 // reference anywhere in the graph is an SSAUse; every definition is an
 // SSADef — names survive only as InputParam debug payload.
 type Graph struct {
-	name        string
-	params      []Node // InputParam nodes (kernel roles only), in declaration order
-	cfg         *CFG   // Level 2 only: nil from NewGraph until Materialize
-	nextID      uint64 // next ID to hand out; monotonic
-	nodes       []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
-	effectRoots []Node // effectful nodes (stores, tile stores, returns), in allocation order — Level-1 Walk/Verify/DCE roots
+	name         string
+	params       []Node // InputParam nodes (kernel roles only), in declaration order
+	cfg          *CFG   // Level 2 only: nil from NewGraph until Materialize
+	nextID       uint64 // next ID to hand out; monotonic
+	nodes        []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
+	effectRoots  []Node // effectful nodes (stores, tile stores, returns), in allocation order — Level-1 Walk/Verify/DCE roots
+	materialized bool   // Materialize has run; cfg and the statement list exist
 }
 
 // NewID returns the graph's next monotonic ID. This is the ONLY source of
@@ -131,10 +133,23 @@ func (g *Graph) Name() string { return g.name }
 func (g *Graph) Params() []Node { return append([]Node(nil), g.params...) }
 
 // Block returns the CFG's entry basic block — the graph's single block in v0.
-func (g *Graph) Block() *BasicBlock { return g.cfg.entry }
+// It is nil until Materialize runs (Level 1 is a statement-free sea of nodes,
+// T-quick-02 nil-safety): construction and passes must not consult the block.
+func (g *Graph) Block() *BasicBlock {
+	if g == nil || g.cfg == nil {
+		return nil
+	}
+	return g.cfg.entry
+}
 
-// CFG returns the graph's control-flow graph (exactly one block in v0).
+// CFG returns the graph's control-flow graph (exactly one block in v0), or nil
+// before Materialize.
 func (g *Graph) CFG() *CFG { return g.cfg }
+
+// Materialized reports whether Materialize has run: the graph is Level 2 with
+// a CFG and a statement list. Codegen-adjacent surfaces (print, DOT) require
+// it; passes operate on the sea and never need it.
+func (g *Graph) Materialized() bool { return g != nil && g.materialized }
 
 // nodeImpl is the internal interface every concrete node type satisfies:
 // the public Node surface plus operand-slot access for chain maintenance.
