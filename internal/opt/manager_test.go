@@ -23,10 +23,10 @@ type stubPass struct {
 	run       func(*opt.Context, *ir.Graph) error
 }
 
-func (s *stubPass) ID() string           { return s.id }
-func (s *stubPass) Requires() []string   { return s.requires }
+func (s *stubPass) ID() string          { return s.id }
+func (s *stubPass) Requires() []string  { return s.requires }
 func (s *stubPass) Produces() opt.Stage { return s.produces }
-func (s *stubPass) Preserved() []string  { return s.preserved }
+func (s *stubPass) Preserved() []string { return s.preserved }
 func (s *stubPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	if s.run != nil {
 		return s.run(ctx, g)
@@ -54,7 +54,7 @@ type failingEnd struct{ err error }
 
 func (f *failingEnd) BeforePass(opt.Pass, *ir.Graph)       {}
 func (f *failingEnd) AfterPass(opt.Pass, *ir.Graph, error) {}
-func (f *failingEnd) AfterPipeline(*ir.Graph) error         { return f.err }
+func (f *failingEnd) AfterPipeline(*ir.Graph) error        { return f.err }
 
 // setFlag restores a flags.F field after the test, keeping tests
 // order-independent.

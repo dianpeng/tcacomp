@@ -16,10 +16,10 @@ import (
 // requirements, no preservation, Run is a no-op.
 type nopPass struct{}
 
-func (nopPass) ID() string                         { return "nop" }
-func (nopPass) Requires() []string                 { return nil }
+func (nopPass) ID() string                        { return "nop" }
+func (nopPass) Requires() []string                { return nil }
 func (nopPass) Produces() opt.Stage               { return opt.StageConstructed }
-func (nopPass) Preserved() []string                { return nil }
+func (nopPass) Preserved() []string               { return nil }
 func (nopPass) Run(*opt.Context, *ir.Graph) error { return nil }
 
 func setDumpAfter(t *testing.T, v string) {
