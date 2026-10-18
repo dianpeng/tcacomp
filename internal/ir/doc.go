@@ -21,10 +21,12 @@
 //     pointer is O(1) — no position search, no slice reindex. Statements
 //     classify as StmtAssign (binds a new local: def wired to the RHS value)
 //     or StmtEffect (pure side-effect op: store to observable memory, kernel
-//     return). The statement list is produced ONLY by Materialize
+//     end node). The statement list is produced ONLY by Materialize
 //     (schedule.go) — after construction and passes, before codegen — one
-//     statement per live effect root in registration order; construction
-//     itself creates no statements and Block()/CFG() return nil until then.
+//     statement per live effectful node reachable from the sea roots
+//     (R2/R3), in allocation order; construction itself creates no
+//     statements and Block()/CFG() return nil until then. Passes insert new
+//     statements via NewStatement (cfg.go).
 //
 //   - Types: Type is an interface with exactly one method, Equal(Type) bool.
 //     NumericType is the concrete numeric component (unexported elem/dims);
@@ -71,22 +73,24 @@
 //     scheduled CFG: a single BasicBlock with an intrusive Statement list,
 //     produced ONLY by Materialize (schedule.go) after construction/passes
 //     and before codegen. The cfg.go types are unchanged — only their time
-//     of creation moves. Effectful nodes (stores, tile stores, returns)
-//     register in Graph.effectRoots at allocation; Level-1 Walk roots are
-//     the graph params plus those effect roots, never BB statements.
+//     of creation moves. The graph has ONE end node (R2, node_end.go): the
+//     first KindReturn, carrying the returned values AND every mem-param's
+//     final chain state via its ImpactBy payload. Level-1 liveness roots at
+//     the two-root set (R3): the RoleTensor params plus the end node —
+//     effectful nodes are NOT roots (a store no end path reaches is
+//     unreachable debris; SMEM/FRAG stores are not observable at all).
 //
 //   - Walking: Walk(g, Visitor) is the analysis/checking substrate —
 //     iterative pre-order DFS with a visited set (cyclic-safe), roots
 //     LEVEL-AWARE: at Level 1 the graph params (declaration order) plus the
-//     effect roots (allocation order), at Level 2 the params plus the BB
-//     statement order (def then rhs); children in operand-slot order, then
-//     payload uses, then lambda bodies. VisitResult gives
-//     Descend/SkipChildren/Stop control (SkipChildren prunes exactly the
-//     skipped node's subtree; a node reachable by another edge is still
-//     visited). The canonical PRINTER and the dot emitter do NOT walk this
-//     way: their StmtNodes DFS is an emission-order function (chain stages
-//     producer-first via pipeInput), golden-pinned — Walk must never be used
-//     where emission order matters.
+//     end node, at Level 2 the params plus the BB statement order (def then
+//     rhs); children in operand-slot order, then payload uses, then lambda
+//     bodies. VisitResult gives Descend/SkipChildren/Stop control
+//     (SkipChildren prunes exactly the skipped node's subtree; a node
+//     reachable by another edge is still visited). The canonical PRINTER and
+//     the dot emitter do NOT walk this way: their StmtNodes DFS is an
+//     emission-order function (chain stages producer-first via pipeInput),
+//     golden-pinned — Walk must never be used where emission order matters.
 //
 //   - Lowered suite (D-3, quick-261018-bl0): the LIR tier of the catalog —
 //     dimvar/bounded-dimvar (value-object induction variables, (init, step)

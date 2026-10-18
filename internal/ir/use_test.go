@@ -59,12 +59,17 @@ func TestUseChain(t *testing.T) {
 	// A lingering use hand-pointed at the tombstoned node is flagged on
 	// re-verify — the exact corruption class Erase protects against. The
 	// white-box rewire retargets the record's def pointer without moving it
-	// between ref lists, exactly as a leaked pointer would.
+	// between ref lists, exactly as a leaked pointer would. Under the
+	// one-end-node root model (R2/R3) a second return is not a walk root, so
+	// the corrupted y is swapped into the END node's operand tree (the
+	// ReplaceAllUsesWith choke point) to sit on a reachable path.
 	d := g.NewConst("ctor", f32, 4.0)
 	y := g.NewBinOp("ctor", BinOpMul, a, d)
-	g.NewReturn("ctor", y)
 	yn := y.(*binOpNode)
 	yn.ops[1].rec.def = b.BasePtr().ssa
+	if err := ctx.ReplaceAllUsesWith(sum, y); err != nil {
+		t.Fatalf("swap end node's operand to the corrupted y: %v", err)
+	}
 
 	vs := Verify(g)
 	found := false

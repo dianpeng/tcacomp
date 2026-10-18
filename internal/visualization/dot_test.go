@@ -13,6 +13,12 @@ import (
 // one statement whose chain is an iteration cluster over a root map (one
 // tensor operand, identity lambda) feeding a store of the same binding.
 // Built exclusively through the ir exported construction surface.
+//
+// R2/R3 note: the store stays live through an end node (env-chained, plus a
+// NewReturnChained end node). The committed golden predates the end node's
+// own statement, so after Materialize the end node's statement is unhooked
+// from the block — EmitDot renders statements, and removing the last one
+// leaves the store's cluster_10 byte-identical.
 func buildDotGraph() *ir.Graph {
 	g := ir.NewGraph("dot_test")
 	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
@@ -26,10 +32,14 @@ func buildDotGraph() *ir.Graph {
 		ir.NewLambda([]ir.Node{v}, g.NewParamRef("dot-test", v)),
 		[]ir.Node{m})
 	ic := g.NewIterCluster("dot-test", []ir.Node{m}, rootMap)
-	g.NewMemStore("dot-test", out, []ir.Node{m}, ic) // auto-registers as an effect root
+	env := ir.NewEnv()
+	store := g.NewMemStoreChained("dot-test", env, out, []ir.Node{m}, ic)
+	g.PinStatementID(store, 10) // the golden pins the store's statement as cluster_10
+	g.NewReturnChained("dot-test", env, []ir.Node{out}, store)
 	if err := g.Materialize(); err != nil {
 		panic(err)
 	}
+	g.Block().Remove(g.Block().Last()) // drop the end node's statement (see header note)
 	return g
 }
 

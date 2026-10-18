@@ -10,18 +10,20 @@ import (
 )
 
 // cleanOracle builds a graph of only Phase-1 kinds through the typed
-// constructors: two consts, a binop over them, a store, and a return.
+// constructors: two consts, a binop over them, an env-chained store, and an
+// end node carrying the store as its returned value — the whole tree is
+// reachable from the sea roots (RoleTensor params + end node, R2/R3).
 func cleanOracle() *ir.Graph {
 	g := ir.NewGraph("clean")
 	f32 := ir.InternScalar(ir.TF32)
+	m := g.NewInputParam("test", ir.RoleDim, "m", nil)
 	tensor := g.NewInputParam("test", ir.RoleTensor, "A", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	c1 := g.NewConst("test", f32, 1)
 	c2 := g.NewConst("test", f32, 2)
 	sum := g.NewBinOp("test", ir.BinOpAdd, c1, c2)
-	// The store and return auto-register as effect roots; both reference
-	// sum, so the whole tree is reachable from the Level-1 walk roots.
-	g.NewMemStore("test", tensor, nil, sum)
-	g.NewReturn("test", sum)
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("test", env, tensor, []ir.Node{m}, sum)
+	g.NewReturnChained("test", env, []ir.Node{tensor}, st)
 	return g
 }
 
@@ -59,7 +61,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	built := cleanOracle()
 	var paramID uint64
 	ir.Walk(built, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
-		if n.KindOf() == ir.KindInputParam {
+		if paramID == 0 && n.KindOf() == ir.KindInputParam {
 			paramID = n.BasePtr().ID()
 		}
 		return ir.Descend
@@ -69,8 +71,8 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	if err == nil {
 		t.Fatal("known kind at unset stage: expected fail-closed legality error, got nil")
 	}
-	// Walk roots graph params first, so the tensor InputParam is the first
-	// illegal node the unset stage's window rejects.
+	// Walk roots graph params first, so the FIRST param InputParam is the
+	// first illegal node the unset stage's window rejects.
 	for _, want := range []string{"stage linearized", fmt.Sprintf("node %d", paramID)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("fail-closed error %q missing %q", err.Error(), want)

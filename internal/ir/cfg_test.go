@@ -6,7 +6,9 @@ import "testing"
 // BasicBlock stores statements in an intrusive doubly-linked list, so
 // removing a statement given its pointer is O(1) — no position search, no
 // slice reindex, and no other statement's identity changes. The statements
-// arrive via Materialize over three chained stores (the sea's effect roots).
+// arrive via Materialize over three env-chained stores plus the end node
+// that keeps them live (R2/R3: the stores reach the sea roots only through
+// the end node's ImpactBy edges).
 func TestIntrusiveListRemoval(t *testing.T) {
 	g := NewGraph("intrusive")
 	f32 := InternScalar(TF32)
@@ -16,21 +18,24 @@ func TestIntrusiveListRemoval(t *testing.T) {
 	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 1))
 	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 2))
 	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 3))
+	g.NewReturnChained("ctor", env, []Node{out}, env.ChainHead(out))
 
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
 	bb := g.Block()
-	s1, s2, s3 := bb.First(), bb.First().Next(), bb.Last()
-	if s1 == nil || s1.Next() != s2 || s2.Next() != s3 || s3.Prev() != s2 || s2.Prev() != s1 {
-		t.Fatal("materialized statement order must be the effect-root (construction) order")
+	s1, s2, s3 := bb.First(), bb.First().Next(), bb.First().Next().Next()
+	ret := bb.Last()
+	if s1 == nil || s1.Next() != s2 || s2.Next() != s3 || s3.Next() != ret ||
+		ret.Prev() != s3 || s3.Prev() != s2 || s2.Prev() != s1 {
+		t.Fatal("materialized statement order must be the effectful nodes' allocation (construction) order: stores, then the end node")
 	}
 
 	// Unlink the middle statement: O(1) via prev/next, order preserved.
 	if !bb.Remove(s2) {
 		t.Fatal("Remove must report true for a linked statement")
 	}
-	if bb.First() != s1 || bb.Last() != s3 {
+	if bb.First() != s1 || bb.Last() != ret {
 		t.Fatal("removing the middle statement must not touch head/tail")
 	}
 	if s1.Next() != s3 || s3.Prev() != s1 {
@@ -47,8 +52,11 @@ func TestIntrusiveListRemoval(t *testing.T) {
 	}
 
 	// Remove the head and the tail.
-	if !bb.Remove(s1) || bb.First() != s3 || bb.Last() != s3 {
+	if !bb.Remove(s1) || bb.First() != s3 || bb.Last() != ret {
 		t.Fatal("head removal must promote the next statement")
+	}
+	if !bb.Remove(ret) || bb.First() != s3 || bb.Last() != s3 {
+		t.Fatal("tail removal must demote the previous statement")
 	}
 	if !bb.Remove(s3) || bb.First() != nil || bb.Last() != nil {
 		t.Fatal("removing the last statement must empty the list")
@@ -57,18 +65,24 @@ func TestIntrusiveListRemoval(t *testing.T) {
 
 // TestIntrusiveListInsert pins the O(1) insertion primitives that later
 // passes need for statement motion. s1 is a materialized store statement;
-// s2/s3/s4 are white-box statements hand-linked around it (list surgery is
-// independent of how statements were created).
+// the end node's statement sits between it and the hand-linked s2/s3/s4
+// (list surgery is independent of how statements were created).
 func TestIntrusiveListInsert(t *testing.T) {
 	g := NewGraph("insert")
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	env := NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewReturnChained("ctor", env, []Node{out}, st)
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
 	s1 := g.Block().First()
+	endS := s1.Next() // the end node's statement
+	if endS == nil || endS.Next() != nil {
+		t.Fatal("precondition: block holds exactly the store and the end-node statements")
+	}
 	s3 := &Statement{id: g.NewID(), kind: StmtAssign, rhs: g.NewConst("ctor", f32, 3)}
 	s3.rhs.BasePtr().stmt = s3
 	s3.def = SSADef{ssa: s3.rhs.BasePtr().ssa}
@@ -78,7 +92,7 @@ func TestIntrusiveListInsert(t *testing.T) {
 	s2.rhs.BasePtr().stmt = s2
 	s2.def = SSADef{ssa: s2.rhs.BasePtr().ssa}
 	g.Block().InsertBefore(s2, s3)
-	if s1.Next() != s2 || s2.Next() != s3 || s2.Prev() != s1 {
+	if endS.Next() != s2 || s2.Next() != s3 || s2.Prev() != endS {
 		t.Fatal("InsertBefore must link between the surrounding statements")
 	}
 
@@ -89,7 +103,7 @@ func TestIntrusiveListInsert(t *testing.T) {
 	if s3.Next() != s4 || g.Block().Last() != s4 {
 		t.Fatal("InsertAfter must extend the tail")
 	}
-	want := []uint64{s1.ID(), s2.ID(), s3.ID(), s4.ID()}
+	want := []uint64{s1.ID(), endS.ID(), s2.ID(), s3.ID(), s4.ID()}
 	i := 0
 	for s := g.Block().First(); s != nil; s = s.Next() {
 		if s.ID() != want[i] {
@@ -101,9 +115,10 @@ func TestIntrusiveListInsert(t *testing.T) {
 
 // TestStatementKindClassification pins the assign/effect split (review's
 // building-phase model): stores and returns are pure side-effect statements,
-// everything else binds a new local. Materialize emits only effect roots, so
-// the effect kinds are observed on real statements and the assign kind via
-// the same classifier.
+// everything else binds a new local. Materialize emits only the live
+// effectful nodes (kept alive by the end node, R2/R3), so the effect kinds
+// are observed on real statements and the assign kind via the same
+// classifier.
 func TestStatementKindClassification(t *testing.T) {
 	g := NewGraph("kinds")
 	f32 := InternScalar(TF32)
@@ -111,8 +126,9 @@ func TestStatementKindClassification(t *testing.T) {
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 
-	st := g.NewMemStore("ctor", out, []Node{m}, v)
-	ret := g.NewReturn("ctor", st)
+	env := NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, []Node{m}, v)
+	ret := g.NewReturnChained("ctor", env, []Node{out}, st)
 	if classifyStmt(st) != StmtEffect || classifyStmt(ret) != StmtEffect {
 		t.Fatal("store and return roots must classify as StmtEffect")
 	}
@@ -134,7 +150,7 @@ func TestStatementKindClassification(t *testing.T) {
 		t.Fatal("return-rooted statement must be StmtEffect (binds no local)")
 	}
 	if bb.First().RHS() != st || bb.Last().RHS() != ret {
-		t.Fatal("materialized statements must root at the effect roots in construction order")
+		t.Fatal("materialized statements must root at the live effectful nodes in allocation order")
 	}
 }
 
@@ -142,8 +158,8 @@ func TestStatementKindClassification(t *testing.T) {
 // reference to a parameter is an SSAUse whose def IS the graph-owned
 // InputParam node — here exercised through a store's target access, an
 // iteration cluster's dims, and a lambda parameter. Verification is pinned at
-// BOTH levels: the Level-1 sea (effect-root walk) and the Level-2 scheduled
-// graph must both report clean.
+// BOTH levels: the Level-1 sea (the end node keeps the whole chain reachable
+// from the sea roots) and the Level-2 scheduled graph must both report clean.
 func TestInputParamReferences(t *testing.T) {
 	g := NewGraph("params")
 	f32 := InternScalar(TF32)
@@ -160,7 +176,9 @@ func TestInputParamReferences(t *testing.T) {
 	body := g.NewBinOp("ctor", BinOpMul, g.NewParamRef("ctor", v), g.NewConst("ctor", f32, 2))
 	rootMap := g.NewMap("ctor", nil, NewLambda([]Node{v}, body), []Node{m, k})
 	ic := g.NewIterCluster("ctor", []Node{m, k}, rootMap)
-	st := g.NewMemStore("ctor", out, []Node{m, k}, ic)
+	env := NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, []Node{m, k}, ic)
+	g.NewReturnChained("ctor", env, []Node{out}, st)
 
 	// The store's payload uses resolve to the parameter nodes.
 	sn := st.(*memStoreNode)

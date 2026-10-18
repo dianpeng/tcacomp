@@ -9,12 +9,12 @@ package ir
 // order" to serialize memory operations. The total order of side effects is
 // carried EXPLICITLY instead:
 //
-//   - Every effectful node (GMEM store, SMEM/FRAG store, kernel return) is
-//     registered in Graph.effectRoots at allocation, so Level-1 Walk/Verify/
-//     DCE have non-statement roots (allocation order — deterministic, never
-//     map iteration). (R3's two-root-set model — end node + RoleTensor
-//     params, with SMEM/FRAG stores NOT observable — arrives in
-//     quick-261018-bl0 task 2.)
+//   - The graph has ONE end node (R2, node_end.go): the first KindReturn,
+//     carrying the kernel's returned values AND — via its ImpactBy payload —
+//     the final chain state of every mem-param. Level-1 liveness roots at the
+//     two-root set (R3): the RoleTensor params plus the end node. Effectful
+//     nodes are NOT roots: a store no end path reaches is unreachable
+//     building debris, and SMEM/FRAG stores are not observable at all.
 //
 //   - A memory access additionally records its per-tensor ordering edge:
 //     effectIns, the ImpactBy payload — SSAUse records pointing at the
@@ -35,8 +35,8 @@ package ir
 //
 // Effect verdicts (skeleton effect.go shape, local naming): for now there is
 // no fine-grained categorization, just free vs. full (X-3). A GMEM store is
-// fully effectful; a kernel return is effectful-via-ImpactBy (R2: its payload
-// carries every mem-param's final chain state — task 2). SMEM/FRAG stores and
+// fully effectful; the kernel's end node is effectful-via-ImpactBy (R2: its
+// payload carries every mem-param's final chain state). SMEM/FRAG stores and
 // loads are FREE: they are in-program memory, not observable kernel I/O, so
 // they are dead-code-eligible when unreferenced (R3).
 
@@ -161,15 +161,27 @@ func (e *Env) ChainHead(tensor Node) Node {
 	return e.heads[tensor.BasePtr()]
 }
 
+// FinalStates returns the current chain head of every tensor in tensors, in
+// argument order (nil for an untouched tensor). It is the Env read face the
+// end-node wiring uses: NewReturnChained consumes exactly these states as
+// its ImpactBy payload (R2).
+func (e *Env) FinalStates(tensors []Node) []Node {
+	states := make([]Node, len(tensors))
+	for i, t := range tensors {
+		states[i] = e.ChainHead(t)
+	}
+	return states
+}
+
 // NewMemStoreChained creates a store exactly like NewMemStore and additionally
 // wires it into the construction environment's per-tensor effect chain: when
 // tensor has a known chain head, the new store's ImpactBy payload points at
 // it (one SSAUse per chain head, via the ordinary payload wiring), giving the
 // sea-of-nodes its explicit total order for that tensor; the new store then
 // becomes the chain head. A nil env (or a tensor with no prior access) leaves
-// the store un-chained — identical to NewMemStore. The store is registered as
-// an effect root either way (allocation-time, kind-based), so Level-1
-// Walk/Verify/DCE see it without any statement structure.
+// the store un-chained — identical to NewMemStore. The store stays live
+// through the end node's ImpactBy path once the builder wires it (R2/R3), so
+// Level-1 Walk/Verify/DCE see it without any statement structure.
 func (g *Graph) NewMemStoreChained(origin string, env *Env, tensor Node, axes []Node, value Node) Node {
 	n := g.NewMemStore(origin, tensor, axes, value).(*memStoreNode)
 	if head := env.ChainHead(tensor); head != nil {

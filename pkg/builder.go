@@ -46,11 +46,14 @@ type Builder struct {
 
 // output is one declared kernel output binding: the tensor name (debug
 // payload; the graph's identity for the tensor is the store's target use),
-// the store node feeding its return, and the reserved return-statement ID.
+// the tensor's resolved InputParam node (the end node's ImpactBy wiring
+// names the chain per tensor, R2), the store node feeding its return, and
+// the reserved end-node statement ID.
 type output struct {
-	name  string
-	store ir.Node
-	retID uint64
+	name   string
+	tensor ir.Node
+	store  ir.Node
+	retID  uint64
 }
 
 // Dim is a first-class handle for a declared shape dimension (D-08). Extent
@@ -221,16 +224,18 @@ func (b *Builder) ScalarParam(name string, t ir.ElemType) Expr {
 }
 
 // Stmt starts a new statement chain and returns its first typestate rung.
-// Two IDs are reserved now — the statement's and its return statement's —
-// before any of the chain's nodes exist, so the canonical print shows dense
-// statement numbers (see ir.ReserveStatementID): the doc-pinned oracle
-// expects `statement #8` for the chain and `statement #9` for the return
-// (IDs 1-7 are the kernel params, 10+ the chain's nodes — the reservation
-// lands ahead of them). The IDs are pinned on the store/return effect roots
-// (ir.PinStatementID) and consumed by Materialize at Build time. The return
-// ID is consumed only if the chain stores a new output tensor; otherwise it
-// stays unused (IDs may skip). Starting a new chain abandons any unfinished
-// one; Build rejects a builder left with an unfinished chain.
+// Two IDs are reserved now — the statement's and the end node's — before any
+// of the chain's nodes exist, so the canonical print shows dense statement
+// numbers (see ir.ReserveStatementID): the doc-pinned oracle expects
+// `statement #8` for the chain and `statement #9` for the end node (IDs 1-7
+// are the kernel params, 10+ the chain's nodes — the reservation lands ahead
+// of them). The IDs are pinned on the store/end nodes (ir.PinStatementID)
+// and consumed by Materialize at Build time. The end-node ID is consumed by
+// the FIRST chain that stores a new output tensor (Build wires one end node
+// per graph, R2); chains storing further tensors keep their own statement
+// IDs but leave later end-node reservations unused (IDs may skip). Starting
+// a new chain abandons any unfinished one; Build rejects a builder left
+// with an unfinished chain.
 func (b *Builder) Stmt() *StmtIter {
 	if b.final {
 		b.noteDeclErr(fmt.Errorf("stmt: builder already finalized by Build"))
@@ -243,14 +248,19 @@ func (b *Builder) Stmt() *StmtIter {
 
 // Build finalizes the graph and returns it, verified exclusively through
 // the normal pass-manager path (D-10). The two-level flow
-// (quick-261017-vdj): the kernel `return` node for each declared output
-// binding is emitted and pinned with its reserved statement ID, the
-// building-phase DCE runs over the Level-1 sea (review P1R-08: dead
+// (quick-261017-vdj), with the one-end-node model (quick-261018-bl0 task 2,
+// R2): a SINGLE kernel end node is emitted over all declared output
+// bindings — the stores in first-store order as its returned values, and
+// every output tensor's final chain state via the builder env
+// (ir.NewReturnChained) — pinned with the FIRST output binding's reserved
+// end-node ID (later bindings' reserved IDs stay unused; IDs may skip). The
+// building-phase DCE then runs over the Level-1 sea (review P1R-08: dead
 // side-effect-free chains are marked and wiped before any pass sees the
 // graph — debris from abandoned chains included), Materialize schedules the
-// sea into the single-block CFG (one statement per live effect root, in
-// construction order), and then a pass.Manager with an EMPTY pass list
-// carrying the VerifyEach instrumentation runs the graph.
+// sea into the single-block CFG (one statement per live effectful node
+// reachable from the sea roots, in allocation order), and then a
+// pass.Manager with an EMPTY pass list carrying the VerifyEach
+// instrumentation runs the graph.
 // VerifyEach's AfterPipeline hook runs the graph verifier even with zero
 // passes and Manager.Run surfaces its error, so Build returns verification
 // failures as Build errors — never a half-built graph, and never by calling
@@ -264,9 +274,15 @@ func (b *Builder) Build() (*ir.Graph, error) {
 		return nil, fmt.Errorf("build: statement chain (reserved statement id %d) was never stored", b.chain.id)
 	}
 	b.final = true
-	for _, o := range b.outputs {
-		ret := b.g.NewReturn(origin, o.store)
-		b.g.PinStatementID(ret, o.retID)
+	if len(b.outputs) > 0 {
+		tensors := make([]ir.Node, 0, len(b.outputs))
+		stores := make([]ir.Node, 0, len(b.outputs))
+		for _, o := range b.outputs {
+			tensors = append(tensors, o.tensor)
+			stores = append(stores, o.store)
+		}
+		ret := b.g.NewReturnChained(origin, b.env, tensors, stores...)
+		b.g.PinStatementID(ret, b.outputs[0].retID)
 	}
 	if err := ir.BuildingDCE(b.g); err != nil {
 		return nil, err
@@ -283,9 +299,9 @@ func (b *Builder) Build() (*ir.Graph, error) {
 }
 
 // noteOutput records a store to t as an output binding, consuming the
-// chain's reserved return-statement ID. Later stores to the same tensor
-// update the binding the return reads (last store wins) without consuming
-// another ID.
+// chain's reserved end-node statement ID. Later stores to the same tensor
+// update the binding the end node reads (last store wins — the chain head
+// the ImpactBy wiring names) without consuming another ID.
 func (b *Builder) noteOutput(t Tensor, store ir.Node, retID uint64) {
 	for i := range b.outputs {
 		if b.outputs[i].name == t.name {
@@ -293,5 +309,5 @@ func (b *Builder) noteOutput(t Tensor, store ir.Node, retID uint64) {
 			return
 		}
 	}
-	b.outputs = append(b.outputs, output{name: t.name, store: store, retID: retID})
+	b.outputs = append(b.outputs, output{name: t.name, tensor: t.node, store: store, retID: retID})
 }

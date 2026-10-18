@@ -127,7 +127,7 @@ type Graph struct {
 	cfg          *CFG   // Level 2 only: nil from NewGraph until Materialize
 	nextID       uint64 // next ID to hand out; monotonic
 	nodes        []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
-	effectRoots  []Node // effectful nodes (GMEM/SMEM/FRAG stores, returns), in allocation order — Level-1 Walk/Verify/DCE roots; superseded by the one-end-node sea roots (R2/R3) in quick-261018-bl0 task 2
+	end          Node   // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
 	materialized bool   // Materialize has run; cfg and the statement list exist
 }
 
@@ -310,16 +310,6 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n.addSlot()
 	}
 	g.nodes = append(g.nodes, n)
-	// Effectful kinds are Level-1 roots the moment they exist: the sea of
-	// nodes has no statement list, so the memory-store family and kernel
-	// returns register themselves in allocation order (effect.go) — Walk,
-	// Verify, and Level-1 DCE root there instead of in a basic block. (R3's
-	// two-root-set model — end node + RoleTensor params, with SMEM/FRAG
-	// stores NOT observable — arrives in quick-261018-bl0 task 2.)
-	switch k {
-	case KindMemStore, KindMemStoreSMem, KindFragStore, KindReturn:
-		g.effectRoots = append(g.effectRoots, n)
-	}
 	return n
 }
 
@@ -399,7 +389,7 @@ func (g *Graph) ReserveStatementID() uint64 {
 // IDs therefore stay dense across the chain nodes exactly as the pre-scheduler
 // flow produced them, which the committed canonical goldens pin byte-for-byte.
 // Pinning is the ONLY way a statement ID is reserved: Materialize assigns all
-// unpinned roots from the counter in effect-root emission order. A nil root is
+// unpinned effectful nodes from the counter in emission order. A nil root is
 // ignored.
 func (g *Graph) PinStatementID(root Node, id uint64) {
 	if root == nil {

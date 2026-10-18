@@ -7,13 +7,13 @@ package ir
 // Walk is an iterative pre-order DFS with an explicit stack and a visited
 // set (cyclic-safe, no recursion — T-1.1-02). The roots are LEVEL-AWARE
 // (two-level IR, quick-261017-vdj): at Level 1 they are the graph's
-// parameter nodes (declaration order) plus the effect roots (effect.go — the
-// sea has no statement list to scan); at Level 2 (after Materialize) they
-// are the params plus the entry block's statements in statement order (a
-// statement's valid def handle, then its rhs). A node's children are its
-// operand defs in operand-slot order (live records only), then its payload
-// uses (parameter references, iteration dims/bounds, lambda params, as-orders,
-// store targets, ImpactBy effect inputs), then its lambda bodies.
+// parameter nodes (declaration order) plus the end node (R2 — effect.go);
+// at Level 2 (after Materialize) they are the params plus the entry block's
+// statements in statement order (a statement's valid def handle, then its
+// rhs). A node's children are its operand defs in operand-slot order (live
+// records only), then its payload uses (parameter references, iteration
+// dims/bounds, lambda params, as-orders, store targets, ImpactBy effect
+// inputs), then its lambda bodies.
 //
 // D-5 resolution: the canonical PRINTER does NOT walk this way — its
 // StmtNodes DFS is an emission-order function (chain stages producer-first
@@ -52,10 +52,12 @@ func (f VisitorFunc) Visit(n Node) VisitResult { return f(n) }
 // The roots are level-aware (two-level IR, quick-261017-vdj):
 //
 //   - Level 1 (before Materialize): the graph's parameter nodes (declaration
-//     order), then the effect roots (effect.go — every store, tile store, and
-//     return registered at allocation) in registration order. There is no
-//     block to scan; the effect roots are what keep side-effecting nodes and
-//     their operand trees reachable.
+//     order), then the end node (R2 — the graph's single KindReturn; the sea
+//     has no block to scan). The end node's operand and ImpactBy paths are
+//     what keep the side-effecting nodes and their operand trees reachable
+//     (R3: the two-root set is the RoleTensor params + the end node, but the
+//     walk conservatively roots at ALL params so def-use checking covers
+//     every parameter's ref list).
 //   - Level 2 (after Materialize): the parameters, then the entry block's
 //     statements in statement order (a statement's valid def handle, then its
 //     rhs).
@@ -75,7 +77,7 @@ func (f VisitorFunc) Visit(n Node) VisitResult { return f(n) }
 // analysis and checking (verify, legality); print/dot keep StmtNodes.
 //
 // The stack pops last-pushed first, so roots push in REVERSE visit order:
-// effect roots / statements tail-to-head (first pops first), then params
+// the end node / statements tail-to-head (first pops first), then params
 // reversed (params pop first); within a statement rhs pushes before its def
 // (def pops first).
 func Walk(g *Graph, v Visitor) {
@@ -105,11 +107,9 @@ func Walk(g *Graph, v Visitor) {
 			}
 		}
 	} else {
-		// Level 1: the effect roots (stores, tile stores, returns) in
-		// registration order — the sea's only side-effect-anchored roots.
-		for i := len(g.effectRoots) - 1; i >= 0; i-- {
-			push(g.effectRoots[i])
-		}
+		// Level 1: the end node (R2) — the sea's only effect-anchored root;
+		// its operand and ImpactBy paths reach every live store.
+		push(g.end)
 	}
 	for i := len(g.params) - 1; i >= 0; i-- {
 		push(g.params[i])

@@ -74,17 +74,50 @@ func TestVerifierFlagsSurplusOperands(t *testing.T) {
 		t.Fatalf("verifier must flag the surplus operands, got %v", vs)
 	}
 
-	// Sanity: the exact-arity construction next to it stays clean.
-	y := g.NewNode(KindBinOp, "ctor", a, b)
-	g.NewReturn("ctor", y)
+	// Sanity: the exact-arity construction in a FRESH graph (one end node)
+	// stays clean.
+	g2 := NewGraph("surplus-clean")
+	a2 := g2.NewConst("ctor", f32, 1.0)
+	b2 := g2.NewConst("ctor", f32, 2.0)
+	y := g2.NewNode(KindBinOp, "ctor", a2, b2)
+	g2.NewReturn("ctor", y)
 	foundY := false
-	for _, v := range Verify(g) {
+	for _, v := range Verify(g2) {
 		if v.NodeID == y.BasePtr().ID() {
 			foundY = true
 		}
 	}
 	if foundY {
 		t.Fatal("exact-arity construction must not be flagged")
+	}
+}
+
+// TestVerifierFlagsMultipleEndNodes pins R2's fail-closed check: a graph
+// with two live return nodes is rejected — the end node is unique, and any
+// return reachable past the first is reported with both IDs. (A second
+// return is not a sea root; here it is wired under the end node through the
+// AddUse choke point so the walk reaches it.)
+func TestVerifierFlagsMultipleEndNodes(t *testing.T) {
+	g := NewGraph("two-ends")
+	f32 := InternScalar(TF32)
+	a := g.NewConst("ctor", f32, 1.0)
+	x := g.NewBinOp("ctor", BinOpAdd, a, a)
+	end := g.NewReturn("ctor", x) // the graph's end node (R2)
+	y := g.NewBinOp("ctor", BinOpMul, a, a)
+	other := g.NewReturn("ctor", y)
+
+	ctx := &MutContext{Pass: "test"}
+	ctx.AddUse(end, other)
+
+	vs := Verify(g)
+	found := false
+	for _, v := range vs {
+		if strings.Contains(v.Msg, "multiple end nodes") && v.Invariant == "use-def" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verifier must flag multiple end nodes, got %v", vs)
 	}
 }
 

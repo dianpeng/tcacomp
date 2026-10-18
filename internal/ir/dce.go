@@ -9,14 +9,17 @@ package ir
 // The algorithm is LEVEL-AWARE (two-level IR, quick-261017-vdj):
 //
 //   - Level 1 (before Materialize): a SEA MARK-SWEEP. MARK roots at the
-//     graph's params plus the effect roots (effect.go) and follows operand
-//     slots, payload uses (store targets, iteration dims, lambda params,
-//     ImpactBy effect inputs), and lambda bodies — exactly Walk's child
-//     relation. SWEEP the Graph.nodes allocation registry: a node with zero
-//     live uses and not marked reachable is erased through MutContext.Erase
-//     in allocation-order passes (a pass that erases nothing ends the loop);
-//     killing a dead user frees its def's next pass. Effect roots are mark
-//     seeds, so stores/returns are never erased by construction.
+//     graph's params plus the end node (R2 — the graph's single KindReturn;
+//     its operand and ImpactBy paths reach every live store) and follows
+//     operand slots, payload uses (store targets, iteration dims, lambda
+//     params, ImpactBy effect inputs), and lambda bodies — exactly Walk's
+//     child relation. SWEEP the Graph.nodes allocation registry: a node with
+//     zero live uses and not marked reachable is erased through
+//     MutContext.Erase in allocation-order passes (a pass that erases nothing
+//     ends the loop); killing a dead user frees its def's next pass. The end
+//     node is a mark seed, so the stores its paths reach are never erased by
+//     construction; a store NO end path reaches is unreachable debris and is
+//     wiped like any other dead node.
 //   - Level 2 (after Materialize): the review's original three-step
 //     statement model below (mark live statements, backward fixpoint, wipe),
 //     kept unchanged for passes that run after scheduling.
@@ -50,7 +53,7 @@ func BuildingDCE(g *Graph) error {
 }
 
 // buildingDCESea is the Level-1 sweep: mark everything reachable from the
-// params and the effect roots (Walk's child relation — operand slots, payload
+// params and the end node (Walk's child relation — operand slots, payload
 // uses including ImpactBy effect inputs, lambda bodies), then erase every
 // unmarked node that no live use keeps alive, in allocation-order passes:
 // erasing a dead user kills its operand/payload records, freeing its defs for
@@ -82,10 +85,12 @@ func buildingDCESea(g *Graph) error {
 }
 
 // markReachable returns the set of nodes reachable from the Level-1 roots —
-// the graph's params plus its effect roots — following exactly the child
+// the graph's params plus its end node (R2) — following exactly the child
 // relation Walk uses (operand slots, payload uses, lambda bodies). These
 // nodes are untouchable for the sea sweep: they are live by root status or
-// feed a live node.
+// feed a live node. All params are seeds (not only the RoleTensor sea
+// roots): params are graph-owned signature nodes whose ref lists the
+// def-use checker audits, so the sweep must never erase them.
 func markReachable(g *Graph) map[Node]bool {
 	live := make(map[Node]bool)
 	var stack []Node
@@ -96,9 +101,7 @@ func markReachable(g *Graph) map[Node]bool {
 		live[n] = true
 		stack = append(stack, n)
 	}
-	for i := len(g.effectRoots) - 1; i >= 0; i-- {
-		push(g.effectRoots[i])
-	}
+	push(g.end)
 	for i := len(g.params) - 1; i >= 0; i-- {
 		push(g.params[i])
 	}

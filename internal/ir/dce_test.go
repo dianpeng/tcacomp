@@ -3,11 +3,14 @@ package ir
 import "testing"
 
 // dceTestGraph builds the review's P1R-08 scenario in sea form: a live
-// store/return pair, a shared def feeding the store, and a two-link dead
+// store/end-node pair, a shared def feeding the store, and a two-link dead
 // chain (dead def feeding a dead def) with no statement structure — at
-// Level 1 reachability from the params and effect roots decides liveness.
+// Level 1 reachability from the sea roots (RoleTensor params + the end
+// node, R3) decides liveness. The store stays live through the end node's
+// ImpactBy edge alone (its value is not returned), pinning R2's chain-state
+// liveness half.
 //
-//	effect roots: store(out[@m], shared), return store
+//	sea roots: param out, end node (ImpactBy: store)
 //	shared = 1.0 + 2.0   (live: feeds the store)
 //	tmp = shared * shared    (dead: nothing uses tmp)
 //	dead2 = tmp + tmp        (dead: only dead tmp uses it)
@@ -21,8 +24,9 @@ func dceTestGraph() (*Graph, Node, Node) {
 	tmp := g.NewBinOp("ctor", BinOpMul, shared, shared)
 	dead2 := g.NewBinOp("ctor", BinOpAdd, tmp, tmp)
 
-	st := g.NewMemStore("ctor", out, []Node{m}, shared)
-	g.NewReturn("ctor", st)
+	env := NewEnv()
+	g.NewMemStoreChained("ctor", env, out, []Node{m}, shared)
+	g.NewReturnChained("ctor", env, []Node{out})
 
 	return g, tmp, dead2
 }
@@ -189,9 +193,10 @@ func TestBuildingDCESeaWipesAbandonedChain(t *testing.T) {
 	abandoned := g.NewMap("ctor", nil, NewLambda([]Node{v}, body), []Node{m})
 	abandoned = g.NewIterCluster("ctor", []Node{m}, abandoned)
 
-	// The real chain: a store + return over an unrelated value.
-	st := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
-	g.NewReturn("ctor", st)
+	// The real chain: a store + end node over an unrelated value.
+	env := NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewReturnChained("ctor", env, []Node{out}, st)
 
 	if err := BuildingDCE(g); err != nil {
 		t.Fatalf("BuildingDCE: %v", err)

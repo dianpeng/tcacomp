@@ -136,8 +136,9 @@ const (
 // (not Value-typed): every exported constructor returns Node, which never
 // statically satisfies Value (Node + IsNone), so a Value-typed statement
 // entry point would force casts at out-of-package call sites — the NoneValue
-// classification lives solely in Value(). Statements are created only by
-// Materialize (schedule.go).
+// classification lives solely in Value(). Statements are created by
+// Materialize (schedule.go) and by the NewStatement factory below (passes
+// that insert statements after scheduling).
 type Statement struct {
 	id    uint64
 	graph *Graph     // owning graph, set at link time; lets the printer detect chain boundaries
@@ -193,4 +194,32 @@ func classifyStmt(rhs Node) StmtKind {
 		return StmtEffect
 	}
 	return StmtAssign
+}
+
+// NewStatement builds one statement rooted at rhs through the same rules
+// Materialize uses — the ID is rhs's PinStatementID-reserved ID or the next
+// ID from the graph's monotonic counter, the kind comes from classifyStmt,
+// the def is wired for StmtAssign, and the RHS root's stmt back-pointer is
+// set so Erase can unlink in O(1) (P1R-02). When the graph already has a
+// CFG (Materialize has run), the statement is appended to the entry block —
+// this is the insertion point for passes that add statements after
+// scheduling (e.g. the pass.Scheduler's LICM hoists). A nil graph or nil rhs
+// yields nil, never a panic.
+func (g *Graph) NewStatement(rhs Node) *Statement {
+	if g == nil || rhs == nil {
+		return nil
+	}
+	id := rhs.BasePtr().stmtID
+	if id == 0 {
+		id = g.NewID()
+	}
+	s := &Statement{id: id, kind: classifyStmt(rhs), rhs: rhs, graph: g}
+	rhs.BasePtr().stmt = s
+	if s.kind == StmtAssign {
+		s.def = SSADef{ssa: rhs.BasePtr().ssa}
+	}
+	if g.cfg != nil {
+		g.cfg.entry.Append(s)
+	}
+	return s
 }

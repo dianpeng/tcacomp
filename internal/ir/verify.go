@@ -32,7 +32,7 @@ const (
 
 // Verify runs both chain-consistency checkers over g and returns every
 // violation found, in deterministic walk order: the level-aware roots (params
-// plus effect roots at Level 1, params plus statement order at Level 2),
+// plus the end node at Level 1, params plus statement order at Level 2),
 // then per-node operand order — never map iteration (RESEARCH Pitfall 1).
 // A nil or empty result means the chains are consistent. Verify needs no
 // Materialize: the Level-1 roots cover the whole constructed graph.
@@ -75,7 +75,7 @@ func asImpl(n Node) nodeImpl {
 }
 
 // walkCheckUseDef walks the graph from the level-aware roots (via Walk,
-// directive 3 — params plus effect roots at Level 1, params plus block
+// directive 3 — params plus the end node at Level 1, params plus block
 // statements at Level 2), checking the use-def direction at every node: each
 // operand slot's handle must resolve to a live (not tombstoned) def of a kind
 // <
@@ -83,11 +83,23 @@ func asImpl(n Node) nodeImpl {
 // "nil def" message; killed records are the handle model's new corruption
 // class, flagged by slot. It returns the visited nodes in walk order for the
 // def-use pass. Lambda bodies are walked as edges alongside operand uses.
+// R2's structural check rides the same walk: a second live KindReturn node
+// past the first is flagged as a multiple-end-nodes violation.
 func walkCheckUseDef(g *Graph, vs *[]Violation) []Node {
 	var nodes []Node
+	var firstEnd Node
 	Walk(g, VisitorFunc(func(n Node) VisitResult {
 		nodes = append(nodes, n)
 		checkNodeUseDef(n, vs)
+		if n.KindOf() == KindReturn {
+			if firstEnd == nil {
+				firstEnd = n
+			} else {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("multiple end nodes: node %d is a return, but node %d is already the graph's end node (R2: exactly one)",
+						n.BasePtr().id, firstEnd.BasePtr().id)))
+			}
+		}
 		return Descend
 	}))
 	return nodes
@@ -247,7 +259,7 @@ func checkOneUse(n Node, u SSAUse, where string, vs *[]Violation) {
 // listed record pointing elsewhere, or a listed record no walked operand
 // slot owns) and under-links (an operand record missing from the def's list)
 // are both reported — corrupting either direction is caught by this walk.
-// Level-1 note: the sea-of-nodes walk roots at the params and effect roots,
+// Level-1 note: the sea-of-nodes walk roots at the params and the end node,
 // so a dead-but-not-yet-DCE'd user is unvisited; its records in a live
 // def's ref list are skipped here (they are the unreachable subgraph's
 // bookkeeping, killed when DCE erases the user), not flagged as over-links.
