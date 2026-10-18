@@ -15,8 +15,10 @@ func twoTensorGraph(t *testing.T) (g *Graph, m, out1, out2, val Node) {
 	return g, m, out1, out2, val
 }
 
-// TestEffectVerdicts pins the free/full split: stores and returns are
-// effectful, everything else (including the value feeding a store) is free.
+// TestEffectVerdicts pins the free/full split as amended by
+// quick-261018-nga decision A: EVERY FamilyMemory node (loads included,
+// nil ImpactBy included) and the kernel return are effectful; pure
+// expression/stage kinds are free.
 func TestEffectVerdicts(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	if e := EffectOf(val); e.Has() {
@@ -37,6 +39,74 @@ func TestEffectVerdicts(t *testing.T) {
 	}
 	if NewEffectFree().Kind() != EffectFree || NewEffectFull().Kind() != EffectFull {
 		t.Fatal("verdict Kind() must return the constants")
+	}
+}
+
+// TestEffectVerdictsMemoryFamily pins amendment A exhaustively: all NINE
+// FamilyMemory kinds are node-local EFFECTFUL even with nil ImpactBy — the
+// single-slot memory model (loads serialize against writes on one region).
+// Pure kinds (scalar-expr family, map, reduce, dimvar/bdimvar) stay free.
+func TestEffectVerdictsMemoryFamily(t *testing.T) {
+	g, m, out1, _, val := twoTensorGraph(t)
+	f32 := InternScalar(TF32)
+
+	smem := g.NewMemNewSMem("ctor", val)
+	frag := g.NewFragNew("ctor", val)
+	memoryNodes := map[string]Node{
+		"memload":       g.NewMemLoad("ctor", out1, []Node{m}),
+		"memstore":      g.NewMemStore("ctor", out1, []Node{m}, val),
+		"memnew":        g.NewMemNew("ctor", val),
+		"memloadsmem":   g.NewMemLoadSMem("ctor", smem),
+		"memstoresmem":  g.NewMemStoreSMem("ctor", val, smem),
+		"memnewsmem":    smem,
+		"fragload":      g.NewFragLoad("ctor", frag),
+		"fragstore":     g.NewFragStore("ctor", val, frag),
+		"fragnew":       frag,
+	}
+	for name, n := range memoryNodes {
+		if got := len(ImpactBy(n)); got != 0 {
+			t.Fatalf("%s fixture must carry nil ImpactBy (unchained), got %d edges", name, got)
+		}
+		if e := EffectOf(n); !e.Has() {
+			t.Fatalf("%s must be effectful with nil ImpactBy (amendment A: single-slot memory model)", name)
+		}
+	}
+
+	// Pure kinds stay free — [4].3: the verdict is self-scoped, never a
+	// lattice meet over operands.
+	lp := g.NewLambdaInputParam("ctor", "l", f32)
+	body := g.NewBinOp("ctor", BinOpAdd, lp, val)
+	piped := g.NewConst("ctor", f32, 5)
+	load := g.NewMemLoad("ctor", out1, []Node{m}) // effectful operand below
+	pureNodes := map[string]Node{
+		"binop":          g.NewBinOp("ctor", BinOpAdd, val, val),
+		"unaryop":        g.NewUnaryOp("ctor", UnaryOpNeg, val),
+		"select":         g.NewSelect("ctor", val, val, val),
+		"cast":           g.NewCast("ctor", f32, val),
+		"call":           g.NewCall("ctor", "exp", val),
+		"param":          g.NewParamRef("ctor", lp),
+		"map":            g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}),
+		"map-over-load":  g.NewMap("ctor", []Node{load}, NewLambda([]Node{lp}, body), []Node{m}),
+		"reduce":         g.NewReduce("ctor", piped, piped, NewLambda([]Node{lp}, body)),
+	}
+	for name, n := range pureNodes {
+		if e := EffectOf(n); e.Has() {
+			t.Fatalf("%s must be effect-free (self-scoped verdict), got %s", name, e)
+		}
+	}
+	iter := g.NewIter("ctor", m, nil, val, val)
+	if e := EffectOf(iter); !e.Has() {
+		t.Fatal("iter must be effectful ([2.3] implicit control flow)")
+	}
+	if e := EffectOf(g.NewForLoop("ctor", iter, val, val)); !e.Has() {
+		t.Fatal("forloop must be effectful ([2.3] implicit control flow closure)")
+	}
+	dv := g.NewDimVar("ctor", m, val, val)
+	if e := EffectOf(dv); e.Has() {
+		t.Fatal("dimvar must be effect-free (value-level IV object)")
+	}
+	if e := EffectOf(g.NewBoundedDimVar("ctor", dv, val)); e.Has() {
+		t.Fatal("bdimvar must be effect-free (value-level IV object)")
 	}
 }
 
