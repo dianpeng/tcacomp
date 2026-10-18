@@ -410,3 +410,198 @@ func TestDCECyclicClusterSurvives(t *testing.T) {
 		t.Fatalf("graph must verify with the cyclic survivors: %v", vs)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Chain-integrity hinges + the dce-verify pass (follow-up to quick-261018-l36).
+// ---------------------------------------------------------------------------
+
+// assertImpactBy fails the test unless n's first ImpactBy effect edge points
+// at want — the chain-integrity assertion the sweep must never disturb.
+func assertImpactBy(t *testing.T, n, want ir.Node) {
+	t.Helper()
+	imp := ir.ImpactBy(n)
+	if len(imp) == 0 {
+		t.Fatalf("node %d (%s) has no ImpactBy edge", n.BasePtr().ID(), n.KindOf())
+	}
+	if got := imp[0].Def(); got == nil || got.BasePtr() != want.BasePtr() {
+		t.Fatalf("node %d (%s) ImpactBy points at %v, want node %d (%s)",
+			n.BasePtr().ID(), n.KindOf(), got, want.BasePtr().ID(), want.KindOf())
+	}
+}
+
+// middleLinkFixture builds hinge 6's graph: one tensor param whose chain is
+// s1 → load (feeds nothing) → s2, with the end node wired at chain head s2.
+func middleLinkFixture() (g *ir.Graph, s1, load, s2, end ir.Node) {
+	g = ir.NewGraph("hinge6")
+	f32 := ir.InternScalar(ir.TF32)
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+	a := g.NewInputParam("ctor", ir.RoleTensor, "a", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	v1 := g.NewConst("ctor", f32, 1)
+	v2 := g.NewConst("ctor", f32, 2)
+	env := ir.NewEnv()
+	s1 = g.NewMemStoreChained("ctor", env, a, []ir.Node{m}, v1)
+	load = g.NewMemLoadChained("ctor", env, a, []ir.Node{m})
+	s2 = g.NewMemStoreChained("ctor", env, a, []ir.Node{m}, v2)
+	end = g.NewReturnChained("ctor", env, []ir.Node{a}, s2)
+	return g, s1, load, s2, end
+}
+
+// Hinge 6 (middle-link conservatism): an UNUSED load sandwiched between two
+// live stores on one region survives. Removing it would need chain splicing
+// (relinking s2's ImpactBy from load to s1), which v0's DCE deliberately
+// does not do — sound because the sweep removes too little, never too much.
+func TestDCEHingeMiddleLinkConservatism(t *testing.T) {
+	g, s1, load, s2, end := middleLinkFixture()
+
+	runDCE(t, g)
+	assertKept(t, g, s1, load, s2, end)
+	assertImpactBy(t, s2, load)
+	assertImpactBy(t, load, s1)
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("graph must verify: %v", vs)
+	}
+}
+
+// deadTailFixture builds hinge 7's graph: tensor a holds a live chain head
+// (s0, snapshot by the end node), tensor b a full live chain (sb1 → lb →
+// sb2). The dead tail — a load chained at s0 AFTER the end node was wired —
+// is referenced by nothing: the env head is construction state, not a graph
+// edge, so no root path reaches it.
+func deadTailFixture() (g *ir.Graph, s0, sb1, lb, sb2, end, deadTail ir.Node) {
+	g = ir.NewGraph("hinge7")
+	f32 := ir.InternScalar(ir.TF32)
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+	a := g.NewInputParam("ctor", ir.RoleTensor, "a", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	b := g.NewInputParam("ctor", ir.RoleTensor, "b", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	va := g.NewConst("ctor", f32, 1)
+	vb1 := g.NewConst("ctor", f32, 2)
+	vb2 := g.NewConst("ctor", f32, 3)
+	env := ir.NewEnv()
+	s0 = g.NewMemStoreChained("ctor", env, a, []ir.Node{m}, va)
+	sb1 = g.NewMemStoreChained("ctor", env, b, []ir.Node{m}, vb1)
+	lb = g.NewMemLoadChained("ctor", env, b, []ir.Node{m})
+	sb2 = g.NewMemStoreChained("ctor", env, b, []ir.Node{m}, vb2)
+	end = g.NewReturnChained("ctor", env, []ir.Node{a, b}, sb2)
+	deadTail = g.NewMemLoadChained("ctor", env, a, []ir.Node{m})
+	return g, s0, sb1, lb, sb2, end, deadTail
+}
+
+// Hinge 7 (dead-tail detachment): sweeping the dead chain tail must detach
+// its effect record from the surviving predecessor's ref list — no dangling
+// residue — while every adjacent live chain keeps its ImpactBy edges intact.
+func TestDCEHingeDeadTailDetachesFromLiveChain(t *testing.T) {
+	g, s0, sb1, lb, sb2, end, deadTail := deadTailFixture()
+
+	runDCE(t, g)
+	assertGone(t, g, deadTail)
+	assertKept(t, g, s0, sb1, lb, sb2, end)
+	if !deadTail.BasePtr().Erased() {
+		t.Fatal("the swept tail must read as erased")
+	}
+	if uses := ir.UsesOf(deadTail); len(uses) != 0 {
+		t.Fatalf("swept tail keeps %d live use(s)", len(uses))
+	}
+	// The predecessor's remaining live users are all live nodes: the tail's
+	// effect record was killed, never left pointing back.
+	set := nodeSet(g)
+	for _, u := range ir.UsesOf(s0) {
+		if user := u.User(); user == nil || !set[user.BasePtr()] {
+			t.Fatalf("s0 keeps a live use whose user is nil or swept: %v", user)
+		}
+	}
+	assertImpactBy(t, sb2, lb)
+	assertImpactBy(t, lb, sb1)
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("graph must verify: %v", vs)
+	}
+}
+
+// runVerify runs the dce-verify pass and fails the test on error.
+func runVerify(t *testing.T, g *ir.Graph) {
+	t.Helper()
+	if err := (dce.VerifyPass{}).Run(nil, g); err != nil {
+		t.Fatalf("dce-verify.Run: %v", err)
+	}
+}
+
+// TestDCEVerifyGreenAfterSweep: the verification pass accepts every cleanly
+// swept fixture — plain debris, the middle-link conservative survivor, and
+// the detached dead tail — both called directly and through the Manager with
+// the registry-declared ordering.
+func TestDCEVerifyGreenAfterSweep(t *testing.T) {
+	g1, _, _, _, _, _, _ := sweepFixture()
+	runDCE(t, g1)
+	runVerify(t, g1)
+
+	g2, _, _, _, _ := middleLinkFixture()
+	runDCE(t, g2)
+	runVerify(t, g2)
+
+	g3, _, _, _, _, _, _ := deadTailFixture()
+	runDCE(t, g3)
+	runVerify(t, g3)
+
+	pm := opt.NewManager([]opt.Pass{dce.Pass{}, dce.VerifyPass{}})
+	pm.AddInstrumentation(opt.NewVerifyEach(nil))
+	if err := pm.Run(g2); err != nil {
+		t.Fatalf("manager [dce, dce-verify] pipeline: %v", err)
+	}
+}
+
+// TestDCEVerifyRequiresSweepFirst: the Manager rejects a [dce-verify, dce]
+// pipeline — verification is only meaningful after the sweep it verifies.
+func TestDCEVerifyRequiresSweepFirst(t *testing.T) {
+	g, _, _, _, _, _, _ := sweepFixture()
+	pm := opt.NewManager([]opt.Pass{dce.VerifyPass{}, dce.Pass{}})
+	err := pm.Run(g)
+	if err == nil || !strings.Contains(err.Error(), "requires") {
+		t.Fatalf("reversed pipeline must fail on Requires, got: %v", err)
+	}
+}
+
+// TestDCEVerifyFlagsDanglingEdge: a live record wired at a tombstone AFTER a
+// clean sweep is reported as a dangling edge — the corruption class the
+// DANGLING check exists for.
+func TestDCEVerifyFlagsDanglingEdge(t *testing.T) {
+	g, _, _, st, _, deadAlloc, _ := sweepFixture()
+	runDCE(t, g)
+
+	mctx := &ir.MutContext{Pass: "test"}
+	mctx.AddUse(st, deadAlloc) // corrupt: the live store now uses the swept alloc
+
+	err := (dce.VerifyPass{}).Run(nil, g)
+	if err == nil {
+		t.Fatal("the verification pass must flag a live use of an erased node")
+	}
+	for _, want := range []string{"dangling", "erased"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q must mention %q", err.Error(), want)
+		}
+	}
+}
+
+// TestDCEVerifyGateNilGraph: a nil graph is a deterministic error.
+func TestDCEVerifyGateNilGraph(t *testing.T) {
+	err := dce.VerifyPass{}.Run(nil, nil)
+	if err == nil || err.Error() != "dce-verify: nil graph" {
+		t.Fatalf("Run(nil) error = %v, want %q", err, "dce-verify: nil graph")
+	}
+}
+
+// TestDCEVerifyGateMaterializedRefused: a materialized graph is refused
+// before any mark is written, leaving it untouched.
+func TestDCEVerifyGateMaterializedRefused(t *testing.T) {
+	g, _, _, _, _, _, _ := sweepFixture()
+	if err := g.Materialize(); err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	before := len(g.AllocatedNodes())
+
+	err := dce.VerifyPass{}.Run(nil, g)
+	if err == nil || !strings.Contains(err.Error(), "materialized") {
+		t.Fatalf("Run on a materialized graph must refuse, got: %v", err)
+	}
+	if after := len(g.AllocatedNodes()); after != before {
+		t.Fatalf("a refused graph must be untouched: %d before, %d after", before, after)
+	}
+}
