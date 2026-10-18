@@ -1,7 +1,8 @@
 package ir
 
-// This file holds the lowered induction-variable nodes (review P1R-04) and
-// their value relations, specified in doc/optana/induction_variable.md:
+// node_dimvar.go holds the LIR induction-variable nodes (KindDimVar/
+// KindBoundedDimVar, D-3) and their value relations, specified in
+// doc/optana/induction_variable.md:
 //
 //   - An induction variable is a VALUE OBJECT: an (init, step) tuple. Two
 //     IVs are equal iff their tuples are equal — identity is value identity,
@@ -14,7 +15,7 @@ package ir
 //     commutative; Belong is its reverse.
 //
 // dimvar is value-level material (FamilyAbstract), not loop-nest structure;
-// the explicit lowered loop is KindForLoop (loop.go).
+// the explicit lowered loop is KindForLoop (node_loop.go).
 
 // dimVarNode: lowered induction variable; ops = [init, step]; the dim
 // binding is a payload use of a dim InputParam (name/debug payload only —
@@ -38,7 +39,7 @@ func (g *Graph) NewDimVar(origin string, dim Node, init, step Node) Node {
 	return n
 }
 
-// initOf/stepOf/maxOf return the node's operand slots, nil-safely.
+// operandAt returns the node's operand slot i, nil-safely.
 func operandAt(n Node, i int) Node {
 	if impl := asImpl(n); impl != nil {
 		j := 0

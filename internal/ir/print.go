@@ -258,25 +258,26 @@ func isStage(n Node) bool {
 		return false
 	}
 	switch n.KindOf() {
-	case KindIterCluster, KindMap, KindReduce, KindStore, KindReturn,
-		KindLoadTile, KindStoreTile, KindForLoop:
+	case KindIterCluster, KindMap, KindReduce, KindMemStore, KindMemStoreSMem,
+		KindFragStore, KindReturn, KindForLoop:
 		return true
 	}
 	return false
 }
 
-// pipeInput returns the node feeding n's chained input — store value,
-// return value, map operand 0 (piped input first, per construct.go), reduce
-// operand 1 (piped), iteration-cluster body — or nil when the input is not
-// itself a stage, meaning n starts (or breaks) the chain.
+// pipeInput returns the node feeding n's chained input — GMEM/SMEM/FRAG
+// store value, return value, map operand 0 (piped input first, per
+// node_lambda.go), reduce operand 1 (piped), iteration-cluster body — or nil
+// when the input is not itself a stage, meaning n starts (or breaks) the
+// chain.
 func pipeInput(n Node) Node {
 	var next Node
 	switch n.KindOf() {
-	case KindStore, KindReturn, KindMap, KindIterCluster:
+	case KindMemStore, KindReturn, KindMap, KindIterCluster:
 		next = opAt(n, 0)
 	case KindReduce:
 		next = opAt(n, 1)
-	case KindStoreTile:
+	case KindMemStoreSMem, KindFragStore:
 		next = opAt(n, 0) // the stored value
 	case KindForLoop:
 		next = opAt(n, 2) // the body
@@ -411,9 +412,9 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(r.lambda(t.combiner))
 		b.WriteString(")")
 		return b.String()
-	case *storeNode:
+	case *memStoreNode:
 		var b strings.Builder
-		b.WriteString("store(")
+		b.WriteString("memstore(")
 		b.WriteString(r.accessText(t.target))
 		b.WriteString(", ")
 		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
@@ -424,13 +425,25 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(")")
 		return b.String()
 	case *returnNode:
-		return "return " + r.value(opAt(t, 0))
-	case *loadTileNode:
-		return "loadtile(" + r.tileAccess(t) + ")"
-	case *storeTileNode:
 		var b strings.Builder
-		b.WriteString("storetile(")
-		b.WriteString(r.tileAccess(t))
+		b.WriteString("return ")
+		for i, v := range OperandsOf(t) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.value(v))
+		}
+		return b.String()
+	case *memLoadNode:
+		return "memload(" + r.memAccess(t, 1) + ")"
+	case *memNewNode:
+		return "memnew(" + r.value(opAt(t, 0)) + ")"
+	case *memLoadSMemNode:
+		return "memloadsmem(" + r.bufferAccess(t, 1) + ")"
+	case *memStoreSMemNode:
+		var b strings.Builder
+		b.WriteString("memstoresmem(")
+		b.WriteString(r.bufferAccess(t, 2))
 		b.WriteString(", ")
 		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
 			b.WriteString("%0")
@@ -439,6 +452,24 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		}
 		b.WriteString(")")
 		return b.String()
+	case *memNewSMemNode:
+		return "memnewsmem(" + r.value(opAt(t, 0)) + ")"
+	case *fragLoadNode:
+		return "fragload(" + r.bufferAccess(t, 1) + ")"
+	case *fragStoreNode:
+		var b strings.Builder
+		b.WriteString("fragstore(")
+		b.WriteString(r.bufferAccess(t, 2))
+		b.WriteString(", ")
+		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
+			b.WriteString("%0")
+		} else {
+			b.WriteString(r.value(val))
+		}
+		b.WriteString(")")
+		return b.String()
+	case *fragNewNode:
+		return "fragnew(" + r.value(opAt(t, 0)) + ")"
 	case *forLoopNode:
 		var b strings.Builder
 		b.WriteString("for(")
@@ -453,16 +484,13 @@ func (r *renderer) stageText(n Node, prev Node) string {
 	}
 }
 
-// tileAccess renders a tile node's `tensor[@biv][@biv]...` access: the
-// tensor operand's debug name followed by one bounded-dimvar rendering per
-// axis operand (operand 0 for loadtile, operand 1 for storetile onward).
-func (r *renderer) tileAccess(n Node) string {
-	tensorIdx := 0
-	if n.KindOf() == KindStoreTile {
-		tensorIdx = 1
-	}
+// memAccess renders an HIR GMEM access's `tensor[@m][@n]` form: the tensor
+// operand's debug name followed by one `[@dim]` per axis operand (the axes
+// start at operand `axesFrom` — 1 for memload, whose operand 0 is the
+// tensor).
+func (r *renderer) memAccess(n Node, axesFrom int) string {
 	var b strings.Builder
-	if t := operandAt(n, tensorIdx); t != nil {
+	if t := operandAt(n, 0); t != nil {
 		if ip, ok := t.(*inputParamNode); ok {
 			b.WriteString(ip.name)
 		} else {
@@ -471,7 +499,34 @@ func (r *renderer) tileAccess(n Node) string {
 	} else {
 		b.WriteString("<nil>")
 	}
-	for i := tensorIdx + 1; i < len(OperandsOf(n)); i++ {
+	for i := axesFrom; i < len(OperandsOf(n)); i++ {
+		b.WriteString("[")
+		if ax := operandAt(n, i); ax != nil {
+			if ip, ok := ax.(*inputParamNode); ok {
+				b.WriteString("@" + ip.name)
+			} else {
+				b.WriteString(r.value(ax))
+			}
+		} else {
+			b.WriteString("<nil>")
+		}
+		b.WriteString("]")
+	}
+	return b.String()
+}
+
+// bufferAccess renders an LIR memory access's `buffer[biv][biv]...` form:
+// the buffer operand's value rendering followed by one `[biv]` per biv
+// operand (the bivs start at operand `bivsFrom` — 1 for loads, 2 for
+// stores, whose leading operands are the stored value and the buffer).
+func (r *renderer) bufferAccess(n Node, bivsFrom int) string {
+	var b strings.Builder
+	if buf := operandAt(n, bivsFrom-1); buf != nil {
+		b.WriteString(r.value(buf))
+	} else {
+		b.WriteString("<nil>")
+	}
+	for i := bivsFrom; i < len(OperandsOf(n)); i++ {
 		b.WriteString("[")
 		b.WriteString(r.value(operandAt(n, i)))
 		b.WriteString("]")
@@ -548,7 +603,7 @@ func (r *renderer) value(n Node) string {
 			}
 		}
 		return "@" + r.value(opAt(t, 0)) + "/" + r.value(opAt(t, 1))
-	case *storeNode:
+	case *memStoreNode:
 		return "%" + paramNameOf(t.target.tensorUse) // store returns the stored value (doc §2.5)
 	default:
 		if num, ok := r.num.Num(n); ok {

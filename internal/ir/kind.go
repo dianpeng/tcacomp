@@ -1,57 +1,83 @@
 package ir
 
 // Kind identifies the operator of an IR node. The enumeration is versioned
-// and stable (IR-03): new kinds introduced by later lowering phases append
-// before KindEnd; existing constants are never renumbered or reordered, so
-// graphs serialized under KindVersion 1 keep their meaning. The pass manager
-// rejects any node with Kind >= KindEnd or Kind == KindInvalid.
+// (IR-03): KindVersion 3 is the tinycudaopto re-organization (quick-261018-bl0)
+// — the enum was renumbered ONCE, deliberately, here: HIR kinds group before
+// LIR kinds (D-3), the generic Load/Store and the LoadTile/StoreTile kinds are
+// gone, and the GMEM MemLoad/MemStore/MemNew family plus the lowered
+// MemLoadSMem/MemStoreSMem/MemNewSMem and FragLoad/FragStore/FragNew families
+// take their places. From v3 onward the rule is append-only again: new kinds
+// introduced by later lowering phases insert before KindEnd within their tier
+// and never renumber existing constants. The pass manager rejects any node
+// with Kind >= KindEnd or Kind == KindInvalid.
+//
+// The authoritative per-kind metadata (tier, family, arity, doc) lives in
+// catalog.go — the dedicated listing file (R4e); kind.go keeps the enum, the
+// canonical spelling, and the family classification only.
 type Kind uint32
 
-// KindVersion is the IR node-kind schema version. Bump when kinds are added
-// (append-only) so downstream consumers can gate on it.
-const KindVersion = 2
+// KindVersion is the IR node-kind schema version. v3 = the tinycudaopto
+// re-organization (deliberate one-time renumbering, recorded above).
+const KindVersion = 3
 
 const (
-	KindInvalid     Kind = iota // unused slot; verifier and legality reject it
-	KindIter                    // abstract: induction variable @m (name, bound dim, init, step)
-	KindIterCluster             // abstract: compound iter(@m, @k, @n) header
-	KindMap                     // abstract: map stage (operands, lambda, as-order)
-	KindReduce                  // abstract: reduce stage (init, piped input, combiner, annotation)
-	KindStore                   // abstract: store(target access, value)
-	KindReturn                  // abstract: kernel return
-	KindConst                   // scalar-expr: typed constant
-	KindParam                   // scalar-expr: lambda parameter reference
-	KindBinOp                   // scalar-expr: binary op (opcode table mirrors syntax.md §7.6)
-	KindUnaryOp                 // scalar-expr: unary op
-	KindSelect                  // scalar-expr: typed conditional ?:
-	KindCast                    // scalar-expr: explicit cast to named type
-	KindCall                    // scalar-expr: registered pure builtin call
-	KindInputParam              // graph-owned kernel/lambda input parameter (SSA def; name is debug-only)
-	KindDimVar                  // lowered: induction variable, an (init, step) value object (doc/optana/induction_variable.md)
-	KindBoundedDimVar           // lowered: dimvar bound to a max — ((iv tuple), Max)
-	KindLoadTile                // lowered: cooperative tile load (tensor, bivs...)
-	KindStoreTile               // lowered: cooperative tile store (value, tensor, bivs...)
-	KindForLoop                 // lowered: explicit loop nest over a bounded dimvar
-	KindEnd                     // sentinel: all kinds < KindEnd
+	KindInvalid Kind = iota // unused slot; verifier and legality reject it
+
+	// --- HIR tier (D-3): the abstract kernel graph the builder produces ---
+	// See catalog.go for the per-kind table; the grouping below mirrors it.
+
+	KindMap         // lambda: map stage (operands, lambda, as-order)
+	KindReduce      // lambda: reduce stage (init, piped input, combiner)
+	KindMemLoad     // GMEM: load tensor[axes...] (tensor operand + axes, ImpactBy)
+	KindMemStore    // GMEM: store(target access, value) — the HIR stage store
+	KindMemNew      // GMEM: create a new global memory extent (extent value)
+	KindIter        // loop: induction variable @m (dim/bound payload, init, step)
+	KindIterCluster // loop: compound iter(@m, @k, @n) header (dims payload, body)
+	KindConst       // scalar-expr: typed constant
+	KindParam       // scalar-expr: lambda parameter reference
+	KindBinOp       // scalar-expr: binary op (opcode table mirrors syntax.md §7.6)
+	KindUnaryOp     // scalar-expr: unary op
+	KindSelect      // scalar-expr: typed conditional ?:
+	KindCast        // scalar-expr: explicit cast to named type
+	KindCall        // scalar-expr: registered pure builtin call
+	KindInputParam  // var: graph-owned kernel/lambda input parameter
+	KindReturn      // end: kernel return — the graph's single end node
+
+	// --- LIR tier (D-3): the lowered suite introduced by optimization passes ---
+
+	KindForLoop       // lowered loop nest over a bounded dimvar (iv, bound, body)
+	KindDimVar        // lowered induction variable, an (init, step) value object
+	KindBoundedDimVar // lowered dimvar bound to a max — ((iv tuple), Max)
+	KindMemLoadSMem   // lowered SMEM load (src smem buffer, bivs...)
+	KindMemStoreSMem  // lowered SMEM store (value, dst smem buffer, bivs...)
+	KindMemNewSMem    // lowered SMEM allocation (extent)
+	KindFragLoad      // lowered fragment load (src frag buffer, bivs...)
+	KindFragStore     // lowered fragment store (value, dst frag buffer, bivs...)
+	KindFragNew       // lowered fragment allocation (extent)
+
+	KindEnd // sentinel: all kinds < KindEnd
 )
 
-// String returns the lowercase canonical name of the kind.
+// String returns the lowercase canonical name of the kind (D-6: the canonical
+// print renders this exact spelling — memstore(...), memloadsmem(...), ...).
 func (k Kind) String() string {
 	switch k {
 	case KindInvalid:
 		return "invalid"
-	case KindIter:
-		return "iter"
-	case KindIterCluster:
-		return "itercluster"
 	case KindMap:
 		return "map"
 	case KindReduce:
 		return "reduce"
-	case KindStore:
-		return "store"
-	case KindReturn:
-		return "return"
+	case KindMemLoad:
+		return "memload"
+	case KindMemStore:
+		return "memstore"
+	case KindMemNew:
+		return "memnew"
+	case KindIter:
+		return "iter"
+	case KindIterCluster:
+		return "itercluster"
 	case KindConst:
 		return "const"
 	case KindParam:
@@ -68,16 +94,26 @@ func (k Kind) String() string {
 		return "call"
 	case KindInputParam:
 		return "inputparam"
+	case KindReturn:
+		return "return"
+	case KindForLoop:
+		return "forloop"
 	case KindDimVar:
 		return "dimvar"
 	case KindBoundedDimVar:
 		return "bdimvar"
-	case KindLoadTile:
-		return "loadtile"
-	case KindStoreTile:
-		return "storetile"
-	case KindForLoop:
-		return "forloop"
+	case KindMemLoadSMem:
+		return "memloadsmem"
+	case KindMemStoreSMem:
+		return "memstoresmem"
+	case KindMemNewSMem:
+		return "memnewsmem"
+	case KindFragLoad:
+		return "fragload"
+	case KindFragStore:
+		return "fragstore"
+	case KindFragNew:
+		return "fragnew"
 	case KindEnd:
 		return "end"
 	default:
@@ -85,19 +121,20 @@ func (k Kind) String() string {
 	}
 }
 
-// Family classifies a Kind into its node family (D-15). FamilyLoop and
-// FamilyTileOp gained their first members with the Phase 1 lowered suite
-// (forloop; loadtile/storetile); FamilyCollective remains reserved with no
-// member kinds until reduce lowering lands. New Phase 3-4 lowering kinds
-// join via new constants without enum surgery (single-tier IR rule).
+// Family classifies a Kind into its node family (D-15). FamilyMemory gained
+// the whole HIR GMEM family (MemLoad/MemStore/MemNew) and the lowered SMEM/
+// FRAG families with the v3 re-organization, replacing FamilyTileOp (the
+// LoadTile/StoreTile kinds are gone — R4d). FamilyCollective remains reserved
+// with no member kinds until reduce lowering lands. New lowering kinds join
+// via new constants without enum surgery (single-tier IR rule).
 type Family int
 
 const (
-	FamilyAbstract Family = iota
-	FamilyLoop
-	FamilyTileOp
-	FamilyCollective
-	FamilyScalarExpr
+	FamilyAbstract   Family = iota
+	FamilyLoop              // iter/itercluster headers and the lowered for-loop
+	FamilyMemory            // GMEM MemLoad/MemStore/MemNew + lowered SMEM/FRAG families
+	FamilyCollective        // reserved: reducers/collectives (no members yet)
+	FamilyScalarExpr        // const/param/binop/unaryop/select/cast/call
 )
 
 // Family returns the family of the kind.
@@ -105,113 +142,17 @@ func (k Kind) Family() Family {
 	switch k {
 	case KindConst, KindParam, KindBinOp, KindUnaryOp, KindSelect, KindCast, KindCall:
 		return FamilyScalarExpr
-	case KindLoadTile, KindStoreTile:
-		return FamilyTileOp
-	case KindForLoop:
+	case KindMemLoad, KindMemStore, KindMemNew,
+		KindMemLoadSMem, KindMemStoreSMem, KindMemNewSMem,
+		KindFragLoad, KindFragStore, KindFragNew:
+		return FamilyMemory
+	case KindIter, KindIterCluster, KindForLoop:
 		return FamilyLoop
 	default:
-		// KindIter, KindIterCluster, KindMap, KindReduce, KindStore,
-		// KindReturn, KindInputParam, KindDimVar, KindBoundedDimVar, and
-		// the sentinel values belong to the abstract suite (the lowered
-		// dimvars are value-level IV objects, doc/optana/
+		// KindMap, KindReduce, KindInputParam, KindReturn, KindDimVar,
+		// KindBoundedDimVar, and the sentinel values belong to the abstract
+		// suite (the lowered dimvars are value-level IV objects, doc/optana/
 		// induction_variable.md, not loop-nest structure).
 		return FamilyAbstract
-	}
-}
-
-// BinOpCode is the binary operator table, mirroring doc/syntax.md §7.6
-// precedence levels from loosest to tightest binding.
-type BinOpCode int
-
-const (
-	BinOpInvalid BinOpCode = iota
-	BinOpLOr               // ||
-	BinOpLAnd              // &&
-	BinOpOr                // |
-	BinOpXor               // ^
-	BinOpAnd               // &
-	BinOpEq                // ==
-	BinOpNE                // !=
-	BinOpLT                // <
-	BinOpLE                // <=
-	BinOpGT                // >
-	BinOpGE                // >=
-	BinOpShL               // <<
-	BinOpShR               // >>
-	BinOpAdd               // +
-	BinOpSub               // -
-	BinOpMul               // *
-	BinOpDiv               // /
-	BinOpMod               // %
-)
-
-// String returns the canonical source spelling of the operator.
-func (op BinOpCode) String() string {
-	switch op {
-	case BinOpLOr:
-		return "||"
-	case BinOpLAnd:
-		return "&&"
-	case BinOpOr:
-		return "|"
-	case BinOpXor:
-		return "^"
-	case BinOpAnd:
-		return "&"
-	case BinOpEq:
-		return "=="
-	case BinOpNE:
-		return "!="
-	case BinOpLT:
-		return "<"
-	case BinOpLE:
-		return "<="
-	case BinOpGT:
-		return ">"
-	case BinOpGE:
-		return ">="
-	case BinOpShL:
-		return "<<"
-	case BinOpShR:
-		return ">>"
-	case BinOpAdd:
-		return "+"
-	case BinOpSub:
-		return "-"
-	case BinOpMul:
-		return "*"
-	case BinOpDiv:
-		return "/"
-	case BinOpMod:
-		return "%"
-	default:
-		return "?"
-	}
-}
-
-// UnaryOpCode is the unary operator table, mirroring doc/syntax.md §7.6.
-type UnaryOpCode int
-
-const (
-	UnaryOpInvalid UnaryOpCode = iota
-	UnaryOpPos                 // +
-	UnaryOpNeg                 // -
-	UnaryOpLNot                // !
-	UnaryOpNot                 // ~
-)
-
-// String returns the canonical source spelling of the operator.
-func (op UnaryOpCode) String() string {
-	switch op {
-	case UnaryOpPos:
-		return "+"
-	case UnaryOpNeg:
-		return "-"
-	case UnaryOpLNot:
-		return "!"
-	case UnaryOpNot:
-		return "~"
-	default:
-		return "?"
 	}
 }

@@ -88,15 +88,35 @@
 //     producer-first via pipeInput), golden-pinned — Walk must never be used
 //     where emission order matters.
 //
-//   - Lowered suite (review P1R-04): dimvar/bounded-dimvar (value-object
-//     induction variables, (init, step) tuples with EQ/NE and the
-//     Include/Belong relations of doc/optana/induction_variable.md),
-//     loadtile/storetile (FamilyTileOp; the tensor is an OPERAND slot, the
-//     axes bounded dimvars), and the explicit for-loop (FamilyLoop; ops =
-//     [iv, bound, body]). Kinds are append-only with a versioned Kind
-//     enumeration (IR-03; KindVersion bumps on additions); the verifier's
-//     shape checks fail closed on operand kinds (bdimvar binds a dimvar,
-//     tiles bind a RoleTensor InputParam, for-loops bind a dimvar).
+//   - Lowered suite (D-3, quick-261018-bl0): the LIR tier of the catalog —
+//     dimvar/bounded-dimvar (value-object induction variables, (init, step)
+//     tuples with EQ/NE and the Include/Belong relations of
+//     doc/optana/induction_variable.md), the explicit for-loop (FamilyLoop;
+//     ops = [iv, bound, body]), and the lowered memory family (FamilyMemory;
+//     SMEM MemLoadSMem/MemStoreSMem/MemNewSMem and FRAG FragLoad/FragStore/
+//     FragNew — the tensor/smem/frag buffer is an OPERAND slot, the axes are
+//     bounded dimvars). The HIR tier owns the abstract stage suite (map/
+//     reduce/iter/itercluster), the GMEM family (MemLoad/MemStore/MemNew),
+//     the scalar-expression suite, InputParam, and the Return end node.
+//     Kinds are cataloged in catalog.go (the dedicated listing file, R4e):
+//     tier, family, arity, and doc per kind, with the append-only versioning
+//     rule of IR-03 (KindVersion 3 is the deliberate one-time tinycudaopto
+//     re-organization); the verifier's shape checks fail closed on operand
+//     kinds (bdimvar binds a dimvar, GMEM tensors bind a RoleTensor
+//     InputParam, SMEM buffers bind a MemNewSMem, FRAG buffers bind a
+//     FragNew, for-loops bind a dimvar).
+//
+//   - Layered node files (R4a, quick-261018-bl0): the concrete node structs
+//     live in node_xxx.go files next to this one — node_lambda.go (map/reduce
+//
+//   - the Lambda record), node_expr.go (scalar-expression suite + the
+//     opcode tables), node_var.go (InputParam + ParamRole), node_memory.go
+//     (HIR GMEM family + the access payload), node_loop.go (iter/
+//     itercluster/forloop), node_dimvar.go (IV value objects + relations),
+//     node_lir_memory.go (SMEM/FRAG family + StorageClass), node_end.go
+//     (Return). node.go holds the shared Base cell, the node interfaces, and
+//     the Graph allocation/wiring primitives; the kind→struct dispatch in
+//     Graph.allocNode is the ONE place a new node kind joins the suite.
 //
 // Interface-width contract (directive 4): Node has exactly 2 methods
 // (BasePtr, KindOf); Value adds exactly IsNone; Type adds exactly Equal;

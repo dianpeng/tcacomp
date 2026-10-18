@@ -13,9 +13,9 @@ func TestIntrusiveListRemoval(t *testing.T) {
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 	env := NewEnv()
-	g.NewStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 1))
-	g.NewStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 2))
-	g.NewStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 3))
+	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 2))
+	g.NewMemStoreChained("ctor", env, out, []Node{m}, g.NewConst("ctor", f32, 3))
 
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)
@@ -64,7 +64,7 @@ func TestIntrusiveListInsert(t *testing.T) {
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestStatementKindClassification(t *testing.T) {
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 
-	st := g.NewStore("ctor", out, []Node{m}, v)
+	st := g.NewMemStore("ctor", out, []Node{m}, v)
 	ret := g.NewReturn("ctor", st)
 	if classifyStmt(st) != StmtEffect || classifyStmt(ret) != StmtEffect {
 		t.Fatal("store and return roots must classify as StmtEffect")
@@ -160,10 +160,10 @@ func TestInputParamReferences(t *testing.T) {
 	body := g.NewBinOp("ctor", BinOpMul, g.NewParamRef("ctor", v), g.NewConst("ctor", f32, 2))
 	rootMap := g.NewMap("ctor", nil, NewLambda([]Node{v}, body), []Node{m, k})
 	ic := g.NewIterCluster("ctor", []Node{m, k}, rootMap)
-	st := g.NewStore("ctor", out, []Node{m, k}, ic)
+	st := g.NewMemStore("ctor", out, []Node{m, k}, ic)
 
 	// The store's payload uses resolve to the parameter nodes.
-	sn := st.(*storeNode)
+	sn := st.(*memStoreNode)
 	if sn.target.tensorUse.SSA().Node() != out {
 		t.Fatal("store target tensor use must resolve to the tensor InputParam node")
 	}
@@ -215,7 +215,7 @@ func TestEraseIsO1(t *testing.T) {
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	st := g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1.0))
+	st := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1.0))
 	last := g.NewReturn("ctor", st)
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)

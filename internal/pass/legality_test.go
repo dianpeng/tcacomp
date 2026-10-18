@@ -20,7 +20,7 @@ func cleanOracle() *ir.Graph {
 	sum := g.NewBinOp("test", ir.BinOpAdd, c1, c2)
 	// The store and return auto-register as effect roots; both reference
 	// sum, so the whole tree is reachable from the Level-1 walk roots.
-	g.NewStore("test", tensor, nil, sum)
+	g.NewMemStore("test", tensor, nil, sum)
 	g.NewReturn("test", sum)
 	return g
 }

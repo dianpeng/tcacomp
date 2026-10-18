@@ -180,15 +180,16 @@ func (s *Statement) Value() Value {
 // is unwired (always true for StmtEffect statements).
 func (s *Statement) Def() SSADef { return s.def }
 
-// classifyStmt assigns the statement kind from the RHS root: a store is the
-// v0 side-effecting stage (StmtEffect), a none-Value root (kernel return)
-// binds no local either, and everything else is an assign statement.
+// classifyStmt assigns the statement kind from the RHS root: a memory store
+// (GMEM/SMEM/FRAG) is a side-effecting operation (StmtEffect), a none-Value
+// root (kernel return) binds no local either, and everything else is an
+// assign statement.
 func classifyStmt(rhs Node) StmtKind {
 	if rhs == nil {
 		return StmtAssign
 	}
 	switch rhs.KindOf() {
-	case KindStore, KindReturn:
+	case KindMemStore, KindMemStoreSMem, KindFragStore, KindReturn:
 		return StmtEffect
 	}
 	return StmtAssign

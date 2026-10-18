@@ -9,19 +9,22 @@ package ir
 // order" to serialize memory operations. The total order of side effects is
 // carried EXPLICITLY instead:
 //
-//   - Every effectful node (store, tile store, kernel return) is registered in
-//     Graph.effectRoots at allocation, so Level-1 Walk/Verify/DCE have
-//     non-statement roots (allocation order — deterministic, never map
-//     iteration).
+//   - Every effectful node (GMEM store, SMEM/FRAG store, kernel return) is
+//     registered in Graph.effectRoots at allocation, so Level-1 Walk/Verify/
+//     DCE have non-statement roots (allocation order — deterministic, never
+//     map iteration). (R3's two-root-set model — end node + RoleTensor
+//     params, with SMEM/FRAG stores NOT observable — arrives in
+//     quick-261018-bl0 task 2.)
 //
-//   - A store additionally records its per-tensor ordering edge: effectIns,
-//     the ImpactBy payload — SSAUse records pointing at the previous chain
-//     head for the same tensor. Because effectIns ride the ordinary
-//     payloadBearer enumeration (storeNode.forEachPayloadUse appends them
-//     after the target access), the verifier's existing use-def/def-use
-//     invariants and Walk cover them in BOTH chain directions with zero new
-//     checkers (T-quick-01), and Level-1 DCE follows them so an overwritten
-//     chain keeps its predecessors alive.
+//   - A memory access additionally records its per-tensor ordering edge:
+//     effectIns, the ImpactBy payload — SSAUse records pointing at the
+//     previous chain head for the same tensor. Chains include READS as well
+//     as writes (skeleton memory.go): NewMemLoadChained chains a load exactly
+//     like NewMemStoreChained chains a store. Because effectIns ride the
+//     ordinary payloadBearer enumeration, the verifier's existing use-def/
+//     def-use invariants and Walk cover them in BOTH chain directions with
+//     zero new checkers (T-quick-01), and Level-1 DCE follows them so an
+//     overwritten chain keeps its predecessors alive.
 //
 // The per-tensor chains are maintained by a construction-time environment
 // object (Env). RESTRICT-ALIAS RULE (skeleton memory.go): the model works
@@ -31,17 +34,18 @@ package ir
 // pointer (review P1R-01: identity is never a name).
 //
 // Effect verdicts (skeleton effect.go shape, local naming): for now there is
-// no fine-grained categorization, just free vs. full. A store is fully
-// effectful; a kernel return is effectful-via-operand — it reads the stored
-// value through its operand SSAUse, so it carries NO chain of its own and its
-// ImpactBy is empty.
+// no fine-grained categorization, just free vs. full (X-3). A GMEM store is
+// fully effectful; a kernel return is effectful-via-ImpactBy (R2: its payload
+// carries every mem-param's final chain state — task 2). SMEM/FRAG stores and
+// loads are FREE: they are in-program memory, not observable kernel I/O, so
+// they are dead-code-eligible when unreferenced (R3).
 
 // Effect verdict constants (Effect.Kind values).
 const (
 	// EffectFree marks a node with no observable side effect.
 	EffectFree = iota
-	// EffectFull marks a node with an observable side effect (store, tile
-	// store, kernel return).
+	// EffectFull marks a node with an observable side effect (GMEM store,
+	// kernel return).
 	EffectFull
 )
 
@@ -74,15 +78,17 @@ func (e Effect) String() string {
 
 // EffectOf returns the side-effect verdict of n (skeleton Value.Effect,
 // delivered as a function to keep the Node interface at exactly two methods —
-// directive 4's interface-width contract). Stores, tile stores, and kernel
-// returns are fully effectful; every other kind is free. Effect-free subtrees
-// are dead-code-eligible at Level 1 when unreachable from the roots.
+// directive 4's interface-width contract). GMEM stores and kernel returns are
+// fully effectful; every other kind — including the lowered SMEM/FRAG memory
+// family, which is in-program memory, not observable kernel I/O (R3) — is
+// free. Effect-free subtrees are dead-code-eligible at Level 1 when
+// unreachable from the roots.
 func EffectOf(n Node) Effect {
 	if n == nil {
 		return NewEffectFree()
 	}
 	switch n.KindOf() {
-	case KindStore, KindStoreTile, KindReturn:
+	case KindMemStore, KindReturn:
 		return NewEffectFull()
 	}
 	return NewEffectFree()
@@ -90,9 +96,10 @@ func EffectOf(n Node) Effect {
 
 // ImpactBy returns the effect-input uses of n — the SSAUse records forming
 // its per-tensor ordering edges — or nil when n carries none. It is the
-// exported read face of the storeNode.effectIns payload; like the skeleton's
-// Value.ImpactBy, a nil result means "no ordering constraint of its own"
-// (which includes every non-store node and every chain-head store).
+// exported read face of the memory family's effectIns payload; like the
+// skeleton's Value.ImpactBy, a nil result means "no ordering constraint of
+// its own" (which includes every non-memory node and every chain-head
+// access).
 func ImpactBy(n Node) []SSAUse {
 	if eb, ok := n.(effectBearer); ok {
 		return eb.impactBy()
@@ -111,10 +118,12 @@ type effectBearer interface {
 // "global state, ie environment"): one isolated effect chain per kernel
 // tensor. Each chain is keyed by the tensor's RoleTensor InputParam NODE —
 // never by name (review P1R-01) — and holds the chain's current head: the
-// most recent store node against that tensor. A store created through the
-// env-aware path (NewStoreChained) wires ImpactBy = the current head, then
-// becomes the new head, so two stores to one tensor form an explicit
-// second-ImpactBy-first edge while stores to distinct tensors stay isolated.
+// most recent memory access (store OR load, see node_memory.go) against that
+// tensor. An access created through the env-aware path (NewMemStoreChained/
+// NewMemLoadChained) wires ImpactBy = the current head, then becomes the new
+// head, so two accesses to one tensor form an explicit
+// second-ImpactBy-first edge while accesses to distinct tensors stay
+// isolated.
 //
 // The restrict-alias rule is the precondition that makes name-free chaining
 // sound: kernel tensors never alias (skeleton memory.go rationale). It is a
@@ -122,18 +131,20 @@ type effectBearer interface {
 // frontend, exactly like the skeleton.
 //
 // An Env is graph-agnostic (chains are keyed by *Base identity), so one Env
-// can serve one builder's whole construction; a nil *Env is accepted by
-// NewStoreChained and simply leaves the store un-chained.
+// can serve one builder's whole construction; a nil *Env is accepted by the
+// chained constructors and simply leaves the access un-chained.
 type Env struct {
-	heads map[*Base]Node // tensor InputParam Base -> current chain-head store node
+	heads map[*Base]Node // tensor InputParam Base -> current chain-head memory node
 }
 
 // NewEnv creates an empty construction environment: no known chains.
 func NewEnv() *Env { return &Env{heads: make(map[*Base]Node)} }
 
 // NoteStore records store as the new chain head for tensor (the tensor's
-// RoleTensor InputParam node). It is the Env half of the env-aware store
-// path; NewStoreChained calls it — direct use is for white-box tests.
+// RoleTensor InputParam node). It is the Env half of the env-aware memory
+// path; the chained constructors call it — direct use is for white-box
+// tests. Despite the historical name it accepts any memory access (loads
+// chain too, skeleton memory.go).
 func (e *Env) NoteStore(tensor Node, store Node) {
 	if e == nil || tensor == nil || store == nil {
 		return
@@ -141,7 +152,7 @@ func (e *Env) NoteStore(tensor Node, store Node) {
 	e.heads[tensor.BasePtr()] = store
 }
 
-// ChainHead returns the current chain head for tensor, or nil when no store
+// ChainHead returns the current chain head for tensor, or nil when no access
 // against that tensor has been noted.
 func (e *Env) ChainHead(tensor Node) Node {
 	if e == nil || tensor == nil {
@@ -150,17 +161,17 @@ func (e *Env) ChainHead(tensor Node) Node {
 	return e.heads[tensor.BasePtr()]
 }
 
-// NewStoreChained creates a store exactly like NewStore and additionally
+// NewMemStoreChained creates a store exactly like NewMemStore and additionally
 // wires it into the construction environment's per-tensor effect chain: when
 // tensor has a known chain head, the new store's ImpactBy payload points at
 // it (one SSAUse per chain head, via the ordinary payload wiring), giving the
 // sea-of-nodes its explicit total order for that tensor; the new store then
-// becomes the chain head. A nil env (or a tensor with no prior store) leaves
-// the store un-chained — identical to NewStore. The store is registered as an
-// effect root either way (allocation-time, kind-based), so Level-1
+// becomes the chain head. A nil env (or a tensor with no prior access) leaves
+// the store un-chained — identical to NewMemStore. The store is registered as
+// an effect root either way (allocation-time, kind-based), so Level-1
 // Walk/Verify/DCE see it without any statement structure.
-func (g *Graph) NewStoreChained(origin string, env *Env, tensor Node, axes []Node, value Node) Node {
-	n := g.NewStore(origin, tensor, axes, value).(*storeNode)
+func (g *Graph) NewMemStoreChained(origin string, env *Env, tensor Node, axes []Node, value Node) Node {
+	n := g.NewMemStore(origin, tensor, axes, value).(*memStoreNode)
 	if head := env.ChainHead(tensor); head != nil {
 		n.effectIns = append(n.effectIns, wirePayloadUse(n, head))
 	}

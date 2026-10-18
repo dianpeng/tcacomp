@@ -2,7 +2,7 @@ statement #8:
   iter(@m, @k, @n) -> map(lhs[@m][@n], rhs[@n][@k], lambda(l, r): l * r) as (@m, @k, @n) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now) |
   iter() -> map(%0, lambda(v): v * scale) as (@m, @k) |
-  store(%output[@m][@k], %0)
+  memstore(%output[@m][@k], %0)
 
 statement #9:
   return %output

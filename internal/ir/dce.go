@@ -127,13 +127,13 @@ func markReachable(g *Graph) map[Node]bool {
 }
 
 // isEffectKind reports whether kind k carries an observable side effect in
-// v0. Stores, kernel returns, and tile stores are the only effects;
-// everything else — including loads and loop nests without an effect in
-// their body (caught by hasEffectNode's reachability walk) — is
+// v0. The memory-store family (GMEM/SMEM/FRAG) and kernel returns are the
+// only effects; everything else — including loads and loop nests without an
+// effect in their body (caught by hasEffectNode's reachability walk) — is
 // dead-code-eligible when unreferenced.
 func isEffectKind(k Kind) bool {
 	switch k {
-	case KindStore, KindReturn, KindStoreTile:
+	case KindMemStore, KindMemStoreSMem, KindFragStore, KindReturn:
 		return true
 	}
 	return false

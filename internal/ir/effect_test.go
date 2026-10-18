@@ -22,7 +22,7 @@ func TestEffectVerdicts(t *testing.T) {
 	if e := EffectOf(val); e.Has() {
 		t.Fatalf("const must be effect-free, got %s", e)
 	}
-	st := g.NewStore("ctor", out1, []Node{m}, val)
+	st := g.NewMemStore("ctor", out1, []Node{m}, val)
 	if e := EffectOf(st); !e.Has() {
 		t.Fatal("store must be fully effectful")
 	}
@@ -46,7 +46,7 @@ func TestEffectVerdicts(t *testing.T) {
 // memory node, per the skeleton's invariant).
 func TestUnchainedStoreHasNoImpactBy(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
-	st := g.NewStore("ctor", out1, []Node{m}, val)
+	st := g.NewMemStore("ctor", out1, []Node{m}, val)
 	if got := ImpactBy(st); len(got) != 0 {
 		t.Fatalf("un-chained store has %d ImpactBy edges, want 0", len(got))
 	}
@@ -62,8 +62,8 @@ func TestSameTensorStoresChain(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	env := NewEnv()
 
-	st1 := g.NewStoreChained("ctor", env, out1, []Node{m}, val)
-	st2 := g.NewStoreChained("ctor", env, out1, []Node{m}, val)
+	st1 := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
+	st2 := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
 
 	if got := ImpactBy(st1); len(got) != 0 {
 		t.Fatalf("first store must not be ordered after anything, got %d edges", len(got))
@@ -93,8 +93,8 @@ func TestCrossTensorStoresStayIsolated(t *testing.T) {
 	g, m, out1, out2, val := twoTensorGraph(t)
 	env := NewEnv()
 
-	g.NewStoreChained("ctor", env, out1, []Node{m}, val)
-	stB := g.NewStoreChained("ctor", env, out2, []Node{m}, val)
+	g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
+	stB := g.NewMemStoreChained("ctor", env, out2, []Node{m}, val)
 
 	if got := ImpactBy(stB); len(got) != 0 {
 		t.Fatalf("store to a fresh tensor must not be ordered after the other tensor's chain, got %d edges", len(got))
@@ -107,7 +107,7 @@ func TestCrossTensorStoresStayIsolated(t *testing.T) {
 func TestEffectRootsRegistered(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	bin := g.NewBinOp("ctor", BinOpAdd, val, val)
-	st := g.NewStore("ctor", out1, []Node{m}, bin)
+	st := g.NewMemStore("ctor", out1, []Node{m}, bin)
 	ret := g.NewReturn("ctor", st)
 
 	roots := g.effectRoots
@@ -139,8 +139,8 @@ func containsNode(ns []Node, want Node) bool {
 func TestImpactByPayloadEnumeration(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	env := NewEnv()
-	g.NewStoreChained("ctor", env, out1, []Node{m}, val)
-	st2 := g.NewStoreChained("ctor", env, out1, []Node{m}, val).(*storeNode)
+	g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
+	st2 := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val).(*memStoreNode)
 
 	// Payload order: tensor, axes, then effect inputs.
 	var payload []Node
@@ -165,12 +165,12 @@ func TestImpactByPayloadEnumeration(t *testing.T) {
 	}
 }
 
-// TestNilEnvStoreChained pins the nil-env path: NewStoreChained with a nil
+// TestNilEnvStoreChained pins the nil-env path: NewMemStoreChained with a nil
 // environment degrades to exactly NewStore (no edges, still an effect root).
 func TestNilEnvStoreChained(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	var env *Env
-	st := g.NewStoreChained("ctor", env, out1, []Node{m}, val)
+	st := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
 	if got := ImpactBy(st); len(got) != 0 {
 		t.Fatalf("nil-env chained store must carry no ImpactBy edges, got %d", len(got))
 	}

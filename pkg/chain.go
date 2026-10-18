@@ -340,7 +340,7 @@ func (c *chain) store(t Tensor, axes ...Dim) (*Stored, error) {
 			return nil, fmt.Errorf("store: @%s is not a live axis at this point of the chain", ax.Name())
 		}
 	}
-	node := c.b.g.NewStoreChained(origin, c.b.env, t.node, dimNodes(axes), c.pipe)
+	node := c.b.g.NewMemStoreChained(origin, c.b.env, t.node, dimNodes(axes), c.pipe)
 	c.b.g.PinStatementID(node, c.id)
 	c.b.chain = nil
 	c.b.noteOutput(t, node, c.retID)

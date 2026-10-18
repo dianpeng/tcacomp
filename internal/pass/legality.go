@@ -73,16 +73,18 @@ func init() {
 	windows[StageConstructed] = constructedWindow()
 }
 
-// constructedWindow marks EVERY Phase-1 kind (KindIter..KindForLoop — the
-// whole abstract, scalar-expr, parameter, and lowered node suite) explicitly
-// Legal. The entries are written out one by one so a future kind appended
-// before KindEnd is visibly absent here until the window is revised.
+// constructedWindow marks EVERY catalog kind (the whole HIR and LIR tiers —
+// ir.AllKinds()) explicitly Legal. Iterating the catalog instead of an enum
+// range keeps the window honest when a future kind inserts before KindEnd:
+// the new kind is present in AllKinds from the day its catalog row lands, so
+// it is Legal here until the window is deliberately revised (the catalog row
+// is the visible revision point).
 func constructedWindow() *LegalityWindow {
 	w := &LegalityWindow{
 		Actions:    make(map[ir.Kind]LegalityAction),
 		Predicates: make(map[ir.Kind]func(ir.Node) error),
 	}
-	for k := ir.KindIter; k <= ir.KindForLoop; k++ {
+	for _, k := range ir.AllKinds() {
 		w.Actions[k] = Legal
 	}
 	return w

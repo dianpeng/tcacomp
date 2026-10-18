@@ -140,7 +140,7 @@ func TestStatementValueNone(t *testing.T) {
 	// A store root produces the stored value (doc §2.5): NOT a none Value.
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	st := g.NewStore("ctor", out, []Node{m}, v)
+	st := g.NewMemStore("ctor", out, []Node{m}, v)
 	ret := g.NewReturn("ctor", st)
 
 	if err := g.Materialize(); err != nil {

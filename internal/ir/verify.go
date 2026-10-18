@@ -131,9 +131,11 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 }
 
 // checkNodeShape enforces the per-kind operand-shape invariants of the
-// lowered node suite (review P1R-04), fail-closed: a bounded dimvar binds a
-// dimvar, tile tensor operands bind a RoleTensor InputParam, and a for-loop
-// binds a dimvar. Nil operands are left to the generic use-def slot check.
+// memory and loop node suites, fail-closed: a bounded dimvar binds a
+// dimvar; HIR GMEM load/store tensors bind a RoleTensor InputParam; LIR
+// SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a FragNew
+// buffer; and a for-loop binds a dimvar. Nil operands are left to the
+// generic use-def slot check.
 func checkNodeShape(n Node, vs *[]Violation) {
 	switch t := n.(type) {
 	case *boundedDimVarNode:
@@ -143,10 +145,18 @@ func checkNodeShape(n Node, vs *[]Violation) {
 					"bounded dimvar operand 0 must be a dimvar"))
 			}
 		}
-	case *loadTileNode:
-		checkTileTensor(n, operandAt(t, 0), vs)
-	case *storeTileNode:
-		checkTileTensor(n, operandAt(t, 1), vs)
+	case *memLoadNode:
+		checkTensorParam(n, operandAt(t, 0), vs)
+	case *memStoreNode:
+		checkTensorParam(n, t.target.tensorUse.Def(), vs)
+	case *memLoadSMemNode:
+		checkSMemBuffer(n, operandAt(t, 0), vs)
+	case *memStoreSMemNode:
+		checkSMemBuffer(n, operandAt(t, 1), vs)
+	case *fragLoadNode:
+		checkFragBuffer(n, operandAt(t, 0), vs)
+	case *fragStoreNode:
+		checkFragBuffer(n, operandAt(t, 1), vs)
 	case *forLoopNode:
 		if iv := operandAt(t, 0); iv != nil {
 			if _, ok := iv.(*dimVarNode); !ok {
@@ -157,17 +167,43 @@ func checkNodeShape(n Node, vs *[]Violation) {
 	}
 }
 
-// checkTileTensor pins a tile node's tensor operand to a RoleTensor
-// InputParam node (the lowered suite promotes the abstract store's payload
-// access into an ordinary operand; the bound must be the parameter itself).
-func checkTileTensor(n Node, tensor Node, vs *[]Violation) {
+// checkTensorParam pins an HIR GMEM access's tensor operand to a RoleTensor
+// InputParam node (the kernel I/O symbol itself — the access axes are the
+// dim operands that follow).
+func checkTensorParam(n Node, tensor Node, vs *[]Violation) {
 	if tensor == nil {
 		return
 	}
 	ip, ok := tensor.(*inputParamNode)
 	if !ok || ip.role != RoleTensor {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			"tile tensor operand must be a RoleTensor InputParam node"))
+			"tensor operand must be a RoleTensor InputParam node"))
+	}
+}
+
+// checkSMemBuffer pins an LIR SMEM access's buffer operand to a MemNewSMem
+// node (the lowered suite promotes the buffer into ordinary SSA data flow;
+// the buffer's def must be the allocation itself).
+func checkSMemBuffer(n Node, buf Node, vs *[]Violation) {
+	if buf == nil {
+		return
+	}
+	if _, ok := buf.(*memNewSMemNode); !ok {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			"smem buffer operand must be a MemNewSMem node"))
+	}
+}
+
+// checkFragBuffer pins an LIR fragment access's buffer operand to a FragNew
+// node (the lowered suite promotes the buffer into ordinary SSA data flow;
+// the buffer's def must be the allocation itself).
+func checkFragBuffer(n Node, buf Node, vs *[]Violation) {
+	if buf == nil {
+		return
+	}
+	if _, ok := buf.(*fragNewNode); !ok {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			"frag buffer operand must be a FragNew node"))
 	}
 }
 

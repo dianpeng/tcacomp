@@ -13,7 +13,7 @@ func TestMaterializeGuards(t *testing.T) {
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
 
 	if g.Block() != nil || g.CFG() != nil {
 		t.Fatal("a fresh Level-1 graph must have no block and no CFG")
@@ -48,8 +48,8 @@ func TestMaterializeEffectRootOrder(t *testing.T) {
 	out2 := g.NewInputParam("ctor", RoleTensor, "out2", InternTensor(TF32, []DimRef{{Name: "m"}}))
 
 	shared := g.NewBinOp("ctor", BinOpAdd, g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 2))
-	st1 := g.NewStore("ctor", out1, []Node{m}, shared)
-	st2 := g.NewStore("ctor", out2, []Node{m}, shared)
+	st1 := g.NewMemStore("ctor", out1, []Node{m}, shared)
+	st2 := g.NewMemStore("ctor", out2, []Node{m}, shared)
 	ret := g.NewReturn("ctor", st1)
 
 	if err := g.Materialize(); err != nil {
@@ -84,7 +84,7 @@ func TestMaterializePinnedIDs(t *testing.T) {
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 
 	g.PinStatementID(nil, 99) // nil root: ignored, never a panic
-	st := g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	st := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
 	g.PinStatementID(st, 40)
 	g.NewReturn("ctor", st) // unpinned
 
@@ -109,8 +109,8 @@ func TestMaterializeSkipsErasedRoots(t *testing.T) {
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	dead := g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
-	st := g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 2))
+	dead := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	st := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 2))
 	ret := g.NewReturn("ctor", st)
 
 	ctx := &MutContext{Pass: "test"}
@@ -137,7 +137,7 @@ func TestPrintRequiresMaterialize(t *testing.T) {
 	f32 := InternScalar(TF32)
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
-	g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
 
 	if got := Print(g); got != "ir: graph not materialized\n" {
 		t.Fatalf("Print on an unmaterialized graph = %q, want the deterministic marker", got)

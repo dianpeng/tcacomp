@@ -21,7 +21,7 @@ func dceTestGraph() (*Graph, Node, Node) {
 	tmp := g.NewBinOp("ctor", BinOpMul, shared, shared)
 	dead2 := g.NewBinOp("ctor", BinOpAdd, tmp, tmp)
 
-	st := g.NewStore("ctor", out, []Node{m}, shared)
+	st := g.NewMemStore("ctor", out, []Node{m}, shared)
 	g.NewReturn("ctor", st)
 
 	return g, tmp, dead2
@@ -60,7 +60,7 @@ func TestBuildingDCEWipesUnreferenced(t *testing.T) {
 
 	// The surviving graph is verifier-clean at BOTH levels: shared lost its
 	// dead-side records and keeps exactly the store's use.
-	shared := bb.First().RHS().(*storeNode).ops[0].SSA().Node()
+	shared := bb.First().RHS().(*memStoreNode).ops[0].SSA().Node()
 	if got := len(UsesOf(shared)); got != 1 {
 		t.Fatalf("shared def has %d uses after DCE, want 1 (the store)", got)
 	}
@@ -105,7 +105,7 @@ func TestBuildingDCEKeepsSideEffects(t *testing.T) {
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 	v := g.NewConst("ctor", f32, 1)
-	st := g.NewStore("ctor", out, []Node{m}, v)
+	st := g.NewMemStore("ctor", out, []Node{m}, v)
 	g.NewReturn("ctor", st)
 
 	if err := BuildingDCE(g); err != nil {
@@ -133,7 +133,7 @@ func TestBuildingDCESharedDefSurvives(t *testing.T) {
 	if err := g.Materialize(); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
-	shared := g.Block().First().RHS().(*storeNode).ops[0].SSA().Node()
+	shared := g.Block().First().RHS().(*memStoreNode).ops[0].SSA().Node()
 	if shared.BasePtr().erased {
 		t.Fatal("shared def must survive: the live store references it")
 	}
@@ -157,7 +157,7 @@ func TestBuildingDCENoDeadIsNoOp(t *testing.T) {
 	m := g.NewInputParam("ctor", RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", RoleTensor, "out", InternTensor(TF32, []DimRef{{Name: "m"}}))
 	v := g.NewConst("ctor", f32, 1)
-	st := g.NewStore("ctor", out, []Node{m}, v)
+	st := g.NewMemStore("ctor", out, []Node{m}, v)
 	ret := g.NewReturn("ctor", st)
 
 	if err := BuildingDCE(g); err != nil {
@@ -190,7 +190,7 @@ func TestBuildingDCESeaWipesAbandonedChain(t *testing.T) {
 	abandoned = g.NewIterCluster("ctor", []Node{m}, abandoned)
 
 	// The real chain: a store + return over an unrelated value.
-	st := g.NewStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
+	st := g.NewMemStore("ctor", out, []Node{m}, g.NewConst("ctor", f32, 1))
 	g.NewReturn("ctor", st)
 
 	if err := BuildingDCE(g); err != nil {

@@ -26,7 +26,7 @@ func buildDotGraph() *ir.Graph {
 		ir.NewLambda([]ir.Node{v}, g.NewParamRef("dot-test", v)),
 		[]ir.Node{m})
 	ic := g.NewIterCluster("dot-test", []ir.Node{m}, rootMap)
-	g.NewStore("dot-test", out, []ir.Node{m}, ic) // auto-registers as an effect root
+	g.NewMemStore("dot-test", out, []ir.Node{m}, ic) // auto-registers as an effect root
 	if err := g.Materialize(); err != nil {
 		panic(err)
 	}

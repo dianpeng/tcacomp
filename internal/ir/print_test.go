@@ -37,7 +37,7 @@ func buildSmallChain() *Graph {
 	combBody := g.NewBinOp("test", BinOpAdd, g.NewParamRef("test", acc), g.NewParamRef("test", now))
 	red := g.NewReduce("test", init, ic, NewLambda([]Node{acc, now}, combBody))
 
-	store := g.NewStore("test", out, []Node{m, k}, red)
+	store := g.NewMemStore("test", out, []Node{m, k}, red)
 	g.NewReturn("test", store) // effect roots: store and return
 	if err := g.Materialize(); err != nil {
 		panic(err)
@@ -55,7 +55,7 @@ func buildSmallChain() *Graph {
 const smallChainPrint = `statement #23:
   iter(@m, @k) -> map(scale, lambda(v): v * (1.0 + 2.0)) as (@m, @k) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now) |
-  store(%output[@m][@k], %0)
+  memstore(%output[@m][@k], %0)
 
 statement #24:
   return %output`
@@ -177,7 +177,7 @@ func TestOracleGoldenBytes(t *testing.T) {
   iter(@m, @k, @n) -> map(lhs[@m][@n], rhs[@n][@k], lambda(l, r): l * r) as (@m, @k, @n) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now) |
   iter() -> map(%0, lambda(v): v * scale) as (@m, @k) |
-  store(%output[@m][@k], %0)
+  memstore(%output[@m][@k], %0)
 
 statement #9:
   return %output`
