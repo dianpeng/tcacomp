@@ -41,6 +41,9 @@ func (bb *BasicBlock) First() *Statement { return bb.head }
 func (bb *BasicBlock) Last() *Statement { return bb.tail }
 
 // Append links s at the list tail in O(1). s must not already be linked.
+// Linking maintains the root's stmt back-pointer (Remove clears it), so a
+// collect-remove-reappend reschedule round-trip — the pass.Scheduler's apply
+// step — leaves every root's statement lookup intact.
 func (bb *BasicBlock) Append(s *Statement) {
 	if s == nil || s.prev != nil || s.next != nil || bb.head == s {
 		return
@@ -53,10 +56,14 @@ func (bb *BasicBlock) Append(s *Statement) {
 		bb.head = s
 	}
 	bb.tail = s
+	if s.rhs != nil {
+		s.rhs.BasePtr().stmt = s
+	}
 }
 
 // InsertBefore links s immediately before at in O(1). Both must be non-nil
-// and s must not already be linked.
+// and s must not already be linked. Like Append, it maintains the root's
+// stmt back-pointer.
 func (bb *BasicBlock) InsertBefore(s, at *Statement) {
 	if s == nil || at == nil || s.prev != nil || s.next != nil || bb.head == s {
 		return
@@ -70,10 +77,14 @@ func (bb *BasicBlock) InsertBefore(s, at *Statement) {
 		bb.head = s
 	}
 	at.prev = s
+	if s.rhs != nil {
+		s.rhs.BasePtr().stmt = s
+	}
 }
 
 // InsertAfter links s immediately after at in O(1). Both must be non-nil and
-// s must not already be linked.
+// s must not already be linked. Like Append, it maintains the root's stmt
+// back-pointer.
 func (bb *BasicBlock) InsertAfter(s, at *Statement) {
 	if s == nil || at == nil || s.prev != nil || s.next != nil || bb.head == s {
 		return
@@ -87,6 +98,9 @@ func (bb *BasicBlock) InsertAfter(s, at *Statement) {
 		bb.tail = s
 	}
 	at.next = s
+	if s.rhs != nil {
+		s.rhs.BasePtr().stmt = s
+	}
 }
 
 // Remove unlinks s from the list in O(1) via its intrusive prev/next links —
@@ -151,6 +165,14 @@ type Statement struct {
 
 // ID returns the statement's stable per-graph integer ID.
 func (s *Statement) ID() uint64 { return s.id }
+
+// Statement returns the statement whose RHS roots at b (set by Materialize
+// and by pass-time statement creation via NewStatement), or nil when b is
+// not a statement root. It is the exported read face of the stmt
+// back-pointer: passes consult it to detect already-scheduled nodes
+// (idempotence under manager-driven re-runs) and to attribute statement
+// ownership during list rescheduling.
+func (b *Base) Statement() *Statement { return b.stmt }
 
 // Kind reports whether the statement binds a new local (StmtAssign) or is a
 // pure side-effect operation (StmtEffect).

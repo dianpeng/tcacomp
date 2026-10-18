@@ -218,15 +218,19 @@ func Label(n Node, num *Numbering) string {
 }
 
 // renderer carries the per-print shared state: the numbering (for `%N`
-// references to anonymous defs) and the verbosity option.
+// references to anonymous defs), the verbosity option, and the statement
+// currently being rendered (a node that roots a DIFFERENT statement renders
+// as `%N` — the statement-boundary rule for pass-inserted value statements).
 type renderer struct {
 	num  *Numbering
 	opts PrintOptions
+	cur  *Statement
 }
 
 // printChain renders one statement's stage chain: `  stage0 |\n  stage1...`,
 // each stage on its own line, ` |` marking all but the last.
 func (r *renderer) printChain(b *strings.Builder, s *Statement) {
+	r.cur = s
 	chain := chainOf(s)
 	for i, st := range chain {
 		b.WriteString("  ")
@@ -292,9 +296,15 @@ func pipeInput(n Node) Node {
 // walk follows pipe inputs backward from the statement's RHS root; it stops
 // at a node that is some other statement's RHS (a statement boundary — that
 // stage prints as its own statement), at a non-stage input, or on a cycle.
+// A non-stage RHS (a value-rooted statement, created by a pass after
+// scheduling — e.g. the pass.Scheduler's LICM hoists via NewStatement) is a
+// degenerate one-element chain: it prints as a single value line.
 func chainOf(s *Statement) []Node {
 	if s == nil || s.rhs == nil {
 		return nil
+	}
+	if !isStage(s.rhs) {
+		return []Node{s.rhs}
 	}
 	rhsOf := make(map[*Base]bool)
 	for o := s.graph.cfg.entry.head; o != nil; o = o.next {
@@ -542,6 +552,19 @@ func (r *renderer) value(n Node) string {
 	if n == nil {
 		return "<nil>" // unwired operand; deterministic marker, verifier owns rejection
 	}
+	// Statement-boundary rule: a node that roots a DIFFERENT assign
+	// statement (created by a pass after scheduling — LICM hoists) renders
+	// as its SSA number from every other statement's tree, exactly like a
+	// chained stage boundary. Restricted to StmtAssign roots so effect
+	// statements keep their established spellings (e.g. `return %output`,
+	// where the store root keeps rendering through its own access rule) and
+	// to the text printer (cur != nil) so DOT labels are untouched.
+	if r.rendersAsRef(n) {
+		if num, ok := r.num.Num(n); ok {
+			return fmt.Sprintf("%%%d", num)
+		}
+		return fmt.Sprintf("%%<%d>", n.BasePtr().id)
+	}
 	switch t := n.(type) {
 	case *constNode:
 		return constText(t)
@@ -724,6 +747,29 @@ func exprPrec(n Node) int {
 	return 12
 }
 
+// rendersAsRef reports whether n renders through the statement-boundary
+// rule (as `%N`) from the statement currently being printed.
+func (r *renderer) rendersAsRef(n Node) bool {
+	if r.cur == nil {
+		return false
+	}
+	os := n.BasePtr().stmt
+	return os != nil && os != r.cur && os.kind == StmtAssign &&
+		os.rhs != nil && os.rhs.BasePtr() == n.BasePtr()
+}
+
+// operandPrec returns the effective binding precedence of n as an operand:
+// a node that renders through the statement-boundary rule (`%N`) is an atom
+// and binds tightest; otherwise the structural expression precedence. Using
+// the RENDERED precedence keeps hoisted operands parenthesis-free (`%0 * 3.0`,
+// never `(%0) * 3.0`).
+func (r *renderer) operandPrec(n Node) int {
+	if r.rendersAsRef(n) {
+		return 12
+	}
+	return exprPrec(n)
+}
+
 // binExpr renders `a + b` with canonical parens: a child parenthesized when
 // it binds looser than the parent, and also when it binds equal on the right
 // (binary levels are left-associative per §7.6, so `a - (b - c)` keeps its
@@ -733,11 +779,11 @@ func (r *renderer) binExpr(t *binOpNode) string {
 	l := opAt(t, 0)
 	rhs := opAt(t, 1)
 	ls := r.value(l)
-	if exprPrec(l) < p {
+	if r.operandPrec(l) < p {
 		ls = "(" + ls + ")"
 	}
 	rs := r.value(rhs)
-	if exprPrec(rhs) <= p {
+	if r.operandPrec(rhs) <= p {
 		rs = "(" + rs + ")"
 	}
 	return ls + " " + t.op.String() + " " + rs
@@ -748,7 +794,7 @@ func (r *renderer) binExpr(t *binOpNode) string {
 func (r *renderer) unaryExpr(t *unaryOpNode) string {
 	x := opAt(t, 0)
 	xs := r.value(x)
-	if exprPrec(x) <= 11 {
+	if r.operandPrec(x) <= 11 {
 		xs = "(" + xs + ")"
 	}
 	return t.op.String() + xs
