@@ -18,6 +18,9 @@ import (
 // The priority scale is the DEFAULT pipeline position vocabulary:
 //
 //	100   early cleanup (dce — erase before anything observes the graph)
+//	101   dce-verify (the post-sweep invariant check)
+//	110   global CSE (gvn — dedup pure computations graph-wide)
+//	111   gvn-verify (the post-dedup invariant check)
 //	...   transformation passes slot between as they land
 //	900   late scheduling (schedule — the pre-codegen ordering fixup)
 //

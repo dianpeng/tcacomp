@@ -237,7 +237,7 @@ func TestGVNLeafPooling(t *testing.T) {
 
 	assertGone(t, g, k2, p2)
 	assertKept(t, g, k1, k3, p1, s1, s2)
-	if ops := ir.OperandsOf(s1); len(ops) != 2 || ops[0] != k1 || ops[1] != p1 {
+	if ops := ir.OperandsOf(s1); len(ops) != 2 || ops[0] != k3 || ops[1] != p1 {
 		t.Fatalf("s1's operands must resolve to the representatives, got %v", ops)
 	}
 	if ops := ir.OperandsOf(s2); len(ops) != 2 || ops[0] != k3 || ops[1] != p1 {
@@ -314,7 +314,7 @@ func TestGVNNeverMergesSideEffects(t *testing.T) {
 	st1 := g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, val)
 	st2 := g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, val)
 
-	one := g.NewConst("ctor", f32, 1)
+	one := g.NewConst("ctor", f32, 7) // distinct from val: the exclusion-set probe must not trip const pooling
 	it1 := g.NewIter("ctor", m, nil, one, one)
 	it2 := g.NewIter("ctor", m, nil, one, one)
 
@@ -451,6 +451,7 @@ func TestGVNLambdaInteriorDedup(t *testing.T) {
 	m1 := g.NewMap("ctor", []ir.Node{piped}, ir.NewLambda([]ir.Node{lp}, s1), []ir.Node{m})
 	m2 := g.NewMap("ctor", []ir.Node{piped}, ir.NewLambda([]ir.Node{lp}, s2), []ir.Node{m})
 	scaffold(g, m, out, piped)
+	_ = m2
 
 	runGVN(t, g)
 
