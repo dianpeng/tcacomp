@@ -88,6 +88,7 @@ None yet.
 | 261018-bl0 | Re-organize IR per tinycudaopto skeleton (layered node_xxx.go files, HIR/LIR catalog, one-end-node model, two-root-set DCE, pass-level topo+LICM scheduler) | 2026-10-18 | ffb1497 | [261018-bl0-re-organize-ir-per-tinycudaopto-skeleton](./quick/261018-bl0-re-organize-ir-per-tinycudaopto-skeleton/) |
 | 261018-ked | Write comprehensive IR documentation (doc/ir.md — organization, two-level design, catalog, SSA, effects, DCE, poset, scheduling, worked examples) | 2026-10-18 | b44eb18 | [261018-ked-write-comprehensive-ir-documentation-doc](./quick/261018-ked-write-comprehensive-ir-documentation-doc/) |
 | 261018-l36 | Implement mark-sweep DCE pass on TCA IR + reorganize internal/opt pass manager (registry/factory/all, init self-registration, priority ordering, shared analysis cache) | 2026-10-18 | 84eef54 | [261018-l36-implement-mark-sweep-dce-pass-on-tca-ir-](./quick/261018-l36-implement-mark-sweep-dce-pass-on-tca-ir-/) |
+| 261018-l36-f1 | fast: add dce-verify post-sweep invariant pass + chain-integrity regression tests (middle-link conservatism, dead-tail detachment) | 2026-10-18 | ca26d2a | — |
 
 ## Session Continuity
 
