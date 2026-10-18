@@ -166,10 +166,13 @@ func TestValueLeafPooling(t *testing.T) {
 		t.Fatal("distinct InputParams must hash differently (kind + node ID)")
 	}
 
-	neg := asValue(t, g.NewConst("ctor", f32, -0.0))
-	pos := asValue(t, g.NewConst("ctor", f32, 0.0))
+	neg := asValue(t, g.NewConst("ctor", f32, math.Copysign(0, -1)))
+	pos := asValue(t, g.NewConst("ctor", f32, 0))
 	if neg.ValueEqual(pos, pureAll{}) {
 		t.Fatal("±0.0 must compare unequal (Float64bits semantics)")
+	}
+	if neg.ValueHash(pureAll{}) == pos.ValueHash(pureAll{}) {
+		t.Fatal("±0.0 must hash differently (Float64bits semantics)")
 	}
 	i32 := asValue(t, g.NewConst("ctor", InternScalar(TI32), 2))
 	if k1.ValueEqual(i32, pureAll{}) {
@@ -315,8 +318,8 @@ func TestValueLambdaBodyCycleGuard(t *testing.T) {
 func TestValueOperandCycleTerminates(t *testing.T) {
 	g, _, _, _, _, _, _ := valueFixture()
 
-	a := g.NewBinOp("ctor", BinOpAdd)
-	b := g.NewBinOp("ctor", BinOpAdd)
+	a := g.NewNode(KindBinOp, "t")
+	b := g.NewNode(KindBinOp, "t")
 	mctx := &MutContext{Pass: "t"}
 	mctx.AddUse(a, b)
 	mctx.AddUse(b, a)

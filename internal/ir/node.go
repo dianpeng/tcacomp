@@ -104,9 +104,21 @@ type ScalarExprNode interface {
 // so it can sit in a statement RHS slot while binding no SSA name. Every
 // concrete node embeds *Base, which promotes IsNone() == false; only
 // returnNode overrides it. Node stays the universal root (D-15).
+//
+// ValueHash/ValueEqual are the GVN value-numbering surface
+// (quick-261018-nga): they take the ACCUMULATED side-effect analysis as
+// input (spec [4].2 — the analysis lives in internal/analysis per amendment
+// F and implements ir.SideEffectAnalysis), key every operand by SSA node
+// identity (amendment D), and treat side-effect nodes as one-of-a-kind
+// ([3].3). Widening Value is deliberate: Node stays at exactly two methods
+// (directive 4's interface-width contract), while the value-numbering
+// contract belongs to the value-carrying face every GVN participant
+// satisfies via *Base promotion.
 type Value interface {
 	Node
 	IsNone() bool
+	ValueHash(se SideEffectAnalysis) uint64
+	ValueEqual(other Value, se SideEffectAnalysis) bool
 }
 
 // IsNone reports whether the node is the none Value. *Base promotes this to

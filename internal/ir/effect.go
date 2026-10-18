@@ -34,11 +34,19 @@ package ir
 // pointer (review P1R-01: identity is never a name).
 //
 // Effect verdicts (skeleton effect.go shape, local naming): for now there is
-// no fine-grained categorization, just free vs. full (X-3). A GMEM store is
-// fully effectful; the kernel's end node is effectful-via-ImpactBy (R2: its
-// payload carries every mem-param's final chain state). SMEM/FRAG stores and
-// loads are FREE: they are in-program memory, not observable kernel I/O, so
-// they are dead-code-eligible when unreferenced (R3).
+// no fine-grained categorization, just free vs. full (X-3). As amended by
+// quick-261018-nga decision A, EVERY FamilyMemory node is node-local
+// EFFECTFUL — loads included, nil ImpactBy included — under the single-slot
+// memory model: each memory region is one slot, tensor subscripts are too
+// coarse to disprove aliasing between a load and a write, so all operations
+// on one memory node must serialize. Allocations (MemNew/MemNewSMem/FragNew)
+// are effectful under the fresh-object rule as well: merging distinct
+// allocations is unsound — each allocation denotes a distinct memory object
+// (LLVM never CSEs allocas). The verdict stays SELF-SCOPED ([4].3): no
+// lattice meet, no operand accumulation — the accumulated GVN gatekeeper
+// lives in internal/analysis. DCE dead-code eligibility is governed by
+// two-root-set reachability (R3), NOT by this verdict: unreferenced memory
+// ops (an SMEM store off every root path included) remain sweepable.
 
 // Effect verdict constants (Effect.Kind values).
 const (
@@ -78,17 +86,27 @@ func (e Effect) String() string {
 
 // EffectOf returns the side-effect verdict of n (skeleton Value.Effect,
 // delivered as a function to keep the Node interface at exactly two methods —
-// directive 4's interface-width contract). GMEM stores and kernel returns are
-// fully effectful; every other kind — including the lowered SMEM/FRAG memory
-// family, which is in-program memory, not observable kernel I/O (R3) — is
-// free. Effect-free subtrees are dead-code-eligible at Level 1 when
-// unreachable from the roots.
+// directive 4's interface-width contract). As amended by quick-261018-nga
+// decision A, EVERY FamilyMemory node (GMEM MemLoad/MemStore/MemNew, the
+// lowered SMEM and FRAG families — loads and allocations included, nil
+// ImpactBy included) and the kernel return are fully effectful: the
+// single-slot memory model serializes all operations on one memory region,
+// and the fresh-object rule keeps distinct allocations unmergeable. Pure
+// kinds — the scalar-expression family, map/reduce stages, the value-level
+// dimvar objects — are free. The verdict is node-local and self-scoped
+// ([4].3); DCE liveness is root-reachability based (R3), so a memory op no
+// root path reaches is still dead-code-eligible.
+//
+// Consumers (grep-audited at quick-261018-nga): the scheduler's LICM calls
+// sit strictly BEHIND the licmHoistableKinds whitelist (scalar-expression
+// kinds only, all free before and after this amendment), and neither DCE,
+// Materialize's isEffectKind, nor the legality windows consult EffectOf.
 func EffectOf(n Node) Effect {
 	if n == nil {
 		return NewEffectFree()
 	}
-	switch n.KindOf() {
-	case KindMemStore, KindReturn:
+	k := n.KindOf()
+	if k.Family() == FamilyMemory || k == KindReturn {
 		return NewEffectFull()
 	}
 	return NewEffectFree()

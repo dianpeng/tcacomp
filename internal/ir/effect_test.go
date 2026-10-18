@@ -94,12 +94,15 @@ func TestEffectVerdictsMemoryFamily(t *testing.T) {
 			t.Fatalf("%s must be effect-free (self-scoped verdict), got %s", name, e)
 		}
 	}
+	// Loop kinds stay FREE under the self-scoped EffectOf ([4].3): implicit
+	// control flow is a verdict of the ACCUMULATED analysis (internal/analysis,
+	// [2.3]), not of the node-local effect model.
 	iter := g.NewIter("ctor", m, nil, val, val)
-	if e := EffectOf(iter); !e.Has() {
-		t.Fatal("iter must be effectful ([2.3] implicit control flow)")
+	if e := EffectOf(iter); e.Has() {
+		t.Fatal("iter must be free under the node-local EffectOf ([2.3] belongs to the accumulated analysis)")
 	}
-	if e := EffectOf(g.NewForLoop("ctor", iter, val, val)); !e.Has() {
-		t.Fatal("forloop must be effectful ([2.3] implicit control flow closure)")
+	if e := EffectOf(g.NewForLoop("ctor", iter, val, val)); e.Has() {
+		t.Fatal("forloop must be free under the node-local EffectOf")
 	}
 	dv := g.NewDimVar("ctor", m, val, val)
 	if e := EffectOf(dv); e.Has() {
