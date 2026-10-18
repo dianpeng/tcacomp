@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-18 - Completed quick task 261018-bl0: Re-organize IR per tinycudaopto skeleton (layered node_xxx.go files, HIR/LIR catalog, one-end-node model, two-root-set DCE, pass-level topo+LICM scheduler)
+last_activity: 2026-10-18 - Completed quick task 261018-ked: Write comprehensive IR documentation (doc/ir.md — organization, two-level design, catalog, SSA, effects, DCE, poset, scheduling, worked examples)
 progress:
   total_phases: 6
   completed_phases: 1
@@ -86,6 +86,7 @@ None yet.
 | 261016-mpu | Refactor phase 1 IR from AST-style to SSA/CFG optimizing-compiler IR per doc/review/phase1_1.md | 2026-10-16 | c470396 | [261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss](./quick/261016-mpu-refactor-phase-1-ir-from-ast-style-to-ss/) |
 | 261017-vdj | Adapt phase-1 SSA IR to new two-level design (sea-of-nodes L1, scheduled CFG L2) per tinycudaopto skeleton | 2026-10-17 | 1440816 | [261017-vdj-adapt-phase-1-ssa-ir-to-new-two-level-de](./quick/261017-vdj-adapt-phase-1-ssa-ir-to-new-two-level-de/) |
 | 261018-bl0 | Re-organize IR per tinycudaopto skeleton (layered node_xxx.go files, HIR/LIR catalog, one-end-node model, two-root-set DCE, pass-level topo+LICM scheduler) | 2026-10-18 | ffb1497 | [261018-bl0-re-organize-ir-per-tinycudaopto-skeleton](./quick/261018-bl0-re-organize-ir-per-tinycudaopto-skeleton/) |
+| 261018-ked | Write comprehensive IR documentation (doc/ir.md — organization, two-level design, catalog, SSA, effects, DCE, poset, scheduling, worked examples) | 2026-10-18 | b44eb18 | [261018-ked-write-comprehensive-ir-documentation-doc](./quick/261018-ked-write-comprehensive-ir-documentation-doc/) |
 
 ## Session Continuity
 
