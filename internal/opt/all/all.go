@@ -9,5 +9,6 @@
 package all
 
 import (
+	_ "tcacomp/internal/opt/dce"
 	_ "tcacomp/internal/opt/schedule"
 )

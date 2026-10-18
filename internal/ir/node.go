@@ -64,6 +64,7 @@ type Base struct {
 	graph         *Graph     // owning graph, set at construction; lets Erase unlink from the block
 	stmt          *Statement // the statement whose RHS root this node is, nil for non-root nodes; lets Erase unlink in O(1)
 	stmtID        uint64     // builder-pinned statement ID for Materialize (PinStatementID); 0 = Materialize draws from the counter
+	mark          bool       // transient mark-sweep state (D-15 exception — see mark.go); never IR content, never printed/serialized/verified
 }
 
 // BasePtr returns the shared cell, implementing Node.
