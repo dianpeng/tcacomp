@@ -1,4 +1,4 @@
-package pass_test
+package opt_test
 
 import (
 	"bytes"
@@ -7,7 +7,7 @@ import (
 
 	"tcacomp/internal/flags"
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 )
 
 func setFlag(t *testing.T, dst *string, v string) {
@@ -29,7 +29,7 @@ func TestInstrumentation(t *testing.T) {
 		var events []string
 		r1 := &recording{name: "r1", events: &events}
 		r2 := &recording{name: "r2", events: &events}
-		pm := pass.NewManager([]pass.Pass{
+		pm := opt.NewManager([]opt.Pass{
 			&stubPass{id: "a"},
 			&stubPass{id: "b"},
 		})
@@ -60,8 +60,8 @@ func TestInstrumentation(t *testing.T) {
 		// whose verification would fail.
 		setVerifyEach(t, false)
 		var buf bytes.Buffer
-		pmOff := pass.NewManager(nil)
-		pmOff.AddInstrumentation(pass.NewVerifyEach(&buf))
+		pmOff := opt.NewManager(nil)
+		pmOff.AddInstrumentation(opt.NewVerifyEach(&buf))
 		if err := pmOff.Run(broken); err != nil {
 			t.Fatalf("VerifyEach=false: expected nil, got %v", err)
 		}
@@ -72,8 +72,8 @@ func TestInstrumentation(t *testing.T) {
 		// VerifyEach=true: the same graph fails verification at pipeline end.
 		flags.F.VerifyEach = true
 		var bufOn bytes.Buffer
-		pmOn := pass.NewManager(nil)
-		pmOn.AddInstrumentation(pass.NewVerifyEach(&bufOn))
+		pmOn := opt.NewManager(nil)
+		pmOn.AddInstrumentation(opt.NewVerifyEach(&bufOn))
 		if err := pmOn.Run(broken); err == nil {
 			t.Fatal("VerifyEach=true: expected verify error, got nil")
 		}
@@ -85,11 +85,11 @@ func TestInstrumentation(t *testing.T) {
 	t.Run("irdump selects pass id", func(t *testing.T) {
 		setFlag(t, &flags.F.DumpAfter, "iter-lower")
 		var buf bytes.Buffer
-		pm := pass.NewManager([]pass.Pass{
+		pm := opt.NewManager([]opt.Pass{
 			&stubPass{id: "iter-lower"},
 			&stubPass{id: "reduce-lower"},
 		})
-		pm.AddInstrumentation(pass.NewIRDump(&buf))
+		pm.AddInstrumentation(opt.NewIRDump(&buf))
 		if err := pm.Run(ir.NewGraph("g")); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
@@ -108,11 +108,11 @@ func TestInstrumentation(t *testing.T) {
 	t.Run("pass timing reports sorted", func(t *testing.T) {
 		setBoolFlag(t, &flags.F.PassTiming, true)
 		var buf bytes.Buffer
-		pm := pass.NewManager([]pass.Pass{
+		pm := opt.NewManager([]opt.Pass{
 			&stubPass{id: "zzz"},
 			&stubPass{id: "aaa"},
 		})
-		pm.AddInstrumentation(pass.NewPassTiming(&buf))
+		pm.AddInstrumentation(opt.NewPassTiming(&buf))
 		if err := pm.Run(ir.NewGraph("t")); err != nil {
 			t.Fatalf("Run: %v", err)
 		}

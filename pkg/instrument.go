@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 	"tcacomp/internal/visualization"
 )
 
@@ -26,8 +26,8 @@ import (
 // visualization.EmitDot into a string (TOOL-03 graphviz dump). Without this
 // wiring the IRDump instrumentation would emit placeholder comments in place
 // of real IR content (TOOL-06).
-func DefaultInstrumentations(w io.Writer) []pass.Instrumentation {
-	dump := pass.NewIRDump(w)
+func DefaultInstrumentations(w io.Writer) []opt.Instrumentation {
+	dump := opt.NewIRDump(w)
 	dump.TextEmitter = ir.Print
 	dump.DotEmitter = func(g *ir.Graph) string {
 		var b strings.Builder
@@ -38,9 +38,9 @@ func DefaultInstrumentations(w io.Writer) []pass.Instrumentation {
 		_ = visualization.EmitDot(&b, g)
 		return b.String()
 	}
-	return []pass.Instrumentation{
-		pass.NewVerifyEach(w),
+	return []opt.Instrumentation{
+		opt.NewVerifyEach(w),
 		dump,
-		pass.NewPassTiming(w),
+		opt.NewPassTiming(w),
 	}
 }

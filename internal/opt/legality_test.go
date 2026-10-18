@@ -1,4 +1,4 @@
-package pass_test
+package opt_test
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 )
 
 // cleanOracle builds a graph of only Phase-1 kinds through the typed
@@ -33,7 +33,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	g := ir.NewGraph("bad")
 	bad := g.NewNode(ir.Kind(1<<20), "test")
 	g.NewReturn("test", bad)
-	pm := pass.NewManager([]pass.Pass{&stubPass{id: "noop", produces: pass.StageConstructed}})
+	pm := opt.NewManager([]opt.Pass{&stubPass{id: "noop", produces: opt.StageConstructed}})
 	err := pm.Run(g)
 	if err == nil {
 		t.Fatal("unknown kind: expected legality error, got nil")
@@ -45,7 +45,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	}
 
 	// Every Phase-1 kind passes StageConstructed.
-	pm = pass.NewManager([]pass.Pass{&stubPass{id: "noop", produces: pass.StageConstructed}})
+	pm = opt.NewManager([]opt.Pass{&stubPass{id: "noop", produces: opt.StageConstructed}})
 	if err := pm.Run(cleanOracle()); err != nil {
 		t.Fatalf("clean oracle at StageConstructed: expected nil, got %v", err)
 	}
@@ -54,7 +54,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	// closed with an empty window, so absence of the kind's entry from the
 	// Actions map rejects it — absence fails closed even for kinds the
 	// pipeline fully knows.
-	unset := pass.WindowFor(pass.StageLinearized)
+	unset := opt.WindowFor(opt.StageLinearized)
 	if unset == nil || len(unset.Actions) != 0 {
 		t.Fatalf("WindowFor(StageLinearized) must be a fail-closed empty window, got %+v", unset)
 	}
@@ -66,7 +66,7 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 		}
 		return ir.Descend
 	}))
-	pm = pass.NewManager([]pass.Pass{&stubPass{id: "noop", produces: pass.StageLinearized}})
+	pm = opt.NewManager([]opt.Pass{&stubPass{id: "noop", produces: opt.StageLinearized}})
 	err = pm.Run(built)
 	if err == nil {
 		t.Fatal("known kind at unset stage: expected fail-closed legality error, got nil")
@@ -80,9 +80,9 @@ func TestLegalityRejectsUnknownKind(t *testing.T) {
 	}
 
 	// The constructed window names every Phase-1 kind Legal explicitly.
-	constructed := pass.WindowFor(pass.StageConstructed)
+	constructed := opt.WindowFor(opt.StageConstructed)
 	for k := ir.KindIter; k <= ir.KindForLoop; k++ {
-		if constructed.Actions[k] != pass.Legal {
+		if constructed.Actions[k] != opt.Legal {
 			t.Errorf("StageConstructed window missing explicit Legal entry for %s", k)
 		}
 	}

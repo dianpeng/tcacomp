@@ -1,4 +1,4 @@
-package pass
+package schedule
 
 // scheduler.go is the optimization-pass scheduler (quick-261018-bl0 task 3,
 // R5): Materialize's default schedule is allocation order (D-7, the
@@ -9,7 +9,7 @@ package pass
 //
 // Run is three steps, all statement-level and built from the exported ir
 // read face only (StmtNodes/OperandsOf/PosetDeps/LambdaBodies/DataDeps/
-// EffectOf/Base.Statement) — the pass package never reaches into ir
+// EffectOf/Base.Statement) — the schedule package never reaches into ir
 // internals:
 //
 //  1. stable topological sort of the statement list (deps via the
@@ -28,7 +28,20 @@ import (
 	"sort"
 
 	"tcacomp/internal/ir"
+	"tcacomp/internal/opt"
 )
+
+// init self-registers the scheduler in the global pass registry
+// (quick-261018-l36 requirement 9 point 4): importing this package — directly
+// or through internal/opt/all — is what makes "schedule" available to
+// BuildPipeline.
+func init() {
+	opt.Register(opt.PassSpec{
+		ID:       "schedule",
+		Priority: 900,
+		Factory:  func() opt.Pass { return Scheduler{} },
+	})
+}
 
 // Scheduler is the statement scheduler + LICM pass. It is stateless: every
 // Run re-derives the schedule from the graph, so re-runs are idempotent.
@@ -42,14 +55,14 @@ func (Scheduler) Requires() []string { return nil }
 
 // Produces: builder-output stage (it reorders statements; it introduces no
 // new node kinds), so the constructed legality window re-checks the graph.
-func (Scheduler) Produces() Stage { return StageConstructed }
+func (Scheduler) Produces() opt.Stage { return opt.StageConstructed }
 
 // Preserved: nothing — every analysis is invalidated.
 func (Scheduler) Preserved() []string { return nil }
 
 // Run executes topo sort → LICM → topo sort. A non-materialized graph is
 // refused with a deterministic message, never a partial schedule.
-func (Scheduler) Run(_ *Context, g *ir.Graph) error {
+func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 	if g == nil || !g.Materialized() {
 		return errors.New("schedule: graph not materialized")
 	}

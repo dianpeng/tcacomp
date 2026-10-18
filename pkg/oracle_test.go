@@ -6,7 +6,7 @@ import (
 
 	"tcacomp/internal/golden"
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 	"tcacomp/pkg"
 )
 
@@ -65,7 +65,7 @@ func TestMatmulScaleGolden(t *testing.T) {
 // TestBuildVerifiesThroughPM (D-10) proves Build's verification flows
 // exclusively through the pass-manager path and can actually fail:
 //
-//   - (a) Build() runs the completed oracle through pass.NewManager(nil) —
+//   - (a) Build() runs the completed oracle through opt.NewManager(nil) —
 //     an EMPTY pass list — carrying the VerifyEach instrumentation, and
 //     returns nil: verification executed because VerifyEach.AfterPipeline
 //     runs a final verification pass even with zero passes and Manager.Run
@@ -106,8 +106,8 @@ func TestBuildVerifiesThroughPM(t *testing.T) {
 	t.Run("unwiredOperandFailsPMVerification", func(t *testing.T) {
 		bg := ir.NewGraph("bad")
 		bg.NewReturn("test", bg.NewNode(ir.KindBinOp, "test", nil, nil))
-		pm := pass.NewManager(nil)
-		pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
+		pm := opt.NewManager(nil)
+		pm.AddInstrumentation(opt.NewVerifyEach(io.Discard))
 		if err := pm.Run(bg); err == nil {
 			t.Fatal("unwired operand through the PM path: nil error, want verification failure")
 		}

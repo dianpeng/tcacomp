@@ -1,11 +1,11 @@
-package pass_test
+package opt_test
 
 import (
 	"testing"
 
 	"tcacomp/internal/analysis"
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 )
 
 type stubAnalysis struct{ name string }
@@ -19,7 +19,7 @@ func TestAnalysisInvalidation(t *testing.T) {
 	dropped := stubAnalysis{name: "dropped"}
 
 	// Direct cache: invalidate-all default empties everything.
-	c := pass.NewCache()
+	c := opt.NewCache()
 	c.Put(kept)
 	c.Put(dropped)
 	c.Invalidate(nil)
@@ -41,7 +41,7 @@ func TestAnalysisInvalidation(t *testing.T) {
 
 	// Through Manager.Run: a pass with Preserved() == ["kept"] keeps it; a
 	// pass with an empty whitelist clears everything.
-	pm := pass.NewManager([]pass.Pass{&stubPass{id: "preserve", preserved: []string{"kept"}}})
+	pm := opt.NewManager([]opt.Pass{&stubPass{id: "preserve", preserved: []string{"kept"}}})
 	pm.Cache().Put(kept)
 	pm.Cache().Put(dropped)
 	if err := pm.Run(ir.NewGraph("t")); err != nil {
@@ -54,7 +54,7 @@ func TestAnalysisInvalidation(t *testing.T) {
 		t.Fatal("unpreserved analysis must be invalidated by Manager.Run")
 	}
 
-	pmClear := pass.NewManager([]pass.Pass{
+	pmClear := opt.NewManager([]opt.Pass{
 		&stubPass{id: "keep-pass", preserved: []string{"kept"}},
 		&stubPass{id: "clear-pass"},
 	})

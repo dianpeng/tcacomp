@@ -5,7 +5,7 @@ import (
 	"io"
 
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 )
 
 // This file is the public builder root (FE-01, D-08): typed first-class
@@ -259,7 +259,7 @@ func (b *Builder) Stmt() *StmtIter {
 // graph — debris from abandoned chains included), Materialize schedules the
 // sea into the single-block CFG (one statement per live effectful node
 // reachable from the sea roots, in allocation order), and then a
-// pass.Manager with an EMPTY pass list carrying the VerifyEach
+// opt.Manager with an EMPTY pass list carrying the VerifyEach
 // instrumentation runs the graph.
 // VerifyEach's AfterPipeline hook runs the graph verifier even with zero
 // passes and Manager.Run surfaces its error, so Build returns verification
@@ -290,8 +290,8 @@ func (b *Builder) Build() (*ir.Graph, error) {
 	if err := b.g.Materialize(); err != nil {
 		return nil, err
 	}
-	pm := pass.NewManager(nil)
-	pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
+	pm := opt.NewManager(nil)
+	pm.AddInstrumentation(opt.NewVerifyEach(io.Discard))
 	if err := pm.Run(b.g); err != nil {
 		return nil, err
 	}

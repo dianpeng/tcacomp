@@ -1,4 +1,4 @@
-package pass_test
+package schedule_test
 
 import (
 	"io"
@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
+	"tcacomp/internal/opt/schedule"
 )
 
 // The Scheduler pins (quick-261018-bl0 task 3, R5): Materialize's default
@@ -14,8 +15,8 @@ import (
 // re-establishes dependency order with a STABLE topological sort (ties keep
 // the pre-existing list order), then runs LICM over lowered for-loops and
 // re-sorts. All reasoning is statement-level, built from the exported ir
-// primitives only (StmtNodes/OperandsOf/PosetDeps/LambdaBodies) — the pass
-// package never reaches into ir internals.
+// primitives only (StmtNodes/OperandsOf/PosetDeps/LambdaBodies) — the
+// schedule package never reaches into ir internals.
 
 // stmtIDs collects the block's statement IDs in list order.
 func stmtIDs(g *ir.Graph) []uint64 {
@@ -50,7 +51,7 @@ func TestSchedulerRequiresMaterialized(t *testing.T) {
 	st := g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, g.NewConst("ctor", f32, 1))
 	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
 
-	s := &pass.Scheduler{}
+	s := &schedule.Scheduler{}
 	if err := s.Run(nil, g); err == nil || !strings.Contains(err.Error(), "schedule: graph not materialized") {
 		t.Fatalf("Run on an unmaterialized graph = %v, want the not-materialized guard", err)
 	}
@@ -94,7 +95,7 @@ func TestSchedulerRestoresDependencyOrder(t *testing.T) {
 		t.Fatalf("precondition: scrambled order = %v, want [200 300 100]", stmtIDs(g))
 	}
 
-	s := &pass.Scheduler{}
+	s := &schedule.Scheduler{}
 	if err := s.Run(nil, g); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -125,7 +126,7 @@ func TestSchedulerCycleFailsClosed(t *testing.T) {
 	ctx := &ir.MutContext{Pass: "test-cycle"}
 	ctx.AddUse(sum, sum) // self-loop: sum now data-depends on itself
 
-	s := &pass.Scheduler{}
+	s := &schedule.Scheduler{}
 	err := s.Run(nil, g)
 	if err == nil || !strings.Contains(err.Error(), "cycle") {
 		t.Fatalf("Run with a dependency cycle = %v, want a cycle error", err)
@@ -176,7 +177,7 @@ func licmFixture(t *testing.T) (g *ir.Graph, c1, c2, v1 ir.Node) {
 func TestSchedulerLICHappyPath(t *testing.T) {
 	g, c1, c2, v1 := licmFixture(t)
 
-	s := &pass.Scheduler{}
+	s := &schedule.Scheduler{}
 	if err := s.Run(nil, g); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -245,7 +246,7 @@ func TestSchedulerLICMNegativeMemoryOps(t *testing.T) {
 			t.Fatal("precondition: the smem store roots its own materialized statement")
 		}
 
-		if err := (&pass.Scheduler{}).Run(nil, g); err != nil {
+		if err := (&schedule.Scheduler{}).Run(nil, g); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 		if st.BasePtr().Statement() != storeStmt {
@@ -275,7 +276,7 @@ func TestSchedulerLICMNegativeMemoryOps(t *testing.T) {
 		}
 		before := stmtIDs(g)
 
-		if err := (&pass.Scheduler{}).Run(nil, g); err != nil {
+		if err := (&schedule.Scheduler{}).Run(nil, g); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 		if load.BasePtr().Statement() != nil {
@@ -317,7 +318,7 @@ func TestSchedulerLICMNestedHoistsToOutermost(t *testing.T) {
 		t.Fatal("precondition: one statement (the end node's) holds the whole nest")
 	}
 
-	if err := (&pass.Scheduler{}).Run(nil, g); err != nil {
+	if err := (&schedule.Scheduler{}).Run(nil, g); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	sC1 := c1.BasePtr().Statement()
@@ -337,7 +338,7 @@ func TestSchedulerLICMNestedHoistsToOutermost(t *testing.T) {
 // must be safe under manager-driven re-runs.
 func TestSchedulerIdempotent(t *testing.T) {
 	g, _, _, _ := licmFixture(t)
-	s := &pass.Scheduler{}
+	s := &schedule.Scheduler{}
 	if err := s.Run(nil, g); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
@@ -368,8 +369,8 @@ func TestSchedulerIdempotent(t *testing.T) {
 // pass without a single violation.
 func TestSchedulerViaManager(t *testing.T) {
 	g, c1, _, _ := licmFixture(t)
-	pm := pass.NewManager([]pass.Pass{&pass.Scheduler{}})
-	pm.AddInstrumentation(pass.NewVerifyEach(io.Discard))
+	pm := opt.NewManager([]opt.Pass{&schedule.Scheduler{}})
+	pm.AddInstrumentation(opt.NewVerifyEach(io.Discard))
 	if err := pm.Run(g); err != nil {
 		t.Fatalf("pipeline Run: %v", err)
 	}

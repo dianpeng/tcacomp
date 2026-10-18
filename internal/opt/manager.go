@@ -1,4 +1,4 @@
-package pass
+package opt
 
 import (
 	"fmt"
@@ -75,7 +75,7 @@ func (pm *Manager) Run(g *ir.Graph) error {
 		for _, in := range pm.instrumentation {
 			in.BeforePass(p, g)
 		}
-		err := p.Run(&Context{Pass: p.ID()}, g)
+		err := p.Run(&Context{Pass: p.ID(), Cache: pm.cache}, g)
 		for i := len(pm.instrumentation) - 1; i >= 0; i-- {
 			pm.instrumentation[i].AfterPass(p, g, err)
 		}

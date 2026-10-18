@@ -8,7 +8,7 @@ import (
 
 	"tcacomp/internal/flags"
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 	"tcacomp/pkg"
 )
 
@@ -18,9 +18,9 @@ type nopPass struct{}
 
 func (nopPass) ID() string                         { return "nop" }
 func (nopPass) Requires() []string                 { return nil }
-func (nopPass) Produces() pass.Stage               { return pass.StageConstructed }
+func (nopPass) Produces() opt.Stage               { return opt.StageConstructed }
 func (nopPass) Preserved() []string                { return nil }
-func (nopPass) Run(*pass.Context, *ir.Graph) error { return nil }
+func (nopPass) Run(*opt.Context, *ir.Graph) error { return nil }
 
 func setDumpAfter(t *testing.T, v string) {
 	t.Helper()
@@ -68,9 +68,9 @@ func returnSumGraph() *ir.Graph {
 	return g
 }
 
-func runNop(t *testing.T, g *ir.Graph, ins ...pass.Instrumentation) error {
+func runNop(t *testing.T, g *ir.Graph, ins ...opt.Instrumentation) error {
 	t.Helper()
-	pm := pass.NewManager([]pass.Pass{nopPass{}})
+	pm := opt.NewManager([]opt.Pass{nopPass{}})
 	for _, in := range ins {
 		pm.AddInstrumentation(in)
 	}
@@ -109,7 +109,7 @@ func TestInstrumentationsRealDumpOutput(t *testing.T) {
 			t.Errorf("dump missing real ir.Print stage content: %q", out)
 		}
 		// The placeholder an unwired emitter would print is a comment line
-		// starting "// [ir dump:" (see internal/pass/instrument.go); it must
+		// starting "// [ir dump:" (see internal/opt/instrument.go); it must
 		// never appear once DefaultInstrumentations has bound ir.Print.
 		if strings.Contains(out, "// [ir dump:") {
 			t.Errorf("dump contains placeholder line — TextEmitter not wired: %q", out)
@@ -151,11 +151,11 @@ func TestDefaultInstrumentationsComposition(t *testing.T) {
 	var haveVerify, haveDump, haveTiming bool
 	for _, in := range ins {
 		switch in.(type) {
-		case *pass.VerifyEach:
+		case *opt.VerifyEach:
 			haveVerify = true
-		case *pass.IRDump:
+		case *opt.IRDump:
 			haveDump = true
-		case *pass.PassTiming:
+		case *opt.PassTiming:
 			haveTiming = true
 		default:
 			t.Errorf("unexpected instrumentation type %T", in)

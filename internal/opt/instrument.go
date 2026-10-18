@@ -1,4 +1,4 @@
-package pass
+package opt
 
 import (
 	"fmt"

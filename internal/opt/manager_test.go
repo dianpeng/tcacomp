@@ -1,4 +1,4 @@
-package pass_test
+package opt_test
 
 import (
 	"errors"
@@ -9,7 +9,7 @@ import (
 
 	"tcacomp/internal/flags"
 	"tcacomp/internal/ir"
-	"tcacomp/internal/pass"
+	"tcacomp/internal/opt"
 )
 
 // stubPass is the test double behind every PM behavior test: it defaults to
@@ -18,16 +18,16 @@ import (
 type stubPass struct {
 	id        string
 	requires  []string
-	produces  pass.Stage
+	produces  opt.Stage
 	preserved []string
-	run       func(*pass.Context, *ir.Graph) error
+	run       func(*opt.Context, *ir.Graph) error
 }
 
 func (s *stubPass) ID() string           { return s.id }
 func (s *stubPass) Requires() []string   { return s.requires }
-func (s *stubPass) Produces() pass.Stage { return s.produces }
+func (s *stubPass) Produces() opt.Stage { return s.produces }
 func (s *stubPass) Preserved() []string  { return s.preserved }
-func (s *stubPass) Run(ctx *pass.Context, g *ir.Graph) error {
+func (s *stubPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	if s.run != nil {
 		return s.run(ctx, g)
 	}
@@ -41,19 +41,19 @@ type recording struct {
 	events *[]string
 }
 
-func (r *recording) BeforePass(p pass.Pass, _ *ir.Graph) {
+func (r *recording) BeforePass(p opt.Pass, _ *ir.Graph) {
 	*r.events = append(*r.events, r.name+":before:"+p.ID())
 }
 
-func (r *recording) AfterPass(p pass.Pass, _ *ir.Graph, _ error) {
+func (r *recording) AfterPass(p opt.Pass, _ *ir.Graph, _ error) {
 	*r.events = append(*r.events, r.name+":after:"+p.ID())
 }
 
 // failingEnd implements PipelineEnd with a fixed error.
 type failingEnd struct{ err error }
 
-func (f *failingEnd) BeforePass(pass.Pass, *ir.Graph)       {}
-func (f *failingEnd) AfterPass(pass.Pass, *ir.Graph, error) {}
+func (f *failingEnd) BeforePass(opt.Pass, *ir.Graph)       {}
+func (f *failingEnd) AfterPass(opt.Pass, *ir.Graph, error) {}
 func (f *failingEnd) AfterPipeline(*ir.Graph) error         { return f.err }
 
 // setFlag restores a flags.F field after the test, keeping tests
@@ -69,7 +69,7 @@ func TestPreconditionRejectsOrder(t *testing.T) {
 	iterLower := &stubPass{id: "iter-lower"}
 	reduceLower := &stubPass{id: "reduce-lower", requires: []string{"iter-lower"}}
 
-	outOfOrder := pass.NewManager([]pass.Pass{reduceLower, iterLower})
+	outOfOrder := opt.NewManager([]opt.Pass{reduceLower, iterLower})
 	err := outOfOrder.Run(ir.NewGraph("t"))
 	if err == nil {
 		t.Fatal("out-of-order pipeline: expected error, got nil")
@@ -80,7 +80,7 @@ func TestPreconditionRejectsOrder(t *testing.T) {
 		}
 	}
 
-	inOrder := pass.NewManager([]pass.Pass{iterLower, reduceLower})
+	inOrder := opt.NewManager([]opt.Pass{iterLower, reduceLower})
 	if err := inOrder.Run(ir.NewGraph("t")); err != nil {
 		t.Fatalf("in-order pipeline: expected success, got %v", err)
 	}
@@ -88,7 +88,7 @@ func TestPreconditionRejectsOrder(t *testing.T) {
 
 func TestPipelineEndErrorSurfaces(t *testing.T) {
 	// A PipelineEnd error aborts Run even with an EMPTY pass list.
-	pm := pass.NewManager(nil)
+	pm := opt.NewManager(nil)
 	pm.AddInstrumentation(&failingEnd{err: errors.New("boom")})
 	err := pm.Run(ir.NewGraph("t"))
 	if err == nil {
@@ -107,8 +107,8 @@ func TestPipelineEndErrorSurfaces(t *testing.T) {
 	bad := broken.NewNode(ir.KindBinOp, "test", nil, nil)
 	broken.NewReturn("test", bad) // effect root: keeps the unwired binop reachable
 
-	ve := pass.NewVerifyEach(io.Discard)
-	pmVerify := pass.NewManager(nil)
+	ve := opt.NewVerifyEach(io.Discard)
+	pmVerify := opt.NewManager(nil)
 	pmVerify.AddInstrumentation(ve)
 	err = pmVerify.Run(broken)
 	if err == nil {
@@ -125,8 +125,8 @@ func TestPipelineEndErrorSurfaces(t *testing.T) {
 	c2 := clean.NewConst("test", f32, 2)
 	clean.NewReturn("test", clean.NewBinOp("test", ir.BinOpAdd, c1, c2))
 
-	pmClean := pass.NewManager(nil)
-	pmClean.AddInstrumentation(pass.NewVerifyEach(io.Discard))
+	pmClean := opt.NewManager(nil)
+	pmClean.AddInstrumentation(opt.NewVerifyEach(io.Discard))
 	if err := pmClean.Run(clean); err != nil {
 		t.Fatalf("empty-pipeline verify over clean graph: expected nil, got %v", err)
 	}
