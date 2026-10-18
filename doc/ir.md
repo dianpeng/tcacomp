@@ -482,3 +482,270 @@ roots a *different* `StmtAssign` statement renders as `%N` from other
 statements' trees (the statement-boundary rule that makes LICM hoists print as
 `%0 * 3.0`, never `(%0) * 3.0`). The DOT emitter shares `StmtNodes`,
 `OperandsOf`, `Label` so `.dot` mirrors the text numbering (D-05).
+
+## 9. Conceptual code → IR: worked examples
+
+Every IR snippet in this section is either **verbatim from a committed
+golden** or **derived from the printer rules of §8.3** (`chainOf` stage
+collection, `stageText`/`value` rendering, `%0` pipe binding). Lines that are
+illustrative-only — not derivable from print.go plus a golden — are marked
+`# illustrative`.
+
+### 9.1 The matmul_scale oracle (real golden, verbatim)
+
+Conceptual kernel (doc/tca.md §5): `output[m][k] = ( Σ_n lhs[m][n] * rhs[n][k] ) * scale`.
+Built through the public builder (`pkg/oracle_test.go: buildMatmulScale`):
+
+```go
+b := pkg.NewBuilder("matmul_scale")
+m, k, n := b.Dim("m", 0), b.Dim("k", 0), b.Dim("n", 0)
+lhs := b.Tensor("lhs", ir.TF32, m, n)
+rhs := b.Tensor("rhs", ir.TF32, n, k)
+out := b.Tensor("output", ir.TF32, m, k)
+scale := b.ScalarParam("scale", ir.TF32)
+
+root, _ := b.Stmt().Iter(m, k, n).
+    Map([]pkg.Operand{pkg.At(lhs, m, n), pkg.At(rhs, n, k)},
+        func(l, r pkg.Expr) pkg.Expr { return b.Mul(l, r) })
+mid := root.As(m, k, n)
+ar, _ := mid.Reduce(b.Float32(0.0),
+    func(acc, v pkg.Expr) pkg.Expr { return b.Add(acc, v) })
+am, _ := ar.Map(nil, func(v pkg.Expr) pkg.Expr { return b.Mul(v, scale) })
+tail := am.As(m, k)
+_, _ = tail.Store(out, m)
+graph, _ := b.Build()
+```
+
+The committed golden `pkg/testdata/matmul_scale.ir`, quoted **verbatim**
+(byte-for-byte, 8 lines):
+
+```
+statement #8:
+  iter(@m, @k, @n) -> map(lhs[@m][@n], rhs[@n][@k], lambda(l, r): l * r) as (@m, @k, @n) |
+  reduce(init=0.0, %0, lambda(acc, now): acc + now) |
+  iter() -> map(%0, lambda(v): v * scale) as (@m, @k) |
+  memstore(%output[@m][@k], %0)
+
+statement #9:
+  return %output
+```
+
+Node-by-node / stage-by-stage:
+
+- **Parameters.** The seven kernel params are InputParam nodes 1–7 in
+  declaration order: `@m, @k, @n, lhs, rhs, output, scale`. The tensor *reads*
+  in the root map are `param` ref nodes (§4 row 9) — the builder never emits
+  `memload` at this level; `memload` is the explicit form effect
+  linearization (future pass) materializes. The refs render structurally:
+  `lhs[@m][@n]` — the axes come from the tensor type's dims, not from stored
+  names.
+- **Statement IDs #8/#9 (Scheme X, D-04).** `Stmt()` reserves **two** IDs
+  before any chain node exists — one pinned on the store, one on the end
+  node — so statement IDs stay dense across the chain's 22 nodes (IDs 10–31)
+  and the return node (32). Without the reservation the statements would
+  print as ≥ #33, and the doc-pinned oracle would drift. Materialize consumes
+  the pinned IDs; the golden pins them byte-for-byte.
+- **Stage 1** — `iter(@m, @k, @n) -> map(...)` is one printed stage: the
+  iteration cluster (node with the three dim payload uses) is transparent for
+  piping, so it renders its body map inline. The map's operands are the two
+  tensor refs; the lambda `lambda(l, r): l * r` is a `Lambda` payload record
+  whose params `l, r` are graph-external `RoleLambda` InputParams and whose
+  body is a `binop` node, canonically re-rendered (D-02). The mandatory
+  `as (@m, @k, @n)` is the map's output-order payload (tca.md §2.7); `@n`
+  last means `@n` is the reduced axis.
+- **Stage 2** — `reduce(init=0.0, %0, lambda(acc, now): acc + now)`. The
+  reduce's piped operand (slot 1) is the stage-1 cluster; because it is
+  pipe-bound to the previous stage it renders as `%0`.
+- **Stage 3** — `iter() -> map(%0, lambda(v): v * scale) as (@m, @k)` is the
+  piped map after the reduce, wrapped in a **zero-arity** iteration cluster
+  (`iter()`) — exactly the fused-tail form of tca.md §2.5. `scale` is a
+  captured kernel scalar, a `param` ref rendering bare.
+- **Stage 4** — `memstore(%output[@m][@k], %0)`. The store's target is the
+  `access` payload (tensor use `%output` + axis uses `@m, @k`); its value
+  operand is the piped stage-3 cluster, printing `%0`. The store is chained
+  into `%output`'s per-tensor effect chain by `NewMemStoreChained` (§6.2) —
+  here it is the first (and only) access, so its `ImpactBy` payload is empty.
+- **Statement #9** — `return %output` is the ONE end node (R2). Its operand
+  is the **store node itself** (the builder passes stores as return values,
+  and a store returns the stored value — which is why it renders `%output`,
+  tca.md §2.5). Its `ImpactBy` payload carries `%output`'s final chain state
+  — the store — so the store stays live through the end node alone (R3: the
+  store is reachable from a root, so building DCE never sweeps it).
+- **`%0` everywhere.** The `%0` in stages 2, 3, and 4 is the **pipe
+  variable**, stage-local per tca.md §2.6 — each is that stage's piped input
+  bound to `%0`, not an SSA definition-order number. Definition-order `%N`
+  numbering (§8.3) never appears in this golden because every operand renders
+  by name or by pipe. (This is also why the reduce's input and the scale
+  map's input can both print `%0`: two different stages, two different
+  bindings of the same pipe notation.)
+- The graph view of the same oracle is committed at
+  `internal/visualization/testdata/matmul_scale.dot` (same numbering, D-05).
+
+### 9.2 Teaching example: trivial scale kernel
+
+Conceptual: `out[i] = in[i] * 2.0` with one dynamic dim — the smallest legal
+chain (a root map must flow through nothing before a store in v0: Iter → Map
+→ As → Store).
+
+```go
+b := pkg.NewBuilder("scale2")
+m := b.Dim("m", 0)
+in := b.Tensor("in", ir.TF32, m)
+out := b.Tensor("out", ir.TF32, m)
+root, _ := b.Stmt().Iter(m).
+    Map([]pkg.Operand{pkg.At(in, m)},
+        func(v pkg.Expr) pkg.Expr { return b.Mul(v, b.Float32(2.0)) })
+_, _ = root.As(m).Store(out, m)
+graph, _ := b.Build()
+```
+
+Derived IR (derivation below; every line follows from printer rules):
+
+```
+statement #4:
+  iter(@m) -> map(in[@m], lambda(v): v * 2.0) as (@m) |
+  memstore(%out[@m], %0)
+
+statement #5:
+  return %out
+```
+
+Derivation:
+
+- **IDs.** Params `@m, in, out` are nodes 1–3. `Stmt()` reserves 4 (pinned on
+  the store) and 5 (pinned on the end node) before the chain's nodes exist —
+  so `statement #4` and `statement #5` regardless of the nine chain nodes
+  that follow (paramRef `in`, lambda param `v`, paramRef `v`, const `2.0`,
+  binop, map, itercluster, store, then the return at Build time).
+- **Stage 1.** The map's single operand is a `param` ref to the `in` tensor;
+  a non-scalar tensor ref renders from the type's dims → `in[@m]`. The
+  lambda body `v * 2.0` is a `binop` (Mul) re-rendered with §7.6 precedence:
+  both operands are atoms (prec 12 > Mul's 10), so no parens (D-02). A
+  single-parameter map lambda is named `v` by the builder's name table
+  (chain.go).
+- **Stage 2.** The store's value operand is the piped stage-1 cluster;
+  pipe-bound to the previous stage it renders `%0`. The target renders
+  `%out[@m]` from the access payload.
+- **Statement #5.** The end node returns the store (which returns the stored
+  value) → `%out`.
+
+### 9.3 Teaching example: two-store effect chains (ImpactBy made visible)
+
+The text printer does **not** render `ImpactBy` edges: a store renders
+through its own access rule (target + value only) and the end node renders
+its value operands only. (This is why the one-end-node wiring of
+quick-261018-bl0 task 2 needed **no** golden change — statement #9 above
+stayed `return %output` in shape.) The effect order therefore has to be read
+from the graph, not the print. This example states both.
+
+Conceptual kernel — two independent outputs, one chain each:
+
+```go
+b := pkg.NewBuilder("two_out")
+m := b.Dim("m", 0)
+in := b.Tensor("in", ir.TF32, m)
+out1 := b.Tensor("out1", ir.TF32, m)
+out2 := b.Tensor("out2", ir.TF32, m)
+mk := func() *pkg.Stored { // one scale-by-2 chain, stored by the caller
+    r, _ := b.Stmt().Iter(m).
+        Map([]pkg.Operand{pkg.At(in, m)},
+            func(v pkg.Expr) pkg.Expr { return b.Mul(v, b.Float32(2.0)) })
+    return r.As(m)
+}
+_, _ = mk().Store(out1, m)
+_, _ = mk().Store(out2, m)
+graph, _ := b.Build()
+```
+
+Derived IR (same derivation as §9.2, one more param and one more chain):
+
+```
+statement #5:
+  iter(@m) -> map(in[@m], lambda(v): v * 2.0) as (@m) |
+  memstore(%out1[@m], %0)
+
+statement #15:
+  iter(@m) -> map(in[@m], lambda(v): v * 2.0) as (@m) |
+  memstore(%out2[@m], %0)
+
+statement #6:
+  return %out1, %out2
+```
+
+- **IDs.** Params are nodes 1–4; chain 1 reserves 5 (store) and 6 (end
+  node); its nine nodes follow; chain 2 reserves **15** (store) and 16
+  (unused — only the first output binding's end-node reservation is consumed,
+  R2) before its nodes. Pinned IDs can therefore print **out of sorted
+  order** (`#5, #15, #6`): list order is allocation order (§8.2), IDs are
+  pinned (D-04).
+- **The return.** `Build` emits ONE end node over all output bindings, in
+  first-store order: values `store1, store2` (rendering `%out1, %out2`).
+
+Now the part the print hides — the `ImpactBy` edge list for this graph
+(edges point consumer → chain head, §6):
+
+```
+store1:  ImpactBy = {}            // first access to %out1 — chain head was nil
+store2:  ImpactBy = {}            // first access to %out2
+end:     ImpactBy = {store1, store2}   // one edge per output tensor's FINAL chain head (R2)
+```
+
+The per-tensor chains are **isolated** — the restrict-alias rule (§6.2) is
+what makes two independent chains sound without any cross-ordering edge.
+
+**Same tensor, second store.** If the second chain stored `out1` again
+(`mk().Store(out1, m)`), the second store would chain after the first —
+exactly the second-ImpactBy-first edge of §6.2:
+
+```
+store1:  ImpactBy = {}            // first access to %out1
+store2:  ImpactBy = {store1}      // NewMemStoreChained wires env.ChainHead(out1)
+end:     ImpactBy = {store2}      // final chain head ONLY — store1 stays live
+                                  // transitively, via store2's ImpactBy path
+                                  // (Level-1 DCE follows payload edges, §7)
+```
+
+(The builder's output binding also updates: the end node's operand for
+`out1` becomes `store2` — last store wins — while `store1` remains live only
+through the chain.)
+
+### 9.4 Teaching example: LIR cache-placement sketch
+
+What an HIR GMEM access lowered through an SMEM cache into a register
+fragment looks like at the node level, once cache lowering (a **future**
+phase) exists. No golden covers this: the node shapes and renderings below
+are what `catalog.go` + `node_lir_memory.go` + `print.go` support today;
+anything beyond is marked.
+
+```
+# illustrative — cache lowering is a FUTURE phase; nothing below is a golden.
+
+alloc = memnewsmem(extent)                                  # SMEM buffer, StorageClass=smem
+fill  = memstoresmem(%gmem_value, alloc, [@m_b, @k_b])     # ops = [value, dst buffer, biv axes]
+tile  = memloadsmem(alloc, [@m_b, @k_b])                   # ops = [src buffer, biv axes]
+faccr = fragnew(extent)                                     # register fragment, StorageClass=frag
+acc   = fragstore(%tile_value, faccr, [@m_b, @k_b])         # returns the stored value (tca.md §2.5)
+reuse = fragload(faccr, [@m_b, @k_b])
+
+# the enclosing nest is the explicit lowered loop (a stage, §4 row 17):
+for(@m_b(init=0.0, step=1.0)/M, ...)  body                  # illustrative — bound/body elided
+#   └ forloop ops = [iv(dimvar), bound(bdimvar), body];  the biv axes are the
+#     lowered form of the HIR access axes;  @m_b/M prints as bdimvar over the
+#     normalized dimvar (doc/optana/induction_variable.md)
+```
+
+Reading the sketch against §4:
+
+- The HIR **payload access** (tensor + axes uses on `memload`/`memstore`)
+  has been promoted into **ordinary operand flow**: the SMEM/FRAG buffer is
+  an operand slot, and the axes are **bounded dimvars** (`bdimvar` value
+  objects, identity = the `(init, step)` tuple — never the name).
+- Every LIR memory node carries its `StorageClass` (`smem`/`frag`), bound at
+  construction (X-4); the verifier fails closed unless buffers are
+  `memnewsmem`/`fragnew` defs.
+- SMEM/FRAG stores are **effect-free** (§6.1): they are not statement roots
+  and are dead-code-eligible unless they feed the end node — a cache that
+  nothing observable consumes simply vanishes at Level-1 DCE.
+- `# illustrative` lines: the `for(...)` rendering (a forloop stage prints
+  `for(v in bound) body`, but no committed example pins the exact shape) and
+  the elided bound/body.
