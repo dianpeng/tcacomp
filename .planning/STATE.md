@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-18 - Completed quick task 261018-l36: Implement mark-sweep DCE pass on TCA IR + reorganize internal/opt pass manager
+last_activity: 2026-10-19 - Completed quick task 261019-jck: Refactor internal/analysis to mirror internal/opt registry pattern
 progress:
   total_phases: 6
   completed_phases: 1
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-18 - Completed quick task 261018-nga: CSE via GVN (side-effect analysis + global value numbering)
+Last activity: 2026-10-19 - Completed quick task 261019-jck: refactor internal/analysis to mirror internal/opt registry pattern
 
 Progress: [██░░░░░░░░] 17%
 
@@ -90,6 +90,7 @@ None yet.
 | 261018-l36 | Implement mark-sweep DCE pass on TCA IR + reorganize internal/opt pass manager (registry/factory/all, init self-registration, priority ordering, shared analysis cache) | 2026-10-18 | 84eef54 | [261018-l36-implement-mark-sweep-dce-pass-on-tca-ir-](./quick/261018-l36-implement-mark-sweep-dce-pass-on-tca-ir-/) |
 | 261018-l36-f1 | fast: add dce-verify post-sweep invariant pass + chain-integrity regression tests (middle-link conservatism, dead-tail detachment) | 2026-10-18 | ca26d2a | — |
 | 261018-nga | Implement CSE via GVN: identity-keyed ValueHash/ValueEqual value contract, amended EffectOf verdicts (all FamilyMemory effectful), accumulated side-effect analysis in internal/analysis, GVN pass + verifier at 110/111 | 2026-10-18 | d8bce2e | [261018-nga-cse-via-gvn-side-effect-analysis-global-](./quick/261018-nga-cse-via-gvn-side-effect-analysis-global-/) |
+| 261019-jck | Refactor internal/analysis to mirror internal/opt registry pattern: top-level registry/abstract-factory infra, sideeffect/ sub-module with init self-registration, all/ composition root | 2026-10-19 | e451b2d | [261019-jck-refactor-internal-analysis-to-mirror-int](./quick/261019-jck-refactor-internal-analysis-to-mirror-int/) |
 
 ## Session Continuity
 
