@@ -14,6 +14,7 @@ Reader's map:
 | `doc/syntax.md` | The v0 frontend language the IR ultimately compiles. |
 | **`doc/ir.md` (this file)** | The implementation-faithful IR spec: file organization, node catalog, SSA/effect/liveness machinery, scheduling, and worked conceptual-code → IR examples. |
 | `doc/optana/induction_variable.md` | Formal spec of the IV/BIV value relations (`SameIV`, `Includes`, …). |
+| `doc/optana/lower_itercluster.md` | The feature request the IterCluster→Iter lowering + Simplification passes implement (quick-261019-ktm); the Input-list restructure and the convention below are its amendments. |
 
 ## 1. Overview & how to read this doc
 
@@ -26,6 +27,33 @@ separate high/mid/low IRs). It is not an AST materialization: every reference
 in the graph is an `SSAUse` record and every definition is an `SSADef`, so
 passes rewrite graphs in place through a small choke-point API rather than
 rebuilding trees (review `doc/review/phase1_1.md`, P1R-01).
+
+> ### ⚠ REQUIREMENT — the Input/ImpactBy-only convention (quick-261019-ktm)
+>
+> A node's inputs live **ONLY** in its two dependency lists — nothing else:
+>
+> | List | Models | Storage |
+> |---|---|---|
+> | **Input** (operand slots) | **data dependencies** | the node's `operandList` |
+> | **ImpactBy** | **side-effect dependencies** | a direct `[]SSAUse` field, on effect bearers only (`memload`/`memstore`/`return`) |
+>
+> **No node may hide state referencing SSA values / nodes / dimvars in record
+> fields outside these two lists — every node kind, loops, lambdas, everything.**
+> A field that *could* hold a reference is a violation the moment it is
+> declared, even when zero-valued. Names, literal constants (e.g. an init
+> value, an axis index), opcodes, and kinds are metadata, not dependencies —
+> they stay. Binder declarations bind positionally from the Input list and
+> never store back-pointers.
+>
+> **Why:** a hidden reference is invisible to `Walk`, the verifier, DCE, GVN,
+> and the printers — the analysis machinery sees only the two lists, so any
+> third storage is a correctness hole, not a style issue.
+>
+> **This is machine-checked** (§5.2): `Verify` runs a reflect sweep
+> (`convention.go`) over every allocated node's struct fields and reports a
+> `convention` violation for any field whose type can carry SSA/Node
+> references outside the sanctioned spellings. Adding a node kind with a
+> hidden reference fails verification in tests immediately.
 
 Its place in the compiler:
 
@@ -61,11 +89,13 @@ implemented: `Kind.String()` is the one source of the spelling).
   doc-only task (flagged as a follow-up in quick-261018-bl0's summary).
 - `doc/tca.md` §5.13's node-suite table likewise predates the v3
   re-organization (quick-261018-bl0): `FamilyTileOp` with `loadtile`/`storetile`
-  is gone (replaced by the SMEM/FRAG families in `FamilyMemory`), the file
-  column still names the old monolithic `construct.go`/`tile.go` layout, and
-  its `dimvar` operand list `[dim, init, step]` reflects the pre-layering
-  shape — the implemented `dimVarNode` has operands `[init, step]` with the
-  dim binding as a payload use (§4 below). Same deferred-sync category.
+  is gone (replaced by the SMEM/FRAG families in `FamilyMemory`) and the file
+  column still names the old monolithic `construct.go`/`tile.go` layout. Its
+  `dimvar` operand list `[dim, init, step]` happens to match the implemented
+  shape again since quick-261019-ktm (the dim binding moved from payload to
+  operand 0, §4) — but the table still misses the six restructure kinds
+  (`iterclusterproject`, `keyedattribute`, `as`, `lambda`, `tensordimof`,
+  `inductionvariable`). Same deferred-sync category.
 
 ## 2. File organization
 
@@ -78,15 +108,16 @@ no enum surgery (append-only, IR-03).
 | File | Owns | Why |
 |---|---|---|
 | `node.go` | The structural core: `Base` cell (ID, kind, `Loc`, `LastTouchedBy`, SSAVar, erased tombstone, surplus count, stmt back-pointer, pinned stmtID), the `Node`/`Value`/`ScalarExprNode`/`nodeImpl` interfaces, `operandList` slot storage, the `Graph` root (name, params, `nodes` registry, `end`, `cfg`), `allocNode` (the one kind→struct dispatch), `wireOperands`/`wirePayloadUse`, `NewGraph`, `NewID`/`ReserveStatementID`/`PinStatementID`, `NewNode`. | One place holds everything every node shares; the dispatch table is the single join point for new kinds (R4a). |
-| `kind.go` | The `Kind` enum (`KindVersion = 3`), `Kind.String()` (lowercase canonical spelling, D-6), `Family` classification (D-15). | Enum + spelling + family only; all other per-kind metadata lives in `catalog.go` (R4e separation). |
+| `kind.go` | The `Kind` enum (`KindVersion = 5`), `Kind.String()` (lowercase canonical spelling, D-6), `Family` classification (D-15). | Enum + spelling + family only; all other per-kind metadata lives in `catalog.go` (R4e separation). |
 | `catalog.go` | The dedicated listing file (R4e): one `kindEntry` per kind — tier (D-3), family, operand arity, one-line doc — plus `HIRKinds()`/`LIRKinds()`/`AllKinds()`/`Tier()`/`fixedArity()`. Rows are in enum order, so `catalog[k-1]` describes `k`. | Pinned invariants (catalog_test.go): `len(AllKinds()) == int(KindEnd)-1`; HIR kinds are exactly the kinds `< KindForLoop` (the tier boundary IS the enum boundary). |
 | `doc.go` | Package design notes (the long header comment: optimizer shape, two-level IR, SSA chains, walking, lowered suite, interface-width contract). | Intent lives with the code it governs. |
-| `node_lambda.go` | HIR lambda stages: `mapNode`, `reduceNode`, the `Lambda` payload record. | The piped input is an **ordinary operand** (map operand 0, reduce operand 1) — "pipe" survives only as builder terminology, so data-dependency edges cover piping with zero special cases. |
+| `node_lambda.go` | HIR lambda stages: `mapNode` (`ops = [value operands..., As?, lambda]`), `reduceNode` (`ops = [piped, KeyedAttribute, lambda]`), the `lambdaNode` expression node, and the **transient** `Lambda` builder record; read faces `LambdaOf`/`lambdaNodeParams`/`lambdaNodeBody`, `AsOf`, `ReduceInitOf`. | "Pipe" survives only as builder terminology (piped input = reduce operand 0). Since the convention revision the lambda itself is a **`KindLambda` node carried as the stage's trailing operand** — params and body are the lambda node's own operands, never hidden records (the `Lambda` struct exists only between the builder call and `NewMap`/`NewReduce`). |
 | `node_expr.go` | HIR scalar-expression suite: `constNode`, `paramRefNode`, `binOpNode`, `unaryOpNode`, `selectNode`, `castNode`, `callNode`, plus the `BinOpCode`/`UnaryOpCode` tables mirroring `doc/syntax.md` §7.6 precedence. | Value-level leaves every lambda body is built from; lowering never rewrites them. |
 | `node_var.go` | `inputParamNode` and the `ParamRole` taxonomy (`RoleDim`, `RoleTensor`, `RoleScalar`, `RoleLambda`), `RoleOf`. | Kernel params are graph-owned (`NewInputParam` appends to `g.params`); lambda params are graph-external by design (inlined at lowering). |
-| `node_memory.go` | HIR GMEM family: `memLoadNode`, `memStoreNode`, `memNewNode`, the `access` payload record (tensor + axes as SSAUses), and the load/store `effectIns` ImpactBy payloads. | The structural tensor access is a **payload** of InputParam uses at this level (P1R-01); lowering promotes the pieces into ordinary SSA operand flow (the LIR family). |
-| `node_loop.go` | Loop-structure nodes: HIR `iterNode`, `iterClusterNode`; LIR `forLoopNode`. | Structure only — the LIR IV *value objects* live in `node_dimvar.go`. |
-| `node_dimvar.go` | LIR `dimVarNode`, `boundedDimVarNode` and the IV/BIV relations: `SameIV`, `SameBIV`, `Includes` (`~>`), `BelongsTo` (`<~`), per `doc/optana/induction_variable.md`. | An induction variable is a value object: identity is the `(init, step)` tuple, never the name. |
+| `node_memory.go` | HIR GMEM family: `memLoadNode` (`ops = [tensor, axes...]`), `memStoreNode` (`ops = [value, tensor, axes...]`), `memNewNode`; the load/store `effectIns` ImpactBy payloads. | The structural tensor access rides **operand slots** since the convention revision (the old `access` payload record is gone) — a store's target components are data deps, its `effectIns` the side-effect deps; the two lists are the node's entire input surface. |
+| `node_loop.go` | Loop-structure nodes: HIR `iterNode` (`ops = [dim, bound?, init, step]` — the bound slot exists only in the bounded form), `iterClusterNode` (`ops = [dims..., inputs...]` — dims LEAD the input list; `ClusterDims`/`ClusterInputs` derive the split), LIR `forLoopNode`. | Structure only — the LIR IV *value objects* live in `node_dimvar.go`. |
+| `node_iterfmt.go` | The IterCluster-format and lowering bridge nodes (quick-261019-ktm): `iterClusterProjectNode`, `keyedAttributeNode`, `asNode`, `tensorDimOfNode`, `inductionVariableNode`. | The five kinds the Input-list restructure introduced — every one operand-only by construction (the convention's first citizens). |
+| `node_dimvar.go` | LIR `dimVarNode` (`ops = [dim, init, step]`), `boundedDimVarNode` (`ops = [iv, max]`) and the IV/BIV relations: `SameIV`, `SameBIV`, `Includes` (`~>`), `BelongsTo` (`<~`), per `doc/optana/induction_variable.md`. | An induction variable is a value object: identity is the `(init, step)` tuple, never the name. |
 | `node_lir_memory.go` | LIR memory family: `memLoadSMemNode`, `memStoreSMemNode`, `memNewSMemNode`, `fragLoadNode`, `fragStoreNode`, `fragNewNode`, the `StorageClass` metadata (`StorageGMEM`/`StorageSMem`/`StorageFrag`), `StorageClassOf`. | Every LIR memory node carries the storage class its constructor bound it to (X-4, mirroring tinycudaopto's `memory_class.go`); the buffer is an **operand slot**, the axes are bounded dimvars. |
 | `node_end.go` | `returnNode` — the graph's ONE end node (R2): `Graph.end`, `End()`, `NewReturn`, `NewReturnChained`. | First `NewReturn` on a graph becomes `g.end`; later returns are ordinary nodes the verifier rejects (fail-closed multiple-end check). |
 | `ssa.go` | The SSA handle layer: `SSAVar`, `SSADef`, `SSAUse`, the `ssaRefRecord` indirection, `UsesOf`/`DefOf`. | Sole pointee of the use-def/def-use relationship (directive 2); see §5. |
@@ -96,9 +127,10 @@ no enum surgery (append-only, IR-03).
 | `dce.go` | `BuildingDCE` and both level algorithms: `markReachable`/`buildingDCESea` (Level 1), `markDeadStatements`/`wipeDeadStatements` (Level 2), `isEffectKind`/`hasEffectNode`, `statementOwnership`. | Building debris is wiped before passes see the graph (P1R-08); see §7. |
 | `schedule.go` | `Graph.Materialize()` — the Level-1 → Level-2 transition. | Deliberately minimal default scheduling (D-7); optimization scheduling is the pass's job (§8.2). |
 | `cfg.go` | Level-2 control-flow shape: `CFG`, `BasicBlock`, `Statement`, the intrusive doubly-linked list (`Append`/`InsertBefore`/`InsertAfter`/`Remove`), `StmtKind` (`StmtAssign`/`StmtEffect`), `NewStatement`, `classifyStmt`. | O(1) removal by pointer (P1R-02); `NewStatement` is the factory passes use after scheduling. |
-| `verify.go` | `Verify`, the `use-def`/`def-use` chain invariants, per-kind shape checks, the multiple-end-nodes check, `Violation` diagnostics. | The cheap verifier callable after every pass (design.md); fail-closed everywhere. |
-| `print.go` | The canonical deterministic printer: `Print`/`PrintOpts`, `Numbering`/`ComputeNumbering`, `StmtNodes`, `chainOf`, `stageText`/`value`, `Label`, `OperandsOf`/`LambdaBodies`, `FormatConst`. | Byte-exact goldens (D-01..D-04, D-13); see §8.3. |
-| `mutate.go` | `MutContext` and the five choke points: `SetDef`, `AddUse`, `RemoveUse`, `ReplaceAllUsesWith`, `Erase`. | The ONLY sanctioned mutation path outside construction (IR-04, D-17); see §5.3. |
+| `verify.go` | `Verify`, the `use-def`/`def-use` chain invariants, per-kind shape checks (incl. the convention-driven dim/bound and dims-lead checks), the multiple-end-nodes check, `Violation` diagnostics. | The cheap verifier callable after every pass (design.md); fail-closed everywhere. |
+| `convention.go` | The Input/ImpactBy-only convention, machine-checked: `hiddenRefFieldType` (type classifier — what counts as a hidden reference) and `checkConvention` (the reflect sweep over every allocated node's struct fields). | Wired into `Verify`; see §1.1's requirement box and §5.2. A forbidden field trips a `convention` violation even when zero-valued — the check is shape-level, fail-closed, and nil types classify hidden. |
+| `print.go` | The canonical deterministic printer: `Print`/`PrintOpts`, `Numbering`/`ComputeNumbering`, `StmtNodes`, `chainOf`, `stageText`/`value`, `Label`, `OperandsOf`/`LambdaBodies`/`LambdaParams`, `FormatConst`. | Byte-exact goldens (D-01..D-04, D-13); see §8.3. `LambdaBodies`/`LambdaParams` are DERIVED faces over the lambda node's operands — no stored records behind them. |
+| `mutate.go` | `MutContext` and the seven choke points: `SetDef`, `AddUse`, `RemoveUse`, `ReplaceAllUsesWith`, `SetLambdaBody`, `ClearLambdaParams`, `Erase`. | The ONLY sanctioned mutation path outside construction (IR-04, D-17); see §5.3. The two lambda choke points are the sanctioned way to edit a stage's lambda through its node (rewire the body operand; drop dead param operand slots). |
 | `types.go` | `ElemType` (syntax.md §3.3 mirror, f8 absent), `DimRef`, the `Type` interface and interned `NumericType`, `InternScalar`/`InternTensor`. | Extensible type interface (directive 1); interning makes interface `==` identity (D-18). |
 
 The exported **construction surface** (`NewMap`, `NewReduce`, `NewMemLoad`,
@@ -149,55 +181,66 @@ the counter at `Materialize` time for unpinned roots.
 
 ## 4. Node catalog
 
-`KindVersion = 3` (IR-03) is the deliberate **one-time** tinycudaopto
-re-organization (quick-261018-bl0): HIR kinds now group before LIR kinds (the
-tier boundary is the enum boundary — `KindReturn` is the last HIR kind,
-`KindForLoop` the first LIR kind), the generic `Load`/`Store` and the
-`LoadTile`/`StoreTile` kinds are gone (R4d), and the GMEM `MemLoad`/`MemStore`/`MemNew`
-family plus the lowered `MemLoadSMem`/`MemStoreSMem`/`MemNewSMem` and
-`FragLoad`/`FragStore`/`FragNew` families take their places. From v3 onward
-the rule is **append-only**: new kinds insert before `KindEnd` within their
-tier and never renumber existing constants. `KindInvalid` (0) and `KindEnd`
-(26) are sentinels with no catalog row; the pass manager's legality windows
-and the verifier reject both, and any kind `>= KindEnd` (IR-03/IR-07).
+`KindVersion = 5` (IR-03). v3 was the deliberate **one-time** tinycudaopto
+re-organization (quick-261018-bl0): HIR kinds group before LIR kinds (the
+tier boundary is the enum boundary), the generic `Load`/`Store` and
+`LoadTile`/`StoreTile` kinds are gone (R4d), and the GMEM + SMEM/FRAG
+families take their places. v4 (quick-261019-ktm round 1) added the
+Input-list restructure kinds to the HIR tier; v5 (the convention revision)
+added `lambda` after `as` — one deliberate LIR-side renumber. From v3 onward
+the rule is **append-only within a tier**: new kinds insert before `KindEnd`
+in their tier and never renumber existing constants (v4/v5's HIR additions
+sit before `KindForLoop`, keeping the tier boundary at the enum boundary).
+`KindInvalid` (0) and `KindEnd` (32) are sentinels with no catalog row; the
+pass manager's legality windows and the verifier reject both, and any kind
+`>= KindEnd` (IR-03/IR-07).
 
-All 25 kinds, exactly as listed in `catalog.go` (enum order; arity `-1` =
-variadic, slots allocated from the operand list):
+All 31 kinds, exactly as listed in `catalog.go` (enum order; arity `-1` =
+variadic, slots allocated from the operand list). **Every row is
+Input/ImpactBy-only** (§1.1's requirement): the "Operands" column below IS
+the node's complete input surface — the only payload storage left in the
+suite is the `effectIns` ImpactBy list of the three effect bearers.
 
-### HIR tier — the abstract kernel graph the builder produces (16 kinds)
+### HIR tier — the abstract kernel graph the builder produces (20 kinds)
 
-| # | Kind (spelling) | Family | Arity | Operands / payload | Semantics |
+| # | Kind (spelling) | Family | Arity | Operands | Semantics |
 |---|---|---|---|---|---|
-| 1 | `map` | Abstract | -1 | ops = operand values (piped input first on a piped map); payload = `Lambda` + `as`-order uses | Lambda map stage, element-wise over its operands; the mandatory `as` clause fixes output axis order (tca.md §2.7). |
-| 2 | `reduce` | Abstract | 2 | ops = `[init, piped]`; payload = combiner `Lambda` | Lambda reduce stage over the producing map's last `as` axis; homogeneous reducer contract (tca.md §4.2). |
-| 3 | `memload` | Memory | -1 | ops = `[tensor, axes...]`; payload = `effectIns` | HIR GMEM load of `tensor[@m][@n]`; chains into the per-tensor effect order via ImpactBy. (The builder's tensor *reads* are `param` refs — §9.1; `memload` is the explicit form effect linearization materializes.) |
-| 4 | `memstore` | Memory | 1 | ops = `[value]`; payload = target `access` (tensor + axes) + `effectIns` | HIR GMEM structural store, the stage store. Returns the stored value (tca.md §2.5), which is what keeps fusion pipes intact. |
+| 1 | `map` | Abstract | -1 | ops = `[value operands..., As?, lambda]` | Lambda map stage, element-wise over its value operands (piped input first on a piped map). The trailing `As` node is the output-axis order (`AsOf`, tca.md §2.7); the trailing `lambda` node closes the list. |
+| 2 | `reduce` | Abstract | -1 | ops = `[piped, KeyedAttribute("init"), lambda]` | Lambda reduce stage over the producing map's last `as` axis (tca.md §4.2). The init rides operand 1 as a `keyedattribute` — `ReduceInitOf` unwraps its value operand; operand 0 is ALWAYS the piped input. |
+| 3 | `memload` | Memory | -1 | ops = `[tensor, axes...]`; ImpactBy = `effectIns` | HIR GMEM load of `tensor[@m][@n]`; chains into the per-tensor effect order via ImpactBy. (The builder's tensor *reads* are `param` refs — §9.1; `memload` is the explicit form effect linearization materializes.) |
+| 4 | `memstore` | Memory | -1 | ops = `[value, tensor, axes...]`; ImpactBy = `effectIns` | HIR GMEM structural store, the stage store. Returns the stored value (tca.md §2.5), which is what keeps fusion pipes intact. The target access rides operand slots 1+ (data deps). |
 | 5 | `memnew` | Memory | 1 | ops = `[extent]` | HIR GMEM allocation; the created extent is a Value. |
-| 6 | `iter` | Loop | 2 | ops = `[init, step]`; payload = dim use, bound use (unwired = unbounded) | Abstract induction variable `@m`, optionally bounded `@m/M` (tca.md §2.3). |
-| 7 | `itercluster` | Loop | 1 | ops = `[body]`; payload = dim uses | Compound header `iter(@m, @k, @n)` = the Cartesian product of its dims (tca.md §2.4). |
-| 8 | `const` | ScalarExpr | 0 | payload = interned type + value | Typed scalar constant; floats print shortest-round-trip f32 with `.0` appended (`FormatConst`). |
-| 9 | `param` | ScalarExpr | 0 | payload = use of a lambda or scalar InputParam | Scalar-expression parameter reference. A reference to a **tensor** param renders structurally (`lhs[@m][@n]` — the axes come from the tensor type's dims); scalar/lambda params render bare (`scale`, `v`). |
+| 6 | `iter` | Loop | -1 | ops = `[dim, bound?, init, step]` | Abstract induction variable `@m`, optionally bounded `@m/M` (tca.md §2.3) — the bound slot exists only in the bounded form. Shape check: operand 0 is a dim InputParam. |
+| 7 | `itercluster` | Loop | -1 | ops = `[dims..., inputs...]` | Compound header `iter(@m, @k, @n)` = the Cartesian product of its dims (tca.md §2.4). The dim InputParams LEAD the input list; `ClusterDims`/`ClusterInputs` derive the split; shape check enforces dims-lead. |
+| 8 | `const` | ScalarExpr | 0 | payload = interned type + value (metadata) | Typed scalar constant; floats print shortest-round-trip f32 with `.0` appended (`FormatConst`). |
+| 9 | `param` | ScalarExpr | 1 | ops = `[the referenced InputParam]` | Scalar-expression parameter reference. A reference to a **tensor** param renders structurally (`lhs[@m][@n]` — the axes come from the tensor type's dims); scalar/lambda params render bare (`scale`, `v`). Shape check: operand 0 is an InputParam. |
 | 10 | `binop` | ScalarExpr | 2 | ops = `[a, b]`; payload = opcode | Binary scalar op; the opcode table mirrors syntax.md §7.6 precedence. |
 | 11 | `unaryop` | ScalarExpr | 1 | ops = `[x]`; payload = opcode | Unary scalar op (`+`, `-`, `!`, `~`). |
 | 12 | `select` | ScalarExpr | 3 | ops = `[cond, then, else]` | Typed conditional `cond ? then : else`. |
 | 13 | `cast` | ScalarExpr | 1 | ops = `[x]`; payload = target type | Explicit cast to a named scalar type; renders `cast<f32>(x)`. |
 | 14 | `call` | ScalarExpr | -1 | ops = args; payload = builtin name | Registered **pure** builtin call. |
 | 15 | `inputparam` | Abstract | 0 | payload = name (debug only), interned type (nil for dims), role | Graph-owned kernel/lambda input parameter. The node's `SSAVar` IS the parameter's def; every reference elsewhere is an `SSAUse`. |
-| 16 | `return` | Abstract | -1 | ops = returned values; payload = `effectIns` | **The graph's single end node** (R2): the first `NewReturn` becomes `Graph.end`; carries return values AND every mem-param's final effect-chain state via ImpactBy (§6.3). The none Value — binds no SSA name. |
+| 16 | `return` | Abstract | -1 | ops = returned values; ImpactBy = `effectIns` | **The graph's single end node** (R2): the first `NewReturn` becomes `Graph.end`; carries return values AND every mem-param's final effect-chain state via ImpactBy (§6.3). The none Value — binds no SSA name. |
+| 17 | `iterclusterproject` | Abstract | 1 | ops = `[cluster]`; payload = index (metadata) | **IterCluster-format bridge** (quick-261019-ktm): binds the cluster's input slot *i* to a Map's parameter *i* — `Map(..., IterClusterProject(cluster, 0), ...)` before lowering. |
+| 18 | `keyedattribute` | Abstract | 1 | ops = `[value]`; payload = key string (metadata) | A named attribute riding an Input list — Reduce's `init`. The VALUE is an operand (a data dep); the name is metadata. |
+| 19 | `as` | Abstract | -1 | ops = `[dim params in order]` | The as-order clause, carried as the LAST VALUE operand of its Map/Reduce (before the trailing lambda) — `AsOf(n)` scans the Input list, no stored pointer. Shape check: operands are dim InputParams; at most one, placed last. |
+| 20 | `lambda` | Abstract | -1 | ops = `[param declarations..., body]` | The lambda expression, carried as the TRAILING operand of its Map/Reduce. The params (RoleLambda InputParams) bind positionally to the stage's Input-list value bindings; the body is the closing operand. The verifier permits only Map/Reduce to carry one. |
 
-### LIR tier — the lowered suite introduced by optimization passes (9 kinds)
+### LIR tier — the lowered suite introduced by optimization passes (11 kinds)
 
-| # | Kind (spelling) | Family | Arity | Operands / payload | Semantics |
+| # | Kind (spelling) | Family | Arity | Operands | Semantics |
 |---|---|---|---|---|---|
-| 17 | `forloop` | Loop | 3 | ops = `[iv(dimvar), bound, body]` | Explicit lowered loop nest. Shape check: operand 0 must be a dimvar. |
-| 18 | `dimvar` | Abstract | 2 | ops = `[init, step]`; payload = dim binding | Lowered induction variable — a value object; identity is the `(init, step)` tuple, never the name (doc/optana/induction_variable.md). Prints `@x(init=…, step=…)`. |
-| 19 | `bdimvar` | Abstract | 2 | ops = `[iv(dimvar), max]` | Bounded IV `((iv tuple), Max)`; prints `@x/M`. Shape check: operand 0 must be a dimvar. |
-| 20 | `memloadsmem` | Memory | -1 | ops = `[src smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM load. Shape check: src must be a `memnewsmem`. |
-| 21 | `memstoresmem` | Memory | -1 | ops = `[value, dst smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM store; returns the stored value (HIR contract, tca.md §2.5). |
-| 22 | `memnewsmem` | Memory | 1 | ops = `[extent]`; class = `StorageSMem` | SMEM allocation. |
-| 23 | `fragload` | Memory | -1 | ops = `[src frag buffer, bivs...]`; class = `StorageFrag` | Lowered register-fragment load. Shape check: src must be a `fragnew`. |
-| 24 | `fragstore` | Memory | -1 | ops = `[value, dst frag buffer, bivs...]`; class = `StorageFrag` | Lowered fragment store; returns the stored value. |
-| 25 | `fragnew` | Memory | 1 | ops = `[extent]`; class = `StorageFrag` | Fragment allocation. |
+| 21 | `forloop` | Loop | 3 | ops = `[iv(dimvar), bound, body]` | Explicit lowered loop nest. Shape check: operand 0 must be a dimvar. |
+| 22 | `dimvar` | Abstract | -1 | ops = `[dim, init, step]` | Lowered induction variable — a value object; identity is the `(init, step)` tuple, never the name (doc/optana/induction_variable.md). Prints `@x(init=…, step=…)`. Shape check: operand 0 is a dim InputParam. |
+| 23 | `bdimvar` | Abstract | 2 | ops = `[iv(dimvar), max]` | Bounded IV `((iv tuple), Max)`; prints `@x/M`. Shape check: operand 0 must be a dimvar. |
+| 24 | `memloadsmem` | Memory | -1 | ops = `[src smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM load. Shape check: src must be a `memnewsmem`. |
+| 25 | `memstoresmem` | Memory | -1 | ops = `[value, dst smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM store; returns the stored value (HIR contract, tca.md §2.5). |
+| 26 | `memnewsmem` | Memory | 1 | ops = `[extent]`; class = `StorageSMem` | SMEM allocation. |
+| 27 | `fragload` | Memory | -1 | ops = `[src frag buffer, bivs...]`; class = `StorageFrag` | Lowered register-fragment load. Shape check: src must be a `fragnew`. |
+| 28 | `fragstore` | Memory | -1 | ops = `[value, dst frag buffer, bivs...]`; class = `StorageFrag` | Lowered fragment store; returns the stored value. |
+| 29 | `fragnew` | Memory | 1 | ops = `[extent]`; class = `StorageFrag` | Fragment allocation. |
+| 30 | `tensordimof` | Abstract | 2 | ops = `[tensor param, TU32 axis const]` | A tensor dimension's upper bound — the bound the lowering gives an `iter`. Shape checks: operand 0 a RoleTensor InputParam, operand 1 a const. |
+| 31 | `inductionvariable` | Abstract | 1 | ops = `[iter]` | The u32 current-iteration value of an iter — what a lowered `MemLoad`'s axes become. Shape check: operand 0 is an iter. |
 
 Notes:
 
@@ -206,15 +249,44 @@ Notes:
   use-def invariant (WR-01). Variadic kinds wire every operand.
 - **Shape checks** (verify.go, fail-closed): HIR GMEM load/store tensors bind
   a `RoleTensor` `inputparam`; SMEM buffers bind a `memnewsmem`; FRAG buffers
-  bind a `fragnew`; `bdimvar` and `forloop` bind a `dimvar` at operand 0.
+  bind a `fragnew`; `bdimvar` and `forloop` bind a `dimvar` at operand 0;
+  `iter`/`dimvar` bind a dim InputParam at operand 0; `param` binds an
+  InputParam at operand 0; `iterclusterproject` binds an itercluster;
+  `inductionvariable` binds an iter; `tensordimof` binds a tensor param + a
+  const axis; `as` binds dim InputParams, at most one, last value operand of
+  its stage; `reduce`'s operand 1 is its `KeyedAttribute`; a map's value-operand
+  count matches its lambda's declared parameter count while params remain.
+- **The Input/ImpactBy-only convention sweep** (convention.go) runs on every
+  `Verify` — see §5.2.
 - The **families** (D-15): `FamilyScalarExpr` (8–14), `FamilyMemory` (3–5,
-  20–25 — gained the whole GMEM family plus SMEM/FRAG at v3, replacing the
-  deleted `FamilyTileOp`), `FamilyLoop` (6, 7, 17), `FamilyAbstract`
-  (1, 2, 15, 16, 18, 19 — the lowered dimvars are value-level IV objects, not
-  loop-nest structure), `FamilyCollective` (reserved, no members until reduce
-  lowering lands).
+  24–29), `FamilyLoop` (6, 7, 21), `FamilyAbstract` (1, 2, 15–20, 22, 23,
+  30, 31 — the lowered dimvars/IVs/bounds are value-level objects, not
+  loop-nest structure; the restructure kinds are value-level Input-list
+  citizens), `FamilyCollective` (reserved, no members until reduce lowering
+  lands).
 - The pass manager rejects nodes with `Kind == KindInvalid` or
   `Kind >= KindEnd` (forward-compatibility within our own pipeline, IR-03).
+
+### 4.1 The IterCluster format and Simplification (quick-261019-ktm)
+
+The frontend-facing Map/Reduce shape above comes in two formats:
+
+- **IterCluster format** (what a frontend builds): the map's inputs are
+  `iterclusterproject` bridges into an `itercluster` whose inputs are the
+  `memload`s over the raw dim params.
+- **Iter format** (canonical): `iter(dim, tensordimof(tensor, axis))` →
+  `inductionvariable(iter)` → `memload(tensor, ivs...)` → Map/Reduce — the
+  loop is gone; everything is ordinary SSA data flow.
+
+The **Simplification** passes (`internal/opt/simplify`, pipeline slots
+102/103/104, between dce-verify and gvn) lower the first into the second and
+finish the job: `simplify-lower` rewrites clusters into iter/IV form,
+`simplify-inline` replaces every lambda-parameter reference with its
+positional Input-list binding (a KeyedAttribute element contributes its
+wrapped value; trailing As/lambda nodes bind nothing) and strips the dead
+parameter declarations, and `simplify-verify` asserts no live projects remain
+and every body is fully inlined. See `doc/optana/lower_itercluster.md` for
+the source feature request.
 
 ## 5. The SSA handle layer (IR-01, D-16)
 
@@ -245,22 +317,48 @@ Invalid/zombie states are representable but checkable: zero handles, killed
 records, and unwired records all read as dead through the nil-safe accessors,
 and the verifier flags them structurally under the use-def invariant.
 
-### 5.2 Payload uses are uses
+### 5.2 The Input/ImpactBy-only convention (and its enforcement)
 
-Every reference in the graph is an `SSAUse` — operand slots **and** payload
-uses alike: lambda params, iteration dims/bounds, map `as`-orders, store
-target accesses, parameter refs, and `ImpactBy` effect inputs are all SSAUse
-records owned by their referencing node, wired by the same `wirePayloadUse`
-machinery as operand slots and enumerated via the `payloadBearer` interface.
-The verifier's use-def/def-use invariants and `Walk` therefore cover payload
-uses exactly like operand slots in **both** chain directions with zero special
-checkers, and names survive only as `inputparam` debug payload — never
-resolution or identity (P1R-01). Lambda bodies are the IR's one non-Use edge
-kind, walked as an edge via `lambdaBearer`.
+Every reference in the graph is an `SSAUse`, and every `SSAUse` a node owns
+lives in exactly one of its two dependency lists (§1.1's requirement):
+
+- **Input (operand slots)** — the data dependencies, stored in the node's
+  embedded `operandList` and wired by `wireOperands`. Since the convention
+  revision this includes everything the pre-revision suite carried as
+  payload: parameter refs (`param`), iteration dims/bounds (`iter`,
+  `dimvar`), a cluster's dims, a store's target access (tensor + axes),
+  map/reduce as-orders (the `as` node), reduce's init (the `keyedattribute`
+  node's value), lambda params and lambda **bodies** (the `lambda` node's
+  operands), IVs and tensor bounds.
+- **ImpactBy** — the side-effect dependencies: a direct `effectIns []SSAUse`
+  field on the three **effect bearers** (`memload`, `memstore`, `return`),
+  wired by `wirePayloadUse` and enumerated via `payloadBearer`/`effectBearer`.
+  This is the ONLY sanctioned payload spelling left in the suite.
+
+The practical consequences passes rely on: the verifier's use-def/def-use
+invariants and `Walk` cover **every** reference in both chain directions
+with zero special cases; `DataDeps`/`PosetDeps` see store targets and
+as-orders as ordinary data edges; DCE, GVN, the printers, and DOT see lambda
+bodies and wrapper nodes (`as`, `keyedattribute`, `lambda`) as ordinary
+graph nodes. GVN keys operands — the lambda included — **by identity**
+(amendment D): two stages are one value only when they share operand NODES,
+never by structural recursion through bodies.
+
+**Machine-checked (D16).** `Verify` calls `checkConvention`
+(`convention.go`): a reflect sweep over every allocated node's concrete
+struct fields — skipping the embedded `*Base` machinery cell and the
+embedded `operandList` (the Input list itself) — flagging any field whose
+type can carry SSA/Node references. The classifier `hiddenRefFieldType` is
+type-level and fail-closed: a direct `[]SSAUse` field is legal only on an
+effect bearer; a nested record (e.g. the transient `Lambda` struct) is
+hidden even there; a nil type classifies hidden. A violation reports as
+invariant `convention`, "`field %q carries SSA/node references outside the
+Input/ImpactBy lists`" — including for forged nodes no constructor can build
+(the sweep reads `g.nodes`, not the root walk).
 
 ### 5.3 Mutation choke points (IR-04, D-17)
 
-All chain edits outside construction flow through `MutContext` — five
+All chain edits outside construction flow through `MutContext` — seven
 operations, each stamping `LastTouchedBy = ctx.Pass` on every node it touches
 so PASS-06 diagnostics name the responsible pass structurally:
 
@@ -270,6 +368,8 @@ so PASS-06 diagnostics name the responsible pass structurally:
 | `AddUse(user, val)` | Appends one operand slot and links it into val's ref list; returns the new handle. |
 | `RemoveUse(u)` | Detaches u from its def's ref list and drops u's slot, **killing** the record so every copy reads dead. A killed record still occupying a slot is exactly the corruption class the verifier flags by node and slot. |
 | `ReplaceAllUsesWith(old, new)` | RAUW, LLVM-style: relocates every live ref record of `old` into `new`'s var in one pass over a snapshot; self-RAUW is a no-op. |
+| `SetLambdaBody(stage, newBody)` | Rewires a Map/Reduce's lambda node's trailing body operand (the sanctioned body edit — an identity-lambda body root cannot be reached by RAUW over its paramRefs). |
+| `ClearLambdaParams(stage, keep)` | Drops the lambda node's dead parameter operand slots; `keep(p)` decides which declarations survive (a param with uses beyond its own declaration slot stays). |
 | `Erase(n)` | Removes n from the graph: kills **operand and payload records alike** (a DCE-erased node must not leave live-looking payload records in a param's ref list — the quick-261017-vdj Erase fix), unlinks n's statement from the block in O(1) through the stmt back-pointer, and tombstones the ID so no later allocation can reuse it (IR-05). Refuses while any live use remains. |
 
 The var-level primitives (`replaceDefine`, `replaceAllReference`, `addRef`,
@@ -337,8 +437,10 @@ never observe construction debris (an abandoned map before a store, a reduce
 whose result is overwritten). It is level-aware.
 
 **Level 1 (sea mark-sweep).** `markReachable` seeds from the **end node plus
-ALL `g.params`** and follows exactly `Walk`'s child relation (operand slots,
-payload uses including `ImpactBy`, lambda bodies). The seeding is deliberately
+ALL `g.params`** and follows exactly `Walk`'s child relation (operand slots —
+which, since the Input/ImpactBy-only convention, already include lambda
+nodes, their params and bodies, wrapper nodes, and store targets — plus the
+`ImpactBy` payload uses). The seeding is deliberately
 broader than the observable root set: the def-use verifier audits every
 graph-owned param's ref list, so dim/scalar signature params must never be
 swept even though they are not observable roots (the quick-261018-bl0
@@ -385,17 +487,19 @@ analysis and consumed by the pass scheduler:
 
 | Function | Returns |
 |---|---|
-| `DataDeps(n)` | The live operand-slot defs of n, in slot order — n's data "must come after" set. |
+| `DataDeps(n)` | The live operand-slot defs of n, in slot order — n's data "must come after" set. Since the convention this includes a store's target-access components (`[value, tensor, axes...]`) — they are data deps now. |
 | `EffectDeps(n)` | The live `ImpactBy` payload defs of n — the explicit per-tensor ordering edges. Non-effectful nodes carry none. |
 | `PosetDeps(n)` | The flat union: data edges (slot order) then effect edges — the single list a topological ordering consumes. |
 | `g.SeaRoots()` | The Level-1 root set: `RoleTensor` params (declaration order) + the end node (§7). |
 
-Edges point **use → def**. Payload uses that are not ordering edges — store
-targets, map `as`-orders, lambda params — are deliberately excluded: they name
-parameters (graph roots) and contribute nothing to a def-poset. All
-enumerations skip killed/unwired records (the handle model's checkable
-corruption classes stay checkable, never traversable) and are deterministic
-(slot order, then payload order — never map iteration, IR-05/RESEARCH Pitfall 1).
+Edges point **use → def**. All enumerations skip killed/unwired records (the
+handle model's checkable corruption classes stay checkable, never
+traversable) and are deterministic (slot order, then payload order — never
+map iteration, IR-05/RESEARCH Pitfall 1). One scheduling-level note: deps on
+`inputparam` nodes impose no statement ordering (params are entry-available
+leaves produced by no statement) — the pass scheduler skips them explicitly
+when building statement edges, because shared tensor/dim params otherwise
+manufacture false cross-statement cycles against the effect chains.
 
 ### 8.2 Scheduling: default `Materialize` (D-7) vs. `pass.Scheduler` (R5)
 

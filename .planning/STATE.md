@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-19 - Completed quick task 261019-ktm: Implement IterCluster lowering (Iter format + Simplification pass) + universal Input/ImpactBy-only IR convention
+Last activity: 2026-10-19 - Quick task 261019-ktm follow-up: synced doc/ir.md to the Input/ImpactBy-only convention (highlighted requirement box, 31-kind catalog, lambda/As/KeyedAttribute layouts, Simplification section)
 
 Progress: [██░░░░░░░░] 17%
 
