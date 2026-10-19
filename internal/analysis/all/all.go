@@ -9,5 +9,6 @@
 package all
 
 import (
+	_ "tcacomp/internal/analysis/loopforest"
 	_ "tcacomp/internal/analysis/sideeffect"
 )

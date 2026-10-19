@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"tcacomp/internal/analysis"
+	"tcacomp/internal/analysis/loopforest"
 	"tcacomp/internal/ir"
 
 	// The blank import of analysis/all is the act under test: it fires
@@ -18,6 +19,9 @@ import (
 func TestAllRegistersEveryAnalysis(t *testing.T) {
 	if _, ok := analysis.Lookup("side-effect"); !ok {
 		t.Error("Lookup(side-effect) failed — analysis/all must register every analysis sub-module")
+	}
+	if _, ok := analysis.Lookup("loop-forest"); !ok {
+		t.Error("Lookup(loop-forest) failed — analysis/all must register every analysis sub-module")
 	}
 }
 
@@ -37,5 +41,27 @@ func TestBuildAllConstructsSideEffect(t *testing.T) {
 	}
 	if !sea.HasSideEffect(nil) {
 		t.Error("HasSideEffect(nil) must be true (fail-closed)")
+	}
+}
+
+// TestBuildAllConstructsLoopForest pins the registered factory's product:
+// BuildAll hands back the loop-nest forest under its stable name, and its
+// value is the concrete loopforest.Forest (the loop-tiling consumer's
+// entry face).
+func TestBuildAllConstructsLoopForest(t *testing.T) {
+	all := analysis.BuildAll(ir.NewGraph("t"))
+	a, ok := all["loop-forest"]
+	if !ok {
+		t.Fatal("BuildAll missing the loop-forest analysis under its stable name")
+	}
+	f, ok := a.(loopforest.Forest)
+	if !ok {
+		t.Fatalf("the loop-forest analysis must be a loopforest.Forest, got %T", a)
+	}
+	if got := f.Name(); got != "loop-forest" {
+		t.Errorf("Name() = %q, want %q", got, "loop-forest")
+	}
+	if roots := f.Roots(); len(roots) != 0 {
+		t.Errorf("an empty graph must yield an empty forest, got %d roots", len(roots))
 	}
 }
