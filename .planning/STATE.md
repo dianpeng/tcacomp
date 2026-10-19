@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-19 - Completed quick task 261019-jck: Refactor internal/analysis to mirror internal/opt registry pattern
+last_activity: 2026-10-19 - Completed quick task 261019-uoq: implement loop fusion via GVN + loop nest forest analysis
 progress:
   total_phases: 6
   completed_phases: 1
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-19 - Completed quick task 261019-tu3: implement type inference pass from doc/optana/type_inf.md
+Last activity: 2026-10-19 - Completed quick task 261019-uoq: implement loop fusion via GVN per doc/optana/loop_fusion.md + loopforest analysis
 
 Progress: [██░░░░░░░░] 17%
 
@@ -93,6 +93,7 @@ None yet.
 | 261019-jck | Refactor internal/analysis to mirror internal/opt registry pattern: top-level registry/abstract-factory infra, sideeffect/ sub-module with init self-registration, all/ composition root | 2026-10-19 | e451b2d | [261019-jck-refactor-internal-analysis-to-mirror-int](./quick/261019-jck-refactor-internal-analysis-to-mirror-int/) |
 | 261019-ktm | Implement IterCluster lowering per doc/optana/lower_itercluster.md (5 new node kinds, As/KeyedAttribute Input-list layout, simplify-lower/inline/verify passes) + revision: universal Input/ImpactBy-only convention machine-checked by the verifier (D14-D16) | 2026-10-19 | 9249a4e | [261019-ktm-implement-itercluster-lowering-feature-f](./quick/261019-ktm-implement-itercluster-lowering-feature-f/) |
 | 261019-tu3 | Implement type inference pass per doc/optana/type_inf.md: IR type cell (Base.ty, TypeOf/IsErased, MutContext.SetType choke point, ir.Builtin registry) + typeinfer pass at priority 105 (DAG post-order compute-then-stamp, full 31-kind catalog rules, idempotent, fail-closed) | 2026-10-19 | 1a4beb0 | [261019-tu3-implement-type-inference-pass-from-doc-o](./quick/261019-tu3-implement-type-inference-pass-from-doc-o/) |
+| 261019-uoq | Implement loop fusion via GVN per doc/optana/loop_fusion.md: KindIter reclassified side-effect free (sideeffect baseVerdict + gvn-verify mirror in lockstep) so identical headers/bounded headers/whole parent-wired nests fuse in one run; + internal/analysis/loopforest ("loop-forest" registered analysis, doc's reversed-edge forest algorithm, on-demand forest-of-trees for future loop tiling) | 2026-10-19 | 7fc95e6 | [261019-uoq-implement-loop-fusion-via-gvn-loop-nest-](./quick/261019-uoq-implement-loop-fusion-via-gvn-loop-nest-/) |
 
 ## Session Continuity
 
