@@ -120,14 +120,20 @@ func TestIsErasedAfterErase(t *testing.T) {
 	if IsErased(p) {
 		t.Fatal("the live param must not report erased")
 	}
-	// The tombstone stays in the allocation registry.
-	found := false
+	// The tombstone leaves AllocatedNodes (live nodes only) and shows up in
+	// Tombstones — IsErased is the per-node face of that same state.
 	for _, n := range g.AllocatedNodes() {
+		if n.BasePtr() == c.BasePtr() {
+			t.Fatal("the tombstoned const must not appear in AllocatedNodes")
+		}
+	}
+	found := false
+	for _, n := range g.Tombstones() {
 		if n.BasePtr() == c.BasePtr() {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("the tombstoned const must stay in AllocatedNodes")
+		t.Fatal("the tombstoned const must appear in Tombstones")
 	}
 }

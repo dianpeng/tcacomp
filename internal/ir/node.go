@@ -66,6 +66,7 @@ type Base struct {
 	stmt          *Statement // the statement whose RHS root this node is, nil for non-root nodes; lets Erase unlink in O(1)
 	stmtID        uint64     // builder-pinned statement ID for Materialize (PinStatementID); 0 = Materialize draws from the counter
 	mark          bool       // transient mark-sweep state (D-15 exception — see mark.go); never IR content, never printed/serialized/verified
+	ty            Type       // computed-type cell (quick-261019-tu3): pass state, nil = not inferred; written only via MutContext.SetType, read via TypeOf. Never printed/serialized/verified — a type is not a chain invariant.
 }
 
 // BasePtr returns the shared cell, implementing Node.
@@ -83,6 +84,30 @@ func (b *Base) LastTouchedBy() string { return b.lastTouchedBy }
 
 // Loc returns the node's location record (IR-06).
 func (b *Base) Loc() Loc { return b.loc }
+
+// TypeOf returns n's computed type — the type-inference pass's product,
+// stamped through MutContext.SetType — or nil while uninferred (and for the
+// deliberately-untyped kinds: allocations, As, Lambda). It is nil-safe for
+// nil nodes; a computed type is pass state, never a chain invariant, so the
+// verifier and the printer never read it (quick-261019-tu3).
+func TypeOf(n Node) Type {
+	if n == nil {
+		return nil
+	}
+	return n.BasePtr().ty
+}
+
+// IsErased reports whether n was tombstoned by MutContext.Erase — the
+// package-level nil-safe face over Base.Erased. AllocatedNodes includes
+// tombstones, so post-erase sweeps (e.g. the type-inference pass skipping
+// killed records) discriminate through this face: a tombstoned node's
+// operand records are dead and must not be type-checked.
+func IsErased(n Node) bool {
+	if n == nil {
+		return false
+	}
+	return n.BasePtr().Erased()
+}
 
 // Node is the root IR node interface (D-15, go/ast shape): every concrete
 // node family satisfies it through its embedded *Base.

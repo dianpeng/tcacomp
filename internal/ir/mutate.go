@@ -9,9 +9,10 @@ import (
 // (IR-04, D-17). The IR stamps LastTouchedBy = ctx.Pass on every node a
 // mutation touches, making PASS-06's last-touched-by diagnostics structural
 // rather than advisory. Construction (construct.go) is exempt; every other
-// mutation of the chains flows through these five functions. The operations
-// take and return SSAUse/SSADef value-type handles: copies are free and
-// mutations propagate through the shared ref records (directive 2).
+// mutation of the chains — and every write of a computed type — flows
+// through these eight functions. The operations take and return
+// SSAUse/SSADef value-type handles: copies are free and mutations propagate
+// through the shared ref records (directive 2).
 type MutContext struct {
 	Pass string
 }
@@ -187,6 +188,29 @@ func (ctx *MutContext) ClearLambdaParams(n Node, keep func(Node) bool) error {
 		}
 	}
 	ctx.stamp(lam)
+	ctx.stamp(n)
+	return nil
+}
+
+// SetType records ty as n's computed type (quick-261019-tu3). Idempotent by
+// design: when n already carries an Equal type, it neither writes nor
+// stamps — so a re-run of a type-inference pass leaves LastTouchedBy stable.
+// A nil n errors (mirroring SetDef/Erase argument checking); a nil ty clears
+// the cell. Type writes flow through MutContext like every other sanctioned
+// mutation, keeping D-15 (no public Base mutators) and PASS-06 diagnostics
+// intact.
+func (ctx *MutContext) SetType(n Node, ty Type) error {
+	if n == nil {
+		return errors.New("ir: SetType on nil node")
+	}
+	b := n.BasePtr()
+	if b.ty == nil && ty == nil {
+		return nil // nothing to write, nothing to stamp
+	}
+	if b.ty != nil && ty != nil && b.ty.Equal(ty) {
+		return nil // already carries an Equal type: no write, no re-stamp
+	}
+	b.ty = ty
 	ctx.stamp(n)
 	return nil
 }

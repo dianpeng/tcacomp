@@ -307,28 +307,19 @@ func Cast(e Expr, t ir.ElemType) Expr {
 	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.materialize()), typ: target}
 }
 
-// pureBuiltins is the v0 pure scalar-builtin registry (syntax.md §6.4):
-// every entry is (f32, ...f32) -> f32 with the exact listed arity. Anything
-// else — memory access, synchronization, atomics, thread-index builtins — is
-// not a scalar-lambda call and is rejected.
-var pureBuiltins = map[string]int{
-	"expf": 1, "logf": 1, "sqrtf": 1, "rsqrtf": 1,
-	"fabsf": 1, "tanhf": 1, "sinf": 1, "cosf": 1,
-	"fminf": 2, "fmaxf": 2,
-	"fmaf": 3,
-}
-
 // Call resolves a registered pure builtin against its pinned signature
-// (§6.4): the name must be registered and every argument must be f32. It is
-// a package-level function because it is self-contained — it adopts the
+// (§6.4): the name must be registered (the signature table lives in
+// internal/ir's Builtin registry — the single source of truth shared with
+// the type-inference pass) and every argument must be f32. It is a
+// package-level function because it is self-contained — it adopts the
 // builder shared by its arguments.
 func Call(name string, args ...Expr) (Expr, error) {
-	arity, ok := pureBuiltins[name]
+	sig, ok := ir.Builtin(name)
 	if !ok {
 		return Expr{}, fmt.Errorf("function %s is not a registered pure scalar builtin", name)
 	}
-	if len(args) != arity {
-		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s) of type f32, got %d", name, arity, len(args))
+	if len(args) != sig.Arity {
+		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s) of type f32, got %d", name, sig.Arity, len(args))
 	}
 	b := args[0].b
 	f32 := ir.InternScalar(ir.TF32)
