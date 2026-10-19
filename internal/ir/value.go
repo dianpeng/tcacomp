@@ -351,6 +351,14 @@ func contentHash(n Node) uint64 {
 		return typeHash(t.typ)
 	case *callNode:
 		return mixString(valueHashOffset, t.name)
+	case *iterClusterProjectNode:
+		// D4/D13: the input-slot index is structural content — projects
+		// with distinct idx never collide into one bucket entry.
+		return mixUint64(valueHashOffset, uint64(t.idx))
+	case *keyedAttributeNode:
+		// D2/D13: the attribute key is identity content ("init" vs any
+		// other key distinguishes attributes wrapping the same value).
+		return mixString(valueHashOffset, t.key)
 	case *memLoadSMemNode:
 		return mixUint32(valueHashOffset, uint32(t.class))
 	case *memStoreSMemNode:
@@ -390,6 +398,12 @@ func contentEqual(a, b Node) bool {
 	case *callNode:
 		tb, ok := b.(*callNode)
 		return ok && ta.name == tb.name
+	case *iterClusterProjectNode:
+		tb, ok := b.(*iterClusterProjectNode)
+		return ok && ta.idx == tb.idx
+	case *keyedAttributeNode:
+		tb, ok := b.(*keyedAttributeNode)
+		return ok && ta.key == tb.key
 	case *memLoadSMemNode:
 		tb, ok := b.(*memLoadSMemNode)
 		return ok && ta.class == tb.class

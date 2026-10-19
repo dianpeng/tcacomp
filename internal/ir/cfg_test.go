@@ -171,10 +171,13 @@ func TestInputParamReferences(t *testing.T) {
 	}
 
 	// Lambda parameter: an InputParam node referenced through Lambda.params
-	// payload uses AND through the body's paramRef.
+	// payload uses AND through the body's paramRef. The map carries one
+	// value operand matching its one lambda param (the Input-list binding
+	// contract, quick-261019-ktm).
 	v := g.NewLambdaInputParam("ctor", "v", f32)
+	in := g.NewConst("ctor", f32, 1)
 	body := g.NewBinOp("ctor", BinOpMul, g.NewParamRef("ctor", v), g.NewConst("ctor", f32, 2))
-	rootMap := g.NewMap("ctor", nil, NewLambda([]Node{v}, body), []Node{m, k})
+	rootMap := g.NewMap("ctor", []Node{in}, NewLambda([]Node{v}, body), []Node{m, k})
 	ic := g.NewIterCluster("ctor", []Node{m, k}, rootMap)
 	env := NewEnv()
 	st := g.NewMemStoreChained("ctor", env, out, []Node{m, k}, ic)
@@ -201,8 +204,14 @@ func TestInputParamReferences(t *testing.T) {
 	if mn.lam.params[0].SSA().Node() != v {
 		t.Fatal("lambda param use must resolve to the lambda InputParam node")
 	}
-	if mn.as[0].SSA().Node() != m || mn.as[1].SSA().Node() != k {
-		t.Fatal("map as-order uses must resolve to the dim InputParam nodes")
+	// The as-order rides the Input list now (D1): AsOf finds the trailing
+	// As node and its operands resolve to the dim InputParam nodes.
+	as := AsOf(rootMap)
+	if as == nil || as.KindOf() != KindAs {
+		t.Fatal("map must carry its as-order as a trailing As node")
+	}
+	if dims := OperandsOf(as); dims[0] != m || dims[1] != k {
+		t.Fatal("map as-order operands must resolve to the dim InputParam nodes")
 	}
 
 	// Fully wired at construction: the verifier reports nothing at Level 1

@@ -48,16 +48,18 @@ func buildSmallChain() *Graph {
 // smallChainPrint is the exact canonical text of buildSmallChain's graph;
 // it pins the stage notation, the `%0` pipe convention (doc §2.6), the
 // `%name` binding convention, and FormatConst's `0.0` spelling. Statement
-// numbers are #23/#24: the 19 nodes (four kernel params, three lambda params,
-// chain stages) share the graph's monotonic ID counter (IR-05), and the
-// return node — an effect root since the scheduler change — takes ID 22
-// before Materialize assigns the statement IDs.
-const smallChainPrint = `statement #23:
+// numbers are #25/#26: the 21 nodes (four kernel params, three lambda
+// params, chain stages, plus the Input-list restructure's wrapper nodes —
+// one As per as-carrying map, one KeyedAttribute per reduce,
+// quick-261019-ktm) share the graph's monotonic ID counter (IR-05), and
+// the return node — an effect root since the scheduler change — takes ID
+// 24 before Materialize assigns the statement IDs.
+const smallChainPrint = `statement #25:
   iter(@m, @k) -> map(scale, lambda(v): v * (1.0 + 2.0)) as (@m, @k) |
   reduce(init=0.0, %0, lambda(acc, now): acc + now) |
   memstore(%output[@m][@k], %0)
 
-statement #24:
+statement #26:
   return %output`
 
 func TestCanonicalPrint(t *testing.T) {

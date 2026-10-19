@@ -70,7 +70,11 @@ func TestWalkPreOrderDeterministic(t *testing.T) {
 	if !equalIDs(first, second) {
 		t.Fatalf("walk order not deterministic: %v vs %v", first, second)
 	}
-	want := []uint64{4, 9, 3, 1, 2, 8, 5, 7, 6} // m, end, sum, a, b, map, lambda param v, body, paramRef
+	// m, end, sum, a, b, map, the map's trailing As node (an operand child
+	// since the Input-list restructure, quick-261019-ktm), lambda param v,
+	// body, paramRef. The As node (ID 8) allocates before the map (ID 9);
+	// the return takes ID 10.
+	want := []uint64{4, 10, 3, 1, 2, 9, 8, 5, 7, 6}
 	if !equalIDs(first, want) {
 		t.Fatalf("walk order = %v, want pre-order %v", first, want)
 	}
@@ -95,7 +99,7 @@ func TestWalkStopBailsEarly(t *testing.T) {
 		}
 		return Descend
 	}))
-	want := []uint64{4, 9, 3, 1, 2, 8} // param m, end, sum's subtree, then Stop at the map
+	want := []uint64{4, 10, 3, 1, 2, 9} // param m, end, sum's subtree, then Stop at the map
 	if got := walkIDs(order); !equalIDs(got, want) {
 		t.Fatalf("Stop must terminate at the map, visited %v, want %v", got, want)
 	}
@@ -126,7 +130,7 @@ func TestWalkSkipChildrenPrunes(t *testing.T) {
 	// The body is pruned, and paramRef — reachable ONLY through the body — is
 	// never visited; a was already visited as sum's operand, so SkipChildren
 	// prunes exactly the skipped edge, not the nodes globally.
-	want := []uint64{4, 9, 3, 1, 2, 8, 5, 7} // m, end, sum, a, b, map, v, body (paramRef pruned)
+	want := []uint64{4, 10, 3, 1, 2, 9, 8, 5, 7} // m, end, sum, a, b, map, As, v, body (paramRef pruned)
 	if got := walkIDs(order); !equalIDs(got, want) {
 		t.Fatalf("SkipChildren must prune the subtree, visited %v, want %v", got, want)
 	}

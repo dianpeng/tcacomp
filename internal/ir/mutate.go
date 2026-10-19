@@ -122,6 +122,48 @@ func (ctx *MutContext) ReplaceAllUsesWith(old, newVal Node) error {
 	return nil
 }
 
+// ClearLambdaParams kills a stage's dead lambda-parameter DECLARATION
+// records (quick-261019-ktm): for every Lambda payload of n (lambdaBearer —
+// Map and Reduce), each param use whose def fails keep is detached from the
+// def's ref list and killed, and the record's params slice is rebuilt over
+// the survivors. This is the sanctioned choke point for lambda-param
+// stripping because the params live in the Lambda RECORD, not in operand
+// slots — RemoveUse/Erase cannot reach them (D8: the declarations are
+// Walk-anchored payload uses, so killing them must keep the def-use chains
+// consistent, exactly as RemoveUse does for operands). keep reports whether
+// a param declaration stays (e.g. it still has live uses elsewhere).
+func (ctx *MutContext) ClearLambdaParams(n Node, keep func(Node) bool) error {
+	if n == nil {
+		return errors.New("ir: ClearLambdaParams on nil node")
+	}
+	if keep == nil {
+		return errors.New("ir: ClearLambdaParams on nil keep predicate")
+	}
+	lb, ok := n.(lambdaBearer)
+	if !ok {
+		return nil // not a lambda-bearing stage: nothing to clear
+	}
+	lb.forEachLambda(func(lam *Lambda) {
+		kept := make([]SSAUse, 0, len(lam.params))
+		for _, u := range lam.params {
+			if u.rec == nil || u.rec.killed {
+				continue // unwired or already-dead record: drop it outright
+			}
+			if keep(u.Def()) {
+				kept = append(kept, u)
+				continue
+			}
+			if def := u.rec.def; def != nil {
+				def.removeRef(u.rec)
+			}
+			u.rec.killed = true
+		}
+		lam.params = kept
+	})
+	ctx.stamp(n)
+	return nil
+}
+
 // Erase removes n from the graph: it detaches all of n's uses from their
 // defs' ref lists (killing the records) — OPERAND SLOTS and PAYLOAD USES
 // alike (store target accesses, iteration dims/bounds, lambda params,

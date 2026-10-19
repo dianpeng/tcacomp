@@ -176,7 +176,7 @@ func TestIterfmtVerifyShapes(t *testing.T) {
 // 1's KeyedAttribute, and both report nil on legacy shapes (no As, wrong
 // operand kind).
 func TestIterfmtInputListAccessors(t *testing.T) {
-	g, a, b, c, lhs, _, _ := iterfmtGraph(t)
+	g, a, b, c, _, _, _ := iterfmtGraph(t)
 	f32 := InternScalar(TF32)
 
 	// Map: [values..., As] — AsOf finds the trailing As; a map without one

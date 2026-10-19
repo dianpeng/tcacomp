@@ -31,8 +31,12 @@ func (g *Graph) NewIter(origin string, dim, bound Node, init, step Node) Node {
 	return n
 }
 
-// iterClusterNode: abstract compound header; ops = [body]; dims are payload
-// uses of dim InputParam nodes.
+// iterClusterNode: abstract compound header; ops = inputs... (the cluster's
+// input list — MemLoad nodes in the IterCluster format, the wrapped Map in
+// the legacy builder format); dims are payload uses of dim InputParam nodes
+// (D3, quick-261019-ktm: the input list is variadic operand slots, so every
+// bridge into the cluster — IterClusterProject included — rides ordinary
+// SSA data edges).
 type iterClusterNode struct {
 	*Base
 	operandList
@@ -47,9 +51,12 @@ func (n *iterClusterNode) forEachPayloadUse(fn func(SSAUse)) {
 }
 
 // NewIterCluster creates an abstract compound iteration header over dim
-// InputParam nodes with body as its single operand.
-func (g *Graph) NewIterCluster(origin string, dims []Node, body Node) Node {
-	n := g.NewNode(KindIterCluster, origin, body).(*iterClusterNode)
+// InputParam nodes with the given input list (D3). The legacy single-body
+// call shape NewIterCluster(origin, dims, mapNode) is the one-input case
+// and compiles unchanged; the IterCluster format passes its MemLoad inputs
+// positionally — IterClusterProject(cluster, i) selects input slot i.
+func (g *Graph) NewIterCluster(origin string, dims []Node, inputs ...Node) Node {
+	n := g.NewNode(KindIterCluster, origin, inputs...).(*iterClusterNode)
 	n.dims = make([]SSAUse, len(dims))
 	for i, d := range dims {
 		n.dims[i] = wirePayloadUse(n, d)

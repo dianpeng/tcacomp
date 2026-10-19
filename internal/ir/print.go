@@ -270,17 +270,27 @@ func isStage(n Node) bool {
 }
 
 // pipeInput returns the node feeding n's chained input — GMEM/SMEM/FRAG
-// store value, return value, map operand 0 (piped input first, per
-// node_lambda.go), reduce operand 1 (piped), iteration-cluster body — or nil
+// store value, return value, map/reduce operand 0 (piped input first, the
+// Input-list layout of quick-261019-ktm: reduce operand 0 is the piped
+// value, operand 1 the init attribute), iteration-cluster input 0 — or nil
 // when the input is not itself a stage, meaning n starts (or breaks) the
-// chain.
+// chain. A map whose operand 0 is an As/KeyedAttribute (zero value inputs)
+// has no pipe: nil, defensively, so a malformed stage never chains.
 func pipeInput(n Node) Node {
 	var next Node
 	switch n.KindOf() {
-	case KindMemStore, KindReturn, KindMap, KindIterCluster:
+	case KindMemStore, KindReturn, KindIterCluster:
 		next = opAt(n, 0)
+	case KindMap:
+		next = opAt(n, 0)
+		if next != nil {
+			switch next.KindOf() {
+			case KindAs, KindKeyedAttribute:
+				return nil // no value operands: nothing pipes into the map
+			}
+		}
 	case KindReduce:
-		next = opAt(n, 1)
+		next = opAt(n, 0) // D12: piped first, init attribute second
 	case KindMemStoreSMem, KindFragStore:
 		next = opAt(n, 0) // the stored value
 	case KindForLoop:
@@ -382,18 +392,39 @@ func (r *renderer) stageText(n Node, prev Node) string {
 			b.WriteString("@" + paramNameOf(d))
 		}
 		b.WriteString(") -> ")
-		if body := opAt(t, 0); body != nil {
-			// The iteration cluster is transparent for piping: a value
-			// piped THROUGH an iter() wrapper is still the previous stage
-			// (doc §2.6), so the body sees prev — this is what renders
-			// `iter() -> map(%0, ...)` for a fused piped map.
-			b.WriteString(r.stageText(body, prev))
+		inputs := OperandsOf(t)
+		switch len(inputs) {
+		case 0:
+			// bare header (dims only)
+		case 1:
+			if body := inputs[0]; body != nil {
+				// The iteration cluster is transparent for piping: a value
+				// piped THROUGH an iter() wrapper is still the previous stage
+				// (doc §2.6), so the body sees prev — this is what renders
+				// `iter() -> map(%0, ...)` for a fused piped map. The legacy
+				// single-input cluster (the wrapped Map) keeps today's bytes.
+				b.WriteString(r.stageText(body, prev))
+			}
+		default:
+			// The IterCluster format's input list (MemLoads pending
+			// simplify-lower): each input renders joined with ", ".
+			for i, in := range inputs {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(r.stageText(in, nil))
+			}
 		}
 		return b.String()
 	case *mapNode:
 		var b strings.Builder
 		b.WriteString("map(")
-		for i, op := range OperandsOf(t) {
+		valueOps := OperandsOf(t)
+		if len(valueOps) > 0 && valueOps[len(valueOps)-1] != nil &&
+			valueOps[len(valueOps)-1].KindOf() == KindAs {
+			valueOps = valueOps[:len(valueOps)-1] // the trailing As renders as the as-clause
+		}
+		for i, op := range valueOps {
 			if i > 0 {
 				b.WriteString(", ")
 			}
@@ -406,14 +437,14 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(", ")
 		b.WriteString(r.lambda(t.lam))
 		b.WriteString(")")
-		b.WriteString(r.asClause(t.as))
+		b.WriteString(r.asClause(AsOf(t)))
 		return b.String()
 	case *reduceNode:
 		var b strings.Builder
 		b.WriteString("reduce(init=")
-		b.WriteString(r.value(opAt(t, 0)))
+		b.WriteString(r.value(ReduceInitOf(t)))
 		b.WriteString(", ")
-		if piped := opAt(t, 1); prev != nil && sameNode(piped, prev) {
+		if piped := opAt(t, 0); prev != nil && sameNode(piped, prev) {
 			b.WriteString("%0")
 		} else {
 			b.WriteString(r.value(piped))
@@ -609,10 +640,48 @@ func (r *renderer) value(n Node) string {
 		return b.String()
 	case *iterNode:
 		s := "@" + paramNameOf(t.dimUse)
-		if t.boundUse.Def() != nil {
-			s += "/" + paramNameOf(t.boundUse) // bounded induction variable, doc §2.3
+		if bound := t.boundUse.Def(); bound != nil {
+			// Bounded induction variable, doc §2.3. The bound is WIDENED to
+			// any value node (quick-261019-ktm D5): a dim InputParam keeps
+			// the `@name` spelling, any other def (a lowered TensorDimOf)
+			// renders through the value renderer instead of the `?` fallback.
+			if ip, ok := bound.(*inputParamNode); ok {
+				s += "/" + ip.name
+			} else {
+				s += "/" + r.value(bound)
+			}
 		}
 		return s
+	case *tensorDimOfNode:
+		// `tensordimof(lhs, 1)` — the tensor's debug name (its value
+		// rendering when not a param) and the axis const's typed spelling.
+		var b strings.Builder
+		b.WriteString("tensordimof(")
+		if tp := operandAt(t, 0); tp != nil {
+			if ip, ok := tp.(*inputParamNode); ok {
+				b.WriteString(ip.name)
+			} else {
+				b.WriteString(r.value(tp))
+			}
+		} else {
+			b.WriteString("<nil>")
+		}
+		b.WriteString(", ")
+		if ax := operandAt(t, 1); ax != nil {
+			if c, ok := ax.(*constNode); ok {
+				b.WriteString(constText(c))
+			} else {
+				b.WriteString(r.value(ax))
+			}
+		} else {
+			b.WriteString("<nil>")
+		}
+		b.WriteString(")")
+		return b.String()
+	case *inductionVariableNode:
+		return "inductionvariable(" + r.value(opAt(t, 0)) + ")"
+	case *keyedAttributeNode:
+		return "keyedattribute(" + t.key + "=" + r.value(opAt(t, 0)) + ")"
 	case *dimVarNode:
 		// Lowered IV: `@x(init=0.0, step=1.0)` — identity is the tuple,
 		// the name is debug payload (doc/optana/induction_variable.md).
@@ -651,15 +720,24 @@ func (r *renderer) lambda(l Lambda) string {
 	return b.String()
 }
 
-// asClause renders the mandatory output-order clause: ` as (@m, @k)`.
-func (r *renderer) asClause(as []SSAUse) string {
+// asClause renders the mandatory output-order clause: ` as (@m, @k)`. The
+// dims come from the trailing As node's operand list (D1) — a nil as
+// renders nothing (the zero-dim/legacy form).
+func (r *renderer) asClause(as Node) string {
+	if as == nil {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(" as (")
-	for i, u := range as {
+	for i, d := range OperandsOf(as) {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("@" + paramNameOf(u))
+		if ip, ok := d.(*inputParamNode); ok {
+			b.WriteString("@" + ip.name)
+		} else {
+			b.WriteString("@" + r.value(d)) // non-param dim: deterministic; verifier owns rejection
+		}
 	}
 	b.WriteString(")")
 	return b.String()

@@ -314,6 +314,16 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &fragNewNode{Base: b}
 	case KindForLoop:
 		n = &forLoopNode{Base: b}
+	case KindIterClusterProject:
+		n = &iterClusterProjectNode{Base: b}
+	case KindKeyedAttribute:
+		n = &keyedAttributeNode{Base: b}
+	case KindAs:
+		n = &asNode{Base: b}
+	case KindTensorDimOf:
+		n = &tensorDimOfNode{Base: b}
+	case KindInductionVariable:
+		n = &inductionVariableNode{Base: b}
 	default:
 		n = &rawNode{Base: b}
 	}

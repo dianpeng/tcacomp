@@ -146,8 +146,13 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // memory and loop node suites, fail-closed: a bounded dimvar binds a
 // dimvar; HIR GMEM load/store tensors bind a RoleTensor InputParam; LIR
 // SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a FragNew
-// buffer; and a for-loop binds a dimvar. Nil operands are left to the
-// generic use-def slot check.
+// buffer; a for-loop binds a dimvar; an IterClusterProject's operand 0 is
+// an itercluster; an InductionVariable's operand 0 is an iter; a
+// TensorDimOf binds a RoleTensor tensor and a const axis; an As binds dim
+// InputParams; a Reduce's operand 1 is its KeyedAttribute init; and a
+// Map/Reduce's optional As is unique and last, with the map's value-operand
+// count matching its lambda parameter count (quick-261019-ktm). Nil
+// operands are left to the generic use-def slot check.
 func checkNodeShape(n Node, vs *[]Violation) {
 	switch t := n.(type) {
 	case *boundedDimVarNode:
@@ -175,6 +180,78 @@ func checkNodeShape(n Node, vs *[]Violation) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					"for-loop operand 0 must be a dimvar"))
 			}
+		}
+	case *iterClusterProjectNode:
+		if cl := operandAt(t, 0); cl != nil {
+			if _, ok := cl.(*iterClusterNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"iterclusterproject operand 0 must be an itercluster"))
+			}
+		}
+	case *inductionVariableNode:
+		if it := operandAt(t, 0); it != nil {
+			if _, ok := it.(*iterNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"inductionvariable operand 0 must be an iter"))
+			}
+		}
+	case *tensorDimOfNode:
+		checkTensorParam(n, operandAt(t, 0), vs)
+		if ax := operandAt(t, 1); ax != nil {
+			if _, ok := ax.(*constNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"tensordimof operand 1 must be a const axis index"))
+			}
+		}
+	case *asNode:
+		for i, op := range OperandsOf(t) {
+			if op == nil {
+				continue // the generic slot check owns nil operands
+			}
+			if ip, ok := op.(*inputParamNode); !ok || ip.role != RoleDim {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("as operand %d must be a dim InputParam", i)))
+			}
+		}
+	case *reduceNode:
+		if attr := operandAt(t, 1); attr != nil {
+			if _, ok := attr.(*keyedAttributeNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"reduce operand 1 must be a KeyedAttribute (init)"))
+			}
+		}
+		checkAsPlacement(t, vs)
+	case *mapNode:
+		checkAsPlacement(t, vs)
+		valueOps := 0
+		ops := OperandsOf(t)
+		if len(ops) > 0 && ops[len(ops)-1] != nil && ops[len(ops)-1].KindOf() == KindAs {
+			valueOps = len(ops) - 1
+		} else {
+			valueOps = len(ops)
+		}
+		if valueOps != len(t.lam.params) {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("map input count must equal lambda parameter count (%d inputs, %d params)",
+					valueOps, len(t.lam.params))))
+		}
+	}
+}
+
+// checkAsPlacement enforces D1's optional-but-unique-and-last layout: when a
+// Map/Reduce Input list carries an As node, at most one exists and it is
+// the LAST operand.
+func checkAsPlacement(n Node, vs *[]Violation) {
+	ops := OperandsOf(n)
+	last := len(ops) - 1
+	for i, op := range ops {
+		if op == nil || op.KindOf() != KindAs {
+			continue
+		}
+		if i != last {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"as must be the last input"))
+			return // one report per stage; duplicate As also trips this
 		}
 	}
 }

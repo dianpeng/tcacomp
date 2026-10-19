@@ -236,17 +236,24 @@ func TestValueInvalidKindsFailClosed(t *testing.T) {
 // by recursive identity-keyed equality. Maps/reduces sharing param atoms and
 // body nodes are one value; distinct combiner-param atoms force unequal; the
 // body recursion terminates (fail-safe false) under cycles.
+//
+// quick-261019-ktm D13 (recorded tension): NewMap/NewReduce allocate a fresh
+// As/KeyedAttribute wrapper node per call, and operands compare by IDENTITY
+// (amendment D) — so two constructor calls with identical shapes are NOT one
+// value anymore. The lambda machinery is therefore pinned over as-less maps
+// and an attribute-sharing reduce (white-box), and the wrapper-identity
+// consequence is pinned explicitly below.
 func TestValueLambdaMachinery(t *testing.T) {
 	g, m, _, _, c1, _, _ := valueFixture()
 	f32 := InternScalar(TF32)
 
 	// Shared atoms: one lambda param, one body over it. Two separate Lambda
-	// records over the SAME atoms: the maps are one value.
+	// records over the SAME atoms: the (as-less) maps are one value.
 	lp := g.NewLambdaInputParam("ctor", "l", f32)
 	body := g.NewBinOp("ctor", BinOpAdd, lp, c1)
 	piped := g.NewConst("ctor", f32, 5)
-	m1 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}))
-	m2 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}))
+	m1 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), nil))
+	m2 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), nil))
 	if !m1.ValueEqual(m2, pureAll{}) {
 		t.Fatal("maps sharing lambda-param atoms and body node must be one value")
 	}
@@ -257,20 +264,29 @@ func TestValueLambdaMachinery(t *testing.T) {
 	// Distinct lambda-param atoms: conservatively unequal (E).
 	lp2 := g.NewLambdaInputParam("ctor", "l2", f32)
 	body2 := g.NewBinOp("ctor", BinOpAdd, lp2, c1)
-	m3 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp2}, body2), []Node{m}))
+	m3 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp2}, body2), nil))
 	if m1.ValueEqual(m3, pureAll{}) {
 		t.Fatal("maps with distinct lambda-param atoms must compare unequal (conservative)")
 	}
 
-	// Reduce participates through the same machinery (E): shared combiner
-	// atoms + shared body ⇒ one value; distinct atoms ⇒ unequal.
+	// Reduce participates through the same machinery (E): a reduce sharing
+	// the attr wrapper node AND the combiner atoms + body is one value. The
+	// twin is built white-box (raw NewNode over the first reduce's attr +
+	// a second Lambda record over the same atoms) because two NewReduce
+	// calls allocate distinct attr wrappers — the D13 consequence pinned
+	// below.
 	acc := g.NewLambdaInputParam("ctor", "acc", f32)
 	rbody := g.NewBinOp("ctor", BinOpMul, acc, c1)
 	init := g.NewConst("ctor", f32, 0)
 	r1 := asValue(t, g.NewReduce("ctor", init, piped, NewLambda([]Node{acc}, rbody)))
-	r2 := asValue(t, g.NewReduce("ctor", init, piped, NewLambda([]Node{acc}, rbody)))
+	r2n := g.NewNode(KindReduce, "ctor", piped, OperandsOf(r1)[1]).(*reduceNode)
+	r2n.combiner = NewLambda([]Node{acc}, rbody)
+	r2 := asValue(t, r2n)
 	if !r1.ValueEqual(r2, pureAll{}) {
-		t.Fatal("reduces sharing combiner atoms and body node must be one value (E)")
+		t.Fatal("reduces sharing the attr wrapper, combiner atoms, and body node must be one value (E)")
+	}
+	if r1.ValueHash(pureAll{}) != r2.ValueHash(pureAll{}) {
+		t.Fatal("equal reduces must hash identically")
 	}
 	acc2 := g.NewLambdaInputParam("ctor", "acc2", f32)
 	rbody2 := g.NewBinOp("ctor", BinOpMul, acc2, c1)
@@ -280,6 +296,21 @@ func TestValueLambdaMachinery(t *testing.T) {
 	}
 	if r1.ValueHash(pureAll{}) == r3.ValueHash(pureAll{}) {
 		t.Fatal("reduces with distinct combiner atoms must hash differently")
+	}
+
+	// D13 (recorded): identical constructor calls allocate DISTINCT wrapper
+	// nodes — the as-clause As and the init KeyedAttribute — and identity
+	// keying (amendment D) keeps the stages apart. Stage-level GVN dedup
+	// becomes As/attr-node-aware future work.
+	m4 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}))
+	m5 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}))
+	if m4.ValueEqual(m5, pureAll{}) {
+		t.Fatal("maps with distinct As wrapper nodes must compare unequal (D13: wrapper identity keys the Input list)")
+	}
+	r4 := asValue(t, g.NewReduce("ctor", init, piped, NewLambda([]Node{acc}, rbody)))
+	r5 := asValue(t, g.NewReduce("ctor", init, piped, NewLambda([]Node{acc}, rbody)))
+	if r4.ValueEqual(r5, pureAll{}) {
+		t.Fatal("reduces with distinct KeyedAttribute wrappers must compare unequal (D13)")
 	}
 }
 

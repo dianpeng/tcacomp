@@ -32,13 +32,13 @@ type kindEntry struct {
 // catalog lists every known IR node kind in enum order.
 var catalog = []kindEntry{
 	// --- HIR tier ---
-	{KindMap, TierHIR, FamilyAbstract, -1, "lambda map stage: operands..., lambda, as-order"},
-	{KindReduce, TierHIR, FamilyAbstract, 2, "lambda reduce stage: init, piped input, combiner lambda"},
+	{KindMap, TierHIR, FamilyAbstract, -1, "lambda map stage: value operands..., trailing As?; lambda payload"},
+	{KindReduce, TierHIR, FamilyAbstract, -1, "lambda reduce stage: piped, KeyedAttribute(init), trailing As?"},
 	{KindMemLoad, TierHIR, FamilyMemory, -1, "GMEM load: tensor operand + axes; chains via ImpactBy"},
 	{KindMemStore, TierHIR, FamilyMemory, 1, "GMEM store: (target access payload, value); HIR stage store"},
 	{KindMemNew, TierHIR, FamilyMemory, 1, "GMEM allocation: (extent value)"},
 	{KindIter, TierHIR, FamilyLoop, 2, "induction variable @m: (dim/bound payload), init, step"},
-	{KindIterCluster, TierHIR, FamilyLoop, 1, "compound iter(@m, @k, @n) header: (dims payload), body"},
+	{KindIterCluster, TierHIR, FamilyLoop, -1, "compound iter(@m, @k, @n) header: (dims payload), inputs..."},
 	{KindConst, TierHIR, FamilyScalarExpr, 0, "typed scalar constant"},
 	{KindParam, TierHIR, FamilyScalarExpr, 0, "lambda parameter reference"},
 	{KindBinOp, TierHIR, FamilyScalarExpr, 2, "binary scalar op (opcode table mirrors syntax.md §7.6)"},
@@ -48,6 +48,9 @@ var catalog = []kindEntry{
 	{KindCall, TierHIR, FamilyScalarExpr, -1, "registered pure builtin call: (builtin, args...)"},
 	{KindInputParam, TierHIR, FamilyAbstract, 0, "graph-owned kernel/lambda input parameter (named)"},
 	{KindReturn, TierHIR, FamilyAbstract, -1, "end node: kernel return (values...); graph's single end"},
+	{KindIterClusterProject, TierHIR, FamilyAbstract, 1, "IterCluster input slot i bound to a Map's param i: (cluster), idx payload"},
+	{KindKeyedAttribute, TierHIR, FamilyAbstract, 1, "named attribute riding an Input list: (value), key payload"},
+	{KindAs, TierHIR, FamilyAbstract, -1, "as-order clause: dim params in order; trailing on Map/Reduce inputs"},
 
 	// --- LIR tier ---
 	{KindForLoop, TierLIR, FamilyLoop, 3, "lowered loop nest: (iv dimvar, bound bdimvar, body)"},
@@ -59,6 +62,8 @@ var catalog = []kindEntry{
 	{KindFragLoad, TierLIR, FamilyMemory, -1, "fragment load: (src frag buffer, bivs...)"},
 	{KindFragStore, TierLIR, FamilyMemory, -1, "fragment store: (value, dst frag buffer, bivs...)"},
 	{KindFragNew, TierLIR, FamilyMemory, 1, "fragment allocation: (extent)"},
+	{KindTensorDimOf, TierLIR, FamilyAbstract, 2, "shape upper bound: (tensor param, TU32 axis const)"},
+	{KindInductionVariable, TierLIR, FamilyAbstract, 1, "u32 current-iteration value of an iter: (iter)"},
 }
 
 // HIRKinds returns the HIR-tier kinds in enum order.
