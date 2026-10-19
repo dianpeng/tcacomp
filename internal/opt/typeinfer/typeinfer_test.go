@@ -96,35 +96,35 @@ func TestExprScalarRules(t *testing.T) {
 	i32c := g.NewConst("t", i32T(), 3)
 	boolc := g.NewConst("t", boolT(), 1)
 
-	wantType(t, f32c, "const f32", f32T())
-
 	sp := g.NewInputParam("t", ir.RoleScalar, "s", f32T())
 	ref := g.NewParamRef("t", sp)
-	wantType(t, ref, "param ref over typed scalar param", f32T())
-	wantType(t, sp, "scalar inputparam", f32T())
 
 	// inputparam roles: dim -> u32 (computed), tensor -> its tensor type.
 	dp := g.NewInputParam("t", ir.RoleDim, "d", nil)
 	tp := g.NewInputParam("t", ir.RoleTensor, "t", tensorT(ir.TF32, "a", "b"))
-	wantType(t, dp, "dim inputparam", u32T())
-	wantType(t, tp, "tensor inputparam", tensorT(ir.TF32, "a", "b"))
 
 	add := g.NewBinOp("t", ir.BinOpAdd, f32c, g.NewConst("t", f32T(), 2))
-	wantType(t, add, "add f32+f32", f32T())
 	lt := g.NewBinOp("t", ir.BinOpLT, add, f32c)
-	wantType(t, lt, "lt f32,f32", boolT())
 	lnot := g.NewUnaryOp("t", ir.UnaryOpLNot, boolc)
-	wantType(t, lnot, "!bool", boolT())
 	bnot := g.NewUnaryOp("t", ir.UnaryOpNot, i32c)
-	wantType(t, bnot, "~i32", i32T())
 	sel := g.NewSelect("t", boolc, f32c, add)
-	wantType(t, sel, "select bool/f32/f32", f32T())
 	cast := g.NewCast("t", ir.InternScalar(ir.TF16), f32c)
-	wantType(t, cast, "cast f32->f16", ir.InternScalar(ir.TF16))
 	call := g.NewCall("t", "expf", f32c)
-	wantType(t, call, "call expf(f32)", f32T())
 
 	mustRun(t, g)
+
+	wantType(t, f32c, "const f32", f32T())
+	wantType(t, ref, "param ref over typed scalar param", f32T())
+	wantType(t, sp, "scalar inputparam", f32T())
+	wantType(t, dp, "dim inputparam", u32T())
+	wantType(t, tp, "tensor inputparam", tensorT(ir.TF32, "a", "b"))
+	wantType(t, add, "add f32+f32", f32T())
+	wantType(t, lt, "lt f32,f32", boolT())
+	wantType(t, lnot, "!bool", boolT())
+	wantType(t, bnot, "~i32", i32T())
+	wantType(t, sel, "select bool/f32/f32", f32T())
+	wantType(t, cast, "cast f32->f16", ir.InternScalar(ir.TF16))
+	wantType(t, call, "call expf(f32)", f32T())
 }
 
 // TestExprScalarErrors pins the fail-closed expr rejections, each on its
@@ -227,7 +227,6 @@ func TestMapTyping(t *testing.T) {
 // as-order fails closed naming the map.
 func TestMapWithoutAsErrors(t *testing.T) {
 	g := ir.NewGraph("mapnoas")
-	m := g.NewInputParam("t", ir.RoleDim, "m", nil)
 	v := g.NewLambdaInputParam("t", "v", f32T())
 	val := g.NewConst("t", f32T(), 1)
 	mp := g.NewMap("t", []ir.Node{val}, ir.NewLambda([]ir.Node{v}, g.NewParamRef("t", v)), nil)

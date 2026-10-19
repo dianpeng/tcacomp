@@ -65,3 +65,26 @@ func RoleOf(n Node) (ParamRole, bool) {
 	}
 	return ip.role, true
 }
+
+// InputParamTypeOf returns the interned payload type of an InputParam node
+// (nil by design for dim params — dims are not typed values in v0), and
+// whether n is an InputParam (quick-261019-tu3 read face).
+func InputParamTypeOf(n Node) (Type, bool) {
+	ip, ok := n.(*inputParamNode)
+	if !ok {
+		return nil, false
+	}
+	return ip.typ, true
+}
+
+// InputParamNameOf returns the InputParam's debug payload name ("?" for any
+// other node kind). Names are diagnostic only (review P1R-01) — the
+// typeinfer map rule reads them to build symbolic DimRefs matching the
+// builder's own dim names (quick-261019-tu3 read face).
+func InputParamNameOf(n Node) string {
+	ip, ok := n.(*inputParamNode)
+	if !ok {
+		return "?"
+	}
+	return ip.name
+}

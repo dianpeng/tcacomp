@@ -19,6 +19,10 @@ import (
 //
 //	100   early cleanup (dce — erase before anything observes the graph)
 //	101   dce-verify (the post-sweep invariant check)
+//	102   simplify-lower (IterCluster format → Iter format)
+//	103   simplify-inline (lambda parameter inlining)
+//	104   simplify-verify (the post-simplify invariant check)
+//	105   type inference (typeinfer — every node typed after Simplification, before gvn)
 //	110   global CSE (gvn — dedup pure computations graph-wide)
 //	111   gvn-verify (the post-dedup invariant check)
 //	...   transformation passes slot between as they land

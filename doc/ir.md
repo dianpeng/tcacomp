@@ -107,13 +107,13 @@ no enum surgery (append-only, IR-03).
 
 | File | Owns | Why |
 |---|---|---|
-| `node.go` | The structural core: `Base` cell (ID, kind, `Loc`, `LastTouchedBy`, SSAVar, erased tombstone, surplus count, stmt back-pointer, pinned stmtID), the `Node`/`Value`/`ScalarExprNode`/`nodeImpl` interfaces, `operandList` slot storage, the `Graph` root (name, params, `nodes` registry, `end`, `cfg`), `allocNode` (the one kind→struct dispatch), `wireOperands`/`wirePayloadUse`, `NewGraph`, `NewID`/`ReserveStatementID`/`PinStatementID`, `NewNode`. | One place holds everything every node shares; the dispatch table is the single join point for new kinds (R4a). |
+| `node.go` | The structural core: `Base` cell (ID, kind, `Loc`, `LastTouchedBy`, SSAVar, erased tombstone, surplus count, stmt back-pointer, pinned stmtID, computed-type cell `ty`), the `Node`/`Value`/`ScalarExprNode`/`nodeImpl` interfaces, `operandList` slot storage, the `Graph` root (name, params, `nodes` registry, `end`, `cfg`), `allocNode` (the one kind→struct dispatch), `wireOperands`/`wirePayloadUse`, `NewGraph`, `NewID`/`ReserveStatementID`/`PinStatementID`, `NewNode`, and the nil-safe type/tombstone read faces `TypeOf`/`IsErased`. | One place holds everything every node shares; the dispatch table is the single join point for new kinds (R4a). The `ty` cell is pass state (quick-261019-tu3): written only through `MutContext.SetType`, read via `TypeOf`, never printed/serialized/verified — a computed type is not a chain invariant. |
 | `kind.go` | The `Kind` enum (`KindVersion = 5`), `Kind.String()` (lowercase canonical spelling, D-6), `Family` classification (D-15). | Enum + spelling + family only; all other per-kind metadata lives in `catalog.go` (R4e separation). |
 | `catalog.go` | The dedicated listing file (R4e): one `kindEntry` per kind — tier (D-3), family, operand arity, one-line doc — plus `HIRKinds()`/`LIRKinds()`/`AllKinds()`/`Tier()`/`fixedArity()`. Rows are in enum order, so `catalog[k-1]` describes `k`. | Pinned invariants (catalog_test.go): `len(AllKinds()) == int(KindEnd)-1`; HIR kinds are exactly the kinds `< KindForLoop` (the tier boundary IS the enum boundary). |
 | `doc.go` | Package design notes (the long header comment: optimizer shape, two-level IR, SSA chains, walking, lowered suite, interface-width contract). | Intent lives with the code it governs. |
 | `node_lambda.go` | HIR lambda stages: `mapNode` (`ops = [value operands..., As?, lambda]`), `reduceNode` (`ops = [piped, KeyedAttribute, lambda]`), the `lambdaNode` expression node, and the **transient** `Lambda` builder record; read faces `LambdaOf`/`lambdaNodeParams`/`lambdaNodeBody`, `AsOf`, `ReduceInitOf`. | "Pipe" survives only as builder terminology (piped input = reduce operand 0). Since the convention revision the lambda itself is a **`KindLambda` node carried as the stage's trailing operand** — params and body are the lambda node's own operands, never hidden records (the `Lambda` struct exists only between the builder call and `NewMap`/`NewReduce`). |
-| `node_expr.go` | HIR scalar-expression suite: `constNode`, `paramRefNode`, `binOpNode`, `unaryOpNode`, `selectNode`, `castNode`, `callNode`, plus the `BinOpCode`/`UnaryOpCode` tables mirroring `doc/syntax.md` §7.6 precedence. | Value-level leaves every lambda body is built from; lowering never rewrites them. |
-| `node_var.go` | `inputParamNode` and the `ParamRole` taxonomy (`RoleDim`, `RoleTensor`, `RoleScalar`, `RoleLambda`), `RoleOf`. | Kernel params are graph-owned (`NewInputParam` appends to `g.params`); lambda params are graph-external by design (inlined at lowering). |
+| `node_expr.go` | HIR scalar-expression suite: `constNode`, `paramRefNode`, `binOpNode`, `unaryOpNode`, `selectNode`, `castNode`, `callNode`, plus the `BinOpCode`/`UnaryOpCode` tables mirroring `doc/syntax.md` §7.6 precedence and the payload read faces `ConstTypeOf`/`CastTypeOf`/`CallNameOf`/`BinOpCodeOf`/`UnaryOpCodeOf`. | Value-level leaves every lambda body is built from; lowering never rewrites them. The payload read faces (quick-261019-tu3) let analysis passes outside package ir read opcodes/types without asserting concrete node types. |
+| `node_var.go` | `inputParamNode` and the `ParamRole` taxonomy (`RoleDim`, `RoleTensor`, `RoleScalar`, `RoleLambda`), `RoleOf`, `InputParamTypeOf`/`InputParamNameOf`. | Kernel params are graph-owned (`NewInputParam` appends to `g.params`); lambda params are graph-external by design (inlined at lowering). |
 | `node_memory.go` | HIR GMEM family: `memLoadNode` (`ops = [tensor, axes...]`), `memStoreNode` (`ops = [value, tensor, axes...]`), `memNewNode`; the load/store `effectIns` ImpactBy payloads. | The structural tensor access rides **operand slots** since the convention revision (the old `access` payload record is gone) — a store's target components are data deps, its `effectIns` the side-effect deps; the two lists are the node's entire input surface. |
 | `node_loop.go` | Loop-structure nodes: HIR `iterNode` (`ops = [dim, bound?, init, step]` — the bound slot exists only in the bounded form), `iterClusterNode` (`ops = [dims..., inputs...]` — dims LEAD the input list; `ClusterDims`/`ClusterInputs` derive the split), LIR `forLoopNode`. | Structure only — the LIR IV *value objects* live in `node_dimvar.go`. |
 | `node_iterfmt.go` | The IterCluster-format and lowering bridge nodes (quick-261019-ktm): `iterClusterProjectNode`, `keyedAttributeNode`, `asNode`, `tensorDimOfNode`, `inductionVariableNode`. | The five kinds the Input-list restructure introduced — every one operand-only by construction (the convention's first citizens). |
@@ -130,8 +130,9 @@ no enum surgery (append-only, IR-03).
 | `verify.go` | `Verify`, the `use-def`/`def-use` chain invariants, per-kind shape checks (incl. the convention-driven dim/bound and dims-lead checks), the multiple-end-nodes check, `Violation` diagnostics. | The cheap verifier callable after every pass (design.md); fail-closed everywhere. |
 | `convention.go` | The Input/ImpactBy-only convention, machine-checked: `hiddenRefFieldType` (type classifier — what counts as a hidden reference) and `checkConvention` (the reflect sweep over every allocated node's struct fields). | Wired into `Verify`; see §1.1's requirement box and §5.2. A forbidden field trips a `convention` violation even when zero-valued — the check is shape-level, fail-closed, and nil types classify hidden. |
 | `print.go` | The canonical deterministic printer: `Print`/`PrintOpts`, `Numbering`/`ComputeNumbering`, `StmtNodes`, `chainOf`, `stageText`/`value`, `Label`, `OperandsOf`/`LambdaBodies`/`LambdaParams`, `FormatConst`. | Byte-exact goldens (D-01..D-04, D-13); see §8.3. `LambdaBodies`/`LambdaParams` are DERIVED faces over the lambda node's operands — no stored records behind them. |
-| `mutate.go` | `MutContext` and the seven choke points: `SetDef`, `AddUse`, `RemoveUse`, `ReplaceAllUsesWith`, `SetLambdaBody`, `ClearLambdaParams`, `Erase`. | The ONLY sanctioned mutation path outside construction (IR-04, D-17); see §5.3. The two lambda choke points are the sanctioned way to edit a stage's lambda through its node (rewire the body operand; drop dead param operand slots). |
+| `mutate.go` | `MutContext` and the eight choke points: `SetDef`, `AddUse`, `RemoveUse`, `ReplaceAllUsesWith`, `SetLambdaBody`, `ClearLambdaParams`, `SetType`, `Erase`. | The ONLY sanctioned mutation path outside construction (IR-04, D-17); see §5.3. The two lambda choke points are the sanctioned way to edit a stage's lambda through its node (rewire the body operand; drop dead param operand slots); `SetType` is the computed-type cell's write path (idempotent by design). |
 | `types.go` | `ElemType` (syntax.md §3.3 mirror, f8 absent), `DimRef`, the `Type` interface and interned `NumericType`, `InternScalar`/`InternTensor`. | Extensible type interface (directive 1); interning makes interface `==` identity (D-18). |
+| `builtins.go` | The pure scalar-builtin signature registry: `BuiltinSignature`, `Builtin(name)` over the fixed `(f32,...f32) -> f32` table (syntax.md §6.4). | Single source of truth shared by `pkg.Call` and the typeinfer pass (quick-261019-tu3); a plain map, never iterated, no runtime mutation path. |
 
 The exported **construction surface** (`NewMap`, `NewReduce`, `NewMemLoad`,
 `NewMemStore`, …) is split across the `node_*.go` files beside the node types
@@ -288,6 +289,17 @@ parameter declarations, and `simplify-verify` asserts no live projects remain
 and every body is fully inlined. See `doc/optana/lower_itercluster.md` for
 the source feature request.
 
+Right after Simplification, the **type inference** pass (`internal/opt/
+typeinfer`, pipeline slot 105, between simplify-verify and gvn —
+quick-261019-tu3, `doc/optana/type_inf.md`) stamps every non-erased node's
+computed type onto the `Base.ty` cell through `SetType`, readable by any
+later pass via `ir.TypeOf`. One memoized post-order pass suffices (SSA, no
+phis, no back edges — an operand cycle fails closed); the pass is
+idempotent and re-runnable after future lowerings. The closed untyped set —
+`memnew`/`memnewsmem`/`fragnew` (allocations carry no dtype), `as` (an
+output-order clause, not a value), `lambda` (no function Type yet), and a
+`return` with 0 or >1 values — deliberately stays nil.
+
 ## 5. The SSA handle layer (IR-01, D-16)
 
 ### 5.1 Handles over one pointee
@@ -358,9 +370,10 @@ Input/ImpactBy lists`" — including for forged nodes no constructor can build
 
 ### 5.3 Mutation choke points (IR-04, D-17)
 
-All chain edits outside construction flow through `MutContext` — seven
+All chain edits outside construction flow through `MutContext` — eight
 operations, each stamping `LastTouchedBy = ctx.Pass` on every node it touches
-so PASS-06 diagnostics name the responsible pass structurally:
+so PASS-06 diagnostics name the responsible pass structurally (with the one
+deliberate exception: `SetType` stamps only when it actually writes):
 
 | Choke point | Effect |
 |---|---|
@@ -370,6 +383,7 @@ so PASS-06 diagnostics name the responsible pass structurally:
 | `ReplaceAllUsesWith(old, new)` | RAUW, LLVM-style: relocates every live ref record of `old` into `new`'s var in one pass over a snapshot; self-RAUW is a no-op. |
 | `SetLambdaBody(stage, newBody)` | Rewires a Map/Reduce's lambda node's trailing body operand (the sanctioned body edit — an identity-lambda body root cannot be reached by RAUW over its paramRefs). |
 | `ClearLambdaParams(stage, keep)` | Drops the lambda node's dead parameter operand slots; `keep(p)` decides which declarations survive (a param with uses beyond its own declaration slot stays). |
+| `SetType(n, ty)` | Writes n's computed-type cell (`Base.ty`, quick-261019-tu3). **Idempotent by design**: when n already carries an Equal type it neither writes nor re-stamps, so a re-run of the type-inference pass leaves `LastTouchedBy` stable. |
 | `Erase(n)` | Removes n from the graph: kills **operand and payload records alike** (a DCE-erased node must not leave live-looking payload records in a param's ref list — the quick-261017-vdj Erase fix), unlinks n's statement from the block in O(1) through the stmt back-pointer, and tombstones the ID so no later allocation can reuse it (IR-05). Refuses while any live use remains. |
 
 The var-level primitives (`replaceDefine`, `replaceAllReference`, `addRef`,

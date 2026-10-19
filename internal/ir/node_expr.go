@@ -214,3 +214,53 @@ func (g *Graph) NewCall(origin string, name string, args ...Node) Node {
 	n.name = name
 	return n
 }
+
+// ---------------------------------------------------------------------------
+// Payload read faces (quick-261019-tu3): the exported views of the expr
+// payloads, so analysis passes outside package ir (typeinfer) read opcode
+// and type payloads without asserting concrete node types. All are total:
+// a foreign kind yields the zero value / false.
+// ---------------------------------------------------------------------------
+
+// ConstTypeOf returns the const's interned payload type, or nil for any
+// other node kind.
+func ConstTypeOf(n Node) Type {
+	if c, ok := n.(*constNode); ok {
+		return c.typ
+	}
+	return nil
+}
+
+// CastTypeOf returns the cast's interned target payload type, or nil for
+// any other node kind.
+func CastTypeOf(n Node) Type {
+	if c, ok := n.(*castNode); ok {
+		return c.typ
+	}
+	return nil
+}
+
+// CallNameOf returns the call's builtin name, or "" for any other node
+// kind.
+func CallNameOf(n Node) string {
+	if c, ok := n.(*callNode); ok {
+		return c.name
+	}
+	return ""
+}
+
+// BinOpCodeOf returns the binop's opcode and whether n is a binop.
+func BinOpCodeOf(n Node) (BinOpCode, bool) {
+	if b, ok := n.(*binOpNode); ok {
+		return b.op, true
+	}
+	return BinOpInvalid, false
+}
+
+// UnaryOpCodeOf returns the unary op's opcode and whether n is a unaryop.
+func UnaryOpCodeOf(n Node) (UnaryOpCode, bool) {
+	if u, ok := n.(*unaryOpNode); ok {
+		return u.op, true
+	}
+	return UnaryOpInvalid, false
+}
