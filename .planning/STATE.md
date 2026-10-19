@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-19 - Quick task 261019-ktm follow-up: synced doc/ir.md to the Input/ImpactBy-only convention (highlighted requirement box, 31-kind catalog, lambda/As/KeyedAttribute layouts, Simplification section)
+Last activity: 2026-10-19 - Completed quick task 261019-tu3: implement type inference pass from doc/optana/type_inf.md
 
 Progress: [██░░░░░░░░] 17%
 
@@ -92,6 +92,7 @@ None yet.
 | 261018-nga | Implement CSE via GVN: identity-keyed ValueHash/ValueEqual value contract, amended EffectOf verdicts (all FamilyMemory effectful), accumulated side-effect analysis in internal/analysis, GVN pass + verifier at 110/111 | 2026-10-18 | d8bce2e | [261018-nga-cse-via-gvn-side-effect-analysis-global-](./quick/261018-nga-cse-via-gvn-side-effect-analysis-global-/) |
 | 261019-jck | Refactor internal/analysis to mirror internal/opt registry pattern: top-level registry/abstract-factory infra, sideeffect/ sub-module with init self-registration, all/ composition root | 2026-10-19 | e451b2d | [261019-jck-refactor-internal-analysis-to-mirror-int](./quick/261019-jck-refactor-internal-analysis-to-mirror-int/) |
 | 261019-ktm | Implement IterCluster lowering per doc/optana/lower_itercluster.md (5 new node kinds, As/KeyedAttribute Input-list layout, simplify-lower/inline/verify passes) + revision: universal Input/ImpactBy-only convention machine-checked by the verifier (D14-D16) | 2026-10-19 | 9249a4e | [261019-ktm-implement-itercluster-lowering-feature-f](./quick/261019-ktm-implement-itercluster-lowering-feature-f/) |
+| 261019-tu3 | Implement type inference pass per doc/optana/type_inf.md: IR type cell (Base.ty, TypeOf/IsErased, MutContext.SetType choke point, ir.Builtin registry) + typeinfer pass at priority 105 (DAG post-order compute-then-stamp, full 31-kind catalog rules, idempotent, fail-closed) | 2026-10-19 | 1a4beb0 | [261019-tu3-implement-type-inference-pass-from-doc-o](./quick/261019-tu3-implement-type-inference-pass-from-doc-o/) |
 
 ## Session Continuity
 
