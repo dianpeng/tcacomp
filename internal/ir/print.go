@@ -157,31 +157,34 @@ func OperandsOf(n Node) []Node {
 	return out
 }
 
-// LambdaBodies returns the body roots of n's lambda payloads (map/reduce
-// stages) — the IR's single non-Use graph edge kind, walked as an edge by
-// the verifier and rendered as a def-to-user edge by DOT emission (D-05).
+// LambdaBodies returns the body roots of map/reduce stages — DERIVED since
+// the Input/ImpactBy-only convention (quick-261019-ktm revision): the body
+// is the trailing operand of the stage's trailing KindLambda node. The
+// verifier, DOT emission (D-05), the GVN body-root set, and the side-effect
+// analysis all consume this face; the storage behind it is ordinary
+// operand slots.
 func LambdaBodies(n Node) []Node {
-	var out []Node
-	if lb, ok := n.(lambdaBearer); ok {
-		lb.forEachLambda(func(lam *Lambda) { out = append(out, lam.Body) })
+	lam := LambdaOf(n)
+	if lam == nil {
+		return nil
 	}
-	return out
+	if body := lambdaNodeBody(lam); body != nil {
+		return []Node{body}
+	}
+	return nil
 }
 
-// LambdaParams returns each lambda payload's parameter DECLARATION uses (in
-// lambda order, each in declaration order) — the read face
-// internal/opt/simplify's inline pass consumes (quick-261019-ktm: the
-// params live in the Lambda RECORD, not in operand slots, so no operand
-// walk can recover their positional order). Non-lambda-bearing nodes yield
-// nil.
-func LambdaParams(n Node) [][]SSAUse {
-	var out [][]SSAUse
-	if lb, ok := n.(lambdaBearer); ok {
-		lb.forEachLambda(func(lam *Lambda) {
-			out = append(out, append([]SSAUse(nil), lam.params...))
-		})
+// LambdaParams returns a map/reduce stage's lambda parameter atoms in
+// binding order — DERIVED since the Input/ImpactBy-only convention: the
+// leading operands of the stage's trailing KindLambda node (the read face
+// internal/opt/simplify's inline pass consumes). Non-lambda-carrying nodes
+// yield nil.
+func LambdaParams(n Node) [][]Node {
+	lam := LambdaOf(n)
+	if lam == nil {
+		return nil
 	}
-	return out
+	return [][]Node{lambdaNodeParams(lam)}
 }
 
 // StmtNodes returns stmt's value nodes in canonical print order: chain
@@ -199,6 +202,9 @@ func StmtNodes(stmt *Statement) []Node {
 		seen[st.BasePtr()] = true
 		out = append(out, st)
 	}
+	// Operand slots carry every data edge since the Input/ImpactBy-only
+	// convention (lambda nodes and their params/bodies included), so the
+	// visit is a plain operand DFS.
 	var visit func(n Node)
 	visit = func(n Node) {
 		if n == nil || seen[n.BasePtr()] {
@@ -209,16 +215,10 @@ func StmtNodes(stmt *Statement) []Node {
 		for _, op := range OperandsOf(n) {
 			visit(op)
 		}
-		if lb, ok := n.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { visit(lam.Body) })
-		}
 	}
 	for _, st := range chain {
 		for _, op := range OperandsOf(st) {
 			visit(op) // the pipe operand is already seen and skips itself
-		}
-		if lb, ok := st.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { visit(lam.Body) })
 		}
 	}
 	return out
@@ -295,18 +295,26 @@ func isStage(n Node) bool {
 func pipeInput(n Node) Node {
 	var next Node
 	switch n.KindOf() {
-	case KindMemStore, KindReturn, KindIterCluster:
+	case KindMemStore:
+		next = opAt(n, 0) // the stored value (tensor/axes follow)
+	case KindReturn:
 		next = opAt(n, 0)
+	case KindIterCluster:
+		// D14: dims LEAD the cluster's input list; the pipe candidate is
+		// the first non-dim INPUT (the legacy wrapped map).
+		if inputs := ClusterInputs(n); len(inputs) > 0 {
+			next = inputs[0]
+		}
 	case KindMap:
 		next = opAt(n, 0)
 		if next != nil {
 			switch next.KindOf() {
-			case KindAs, KindKeyedAttribute:
+			case KindAs, KindKeyedAttribute, KindLambda:
 				return nil // no value operands: nothing pipes into the map
 			}
 		}
 	case KindReduce:
-		next = opAt(n, 0) // D12: piped first, init attribute second
+		next = opAt(n, 0) // D12: piped first, init attribute second, lambda last
 	case KindMemStoreSMem, KindFragStore:
 		next = opAt(n, 0) // the stored value
 	case KindForLoop:
@@ -347,11 +355,14 @@ func chainOf(s *Statement) []Node {
 		}
 		// An iteration cluster renders its body stage inline (`iter(...) ->
 		// map(...)` is one printed stage), so the body is not a chain
-		// element of its own; the walk continues from the body's pipe input.
+		// element of its own; the walk continues from the body's pipe
+		// input. D14: the body is the cluster's first non-dim INPUT.
 		if len(chain) > 0 {
-			if ic, ok := chain[len(chain)-1].(*iterClusterNode); ok && sameNode(opAt(ic, 0), n) {
-				n = pipeInput(n)
-				continue
+			if ic, ok := chain[len(chain)-1].(*iterClusterNode); ok {
+				if inputs := ClusterInputs(ic); len(inputs) > 0 && sameNode(inputs[0], n) {
+					n = pipeInput(n)
+					continue
+				}
 			}
 		}
 		chain = append(chain, n)
@@ -370,12 +381,19 @@ func opAt(n Node, i int) Node {
 	return ops[i]
 }
 
-// paramNameOf resolves a payload use to its InputParam's debug name. A
-// zero/killed use or a def that is not an InputParam renders a deterministic
-// placeholder — the verifier owns rejecting such graphs (review P1R-01:
-// names are debug payload only, never resolution state).
+// paramNameOf resolves a use to its InputParam's debug name (the ImpactBy
+// renderers' form). A zero/killed use or a def that is not an InputParam
+// renders a deterministic placeholder — the verifier owns rejecting such
+// graphs (review P1R-01: names are debug payload only, never resolution
+// state).
 func paramNameOf(u SSAUse) string {
-	ip, ok := u.Def().(*inputParamNode)
+	return paramNameOfNode(u.Def())
+}
+
+// paramNameOfNode resolves a node to its InputParam debug name (the
+// operand-based twin of paramNameOf — the D14/D15 renderers read operands).
+func paramNameOfNode(n Node) string {
+	ip, ok := n.(*inputParamNode)
 	if !ok {
 		return "?"
 	}
@@ -401,14 +419,14 @@ func (r *renderer) stageText(n Node, prev Node) string {
 	case *iterClusterNode:
 		var b strings.Builder
 		b.WriteString("iter(")
-		for i, d := range t.dims {
+		for i, d := range ClusterDims(t) {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString("@" + paramNameOf(d))
+			b.WriteString("@" + paramNameOfNode(d))
 		}
 		b.WriteString(") -> ")
-		inputs := OperandsOf(t)
+		inputs := ClusterInputs(t)
 		switch len(inputs) {
 		case 0:
 			// bare header (dims only)
@@ -436,6 +454,12 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		var b strings.Builder
 		b.WriteString("map(")
 		valueOps := OperandsOf(t)
+		// The trailing lambda node (always) and As node (when present) are
+		// layout markers, not value operands.
+		if len(valueOps) > 0 && valueOps[len(valueOps)-1] != nil &&
+			valueOps[len(valueOps)-1].KindOf() == KindLambda {
+			valueOps = valueOps[:len(valueOps)-1]
+		}
 		if len(valueOps) > 0 && valueOps[len(valueOps)-1] != nil &&
 			valueOps[len(valueOps)-1].KindOf() == KindAs {
 			valueOps = valueOps[:len(valueOps)-1] // the trailing As renders as the as-clause
@@ -451,7 +475,7 @@ func (r *renderer) stageText(n Node, prev Node) string {
 			}
 		}
 		b.WriteString(", ")
-		b.WriteString(r.lambda(t.lam))
+		b.WriteString(r.lambdaText(lambdaNodeOf(t)))
 		b.WriteString(")")
 		b.WriteString(r.asClause(AsOf(t)))
 		return b.String()
@@ -466,13 +490,13 @@ func (r *renderer) stageText(n Node, prev Node) string {
 			b.WriteString(r.value(piped))
 		}
 		b.WriteString(", ")
-		b.WriteString(r.lambda(t.combiner))
+		b.WriteString(r.lambdaText(lambdaNodeOf(t)))
 		b.WriteString(")")
 		return b.String()
 	case *memStoreNode:
 		var b strings.Builder
 		b.WriteString("memstore(")
-		b.WriteString(r.accessText(t.target))
+		b.WriteString(r.accessText(t))
 		b.WriteString(", ")
 		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
 			b.WriteString("%0")
@@ -619,11 +643,13 @@ func (r *renderer) value(n Node) string {
 		// A reference to a tensor param IS the structural access: with no
 		// separate access node kind in the v0 suite, the axes render from
 		// the tensor type's dims (lhs[@m][@n]); scalar params and lambda
-		// params render bare (scale, v). The name comes from the use's
-		// def node's debug payload — never from resolution state.
-		if typ, ok := inputParamType(t.use.Def()); ok {
+		// params render bare (scale, v). The name comes from the operand
+		// def node's debug payload — never from resolution state (D14: the
+		// reference rides operand 0).
+		target := opAt(t, 0)
+		if typ, ok := inputParamType(target); ok {
 			if pt, ok := typ.(*NumericType); ok && !pt.IsScalar() {
-				if ip, ok := t.use.Def().(*inputParamNode); ok {
+				if ip, ok := target.(*inputParamNode); ok {
 					var b strings.Builder
 					b.WriteString(ip.name)
 					for _, d := range pt.Dims() {
@@ -633,7 +659,7 @@ func (r *renderer) value(n Node) string {
 				}
 			}
 		}
-		return paramNameOf(t.use) // lambda params and captured kernel scalars both render bare
+		return paramNameOfNode(target) // lambda params and captured kernel scalars both render bare
 	case *binOpNode:
 		return r.binExpr(t)
 	case *unaryOpNode:
@@ -655,16 +681,22 @@ func (r *renderer) value(n Node) string {
 		b.WriteString(")")
 		return b.String()
 	case *iterNode:
-		s := "@" + paramNameOf(t.dimUse)
-		if bound := t.boundUse.Def(); bound != nil {
-			// Bounded induction variable, doc §2.3. The bound is WIDENED to
-			// any value node (quick-261019-ktm D5): a dim InputParam keeps
-			// the `@name` spelling, any other def (a lowered TensorDimOf)
-			// renders through the value renderer instead of the `?` fallback.
-			if ip, ok := bound.(*inputParamNode); ok {
+		// D14: ops = [dim, bound?, init, step] — the bound slot exists only
+		// in the bounded form.
+		ops := OperandsOf(t)
+		if len(ops) == 0 || ops[0] == nil {
+			return "@?"
+		}
+		s := "@" + paramNameOfNode(ops[0])
+		if len(ops) == 4 {
+			// Bounded induction variable, doc §2.3. The bound accepts any
+			// value node (D5): a dim InputParam keeps the `@name` spelling,
+			// any other def (a lowered TensorDimOf) renders through the
+			// value renderer.
+			if ip, ok := ops[1].(*inputParamNode); ok {
 				s += "/" + ip.name
 			} else {
-				s += "/" + r.value(bound)
+				s += "/" + r.value(ops[1])
 			}
 		}
 		return s
@@ -701,18 +733,22 @@ func (r *renderer) value(n Node) string {
 	case *dimVarNode:
 		// Lowered IV: `@x(init=0.0, step=1.0)` — identity is the tuple,
 		// the name is debug payload (doc/optana/induction_variable.md).
-		return "@" + paramNameOf(t.dimUse) +
-			"(init=" + r.value(opAt(t, 0)) + ", step=" + r.value(opAt(t, 1)) + ")"
+		// D14: ops = [dim, init, step].
+		return "@" + paramNameOfNode(opAt(t, 0)) +
+			"(init=" + r.value(opAt(t, 1)) + ", step=" + r.value(opAt(t, 2)) + ")"
 	case *boundedDimVarNode:
 		// Bounded IV: `@x/M` — the dimvar's name with its max bound.
 		if iv := opAt(t, 0); iv != nil {
 			if dv, ok := iv.(*dimVarNode); ok {
-				return "@" + paramNameOf(dv.dimUse) + "/" + r.value(opAt(t, 1))
+				return "@" + paramNameOfNode(opAt(dv, 0)) + "/" + r.value(opAt(t, 1))
 			}
 		}
 		return "@" + r.value(opAt(t, 0)) + "/" + r.value(opAt(t, 1))
 	case *memStoreNode:
-		return "%" + paramNameOf(t.target.tensorUse) // store returns the stored value (doc §2.5)
+		// The store returns the stored value (doc §2.5) — the bare tensor
+		// name in value position (the full access rendering belongs to the
+		// stage printer; the tensor rides slot 1, D14).
+		return "%" + paramNameOfNode(opAt(t, 1))
 	default:
 		if num, ok := r.num.Num(n); ok {
 			return fmt.Sprintf("%%%d", num)
@@ -721,18 +757,30 @@ func (r *renderer) value(n Node) string {
 	}
 }
 
-// lambda renders `lambda(p1, p2): <body>`.
-func (r *renderer) lambda(l Lambda) string {
+// lambdaText renders a lambda node's `lambda(p1, p2): <body>` — the
+// params from the node's leading operands, the body from its trailing
+// operand (D15).
+func (r *renderer) lambdaText(lam Node) string {
+	if lam == nil {
+		return "lambda(): <nil>"
+	}
+	ops := OperandsOf(lam)
+	var body Node
+	params := ops
+	if len(ops) > 0 {
+		params = ops[:len(ops)-1]
+		body = ops[len(ops)-1]
+	}
 	var b strings.Builder
 	b.WriteString("lambda(")
-	for i, p := range l.params {
+	for i, p := range params {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(paramNameOf(p))
+		b.WriteString(paramNameOfNode(p))
 	}
 	b.WriteString("): ")
-	b.WriteString(r.value(l.Body))
+	b.WriteString(r.value(body))
 	return b.String()
 }
 
@@ -759,12 +807,22 @@ func (r *renderer) asClause(as Node) string {
 	return b.String()
 }
 
-// accessText renders a structural store access: `%output[@m][@k]`.
-func (r *renderer) accessText(a access) string {
+// accessText renders a structural store access: `%output[@m][@k]` — the
+// tensor operand (slot 1) and axis operands (slots 2...) of the store
+// (D14: the target access rides the Input list).
+func (r *renderer) accessText(n Node) string {
 	var b strings.Builder
-	b.WriteString("%" + paramNameOf(a.tensorUse))
-	for _, ax := range a.axes {
-		b.WriteString("[@" + paramNameOf(ax) + "]")
+	if tp := opAt(n, 1); tp != nil {
+		b.WriteString("%" + paramNameOfNode(tp))
+	} else {
+		b.WriteString("%?")
+	}
+	for i := 2; i < len(OperandsOf(n)); i++ {
+		if ax := opAt(n, i); ax != nil {
+			b.WriteString("[@" + paramNameOfNode(ax) + "]")
+		} else {
+			b.WriteString("[@?]")
+		}
 	}
 	return b.String()
 }

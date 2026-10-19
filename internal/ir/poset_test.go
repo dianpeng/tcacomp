@@ -27,18 +27,19 @@ func posetGraph(t *testing.T) (g *Graph, env *Env, m, out1, out2, sum, st1, st2,
 
 // TestDataDepsPinsOperandOrder: data dependencies are the LIVE operand-slot
 // defs in slot order — the poset edge set the scheduler's topo sort and
-// LICM treat as "must come after" (R1). Payload uses (store targets, map
-// as-orders, ImpactBy edges) are NOT data deps; they ride their own faces.
+// LICM treat as "must come after" (R1). A store's target access rides its
+// operand slots (Input/ImpactBy-only convention), so it IS a data dep;
+// ImpactBy edges stay on their own face.
 func TestDataDepsPinsOperandOrder(t *testing.T) {
 	_, _, _, _, _, sum, st1, st2, ret := posetGraph(t)
 
 	if got := DataDeps(sum); len(got) != 2 || got[0].BasePtr().ID() != 4 || got[1].BasePtr().ID() != 5 {
 		t.Fatalf("DataDeps(sum) = %v, want the two consts in slot order", got)
 	}
-	// A store's only operand slot is the stored value; the target access is
-	// payload, not a data dep.
-	if got := DataDeps(st1); len(got) != 1 || got[0] != sum {
-		t.Fatalf("DataDeps(st1) = %v, want [sum] (the stored value; target is payload)", got)
+	// A store's data deps are [value, tensor, axes...]: the stored value,
+	// then the target-access components in slot order.
+	if got := DataDeps(st1); len(got) != 3 || got[0] != sum {
+		t.Fatalf("DataDeps(st1) = %v, want [sum, tensor, axis] (value then target access)", got)
 	}
 	if got := DataDeps(ret); len(got) != 1 || got[0] != st2 {
 		t.Fatalf("DataDeps(end) = %v, want [st2] (the returned value; ImpactBy is separate)", got)

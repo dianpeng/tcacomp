@@ -92,18 +92,15 @@ func (InlinePass) Run(_ *opt.Context, g *ir.Graph) error {
 		paramGroups := ir.LambdaParams(stage)
 		var stageParams []ir.Node
 		for _, group := range paramGroups {
-			for _, u := range group {
-				stageParams = append(stageParams, u.Def())
-			}
+			stageParams = append(stageParams, group...)
 		}
 
 		for _, group := range paramGroups {
-			for i, pu := range group {
-				if pu.IsKilled() {
+			for i, param := range group {
+				if param == nil || param.BasePtr().Erased() {
 					continue
 				}
-				param := pu.Def()
-				if param == nil || i >= len(bindings) || bindings[i] == nil {
+				if i >= len(bindings) || bindings[i] == nil {
 					continue // unbound position: the verifier owns the mismatch
 				}
 				if err := inlineParam(mctx, stage, param, bindings[i]); err != nil {
@@ -112,14 +109,19 @@ func (InlinePass) Run(_ *opt.Context, g *ir.Graph) error {
 			}
 		}
 
-		// Strip the dead parameter DECLARATIONS (the params live in the
-		// Lambda record, not operand slots — ClearLambdaParams is the
-		// choke point). A param still holding live uses (an acc-style
-		// survivor) stays declared.
+		// Strip the dead parameter DECLARATIONS — the declarations ride the
+		// stage's trailing lambda node's operand slots (D15), and
+		// ClearLambdaParams is the choke point that drops them. A param
+		// still holding live uses beyond that declaration slot (an
+		// acc-style survivor) stays declared.
+		var lamBase *ir.Base
+		if lam := ir.LambdaOf(stage); lam != nil {
+			lamBase = lam.BasePtr()
+		}
 		keep := func(p ir.Node) bool {
 			for _, u := range ir.UsesOf(p) {
-				if user := u.User(); user != nil && user.BasePtr() != stage.BasePtr() {
-					return true // a live use beyond the declaration record itself
+				if user := u.User(); user != nil && user.BasePtr() != lamBase {
+					return true // a live use beyond the declaration slot itself
 				}
 			}
 			return false
@@ -152,6 +154,11 @@ func (InlinePass) Run(_ *opt.Context, g *ir.Graph) error {
 // unwrapped to their wrapped value operand.
 func valueBindings(stage ir.Node) []ir.Node {
 	ops := ir.OperandsOf(stage)
+	// The trailing lambda node (always, D15) and As node (when present,
+	// D1) are layout markers, not value bindings.
+	if len(ops) > 0 && ops[len(ops)-1] != nil && ops[len(ops)-1].KindOf() == ir.KindLambda {
+		ops = ops[:len(ops)-1]
+	}
 	if len(ops) > 0 && ops[len(ops)-1] != nil && ops[len(ops)-1].KindOf() == ir.KindAs {
 		ops = ops[:len(ops)-1]
 	}

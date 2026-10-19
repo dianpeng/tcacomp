@@ -6,62 +6,80 @@ package ir
 // KindBoundedDimVar) are value-level material, not loop-nest structure — they
 // live with their relations in node_dimvar.go.
 
-// iterNode: abstract induction variable; ops = [init, step]; dim/bound are
-// payload uses of dim InputParam nodes (bound unwired = unbounded).
+// iterNode: abstract induction variable; ops = [dim, bound?, init, step].
+// The dim binding and the bound ride the Input list (Input/ImpactBy-only
+// convention, quick-261019-ktm revision) — the bound slot EXISTS only in
+// the bounded form (`@x/M`), so the unbounded form (`@x`) is a 3-operand
+// node [dim, init, step]. The bound accepts any value node (D5: dim params
+// and lowered TensorDimOf bounds alike).
 type iterNode struct {
 	*Base
 	operandList
-	dimUse   SSAUse
-	boundUse SSAUse
-}
-
-// forEachPayloadUse implements payloadBearer: dim then bound.
-func (n *iterNode) forEachPayloadUse(fn func(SSAUse)) {
-	fn(n.dimUse)
-	fn(n.boundUse)
 }
 
 // NewIter creates an abstract induction-variable node over the dim
-// InputParam node dim, bounded by the InputParam node bound (nil = the
-// unbounded form @x), with init and step operands.
+// InputParam node dim, bounded by bound (nil = the unbounded form @x, a
+// 3-operand node), with init and step operands. The verifier's shape check
+// pins operand 0 to a dim InputParam.
 func (g *Graph) NewIter(origin string, dim, bound Node, init, step Node) Node {
-	n := g.NewNode(KindIter, origin, init, step).(*iterNode)
-	n.dimUse = wirePayloadUse(n, dim)
-	n.boundUse = wirePayloadUse(n, bound)
-	return n
+	if bound == nil {
+		return g.NewNode(KindIter, origin, dim, init, step)
+	}
+	return g.NewNode(KindIter, origin, dim, bound, init, step)
 }
 
-// iterClusterNode: abstract compound header; ops = inputs... (the cluster's
-// input list — MemLoad nodes in the IterCluster format, the wrapped Map in
-// the legacy builder format); dims are payload uses of dim InputParam nodes
-// (D3, quick-261019-ktm: the input list is variadic operand slots, so every
-// bridge into the cluster — IterClusterProject included — rides ordinary
-// SSA data edges).
+// iterClusterNode: abstract compound header; ops = [dims..., inputs...] —
+// the cluster's dims (RoleDim InputParams) LEAD the input list, the inputs
+// follow (MemLoad nodes in the IterCluster format, the wrapped Map in the
+// legacy builder format). D3's variadic input list plus the convention move
+// of the dims (quick-261019-ktm revision) — every reference rides ordinary
+// SSA data edges.
 type iterClusterNode struct {
 	*Base
 	operandList
-	dims []SSAUse
-}
-
-// forEachPayloadUse implements payloadBearer: cluster dims in order.
-func (n *iterClusterNode) forEachPayloadUse(fn func(SSAUse)) {
-	for _, u := range n.dims {
-		fn(u)
-	}
 }
 
 // NewIterCluster creates an abstract compound iteration header over dim
 // InputParam nodes with the given input list (D3). The legacy single-body
 // call shape NewIterCluster(origin, dims, mapNode) is the one-input case
 // and compiles unchanged; the IterCluster format passes its MemLoad inputs
-// positionally — IterClusterProject(cluster, i) selects input slot i.
+// positionally — IterClusterProject(cluster, i) selects INPUT slot i
+// (ClusterInputs skips the leading dims).
 func (g *Graph) NewIterCluster(origin string, dims []Node, inputs ...Node) Node {
-	n := g.NewNode(KindIterCluster, origin, inputs...).(*iterClusterNode)
-	n.dims = make([]SSAUse, len(dims))
-	for i, d := range dims {
-		n.dims[i] = wirePayloadUse(n, d)
+	ops := make([]Node, 0, len(dims)+len(inputs))
+	ops = append(ops, dims...)
+	ops = append(ops, inputs...)
+	return g.NewNode(KindIterCluster, origin, ops...)
+}
+
+// isDimParam reports whether n is a RoleDim InputParam node.
+func isDimParam(n Node) bool {
+	role, ok := RoleOf(n)
+	return ok && role == RoleDim
+}
+
+// ClusterDims returns the cluster's dim InputParam operands — the leading
+// RoleDim operands of its input list (D14 read face).
+func ClusterDims(n Node) []Node {
+	var dims []Node
+	for _, op := range OperandsOf(n) {
+		if op == nil || !isDimParam(op) {
+			break
+		}
+		dims = append(dims, op)
 	}
-	return n
+	return dims
+}
+
+// ClusterInputs returns the cluster's non-dim operands in input order —
+// the inputs IterClusterProject indexes into (D14 read face).
+func ClusterInputs(n Node) []Node {
+	ops := OperandsOf(n)
+	dims := len(ClusterDims(n))
+	if dims >= len(ops) {
+		return nil
+	}
+	return append([]Node(nil), ops[dims:]...)
 }
 
 // forLoopNode: lowered loop nest; ops = [iv, bound, body] — the bounded

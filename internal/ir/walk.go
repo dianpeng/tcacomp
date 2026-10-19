@@ -62,10 +62,9 @@ func (f VisitorFunc) Visit(n Node) VisitResult { return f(n) }
 //     statements in statement order (a statement's valid def handle, then its
 //     rhs).
 //
-// In both levels a node's children are its operand defs in operand-slot order
-// (live records only), then its payload uses (parameter references, iteration
-// dims/bounds, lambda params, as-orders, store targets and ImpactBy effect
-// inputs), then its lambda bodies. The visitor's VisitResult controls the
+// In both levels a node's children are its operand defs in operand-slot
+// order (live records only), then its payload uses (the ImpactBy effect
+// inputs). The visitor's VisitResult controls the
 // walk: Descend enqueues the children, SkipChildren prunes the subtree, Stop
 // terminates the walk immediately. Order is fully deterministic (param order
 // + root order + operand order + payload order + lambda order only, never map
@@ -138,9 +137,6 @@ func Walk(g *Graph, v Visitor) {
 					children = append(children, u.rec.def.node)
 				}
 			})
-		}
-		if lb, ok := n.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { children = append(children, lam.Body) })
 		}
 		for i := len(children) - 1; i >= 0; i-- {
 			push(children[i])

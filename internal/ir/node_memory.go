@@ -13,30 +13,9 @@ package ir
 // second-ImpactBy-first edge while distinct tensors stay isolated (the
 // restrict-alias rule: kernel tensors never alias).
 
-// access is a structural tensor access: lhs[@m][@n]. Every component is an
-// SSAUse — the tensor InputParam and one dim InputParam per axis — never a
-// name (review P1R-01).
-type access struct {
-	tensorUse SSAUse
-	axes      []SSAUse
-}
-
-// Tensor returns the access's tensor parameter node, or nil when unwired.
-func (a access) Tensor() Node { return a.tensorUse.Def() }
-
-// Axes returns the access's axis parameter nodes in subscript order; unwired
-// slots yield nil entries.
-func (a access) Axes() []Node {
-	out := make([]Node, len(a.axes))
-	for i, u := range a.axes {
-		out[i] = u.Def()
-	}
-	return out
-}
-
 // memLoadNode: HIR GMEM load; ops = [tensor, axes...] — the tensor InputParam
 // first, then one dim InputParam per axis in subscript order. effectIns is
-// the ImpactBy payload — the per-tensor ordering edge wired by the env-aware
+// the ImpactBy list — the per-tensor ordering edge wired by the env-aware
 // construction path (effect.go), chaining reads into the same effect chains
 // as writes (skeleton memory.go).
 type memLoadNode struct {
@@ -84,26 +63,23 @@ func (g *Graph) NewMemLoadChained(origin string, env *Env, tensor Node, axes []N
 	return n
 }
 
-// memStoreNode: HIR GMEM store — the HIR stage store; ops = [value]; target
-// is a payload access of InputParam uses; effectIns is the ImpactBy payload —
-// the per-tensor ordering edge wired by the env-aware construction path
-// (effect.go). The store returns the stored value (doc §2.5).
+// memStoreNode: HIR GMEM store — the HIR stage store; ops =
+// [value, tensor, axes...] — the stored value, then the target access's
+// tensor InputParam and one dim InputParam per axis in subscript order
+// (Input/ImpactBy-only convention, quick-261019-ktm revision: the target
+// components are data dependencies and ride the Input list); effectIns is
+// the ImpactBy list — the per-tensor ordering edge wired by the env-aware
+// construction path (effect.go). The store returns the stored value
+// (doc §2.5).
 type memStoreNode struct {
 	*Base
 	operandList
-	target    access
 	effectIns []SSAUse
 }
 
-// forEachPayloadUse implements payloadBearer: target tensor, then axes, then
-// the ImpactBy effect inputs — so the verifier's use-def/def-use invariants
-// and Walk treat ordering edges as first-class graph edges in both chain
-// directions with zero new checkers (T-quick-01).
+// forEachPayloadUse implements payloadBearer: the ImpactBy effect inputs
+// (the store's ONLY payload — target access components are operands now).
 func (n *memStoreNode) forEachPayloadUse(fn func(SSAUse)) {
-	fn(n.target.tensorUse)
-	for _, u := range n.target.axes {
-		fn(u)
-	}
 	for _, u := range n.effectIns {
 		fn(u)
 	}
@@ -114,17 +90,13 @@ func (n *memStoreNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effe
 
 // NewMemStore creates a HIR GMEM structural store node writing value through
 // the target access: tensor is the tensor InputParam node and axes its dim
-// InputParam nodes (nil/empty for a whole-tensor store).
+// InputParam nodes (nil/empty for a whole-tensor store). The verifier's
+// shape check pins operand 1 to a RoleTensor InputParam.
 func (g *Graph) NewMemStore(origin string, tensor Node, axes []Node, value Node) Node {
-	n := g.NewNode(KindMemStore, origin, value).(*memStoreNode)
-	n.target.tensorUse = wirePayloadUse(n, tensor)
-	if len(axes) > 0 {
-		n.target.axes = make([]SSAUse, len(axes))
-		for i, ax := range axes {
-			n.target.axes[i] = wirePayloadUse(n, ax)
-		}
-	}
-	return n
+	ops := make([]Node, 0, 1+1+len(axes))
+	ops = append(ops, value, tensor)
+	ops = append(ops, axes...)
+	return g.NewNode(KindMemStore, origin, ops...)
 }
 
 // memNewNode: HIR GMEM allocation; ops = [extent]. The created global extent

@@ -1,131 +1,174 @@
 package ir
 
 // node_lambda.go holds the HIR lambda-stage nodes (KindMap/KindReduce, D-3)
-// and the Lambda payload record. "Pipe" survives only as BUILDER terminology
-// (the fluent pkg chain): the IR itself models a stage's piped input as an
-// ordinary operand — the map's operand 0 and the reduce's operand 0 — so the
-// sea-of-nodes' data-dependency edges cover piping with zero special cases
-// (tinycudaopto lambda.go: pipes were removed as IR nodes; the edges stay).
+// and the lambda expression node (KindLambda, quick-261019-ktm revision
+// D15). "Pipe" survives only as BUILDER terminology (the fluent pkg chain):
+// the IR itself models a stage's piped input as an ordinary operand — the
+// map's and the reduce's operand 0 — so the sea-of-nodes' data-dependency
+// edges cover piping with zero special cases (tinycudaopto lambda.go: pipes
+// were removed as IR nodes; the edges stay).
 //
-// Input-list restructure (quick-261019-ktm, D1/D2/D9): EVERY incoming
-// reference of a Map/Reduce rides its operand list. The map's as-order is a
-// trailing KindAs node appended by NewMap; the reduce's initializer rides
-// operand 1 as a KindKeyedAttribute ("init") wrapping the value; a lambda
-// parameter binds positionally to the i-th Input-list VALUE binding, where
-// an attribute element contributes its wrapped value operand and a trailing
-// As binds nothing. The accessors AsOf/ReduceInitOf read the layout back
-// without hidden pointer state.
+// Input/ImpactBy-only convention (quick-261019-ktm revision): Map and
+// Reduce store NO lambda record — they carry a KindLambda NODE as their
+// TRAILING operand. The lambda node's own Input list is
+// [param declarations..., body]: the parameter atoms (RoleLambda
+// InputParams) in binding order, then the body expression. Every reference
+// — as-order (trailing As), initializer (operand 1 KeyedAttribute), lambda
+// parameters, and the body — rides an ordinary operand slot, so Walk,
+// Verify, DCE, GVN, and the printers see stage inputs as plain SSA edges.
+// Simplification (internal/opt/simplify) still inlines bodies and strips
+// parameters; until then the body is simply graph-visible data flow.
+//
+// Lambda binding rule (D9, unchanged): lambda param i binds to the i-th
+// Input-list VALUE binding of the Map/Reduce, where a KeyedAttribute
+// element contributes its wrapped value operand and trailing As/lambda
+// nodes bind nothing.
 
-// Lambda is the payload of map/reduce stage nodes: lambda(l, r): <body>.
-// It is a record, not a Kind. Its params are the parameter DECLARATIONS
-// (ordered, Walk-anchored SSAUses of lambda InputParam nodes — D8: the
-// declarations stay; the BINDING is the Input-list correspondence, not a
-// hidden pointer). Lambda bodies are inlined at lowering
-// (internal/opt/simplify).
+// Lambda is the TRANSIENT construction record the builder API hands to
+// NewMap/NewReduce (D15): parameter atoms in binding order plus the body.
+// It holds PLAIN NODES, wires nothing, and no IR node ever stores one —
+// NewMap/NewReduce materialize a KindLambda node from it. (The pre-revision
+// record stored SSAUse params and a raw Body pointer inside the stage —
+// exactly the hidden state the Input/ImpactBy-only convention bans.)
 type Lambda struct {
-	params []SSAUse
+	params []Node
 	Body   Node
 }
 
-// Params returns the lambda's parameter uses in declaration order.
-func (l Lambda) Params() []SSAUse { return append([]SSAUse(nil), l.params...) }
+// Params returns the lambda's parameter atoms in declaration order.
+func (l Lambda) Params() []Node { return append([]Node(nil), l.params...) }
 
-// NewLambda builds a lambda record over the given lambda-InputParam nodes,
-// wiring one payload use per parameter. The record's use back-pointers are
-// fixed up to the owning stage node when the lambda is attached by
-// NewMap/NewReduce (the node does not exist yet at Lambda construction).
+// NewLambda builds the transient lambda construction record over the given
+// lambda-InputParam nodes and body. It wires nothing.
 func NewLambda(params []Node, body Node) Lambda {
-	lam := Lambda{Body: body}
-	for _, p := range params {
-		lam.params = append(lam.params, wirePayloadUse(nil, p))
-	}
-	return lam
+	return Lambda{params: append([]Node(nil), params...), Body: body}
 }
 
-// mapNode: abstract map stage; ops = [value operands..., As?] — the
-// as-order rides the operand list as a trailing KindAs node (D1); lam is
-// the payload record (parameter declarations + body).
+// lambdaNode: the lambda expression node; ops = [params..., body]. The
+// parameter atoms lead in binding order, the body expression closes the
+// list. Carried by Map/Reduce as their trailing operand; pure
+// (FamilyAbstract) and GVN-eligible (two lambdas over the same atoms and
+// body node are one value).
+type lambdaNode struct {
+	*Base
+	operandList
+}
+
+// NewLambdaNode creates a lambda expression node over the parameter atoms
+// (in binding order) and the body expression. The verifier permits only
+// NewMap/NewReduce to carry it; standalone lambdas are construction debris.
+func (g *Graph) NewLambdaNode(origin string, params []Node, body Node) Node {
+	ops := make([]Node, 0, len(params)+1)
+	ops = append(ops, params...)
+	ops = append(ops, body)
+	return g.NewNode(KindLambda, origin, ops...)
+}
+
+// mapNode: abstract map stage; ops = [value operands..., As?, lambda] — the
+// as-order rides the operand list as a trailing As node (D1) and the lambda
+// node closes the list (D15); NO payload records.
 type mapNode struct {
 	*Base
 	operandList
-	lam Lambda
-}
-
-// forEachLambda implements lambdaBearer.
-func (n *mapNode) forEachLambda(fn func(*Lambda)) { fn(&n.lam) }
-
-// forEachPayloadUse implements payloadBearer: the lambda parameter
-// declarations (the as-order left the payload with D1 — it lives on the
-// Input list now).
-func (n *mapNode) forEachPayloadUse(fn func(SSAUse)) {
-	for _, u := range n.lam.params {
-		fn(u)
-	}
 }
 
 // NewMap creates an abstract map stage over operand values ops, with lambda
 // lam and explicit result-axis order as (InputParam nodes for the axes).
-// When as is non-empty a trailing As node is allocated (before the map, so
-// allocation order is deterministic: wrapper first, then the stage) and
-// appended to the wired operand list. The signature is unchanged — the
-// legacy builder path compiles as-is.
+// When as is non-empty a trailing As node is allocated, then the lambda
+// node (wrapper nodes before the stage, so allocation order is
+// deterministic), and both are appended to the wired operand list. The
+// signature is unchanged — the legacy builder path compiles as-is.
 func (g *Graph) NewMap(origin string, ops []Node, lam Lambda, as []Node) Node {
-	wired := ops
+	wired := make([]Node, 0, len(ops)+2)
+	wired = append(wired, ops...)
 	if len(as) > 0 {
-		asNode := g.NewAs(origin, as...)
-		wired = make([]Node, 0, len(ops)+1)
-		wired = append(wired, ops...)
-		wired = append(wired, asNode)
+		wired = append(wired, g.NewAs(origin, as...))
 	}
-	n := g.NewNode(KindMap, origin, wired...).(*mapNode)
-	fixupLambdaUsers(n, &lam)
-	n.lam = lam
-	return n
+	wired = append(wired, g.NewLambdaNode(origin, lam.params, lam.Body))
+	return g.NewNode(KindMap, origin, wired...)
 }
 
 // reduceNode: abstract reduce stage; ops = [piped, KeyedAttribute("init",
-// init), As?] — the initializer rides operand 1 as a keyed attribute (D2),
-// an optional trailing As may follow (D1); combiner is the payload record.
+// init), As?, lambda] — the initializer rides operand 1 as a keyed
+// attribute (D2), the lambda node closes the list (D15); NO payload
+// records.
 type reduceNode struct {
 	*Base
 	operandList
-	combiner Lambda
-}
-
-// forEachLambda implements lambdaBearer.
-func (n *reduceNode) forEachLambda(fn func(*Lambda)) { fn(&n.combiner) }
-
-// forEachPayloadUse implements payloadBearer: combiner parameter
-// declarations.
-func (n *reduceNode) forEachPayloadUse(fn func(SSAUse)) {
-	for _, u := range n.combiner.params {
-		fn(u)
-	}
 }
 
 // NewReduce creates an abstract reduce stage with init and piped operands
 // and combiner lambda. The signature is unchanged (zero call-site churn);
-// internally the operand list is [piped, KeyedAttribute("init", init)] with
-// the attribute allocated BEFORE the reduce so allocation order is
-// deterministic (wrapper first, then the stage — the NewMap rule).
+// internally the operand list is [piped, KeyedAttribute("init", init),
+// lambda] with the wrappers allocated BEFORE the reduce so allocation order
+// is deterministic.
 func (g *Graph) NewReduce(origin string, init Node, piped Node, combiner Lambda) Node {
 	attr := g.NewKeyedAttribute(origin, "init", init)
-	n := g.NewNode(KindReduce, origin, piped, attr).(*reduceNode)
-	fixupLambdaUsers(n, &combiner)
-	n.combiner = combiner
-	return n
+	lam := g.NewLambdaNode(origin, combiner.params, combiner.Body)
+	return g.NewNode(KindReduce, origin, piped, attr, lam)
+}
+
+// lambdaNodeOf returns n's lambda node — the TRAILING operand when it is a
+// KindLambda — or nil. Map and Reduce always carry one (until a future pass
+// strips it); the read is derived, never stored.
+func lambdaNodeOf(n Node) Node {
+	ops := OperandsOf(n)
+	if len(ops) == 0 {
+		return nil
+	}
+	last := ops[len(ops)-1]
+	if last != nil && last.KindOf() == KindLambda {
+		return last
+	}
+	return nil
+}
+
+// LambdaOf returns the lambda node carried by a Map or Reduce (its trailing
+// operand), or nil for any other shape (D15 read face).
+func LambdaOf(n Node) Node {
+	if n == nil {
+		return nil
+	}
+	switch n.KindOf() {
+	case KindMap, KindReduce:
+		return lambdaNodeOf(n)
+	}
+	return nil
+}
+
+// lambdaNodeParams returns the lambda node's leading parameter operands
+// (all but the trailing body).
+func lambdaNodeParams(lam Node) []Node {
+	ops := OperandsOf(lam)
+	if len(ops) <= 1 {
+		return nil
+	}
+	return ops[:len(ops)-1]
+}
+
+// lambdaNodeBody returns the lambda node's trailing body operand, or nil.
+func lambdaNodeBody(lam Node) Node {
+	ops := OperandsOf(lam)
+	if len(ops) == 0 {
+		return nil
+	}
+	return ops[len(ops)-1]
 }
 
 // AsOf returns the trailing as-order node of a Map (or Reduce, when one
-// arrives): the LAST KindAs operand of n's Input list, or nil when n
-// carries none (D1: the layout contract is optional-but-unique-and-last;
-// the verifier enforces the placement, this accessor reads it back without
-// hidden pointer state).
+// arrives): the last KindAs operand of n's Input list BEFORE the trailing
+// lambda operand, or nil when n carries none (D1: the layout contract is
+// optional-but-unique-and-last among the value inputs; the verifier
+// enforces the placement, this accessor reads it back without hidden
+// pointer state).
 func AsOf(n Node) Node {
 	if n == nil {
 		return nil
 	}
 	ops := OperandsOf(n)
+	if lam := lambdaNodeOf(n); lam != nil && len(ops) > 0 {
+		ops = ops[:len(ops)-1] // the As rides before the lambda
+	}
 	for i := len(ops) - 1; i >= 0; i-- {
 		if ops[i] != nil && ops[i].KindOf() == KindAs {
 			return ops[i]

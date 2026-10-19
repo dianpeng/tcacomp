@@ -23,11 +23,12 @@ import "slices"
 // verifier's job (PASS-06). This lets cross-package tests construct
 // out-of-window or unwired graphs to prove rejection.
 //
-// Every reference in the graph is an SSAUse (review P1R-01): operand slots
-// hold SSAUse handles, and payload fields (lambda params, store target
-// accesses, iteration dims/bounds, map as-orders, parameter refs, ImpactBy
-// effect inputs) hold SSAUse records wired exactly like operand uses — a
-// fresh ref record in the def's SSAVar, owned by the referencing node. Names
+// Every reference in the graph is an SSAUse (review P1R-01) and rides one
+// of exactly two dependency lists (Input/ImpactBy-only convention,
+// quick-261019-ktm revision): operand slots hold the DATA dependencies, and
+// the one remaining payload storage — the ImpactBy effect-input lists of
+// memLoad/memStore/return — holds the SIDE-EFFECT dependencies, each a
+// fresh ref record in the def's SSAVar owned by the referencing node. Names
 // appear ONLY as InputParam debug payload and are never used for resolution
 // or identity.
 
@@ -238,17 +239,15 @@ type rawNode struct {
 	operandList
 }
 
-// lambdaBearer is implemented by nodes carrying Lambda payloads; the
-// verifier walks lambda bodies as graph edges alongside operand uses.
-type lambdaBearer interface {
-	forEachLambda(fn func(*Lambda))
-}
-
-// payloadBearer is implemented by nodes carrying non-operand SSAUse payloads
-// (parameter refs, iteration dims/bounds, lambda params, as-orders, store
-// targets, ImpactBy effect inputs). The verifier treats payload uses exactly
-// like operand slots in both chain directions; Walk follows them as graph
-// edges.
+// payloadBearer is implemented by nodes carrying non-operand SSAUse
+// payloads. Since the Input/ImpactBy-only convention (quick-261019-ktm
+// revision) the ONLY payload left in the suite is the ImpactBy effect-input
+// list of the effect bearers (memLoad/memStore/return) — the convention's
+// second sanctioned dependency kind. The verifier treats payload uses
+// exactly like operand slots in both chain directions; Walk follows them as
+// graph edges. (The pre-revision bearers — paramRefs, iters, clusters,
+// dimvars, stores' target accesses, map/reduce lambda records — all moved
+// their references into operand slots.)
 type payloadBearer interface {
 	forEachPayloadUse(fn func(SSAUse))
 }
@@ -320,6 +319,8 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &keyedAttributeNode{Base: b}
 	case KindAs:
 		n = &asNode{Base: b}
+	case KindLambda:
+		n = &lambdaNode{Base: b}
 	case KindTensorDimOf:
 		n = &tensorDimOfNode{Base: b}
 	case KindInductionVariable:
@@ -364,25 +365,14 @@ func wireOperands(n nodeImpl, operands ...Node) int {
 // wirePayloadUse links val as a payload (non-operand-slot) reference of
 // user, creating a fresh ref record in the def's SSAVar exactly as operand
 // wiring does. A nil val (or a foreign node without a var) leaves a zero
-// handle for the verifier to flag. The user back-pointer may be nil when the
-// owning node does not exist yet (Lambda records); NewMap/NewReduce fix the
-// records up to the stage node when attaching the lambda.
+// handle for the verifier to flag. Post-convention this serves ONLY the
+// ImpactBy effect inputs of the memory/end nodes (the second sanctioned
+// dependency kind).
 func wirePayloadUse(user Node, val Node) SSAUse {
 	if val == nil || val.BasePtr().ssa == nil {
 		return SSAUse{}
 	}
 	return SSAUse{rec: val.BasePtr().ssa.addRef(user)}
-}
-
-// fixupLambdaUsers retargets a freshly-built lambda record's parameter use
-// records at their owning stage node (they were created with a nil user
-// before the node existed).
-func fixupLambdaUsers(n Node, lam *Lambda) {
-	for i := range lam.params {
-		if r := lam.params[i].rec; r != nil {
-			r.user = n
-		}
-	}
 }
 
 // NewGraph creates an empty named graph in its Level-1 form: a pure sea of

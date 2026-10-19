@@ -372,9 +372,10 @@ func TestGVNReduceParticipates(t *testing.T) {
 	assertGone(t, g, c2)
 	// Input-list layout (quick-261019-ktm): operand 0 is the piped value
 	// (rewired to the representative by the c2→c1 RAUW), operand 1 the
-	// KeyedAttribute wrapping init — unwrapped through ReduceInitOf.
+	// KeyedAttribute wrapping init (unwrapped through ReduceInitOf), and
+	// the lambda node closes the list (revision D15).
 	ops := ir.OperandsOf(r)
-	if len(ops) != 2 || ops[0] != c1 {
+	if len(ops) != 3 || ops[0] != c1 || ops[2].KindOf() != ir.KindLambda {
 		t.Fatalf("the reduce's piped operand must resolve to the representative, got %v", ops)
 	}
 	if got := ir.ReduceInitOf(r); got != init {

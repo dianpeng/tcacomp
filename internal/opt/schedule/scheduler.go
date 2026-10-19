@@ -193,7 +193,12 @@ func statementOwners(stmts []*ir.Statement) map[*ir.Base]*ir.Statement {
 // contributes the edge O → S. A dep owned by S itself is an internal tree
 // edge and contributes nothing — EXCEPT a genuine self-dependency (d == n,
 // a node depending on itself), which is kept as a self-edge: it makes the
-// statement unschedulable, which the cycle remainder reports.
+// statement unschedulable, which the cycle remainder reports. InputParam
+// deps contribute nothing: kernel/lambda params are graph-owned leaves
+// produced by no statement (available from kernel entry), and since store
+// target accesses ride operand slots (Input/ImpactBy-only convention,
+// quick-261019-ktm revision) a shared tensor/dim param would otherwise
+// manufacture false cross-statement edges against the effect chains.
 func statementEdges(stmts []*ir.Statement, owner map[*ir.Base]*ir.Statement) (map[*ir.Statement][]*ir.Statement, map[*ir.Statement][]*ir.Statement) {
 	predSet := make(map[*ir.Statement]map[*ir.Statement]bool, len(stmts))
 	succs := make(map[*ir.Statement][]*ir.Statement, len(stmts))
@@ -202,6 +207,9 @@ func statementEdges(stmts []*ir.Statement, owner map[*ir.Base]*ir.Statement) (ma
 			for _, d := range ir.PosetDeps(n) {
 				if d == nil {
 					continue
+				}
+				if d.BasePtr().KindOf() == ir.KindInputParam {
+					continue // graph-owned leaf: produced by no statement, order-free
 				}
 				o := owner[d.BasePtr()]
 				if o == nil {

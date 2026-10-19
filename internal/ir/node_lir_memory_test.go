@@ -112,8 +112,8 @@ func TestLIRMemoryShapesVerifyClean(t *testing.T) {
 	p := Print(g)
 	for _, want := range []string{
 		"memstoresmem(%2[@x/64.0], %1)",
-		"fragstore(%11[@x/64.0], %10)",
-		"memstore(%out[@x], %0 + %9)",
+		"fragstore(%12[@x/64.0], %11)",
+		"memstore(%out[@x], %0 + %10)",
 		"return %out",
 	} {
 		if !strings.Contains(p, want) {
@@ -134,8 +134,8 @@ func TestLIRMemoryShapesVerifyClean(t *testing.T) {
 		{lt, "memloadsmem(%2[@x/64.0])"},
 		{sts, "memstoresmem(%2[@x/64.0], %1)"},
 		{frag, "fragnew(64.0)"},
-		{fl, "fragload(%11[@x/64.0])"},
-		{fst, "fragstore(%11[@x/64.0], %10)"},
+		{fl, "fragload(%12[@x/64.0])"},
+		{fst, "fragstore(%12[@x/64.0], %11)"},
 	} {
 		if got := Label(check.n, num); got != check.want {
 			t.Errorf("Label = %q, want %q", got, check.want)

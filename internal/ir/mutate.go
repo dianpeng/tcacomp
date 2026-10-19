@@ -122,13 +122,14 @@ func (ctx *MutContext) ReplaceAllUsesWith(old, newVal Node) error {
 	return nil
 }
 
-// SetLambdaBody rewires the body pointer of n's (single) lambda payload to
-// newBody — the sanctioned choke point for the ONE raw-pointer edge in the
-// IR (Lambda.Body), which RAUW cannot reach: uses ride ref records, the
-// body does not (quick-261019-ktm; the inline pass needs it when a lambda
-// body ROOT is itself a parameter reference). It moves no records: the old
-// body's own operand/payload records are managed by the caller through the
-// ordinary choke points, and Erase still refuses while live uses remain.
+// SetLambdaBody rewires the body expression of n's lambda node to newBody.
+// Since the Input/ImpactBy-only convention (quick-261019-ktm revision) the
+// body is an ordinary OPERAND slot of the trailing KindLambda node, so this
+// is a plain SetDef over that slot (kept as its own choke point for
+// discoverability — the inline pass uses it when a lambda body ROOT is
+// itself a parameter reference). The previous raw-pointer semantics
+// (pre-revision Lambda.Body) no longer exist: RAUW can now reach body uses
+// too.
 func (ctx *MutContext) SetLambdaBody(n Node, newBody Node) error {
 	if n == nil {
 		return errors.New("ir: SetLambdaBody on nil node")
@@ -136,35 +137,34 @@ func (ctx *MutContext) SetLambdaBody(n Node, newBody Node) error {
 	if newBody == nil {
 		return errors.New("ir: SetLambdaBody on nil body")
 	}
-	lb, ok := n.(lambdaBearer)
-	if !ok {
-		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): not a lambda-bearing stage", n.BasePtr().id, n.KindOf())
+	lam := lambdaNodeOf(n)
+	if lam == nil {
+		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): no trailing lambda node", n.BasePtr().id, n.KindOf())
 	}
-	set := false
-	lb.forEachLambda(func(lam *Lambda) {
-		if set {
-			return // v0 stages carry exactly one lambda; refuse to be clever
+	old := lambdaNodeBody(lam)
+	if old == nil {
+		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): lambda carries no body operand", n.BasePtr().id, n.KindOf())
+	}
+	for _, u := range UsesOf(old) { // snapshot; the body slot's record is the one whose user is the lambda
+		if user := u.User(); user != nil && user.BasePtr() == lam.BasePtr() {
+			if err := ctx.SetDef(u, newBody); err != nil {
+				return err
+			}
+			ctx.stamp(lam)
+			return nil
 		}
-		lam.Body = newBody
-		set = true
-	})
-	if !set {
-		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): no lambda payload", n.BasePtr().id, n.KindOf())
 	}
-	ctx.stamp(n)
-	return nil
+	return fmt.Errorf("ir: SetLambdaBody on node %d (%s): the lambda's body operand record is missing", n.BasePtr().id, n.KindOf())
 }
 
 // ClearLambdaParams kills a stage's dead lambda-parameter DECLARATION
-// records (quick-261019-ktm): for every Lambda payload of n (lambdaBearer —
-// Map and Reduce), each param use whose def fails keep is detached from the
-// def's ref list and killed, and the record's params slice is rebuilt over
-// the survivors. This is the sanctioned choke point for lambda-param
-// stripping because the params live in the Lambda RECORD, not in operand
-// slots — RemoveUse/Erase cannot reach them (D8: the declarations are
-// Walk-anchored payload uses, so killing them must keep the def-use chains
-// consistent, exactly as RemoveUse does for operands). keep reports whether
-// a param declaration stays (e.g. it still has live uses elsewhere).
+// operand slots (quick-261019-ktm revision): for the trailing lambda node
+// of n (Map/Reduce), each leading param operand whose def fails keep is
+// removed through the RemoveUse choke point (record killed, slot dropped —
+// binding order of the survivors is preserved). Post-convention the params
+// ARE operand slots, so this is a batched RemoveUse rather than a
+// record-slice rebuild. keep reports whether a param declaration stays
+// (e.g. it still has live uses elsewhere).
 func (ctx *MutContext) ClearLambdaParams(n Node, keep func(Node) bool) error {
 	if n == nil {
 		return errors.New("ir: ClearLambdaParams on nil node")
@@ -172,27 +172,21 @@ func (ctx *MutContext) ClearLambdaParams(n Node, keep func(Node) bool) error {
 	if keep == nil {
 		return errors.New("ir: ClearLambdaParams on nil keep predicate")
 	}
-	lb, ok := n.(lambdaBearer)
-	if !ok {
-		return nil // not a lambda-bearing stage: nothing to clear
+	lam := lambdaNodeOf(n)
+	if lam == nil {
+		return nil // not a lambda-carrying stage: nothing to clear
 	}
-	lb.forEachLambda(func(lam *Lambda) {
-		kept := make([]SSAUse, 0, len(lam.params))
-		for _, u := range lam.params {
-			if u.rec == nil || u.rec.killed {
-				continue // unwired or already-dead record: drop it outright
-			}
-			if keep(u.Def()) {
-				kept = append(kept, u)
-				continue
-			}
-			if def := u.rec.def; def != nil {
-				def.removeRef(u.rec)
-			}
-			u.rec.killed = true
+	for _, p := range lambdaNodeParams(lam) {
+		if p == nil || keep(p) {
+			continue
 		}
-		lam.params = kept
-	})
+		for _, u := range UsesOf(p) { // snapshot; drop the slots the lambda owns
+			if user := u.User(); user != nil && user.BasePtr() == lam.BasePtr() {
+				ctx.RemoveUse(u)
+			}
+		}
+	}
+	ctx.stamp(lam)
 	ctx.stamp(n)
 	return nil
 }

@@ -32,15 +32,15 @@ type kindEntry struct {
 // catalog lists every known IR node kind in enum order.
 var catalog = []kindEntry{
 	// --- HIR tier ---
-	{KindMap, TierHIR, FamilyAbstract, -1, "lambda map stage: value operands..., trailing As?; lambda payload"},
-	{KindReduce, TierHIR, FamilyAbstract, -1, "lambda reduce stage: piped, KeyedAttribute(init), trailing As?"},
+	{KindMap, TierHIR, FamilyAbstract, -1, "lambda map stage: value operands..., trailing As?, trailing lambda node"},
+	{KindReduce, TierHIR, FamilyAbstract, -1, "lambda reduce stage: piped, KeyedAttribute(init), trailing As?, trailing lambda node"},
 	{KindMemLoad, TierHIR, FamilyMemory, -1, "GMEM load: tensor operand + axes; chains via ImpactBy"},
-	{KindMemStore, TierHIR, FamilyMemory, 1, "GMEM store: (target access payload, value); HIR stage store"},
+	{KindMemStore, TierHIR, FamilyMemory, -1, "GMEM store: (value, tensor, axes...) — the HIR stage store"},
 	{KindMemNew, TierHIR, FamilyMemory, 1, "GMEM allocation: (extent value)"},
-	{KindIter, TierHIR, FamilyLoop, 2, "induction variable @m: (dim/bound payload), init, step"},
-	{KindIterCluster, TierHIR, FamilyLoop, -1, "compound iter(@m, @k, @n) header: (dims payload), inputs..."},
+	{KindIter, TierHIR, FamilyLoop, -1, "induction variable @m: (dim, bound?, init, step) — the bound slot is present only when bounded"},
+	{KindIterCluster, TierHIR, FamilyLoop, -1, "compound iter(@m, @k, @n) header: (dims..., inputs...) — dims lead the input list"},
 	{KindConst, TierHIR, FamilyScalarExpr, 0, "typed scalar constant"},
-	{KindParam, TierHIR, FamilyScalarExpr, 0, "lambda parameter reference"},
+	{KindParam, TierHIR, FamilyScalarExpr, 1, "lambda/kernel parameter reference: (the InputParam)"},
 	{KindBinOp, TierHIR, FamilyScalarExpr, 2, "binary scalar op (opcode table mirrors syntax.md §7.6)"},
 	{KindUnaryOp, TierHIR, FamilyScalarExpr, 1, "unary scalar op"},
 	{KindSelect, TierHIR, FamilyScalarExpr, 3, "typed conditional ?: (cond, then, else)"},
@@ -50,11 +50,12 @@ var catalog = []kindEntry{
 	{KindReturn, TierHIR, FamilyAbstract, -1, "end node: kernel return (values...); graph's single end"},
 	{KindIterClusterProject, TierHIR, FamilyAbstract, 1, "IterCluster input slot i bound to a Map's param i: (cluster), idx payload"},
 	{KindKeyedAttribute, TierHIR, FamilyAbstract, 1, "named attribute riding an Input list: (value), key payload"},
-	{KindAs, TierHIR, FamilyAbstract, -1, "as-order clause: dim params in order; trailing on Map/Reduce inputs"},
+	{KindAs, TierHIR, FamilyAbstract, -1, "as-order clause: dim params in order; trailing on Map/Reduce value inputs"},
+	{KindLambda, TierHIR, FamilyAbstract, -1, "lambda expression: (param declarations..., body); map/reduce carry it as their trailing input"},
 
 	// --- LIR tier ---
 	{KindForLoop, TierLIR, FamilyLoop, 3, "lowered loop nest: (iv dimvar, bound bdimvar, body)"},
-	{KindDimVar, TierLIR, FamilyAbstract, 2, "lowered induction variable: (init, step) value object"},
+	{KindDimVar, TierLIR, FamilyAbstract, 3, "lowered induction variable: (dim, init, step) value object"},
 	{KindBoundedDimVar, TierLIR, FamilyAbstract, 2, "dimvar bound to a max: ((iv tuple), max)"},
 	{KindMemLoadSMem, TierLIR, FamilyMemory, -1, "SMEM load: (src smem buffer, bivs...)"},
 	{KindMemStoreSMem, TierLIR, FamilyMemory, -1, "SMEM store: (value, dst smem buffer, bivs...)"},

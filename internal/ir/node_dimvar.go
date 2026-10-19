@@ -17,26 +17,21 @@ package ir
 // dimvar is value-level material (FamilyAbstract), not loop-nest structure;
 // the explicit lowered loop is KindForLoop (node_loop.go).
 
-// dimVarNode: lowered induction variable; ops = [init, step]; the dim
-// binding is a payload use of a dim InputParam (name/debug payload only —
-// identity is the (init, step) tuple).
+// dimVarNode: lowered induction variable; ops = [dim, init, step]. The dim
+// binding rides operand 0 (Input/ImpactBy-only convention,
+// quick-261019-ktm revision) — the name is debug payload only, identity is
+// the (init, step) tuple.
 type dimVarNode struct {
 	*Base
 	operandList
-	dimUse SSAUse
 }
-
-// forEachPayloadUse implements payloadBearer: the dim binding.
-func (n *dimVarNode) forEachPayloadUse(fn func(SSAUse)) { fn(n.dimUse) }
 
 // NewDimVar creates a lowered induction variable over dim (a dim
 // InputParam), with init and step value operands. The IV's identity is the
-// (init, step) tuple — never the name.
+// (init, step) tuple — never the name. The verifier's shape check pins
+// operand 0 to a dim InputParam.
 func (g *Graph) NewDimVar(origin string, dim Node, init, step Node) Node {
-	n := g.allocNode(KindDimVar, origin, 2).(*dimVarNode)
-	n.dimUse = wirePayloadUse(n, dim)
-	wireOperands(n, init, step)
-	return n
+	return g.NewNode(KindDimVar, origin, dim, init, step)
 }
 
 // operandAt returns the node's operand slot i, nil-safely.
@@ -90,8 +85,8 @@ func SameIV(a, b Node) bool {
 	if !ok {
 		return false
 	}
-	return sameValue(operandAt(da, 0), operandAt(db, 0)) &&
-		sameValue(operandAt(da, 1), operandAt(db, 1))
+	return sameValue(operandAt(da, 1), operandAt(db, 1)) &&
+		sameValue(operandAt(da, 2), operandAt(db, 2))
 }
 
 // normalizedIV reports whether n is a dimVarNode with the normalized tuple
@@ -102,14 +97,14 @@ func normalizedIV(n Node) bool {
 	if !ok {
 		return false
 	}
-	iv, iok := constValueOf(operandAt(d, 0))
-	sv, sok := constValueOf(operandAt(d, 1))
+	iv, iok := constValueOf(operandAt(d, 1))
+	sv, sok := constValueOf(operandAt(d, 2))
 	return iok && sok && iv == 0 && sv == 1
 }
 
 // boundedDimVarNode: a dimvar bound to a learned maximum — the tuple
 // ((iv tuple), Max). ops = [iv, max]; the dim name renders from the bound
-// dimvar (op 0).
+// dimvar's dim operand.
 type boundedDimVarNode struct {
 	*Base
 	operandList

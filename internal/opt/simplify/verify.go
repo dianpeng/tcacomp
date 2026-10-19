@@ -88,8 +88,8 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 		}
 		declared := make(map[*ir.Base]bool)
 		for _, group := range ir.LambdaParams(stage) {
-			for _, u := range group {
-				if p := u.Def(); p != nil {
+			for _, p := range group {
+				if p != nil {
 					declared[p.BasePtr()] = true
 				}
 			}

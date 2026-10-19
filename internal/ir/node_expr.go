@@ -120,26 +120,22 @@ func (g *Graph) NewConst(origin string, t Type, v float64) Node {
 	return n
 }
 
-// paramRefNode: scalar-expr reference to a (lambda or scalar) InputParam;
-// the reference IS the payload use.
+// paramRefNode: scalar-expr reference to a (lambda or scalar) InputParam.
+// The reference IS operand 0 (Input/ImpactBy-only convention,
+// quick-261019-ktm revision: the parameter target is a data dependency, so
+// it rides the Input list — no payload field).
 type paramRefNode struct {
 	*Base
 	operandList
-	use SSAUse
 }
 
 func (*paramRefNode) scalarExprNode() {}
 
-// forEachPayloadUse implements payloadBearer: the parameter reference.
-func (n *paramRefNode) forEachPayloadUse(fn func(SSAUse)) { fn(n.use) }
-
-// NewParamRef creates a scalar parameter-reference node: a payload SSAUse
-// pointing at an InputParam node (a lambda parameter or a captured kernel
-// scalar).
+// NewParamRef creates a scalar parameter-reference node: operand 0 points
+// at an InputParam node (a lambda parameter or a captured kernel scalar).
+// The verifier's shape check pins the operand kind.
 func (g *Graph) NewParamRef(origin string, p Node) Node {
-	n := g.NewNode(KindParam, origin).(*paramRefNode)
-	n.use = wirePayloadUse(n, p)
-	return n
+	return g.NewNode(KindParam, origin, p)
 }
 
 // binOpNode: binary scalar expression; ops = [a, b].

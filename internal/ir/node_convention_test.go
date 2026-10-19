@@ -331,7 +331,7 @@ func TestConventionReflectCoversAllKinds(t *testing.T) {
 	if !hiddenRefFieldType(reflect.TypeOf(Node(nil)), false) {
 		t.Fatal("Node fields must classify as hidden references")
 	}
-	if hiddenRefFieldType(reflect.TypeOf(Lambda{}), true) {
+	if !hiddenRefFieldType(reflect.TypeOf(Lambda{}), true) {
 		t.Fatal("Lambda records must classify as hidden references even on effect bearers")
 	}
 }

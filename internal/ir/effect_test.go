@@ -204,26 +204,33 @@ func containsNode(ns []Node, want Node) bool {
 }
 
 // TestImpactByPayloadEnumeration pins the payload contract the verifier and
-// Walk rely on (T-quick-01): the ImpactBy records ride the store's ordinary
-// payloadBearer enumeration AFTER the target access, so both chain directions
-// see them as first-class edges.
+// Walk rely on (T-quick-01, Input/ImpactBy-only convention): the store's
+// target access rides its OPERAND slots, so the payloadBearer enumeration
+// carries exactly the ImpactBy effect inputs — both chain directions see
+// them as first-class edges.
 func TestImpactByPayloadEnumeration(t *testing.T) {
 	g, m, out1, _, val := twoTensorGraph(t)
 	env := NewEnv()
 	st1 := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val)
 	st2 := g.NewMemStoreChained("ctor", env, out1, []Node{m}, val).(*memStoreNode)
 
-	// Payload order: tensor, axes, then effect inputs.
+	// The payload enumeration is the ImpactBy list alone (the tensor/axis
+	// target components are operands, quick-261019-ktm revision).
 	var payload []Node
 	st2.forEachPayloadUse(func(u SSAUse) { payload = append(payload, u.Def()) })
-	want := []Node{out1, m, st1} // tensor, axis, first store
-	if len(payload) != 3 {
-		t.Fatalf("store payload enumeration = %d uses, want 3 (tensor, axis, ImpactBy)", len(payload))
+	want := []Node{st1} // the chained first store
+	if len(payload) != 1 {
+		t.Fatalf("store payload enumeration = %d uses, want 1 (the ImpactBy edge)", len(payload))
 	}
 	for i := range want {
 		if payload[i] != want[i] {
 			t.Fatalf("payload use %d = %v, want %v", i, payload[i], want[i])
 		}
+	}
+	// The target access components ride the operand slots: [value, tensor,
+	// axes...].
+	if ops := OperandsOf(st2); len(ops) != 3 || ops[1] != out1 || ops[2] != m {
+		t.Fatalf("store operands must be [value, tensor, axis], got %v", ops)
 	}
 
 	// The ImpactBy record is owned by the second store in BOTH directions:

@@ -37,8 +37,17 @@ func TestIterfmtNodesConstructAndVerify(t *testing.T) {
 	loadL := g.NewMemLoad("ctor", lhs, []Node{a, b})
 	loadR := g.NewMemLoad("ctor", rhs, []Node{a, c})
 	cluster := g.NewIterCluster("ctor", []Node{a, b, c}, loadL, loadR)
-	if ops := OperandsOf(cluster); len(ops) != 2 || ops[0] != loadL || ops[1] != loadR {
-		t.Fatalf("cluster inputs must ride the operand list in order, got %v", ops)
+	// Dims LEAD the input list, inputs follow (Input/ImpactBy-only
+	// convention, quick-261019-ktm revision).
+	if ops := OperandsOf(cluster); len(ops) != 5 || ops[0] != a || ops[1] != b || ops[2] != c ||
+		ops[3] != loadL || ops[4] != loadR {
+		t.Fatalf("cluster operands must be [dims..., inputs...] in order, got %v", ops)
+	}
+	if dims := ClusterDims(cluster); len(dims) != 3 || dims[0] != a || dims[1] != b || dims[2] != c {
+		t.Fatalf("ClusterDims must read the leading dims, got %v", dims)
+	}
+	if ins := ClusterInputs(cluster); len(ins) != 2 || ins[0] != loadL || ins[1] != loadR {
+		t.Fatalf("ClusterInputs must read the inputs in order, got %v", ins)
 	}
 
 	p0 := g.NewIterClusterProject("ctor", cluster, 0)
@@ -206,8 +215,8 @@ func TestIterfmtInputListAccessors(t *testing.T) {
 	if got := ReduceInitOf(red); got != init {
 		t.Fatalf("ReduceInitOf must unwrap the init attribute, got %v", got)
 	}
-	if ops := OperandsOf(red); len(ops) != 2 || ops[0] != val {
-		t.Fatalf("reduce operand 0 must be the piped input, got %v", ops)
+	if ops := OperandsOf(red); len(ops) != 3 || ops[0] != val || ops[2].KindOf() != KindLambda {
+		t.Fatalf("reduce operands must be [piped, init attribute, lambda], got %v", ops)
 	}
 	if ReduceInitOf(mp) != nil {
 		t.Fatal("ReduceInitOf must report nil for a non-reduce node")

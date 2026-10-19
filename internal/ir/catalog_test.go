@@ -33,12 +33,13 @@ func TestCatalogListsEveryKind(t *testing.T) {
 			t.Errorf("%s listed as LIR but reports tier %v", k, k.Tier())
 		}
 	}
-	// The tier boundary IS the enum boundary: the last HIR kind is KindAs
-	// (KindReturn closes the original HIR suite; the Input-list restructure
-	// additions — IterClusterProject/KeyedAttribute/As, quick-261019-ktm —
-	// extend the HIR tier after it), and the LIR tier begins at KindForLoop.
-	if len(hir) == 0 || hir[len(hir)-1] != KindAs {
-		t.Error("the HIR tier must end at KindAs (enum boundary before KindForLoop is wrong)")
+	// The tier boundary IS the enum boundary: the last HIR kind is
+	// KindLambda (KindReturn closes the original HIR suite; the Input-list
+	// restructure additions — IterClusterProject/KeyedAttribute/As/Lambda,
+	// quick-261019-ktm — extend the HIR tier after it), and the LIR tier
+	// begins at KindForLoop.
+	if len(hir) == 0 || hir[len(hir)-1] != KindLambda {
+		t.Error("the HIR tier must end at KindLambda (enum boundary before KindForLoop is wrong)")
 	}
 	if len(lir) == 0 || lir[0] != KindForLoop {
 		t.Error("the LIR tier must begin at KindForLoop")

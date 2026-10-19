@@ -11,9 +11,8 @@ package ir
 //   - Level 1 (before Materialize): a SEA MARK-SWEEP. MARK roots at the
 //     graph's params plus the end node (R2 — the graph's single KindReturn;
 //     its operand and ImpactBy paths reach every live store) and follows
-//     operand slots, payload uses (store targets, iteration dims, lambda
-//     params, ImpactBy effect inputs), and lambda bodies — exactly Walk's
-//     child relation. SWEEP the Graph.nodes allocation registry: a node with
+//     operand slots and the ImpactBy payload uses — exactly Walk's child
+//     relation. SWEEP the Graph.nodes allocation registry: a node with
 //     zero live uses and not marked reachable is erased through
 //     MutContext.Erase in allocation-order passes (a pass that erases nothing
 //     ends the loop); killing a dead user frees its def's next pass. The end
@@ -122,9 +121,6 @@ func markReachable(g *Graph) map[Node]bool {
 				}
 			})
 		}
-		if lb, ok := n.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { push(lam.Body) })
-		}
 	}
 	return live
 }
@@ -171,9 +167,6 @@ func hasEffectNode(n Node) bool {
 					stack = append(stack, u.rec.def.node)
 				}
 			})
-		}
-		if lb, ok := cur.(lambdaBearer); ok {
-			lb.forEachLambda(func(lam *Lambda) { stack = append(stack, lam.Body) })
 		}
 	}
 	return false
@@ -266,9 +259,6 @@ func statementOwnership(g *Graph) map[Node]*Statement {
 					}
 				})
 			}
-			if lb, ok := n.(lambdaBearer); ok {
-				lb.forEachLambda(func(lam *Lambda) { visit(lam.Body) })
-			}
 		}
 		visit(s.rhs)
 	}
@@ -318,9 +308,6 @@ func wipeDeadStatements(g *Graph, dead map[*Statement]bool, ctx *MutContext) err
 						visit(u.rec.def.node)
 					}
 				})
-			}
-			if lb, ok := n.(lambdaBearer); ok {
-				lb.forEachLambda(func(lam *Lambda) { visit(lam.Body) })
 			}
 		}
 		visit(s.rhs)

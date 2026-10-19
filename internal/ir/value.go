@@ -23,11 +23,11 @@ import "math"
 //     ValueHashOneOfAKind and compares false to everything — including
 //     ITSELF. Side-effect nodes never participate in value numbering.
 //
-//   - LAMBDA MACHINERY (amendment E): the ONLY recursion in the whole
-//     contract runs through lambda payloads (Map AND Reduce): params by
-//     identity, bodies by recursive identity-keyed equality. Cycle guards
-//     make the recursion terminate on malformed (cyclic) bodies, failing
-//     safe (fixed hash contribution / false).
+//   - LAMBDA NODES (quick-261019-ktm revision): a Map/Reduce's lambda is a
+//     KindLambda NODE carried as a trailing operand; its params and body
+//     are ITS operands. Nothing recurses: the lambda compares by identity
+//     like any other operand (the pre-revision recursive body equality is
+//     gone with the hidden Lambda record).
 //
 // CONTRACT (relied upon by gvn-verify): ValueEqual(a, b) == true MUST imply
 // ValueHash(a) == ValueHash(b). The hash is best-effort — collisions are
@@ -94,20 +94,15 @@ func mixString(h uint64, s string) uint64 {
 //
 // Atoms (KindInputParam) mix kind + node ID: one node per parameter, never
 // structurally pooled. Composites mix: kind; per-kind content fields
-// (const type + Float64bits value; opcodes; cast type; call name; LIR
-// storage class); the operand slot count and each slot's def node ID in
-// canonical slot order (0 for unwired); each payload use's target node ID
-// in payload order; per lambda the param count, param target IDs, and the
-// body's recursive hash. Operands are NEVER recursed into structurally
-// (amendment D) — the only recursion is through lambda bodies.
+// (const type + Float64bits value; opcodes; cast type; call name; project
+// idx; attribute key; LIR storage class); the operand slot count and each
+// slot's def node ID in canonical slot order (0 for unwired); each payload
+// use's target node ID in payload order. Operands are NEVER recursed into
+// structurally (amendment D) — since the Input/ImpactBy-only convention
+// there is no recursion anywhere in the contract (lambda bodies are
+// operands of the KindLambda node, compared by identity like everything
+// else).
 func (b *Base) ValueHash(se SideEffectAnalysis) uint64 {
-	return nodeValueHash(b, se, make(map[*Base]bool))
-}
-
-// nodeValueHash is ValueHash's recursion core: inProgress tracks the
-// lambda-body recursion stack so a body cycle terminates (re-entry
-// contributes a fixed 0 — fail-safe, deterministic).
-func nodeValueHash(b *Base, se SideEffectAnalysis, inProgress map[*Base]bool) uint64 {
 	node := hashTarget(b)
 	if node == nil || se == nil || !validValueKind(b.kind) || se.HasSideEffect(node) {
 		return ValueHashOneOfAKind
@@ -117,11 +112,6 @@ func nodeValueHash(b *Base, se SideEffectAnalysis, inProgress map[*Base]bool) ui
 		// former "InputParam atoms" rule survives as the ID mix.
 		return mixUint64(mixUint64(valueHashOffset, uint64(b.kind)), b.id)
 	}
-	if inProgress[b] {
-		return 0 // lambda-body cycle: fixed contribution, terminate
-	}
-	inProgress[b] = true
-	defer delete(inProgress, b)
 
 	h := valueHashOffset
 	h = mixUint32(h, uint32(b.kind))
@@ -134,8 +124,9 @@ func nodeValueHash(b *Base, se SideEffectAnalysis, inProgress map[*Base]bool) ui
 		h = mixUint64(h, nodeIDOrZero(d))
 	}
 
-	// Payload uses (parameter refs, dims/bounds, lambda params, as-orders,
-	// store targets, ImpactBy inputs): target IDs in payload order.
+	// Payload uses (the ImpactBy effect inputs of the memory/end nodes):
+	// target IDs in payload order. Effectful nodes hash to the sentinel
+	// before ever reaching here, so this is completeness plumbing.
 	if pb, ok := node.(payloadBearer); ok {
 		var targets []uint64
 		pb.forEachPayloadUse(func(u SSAUse) { targets = append(targets, nodeIDOrZero(u.Def())) })
@@ -145,79 +136,33 @@ func nodeValueHash(b *Base, se SideEffectAnalysis, inProgress map[*Base]bool) ui
 		}
 	}
 
-	// Lambda payloads (Map AND Reduce, amendment E): param count, param
-	// target IDs, then the body's recursive hash.
-	if lb, ok := node.(lambdaBearer); ok {
-		var bodies []Node
-		lb.forEachLambda(func(lam *Lambda) {
-			h = mixUint64(h, uint64(len(lam.params)))
-			for _, u := range lam.params {
-				h = mixUint64(h, nodeIDOrZero(u.Def()))
-			}
-			bodies = append(bodies, lam.Body)
-		})
-		for _, body := range bodies {
-			if body == nil || body.BasePtr() == nil {
-				h = mixUint64(h, 0)
-				continue
-			}
-			h = mixUint64(h, nodeValueHash(body.BasePtr(), se, inProgress))
-		}
-	}
-
 	if h == ValueHashOneOfAKind {
 		h ^= valueHashPerturb // no pure node may collide with the sentinel
 	}
 	return h
 }
 
-// ValueEqual reports whether b and other are the SAME value under the
-// accumulated side-effect analysis se — same kind, same content fields, and
-// pairwise IDENTICAL operand/payload/lambda-param defs (amendment D: node
-// identity, never structural recursion over operands), with recursion only
-// through lambda bodies (amendment E: Map AND Reduce share the machinery).
-//
-// False whenever either side is nil, unanalyzable (se == nil), effectful per
-// se ([3].3 — including self-comparison), or of an invalid kind. The
-// CONTRACT ValueEqual(a,b) == true ⇒ ValueHash(a) == ValueHash(b) is what
-// gvn-verify's bucket math relies on; both methods mix/compare exactly the
-// same fields in the same canonical orders.
 func (b *Base) ValueEqual(other Value, se SideEffectAnalysis) bool {
-	if other == nil || other.BasePtr() == nil || se == nil {
+	a, o := b, other
+	if o == nil || o.BasePtr() == nil || se == nil || a == nil {
 		return false
 	}
-	return nodeValueEqual(b, other.BasePtr(), se, make(map[valuePair]bool))
-}
-
-// valuePair is one in-progress (a, b) comparison — the lambda-body
-// recursion cycle guard. Re-entry of a live pair fails safe (false).
-type valuePair struct{ a, b *Base }
-
-// nodeValueEqual is ValueEqual's recursion core over the two Base cells.
-func nodeValueEqual(a, b *Base, se SideEffectAnalysis, pairs map[valuePair]bool) bool {
-	if a == nil || b == nil || !validValueKind(a.kind) || !validValueKind(b.kind) {
+	if !validValueKind(a.kind) || !validValueKind(o.BasePtr().kind) {
 		return false
 	}
-	na, nb := hashTarget(a), hashTarget(b)
+	na, nb := hashTarget(a), hashTarget(o.BasePtr())
 	if se.HasSideEffect(na) || se.HasSideEffect(nb) {
-		return false // [3].3: side-effect nodes are never equal, even to themselves
+		return false // [3.3]: side-effect nodes are never equal, even to themselves
 	}
-	if a == b {
+	if a == o.BasePtr() {
 		return true // the same pure node with a valid kind
 	}
-	if a.kind != b.kind {
+	if a.kind != o.BasePtr().kind {
 		return false
 	}
 	if a.kind == KindInputParam {
 		return false // distinct atoms (identity was checked above)
 	}
-
-	pair := valuePair{a, b}
-	if pairs[pair] {
-		return false // lambda-body cycle: fail safe
-	}
-	pairs[pair] = true
-	defer delete(pairs, pair)
 
 	if !contentEqual(na, nb) {
 		return false
@@ -249,42 +194,6 @@ func nodeValueEqual(a, b *Base, se SideEffectAnalysis, pairs map[valuePair]bool)
 		}
 		for i := range ta {
 			if !defIdentity(ta[i], tb[i]) {
-				return false
-			}
-		}
-	}
-
-	// Lambda payloads (Map AND Reduce): same lambda count, same param count,
-	// pairwise-identical params, recursively-equal bodies.
-	if lbA, okA := na.(lambdaBearer); okA {
-		lbB, okB := nb.(lambdaBearer)
-		if !okB {
-			return false
-		}
-		var lamA, lamB []*Lambda
-		lbA.forEachLambda(func(lam *Lambda) { lamA = append(lamA, lam) })
-		lbB.forEachLambda(func(lam *Lambda) { lamB = append(lamB, lam) })
-		if len(lamA) != len(lamB) {
-			return false
-		}
-		for i := range lamA {
-			la, lb := lamA[i], lamB[i]
-			if len(la.params) != len(lb.params) {
-				return false
-			}
-			for j := range la.params {
-				if !defIdentity(la.params[j].Def(), lb.params[j].Def()) {
-					return false
-				}
-			}
-			ba, bb := la.Body, lb.Body
-			if (ba == nil) != (bb == nil) {
-				return false
-			}
-			if ba == nil {
-				continue
-			}
-			if !nodeValueEqual(ba.BasePtr(), bb.BasePtr(), se, pairs) {
 				return false
 			}
 		}

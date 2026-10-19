@@ -43,6 +43,7 @@ func Verify(g *Graph) []Violation {
 	var vs []Violation
 	nodes := walkCheckUseDef(g, &vs)
 	checkDefUse(nodes, &vs)
+	checkConvention(g, &vs)
 	return vs
 }
 
@@ -144,15 +145,18 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 
 // checkNodeShape enforces the per-kind operand-shape invariants of the
 // memory and loop node suites, fail-closed: a bounded dimvar binds a
-// dimvar; HIR GMEM load/store tensors bind a RoleTensor InputParam; LIR
-// SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a FragNew
-// buffer; a for-loop binds a dimvar; an IterClusterProject's operand 0 is
-// an itercluster; an InductionVariable's operand 0 is an iter; a
-// TensorDimOf binds a RoleTensor tensor and a const axis; an As binds dim
-// InputParams; a Reduce's operand 1 is its KeyedAttribute init; and a
-// Map/Reduce's optional As is unique and last, with the map's value-operand
-// count matching its lambda parameter count (quick-261019-ktm). Nil
-// operands are left to the generic use-def slot check.
+// dimvar; an iter's and a dimvar's operand 0 is a dim InputParam; a
+// paramRef's operand 0 is an InputParam; a cluster's dim operands LEAD its
+// input list; HIR GMEM load/store tensors bind a RoleTensor InputParam;
+// LIR SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a
+// FragNew buffer; a for-loop binds a dimvar; an IterClusterProject's
+// operand 0 is an itercluster; an InductionVariable's operand 0 is an
+// iter; a TensorDimOf binds a RoleTensor tensor and a const axis; an As
+// binds dim InputParams; a Reduce's operand 1 is its KeyedAttribute init;
+// and a Map/Reduce's optional As is unique and last, with the map's
+// value-operand count matching its lambda parameter count
+// (quick-261019-ktm). Nil operands are left to the generic use-def slot
+// check.
 func checkNodeShape(n Node, vs *[]Violation) {
 	switch t := n.(type) {
 	case *boundedDimVarNode:
@@ -162,10 +166,46 @@ func checkNodeShape(n Node, vs *[]Violation) {
 					"bounded dimvar operand 0 must be a dimvar"))
 			}
 		}
+	case *iterNode:
+		if d := operandAt(t, 0); d != nil && !isDimParam(d) {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"iter operand 0 must be a dim InputParam"))
+		}
+	case *dimVarNode:
+		if d := operandAt(t, 0); d != nil && !isDimParam(d) {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"dimvar operand 0 must be a dim InputParam"))
+		}
+	case *paramRefNode:
+		if p := operandAt(t, 0); p != nil {
+			if _, ok := p.(*inputParamNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"param operand 0 must be an InputParam node"))
+			}
+		}
+	case *iterClusterNode:
+		// The cluster's dim operands must LEAD the input list: once a
+		// non-dim operand appears, no dim may follow (D14 read-face
+		// contract: ClusterDims/ClusterInputs split at that boundary).
+		seenInput := false
+		for _, op := range OperandsOf(t) {
+			if op == nil {
+				continue
+			}
+			if isDimParam(op) {
+				if seenInput {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						"cluster dims must lead the input list"))
+					break
+				}
+				continue
+			}
+			seenInput = true
+		}
 	case *memLoadNode:
 		checkTensorParam(n, operandAt(t, 0), vs)
 	case *memStoreNode:
-		checkTensorParam(n, t.target.tensorUse.Def(), vs)
+		checkTensorParam(n, operandAt(t, 1), vs)
 	case *memLoadSMemNode:
 		checkSMemBuffer(n, operandAt(t, 0), vs)
 	case *memStoreSMemNode:
@@ -223,31 +263,43 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		checkAsPlacement(t, vs)
 	case *mapNode:
 		checkAsPlacement(t, vs)
-		valueOps := 0
-		ops := OperandsOf(t)
-		if len(ops) > 0 && ops[len(ops)-1] != nil && ops[len(ops)-1].KindOf() == KindAs {
-			valueOps = len(ops) - 1
-		} else {
-			valueOps = len(ops)
+		// ops = [value operands..., As?, lambda] (D15): strip the trailing
+		// lambda node and the As layout marker to count value operands.
+		valueOps := OperandsOf(t)
+		if len(valueOps) > 0 && valueOps[len(valueOps)-1] != nil &&
+			valueOps[len(valueOps)-1].KindOf() == KindLambda {
+			valueOps = valueOps[:len(valueOps)-1]
+		}
+		if len(valueOps) > 0 && valueOps[len(valueOps)-1] != nil &&
+			valueOps[len(valueOps)-1].KindOf() == KindAs {
+			valueOps = valueOps[:len(valueOps)-1]
 		}
 		// The positional binding contract (Input[i] ↔ param i, D4) holds
 		// while parameters remain declared. A FULLY INLINED map — the
 		// output of simplify-inline (quick-261019-ktm) — declares no
 		// params; its inputs are plain SSA data flow, so the count check
 		// is vacuous there.
-		if len(t.lam.params) > 0 && valueOps != len(t.lam.params) {
+		var lamParams int
+		if lam := lambdaNodeOf(t); lam != nil {
+			lamParams = len(lambdaNodeParams(lam))
+		}
+		if lamParams > 0 && len(valueOps) != lamParams {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
 				fmt.Sprintf("map input count must equal lambda parameter count (%d inputs, %d params)",
-					valueOps, len(t.lam.params))))
+					len(valueOps), lamParams)))
 		}
 	}
 }
 
 // checkAsPlacement enforces D1's optional-but-unique-and-last layout: when a
 // Map/Reduce Input list carries an As node, at most one exists and it is
-// the LAST operand.
+// the last operand BEFORE the trailing lambda node (D15: the lambda closes
+// the Input list).
 func checkAsPlacement(n Node, vs *[]Violation) {
 	ops := OperandsOf(n)
+	if lam := lambdaNodeOf(n); lam != nil && len(ops) > 0 {
+		ops = ops[:len(ops)-1] // the trailing lambda is a layout marker, not a value input
+	}
 	last := len(ops) - 1
 	for i, op := range ops {
 		if op == nil || op.KindOf() != KindAs {

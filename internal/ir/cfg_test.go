@@ -183,25 +183,24 @@ func TestInputParamReferences(t *testing.T) {
 	st := g.NewMemStoreChained("ctor", env, out, []Node{m, k}, ic)
 	g.NewReturnChained("ctor", env, []Node{out}, st)
 
-	// The store's payload uses resolve to the parameter nodes.
-	sn := st.(*memStoreNode)
-	if sn.target.tensorUse.SSA().Node() != out {
+	// The store's target access rides its operand slots (D14): slot 1 is
+	// the tensor InputParam, slots 2+ the axis InputParams.
+	stOps := OperandsOf(st)
+	if stOps[1] != out {
 		t.Fatal("store target tensor use must resolve to the tensor InputParam node")
 	}
-	for i, ax := range sn.target.axes {
+	for i, ax := range stOps[2:] {
 		want := []Node{m, k}[i]
-		if ax.SSA().Node() != want {
+		if ax != want {
 			t.Fatalf("store axis use %d must resolve to its dim InputParam node", i)
 		}
 	}
 
 	// The iteration cluster's dims and the lambda's param resolve the same way.
-	icn := ic.(*iterClusterNode)
-	if icn.dims[0].SSA().Node() != m || icn.dims[1].SSA().Node() != k {
+	if dims := ClusterDims(ic); dims[0] != m || dims[1] != k {
 		t.Fatal("iteration cluster dim uses must resolve to the dim InputParam nodes")
 	}
-	mn := rootMap.(*mapNode)
-	if mn.lam.params[0].SSA().Node() != v {
+	if ps := LambdaParams(rootMap); len(ps) != 1 || ps[0][0] != v {
 		t.Fatal("lambda param use must resolve to the lambda InputParam node")
 	}
 	// The as-order rides the Input list now (D1): AsOf finds the trailing

@@ -253,11 +253,20 @@ func TestValueLambdaMachinery(t *testing.T) {
 	body := g.NewBinOp("ctor", BinOpAdd, lp, c1)
 	piped := g.NewConst("ctor", f32, 5)
 	m1 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), nil))
+	// Two constructor calls allocate DISTINCT lambda nodes, and the lambda
+	// keys by identity like any other operand (revision): the maps compare
+	// unequal even over the same atoms and body node.
 	m2 := asValue(t, g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), nil))
-	if !m1.ValueEqual(m2, pureAll{}) {
-		t.Fatal("maps sharing lambda-param atoms and body node must be one value")
+	if m1.ValueEqual(m2, pureAll{}) {
+		t.Fatal("maps with distinct lambda nodes must compare unequal (identity keying)")
 	}
-	if m1.ValueHash(pureAll{}) != m2.ValueHash(pureAll{}) {
+	// A twin sharing EVERY operand node (white-box, like the reduce twin
+	// below) is one value and hashes identically.
+	m1twin := asValue(t, g.NewNode(KindMap, "ctor", OperandsOf(m1)...))
+	if !m1.ValueEqual(m1twin, pureAll{}) {
+		t.Fatal("maps sharing every operand node must be one value")
+	}
+	if m1.ValueHash(pureAll{}) != m1twin.ValueHash(pureAll{}) {
 		t.Fatal("equal maps must hash identically")
 	}
 
@@ -269,24 +278,31 @@ func TestValueLambdaMachinery(t *testing.T) {
 		t.Fatal("maps with distinct lambda-param atoms must compare unequal (conservative)")
 	}
 
-	// Reduce participates through the same machinery (E): a reduce sharing
-	// the attr wrapper node AND the combiner atoms + body is one value. The
-	// twin is built white-box (raw NewNode over the first reduce's attr +
-	// a second Lambda record over the same atoms) because two NewReduce
-	// calls allocate distinct attr wrappers — the D13 consequence pinned
+	// Reduce participates through the same machinery (E): identity keying
+	// (revision) — a reduce sharing EVERY operand node (piped value, attr
+	// wrapper, lambda node) is one value; nothing recurses structurally
+	// into the lambda. The twin is built white-box (raw NewNode over the
+	// first reduce's own operands) because two NewReduce calls allocate
+	// distinct attr wrappers and lambda nodes — the D13 consequence pinned
 	// below.
 	acc := g.NewLambdaInputParam("ctor", "acc", f32)
 	rbody := g.NewBinOp("ctor", BinOpMul, acc, c1)
 	init := g.NewConst("ctor", f32, 0)
 	r1 := asValue(t, g.NewReduce("ctor", init, piped, NewLambda([]Node{acc}, rbody)))
-	r2n := g.NewNode(KindReduce, "ctor", piped, OperandsOf(r1)[1]).(*reduceNode)
-	r2n.combiner = NewLambda([]Node{acc}, rbody)
-	r2 := asValue(t, r2n)
+	r2 := asValue(t, g.NewNode(KindReduce, "ctor", OperandsOf(r1)...))
 	if !r1.ValueEqual(r2, pureAll{}) {
-		t.Fatal("reduces sharing the attr wrapper, combiner atoms, and body node must be one value (E)")
+		t.Fatal("reduces sharing every operand node must be one value (E)")
 	}
 	if r1.ValueHash(pureAll{}) != r2.ValueHash(pureAll{}) {
 		t.Fatal("equal reduces must hash identically")
+	}
+	// A fresh lambda NODE over the same atoms and body keeps the stages
+	// apart: the lambda keys by identity like any other operand.
+	r2l := asValue(t, g.NewNode(KindReduce, "ctor",
+		OperandsOf(r1)[0], OperandsOf(r1)[1],
+		g.NewLambdaNode("ctor", []Node{acc}, rbody)))
+	if r1.ValueEqual(r2l, pureAll{}) {
+		t.Fatal("reduces with distinct lambda nodes must compare unequal (identity keying)")
 	}
 	acc2 := g.NewLambdaInputParam("ctor", "acc2", f32)
 	rbody2 := g.NewBinOp("ctor", BinOpMul, acc2, c1)
@@ -314,31 +330,40 @@ func TestValueLambdaMachinery(t *testing.T) {
 	}
 }
 
-// TestValueLambdaBodyCycleGuard pins the recursion guards: a lambda-body
-// cycle closed through raw Body pointers (only representable in-package)
-// makes both the hash and the equality terminate, failing safe (hash mixes
-// a fixed contribution; equality returns false).
+// TestValueLambdaBodyCycleGuard pins the termination property under the
+// operand layout (revision): a body cycle forged through the lambda nodes'
+// trailing body slots (only representable in-package) keeps the hash and
+// the equality terminating and deterministic — operands compare by
+// identity, never by recursion, so a cycle has nothing to traverse.
 func TestValueLambdaBodyCycleGuard(t *testing.T) {
 	g, m, _, _, _, _, _ := valueFixture()
 	f32 := InternScalar(TF32)
 
 	lp := g.NewLambdaInputParam("ctor", "l", f32)
-	x := g.NewMap("ctor", nil, NewLambda([]Node{lp}, nil), []Node{m}).(*mapNode)
-	y := g.NewMap("ctor", nil, NewLambda([]Node{lp}, nil), []Node{m}).(*mapNode)
-	x.lam.Body = y // raw body cycle: x's body is y, y's body is x
-	y.lam.Body = x
+	x := g.NewMap("ctor", nil, NewLambda([]Node{lp}, nil), []Node{m})
+	y := g.NewMap("ctor", nil, NewLambda([]Node{lp}, nil), []Node{m})
 
-	// Both calls must return (termination) and fail safe.
+	// Wire the raw cycle through the lambda nodes' trailing body slots:
+	// x's body is y, y's body is x.
+	wireBodyCycle := func(host, target Node) {
+		lam := LambdaOf(host)
+		impl := asImpl(lam)
+		impl.setSlot(len(OperandsOf(lam))-1, SSAUse{rec: target.BasePtr().ssa.addRef(lam)})
+	}
+	wireBodyCycle(x, y)
+	wireBodyCycle(y, x)
+
+	// Both calls must return (termination) and stay deterministic.
 	vx, vy := asValue(t, x), asValue(t, y)
 	vx.ValueHash(pureAll{}) //nolint:staticcheck // termination probe
 	if vx.ValueHash(pureAll{}) != vx.ValueHash(pureAll{}) {
 		t.Fatal("hash must stay deterministic under a body cycle")
 	}
 	if vx.ValueEqual(vy, pureAll{}) {
-		t.Fatal("cyclic bodies must compare false (fail-safe cycle guard)")
+		t.Fatal("cyclic twins must compare false (identity keying)")
 	}
 	if !vx.ValueEqual(vx, pureAll{}) {
-		t.Fatal("self-comparison of a cyclic-body map must still succeed (pair (x,x) recurses symmetrically)")
+		t.Fatal("self-comparison must still succeed (identity keying never recurses)")
 	}
 }
 

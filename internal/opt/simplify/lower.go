@@ -297,7 +297,7 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 		if !ok {
 			continue // unreachable: p is a project by collection
 		}
-		inputs := ir.OperandsOf(cl)
+		inputs := ir.ClusterInputs(cl) // the input list AFTER the leading dims (D14 read face)
 		if idx < 0 || idx >= len(inputs) || inputs[idx] == nil {
 			return fmt.Errorf("simplify-lower: project node %d indexes cluster input %d of %d (out of range)",
 				p.BasePtr().ID(), idx, len(inputs))

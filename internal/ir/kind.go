@@ -9,9 +9,12 @@ package ir
 // take their places. KindVersion 4 is the Input-list restructure
 // (quick-261019-ktm): the HIR additions (IterClusterProject, KeyedAttribute,
 // As, inserted after KindReturn) renumbered the LIR constants ONCE,
-// deliberately — the tier-boundary rule (HIR kinds < KindForLoop) survives,
-// and from v4 onward the rule is append-only again: new kinds introduced by
-// later lowering phases insert before KindEnd within their tier and never
+// deliberately. KindVersion 5 is the Input/ImpactBy-only convention
+// enforcement (quick-261019-ktm revision): KindLambda joined the HIR
+// additions and renumbered the LIR constants once more, deliberately —
+// the tier-boundary rule (HIR kinds < KindForLoop) survives, and from v5
+// onward the rule is append-only again: new kinds introduced by later
+// lowering phases insert before KindEnd within their tier and never
 // renumber existing constants. The pass manager rejects any node
 // with Kind >= KindEnd or Kind == KindInvalid.
 //
@@ -21,10 +24,10 @@ package ir
 type Kind uint32
 
 // KindVersion is the IR node-kind schema version. v3 = the tinycudaopto
-// re-organization (deliberate one-time renumbering, recorded above); v4 = the
-// Input-list restructure (quick-261019-ktm): the HIR insertions renumbered
-// the LIR constants once, deliberately.
-const KindVersion = 4
+// re-organization; v4 = the Input-list restructure (quick-261019-ktm); v5 =
+// the Input/ImpactBy-only convention (quick-261019-ktm revision: KindLambda
+// joined the HIR tier). Each renumbered the LIR constants once, deliberately.
+const KindVersion = 5
 
 const (
 	KindInvalid Kind = iota // unused slot; verifier and legality reject it
@@ -57,7 +60,8 @@ const (
 
 	KindIterClusterProject // bridge: IterCluster input slot i → Map param i
 	KindKeyedAttribute     // named attribute riding an Input list (Reduce's init)
-	KindAs                 // as-order clause: dims..., trailing on Map/Reduce inputs
+	KindAs                 // as-order clause: dims..., trailing on Map/Reduce value inputs
+	KindLambda             // lambda expression: (param declarations..., body); map/reduce carry it as their trailing input
 
 	// --- LIR tier (D-3): the lowered suite introduced by optimization passes ---
 
@@ -120,6 +124,8 @@ func (k Kind) String() string {
 		return "keyedattribute"
 	case KindAs:
 		return "as"
+	case KindLambda:
+		return "lambda"
 	case KindForLoop:
 		return "forloop"
 	case KindDimVar:
@@ -179,10 +185,11 @@ func (k Kind) Family() Family {
 	default:
 		// KindMap, KindReduce, KindInputParam, KindReturn, KindDimVar,
 		// KindBoundedDimVar, the Input-list restructure additions
-		// (IterClusterProject, KeyedAttribute, As — reference-carrier nodes,
-		// quick-261019-ktm), the lowered shape/iteration VALUE nodes
-		// (TensorDimOf, InductionVariable — pure value nodes per the DimVar
-		// precedent), and the sentinel values belong to the abstract suite
+		// (IterClusterProject, KeyedAttribute, As, Lambda — reference-carrier
+		// and expression-carrier nodes, quick-261019-ktm), the lowered
+		// shape/iteration VALUE nodes (TensorDimOf, InductionVariable — pure
+		// value nodes per the DimVar precedent), and the sentinel values
+		// belong to the abstract suite
 		// (the lowered dimvars are value-level IV objects, doc/optana/
 		// induction_variable.md, not loop-nest structure).
 		return FamilyAbstract

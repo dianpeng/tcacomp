@@ -203,9 +203,10 @@ func TestLowerDocExample(t *testing.T) {
 	}
 
 	// The map's operand slots 0/1 resolve to the two loads; the trailing As
-	// survives as the last operand.
+	// survives as the last VALUE operand, before the lambda node (D15).
 	ops := ir.OperandsOf(mp)
-	if len(ops) != 3 || ops[0] != loadL || ops[1] != loadR {
+	if len(ops) != 4 || ops[0] != loadL || ops[1] != loadR ||
+		ops[2].KindOf() != ir.KindAs || ops[3].KindOf() != ir.KindLambda {
 		t.Fatalf("map inputs must resolve to the loads directly, got %v", ops)
 	}
 	if as := ir.AsOf(mp); as == nil || len(ir.OperandsOf(as)) != 3 {
@@ -387,7 +388,7 @@ func TestInlineMap(t *testing.T) {
 	if len(params) != 1 || len(params[0]) != 2 {
 		t.Fatalf("the map's lambda must declare 2 params, got %v", params)
 	}
-	lp, rp := params[0][0].Def(), params[0][1].Def()
+	lp, rp := params[0][0], params[0][1]
 
 	runInline(t, g)
 
@@ -467,7 +468,7 @@ func TestInlineReduce(t *testing.T) {
 	if !useWithUser(acc, keeper) {
 		t.Fatal("acc's surviving use must be the keeper binop")
 	}
-	if params := ir.LambdaParams(red); len(params) != 1 || len(params[0]) != 1 || params[0][0].Def() != acc {
+	if params := ir.LambdaParams(red); len(params) != 1 || len(params[0]) != 1 || params[0][0] != acc {
 		t.Fatalf("the reduce's lambda must declare exactly [acc], got %v", params)
 	}
 	assertCleanVerify(t, g, "the inlined reduce")
@@ -606,7 +607,8 @@ func TestSimplifyPipelineWiring(t *testing.T) {
 	if live := nodesOfKind(g, ir.KindIterClusterProject); len(live) != 0 {
 		t.Fatalf("projects survived the pipeline: %d", len(live))
 	}
-	if ops := ir.OperandsOf(mp); len(ops) != 3 || ops[0] != loadL || ops[1] != loadR {
+	if ops := ir.OperandsOf(mp); len(ops) != 4 || ops[0] != loadL || ops[1] != loadR ||
+		ops[3].KindOf() != ir.KindLambda {
 		t.Fatalf("map inputs must be the loads after the pipeline, got %v", ops)
 	}
 	if err := g.Materialize(); err != nil {
