@@ -230,7 +230,12 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		} else {
 			valueOps = len(ops)
 		}
-		if valueOps != len(t.lam.params) {
+		// The positional binding contract (Input[i] ↔ param i, D4) holds
+		// while parameters remain declared. A FULLY INLINED map — the
+		// output of simplify-inline (quick-261019-ktm) — declares no
+		// params; its inputs are plain SSA data flow, so the count check
+		// is vacuous there.
+		if len(t.lam.params) > 0 && valueOps != len(t.lam.params) {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
 				fmt.Sprintf("map input count must equal lambda parameter count (%d inputs, %d params)",
 					valueOps, len(t.lam.params))))

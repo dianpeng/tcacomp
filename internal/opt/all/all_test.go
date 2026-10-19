@@ -15,7 +15,7 @@ import (
 // registry is process-global, so this asserts MEMBERSHIP of specific IDs
 // only — never exact pipeline length.
 func TestAllRegistersEveryPass(t *testing.T) {
-	for _, id := range []string{"dce", "schedule"} {
+	for _, id := range []string{"dce", "dce-verify", "simplify-lower", "simplify-inline", "simplify-verify", "gvn", "gvn-verify", "schedule"} {
 		if _, ok := opt.Lookup(id); !ok {
 			t.Errorf("Lookup(%q) failed — opt/all must register every pass sub-module", id)
 		}

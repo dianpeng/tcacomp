@@ -12,4 +12,5 @@ import (
 	_ "tcacomp/internal/opt/dce"
 	_ "tcacomp/internal/opt/gvn"
 	_ "tcacomp/internal/opt/schedule"
+	_ "tcacomp/internal/opt/simplify"
 )

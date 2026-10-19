@@ -218,8 +218,7 @@ func TestLowerDocExample(t *testing.T) {
 			t.Fatalf("no live %s may remain after lowering, got %d", k, len(live))
 		}
 	}
-	tomb := nodeSet(g)
-	if tomb[cluster.BasePtr()] {
+	if alive := nodeSet(g); alive[cluster.BasePtr()] {
 		t.Fatal("the cluster must be erased (tombstoned)")
 	}
 	assertCleanVerify(t, g, "the lowered doc example")
@@ -406,9 +405,9 @@ func TestInlineMap(t *testing.T) {
 		t.Fatalf("the inlined body must resolve to the two loads, got %v", ops)
 	}
 	// The lambda InputParams are erased (tombstoned) and use-free.
-	tomb := nodeSet(g)
+	alive := nodeSet(g)
 	for _, p := range []ir.Node{lp, rp} {
-		if tomb[p.BasePtr()] {
+		if alive[p.BasePtr()] {
 			t.Fatalf("lambda param %d must be erased", p.BasePtr().ID())
 		}
 	}
@@ -458,11 +457,11 @@ func TestInlineReduce(t *testing.T) {
 		t.Fatalf("identity body must rewire to the load, got %v", bodies)
 	}
 	// now is erased; acc stays declared (still used by keeper).
-	tomb := nodeSet(g)
-	if tomb[now.BasePtr()] {
+	alive := nodeSet(g)
+	if alive[now.BasePtr()] {
 		t.Fatal("the fully-inlined param `now` must be erased")
 	}
-	if tomb[acc.BasePtr()] {
+	if !alive[acc.BasePtr()] {
 		t.Fatal("acc must stay live (a non-paramRef use remains)")
 	}
 	if !useWithUser(acc, keeper) {
@@ -514,7 +513,7 @@ func TestSimplifyVerifyPass(t *testing.T) {
 		// Re-add a stray project (hand-corruption probe): any live
 		// IterClusterProject fails the no-projects invariant.
 		stray := g.NewConst("test", ir.InternScalar(ir.TF32), 0)
-		g.NewNode(ir.KindIterClusterProject, "test", stray, 7)
+		g.NewIterClusterProject("test", stray, 7)
 		err := (simplify.VerifyPass{}).Run(nil, g)
 		if err == nil || !strings.Contains(err.Error(), "iterclusterproject") {
 			t.Fatalf("a live project must fail simplify-verify, got: %v", err)
@@ -572,6 +571,7 @@ func TestSimplifyPipelineWiring(t *testing.T) {
 	}
 
 	// The default pipeline contains all three, in order.
+	pipe := opt.BuildPipeline()
 	seenOrder := []string{}
 	for _, p := range pipe {
 		switch p.ID() {

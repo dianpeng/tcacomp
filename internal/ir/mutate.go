@@ -122,6 +122,39 @@ func (ctx *MutContext) ReplaceAllUsesWith(old, newVal Node) error {
 	return nil
 }
 
+// SetLambdaBody rewires the body pointer of n's (single) lambda payload to
+// newBody — the sanctioned choke point for the ONE raw-pointer edge in the
+// IR (Lambda.Body), which RAUW cannot reach: uses ride ref records, the
+// body does not (quick-261019-ktm; the inline pass needs it when a lambda
+// body ROOT is itself a parameter reference). It moves no records: the old
+// body's own operand/payload records are managed by the caller through the
+// ordinary choke points, and Erase still refuses while live uses remain.
+func (ctx *MutContext) SetLambdaBody(n Node, newBody Node) error {
+	if n == nil {
+		return errors.New("ir: SetLambdaBody on nil node")
+	}
+	if newBody == nil {
+		return errors.New("ir: SetLambdaBody on nil body")
+	}
+	lb, ok := n.(lambdaBearer)
+	if !ok {
+		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): not a lambda-bearing stage", n.BasePtr().id, n.KindOf())
+	}
+	set := false
+	lb.forEachLambda(func(lam *Lambda) {
+		if set {
+			return // v0 stages carry exactly one lambda; refuse to be clever
+		}
+		lam.Body = newBody
+		set = true
+	})
+	if !set {
+		return fmt.Errorf("ir: SetLambdaBody on node %d (%s): no lambda payload", n.BasePtr().id, n.KindOf())
+	}
+	ctx.stamp(n)
+	return nil
+}
+
 // ClearLambdaParams kills a stage's dead lambda-parameter DECLARATION
 // records (quick-261019-ktm): for every Lambda payload of n (lambdaBearer —
 // Map and Reduce), each param use whose def fails keep is detached from the

@@ -168,6 +168,22 @@ func LambdaBodies(n Node) []Node {
 	return out
 }
 
+// LambdaParams returns each lambda payload's parameter DECLARATION uses (in
+// lambda order, each in declaration order) — the read face
+// internal/opt/simplify's inline pass consumes (quick-261019-ktm: the
+// params live in the Lambda RECORD, not in operand slots, so no operand
+// walk can recover their positional order). Non-lambda-bearing nodes yield
+// nil.
+func LambdaParams(n Node) [][]SSAUse {
+	var out [][]SSAUse
+	if lb, ok := n.(lambdaBearer); ok {
+		lb.forEachLambda(func(lam *Lambda) {
+			out = append(out, append([]SSAUse(nil), lam.params...))
+		})
+	}
+	return out
+}
+
 // StmtNodes returns stmt's value nodes in canonical print order: chain
 // stages producer-first, then per stage the operand subtrees depth-first
 // (operand slots in order, lambda bodies included), every node exactly once.

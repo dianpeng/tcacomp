@@ -44,6 +44,18 @@ func (g *Graph) NewIterClusterProject(origin string, cluster Node, idx int) Node
 	return n
 }
 
+// IterClusterProjectIndex returns the project's cluster input-slot index —
+// the positional binding contract's read face (quick-261019-ktm: lowering
+// resolves Map Input slot i to the cluster's input slot idx). Non-project
+// nodes report ok == false.
+func IterClusterProjectIndex(n Node) (int, bool) {
+	p, ok := n.(*iterClusterProjectNode)
+	if !ok {
+		return 0, false
+	}
+	return p.idx, true
+}
+
 // keyedAttributeNode: HIR named attribute riding an Input list —
 // ops = [value]; key is the debug/identity payload ("init" for Reduce's
 // initializer, D2). Attributes unwrap to their value operand at lambda
