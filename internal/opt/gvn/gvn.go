@@ -38,6 +38,16 @@ func init() {
 // side-effect analysis (internal/analysis/sideeffect, amendment F)
 // supplies the gate.
 //
+// Iter nodes participate through that contract with NESTED AWARENESS
+// (doc/optana/loop_fusion.md): two iters are one value iff their kind,
+// operand count, and every operand-slot def identity match — dim, bound
+// (in the 4-operand bounded form), init, step, and any parent-Iter
+// operands appended after the standard slots for nested loops. Equal
+// loop headers therefore fuse, and whole nests fuse through the
+// parent-operand RAUW cascade (a loop nest is GVNed only when all its
+// nodes are equal); iters fed by effectful operands stay excluded via
+// the order-sensitive taint (sideeffect).
+//
 // Determinism: nodes are processed in AllocatedNodes() order — the
 // construction registry is def-before-use topological, so a node's
 // operands have already resolved to their FINAL representatives by the

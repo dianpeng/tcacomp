@@ -11,7 +11,7 @@ import "math"
 //   - IDENTITY KEYING (amendment D): every operand and payload target is
 //     keyed by SSA node identity — the def node's ID in the hash, def-node
 //     identity in equality — NEVER by recursive structural equality over
-//     operands. Two one-of-a-kind defs with identical fields (two iters,
+//     operands. Two one-of-a-kind defs with identical fields (two stores,
 //     two allocations) therefore never merge their consumers, while
 //     duplicates over the SAME defs do. This is also what makes pure nodes
 //     with side-effectful operands safely GVN-eligible: the operand's

@@ -25,13 +25,18 @@
 //     Const, Param, InputParam, DimVar/BoundedDimVar) never propagate, so
 //     address and index math over iter values stays GVN-eligible.
 //
-// The propagation clause is FUTURE-ARMING: today base ⊇ order-sensitive
-// (every order-sensitive kind is already base-effectful), so the closure
-// adds nothing on real graphs — it exists so a future collective kind can
-// join the order-sensitive set WITHOUT touching the base verdicts, and it
-// is pinned by the negative tests (pure kinds with effectful operands and
-// bodies stay pure). gvn-verify independently re-derives this fixpoint
-// and checks the analysis against it.
+// The propagation clause is LIVE: since doc/optana/loop_fusion.md
+// reclassified the bare Iter as side-effect free ("The Iter node is
+// itself side effect free"), KindIter is order-sensitive (FamilyLoop)
+// but NOT base-effectful — an Iter with an accumulated-effectful operand
+// (e.g. a MemLoad init) taints effectful and stays out of GVN (the
+// loop-fusion soundness gate), while a bare Iter is pure and
+// GVN-eligible, which is what lets gvn fuse identical loop headers. A
+// future collective kind joins the order-sensitive set the same way,
+// WITHOUT touching the base verdicts; the negative tests pin that pure
+// kinds with effectful operands and bodies stay pure. gvn-verify
+// independently re-derives this fixpoint and checks the analysis against
+// it.
 package sideeffect
 
 import (
@@ -175,8 +180,12 @@ func baseVerdict(n ir.Node) bool {
 	if k.Family() == ir.FamilyMemory {
 		return true // [2.2] as amended by A: loads included, nil ImpactBy included
 	}
+	// The bare Iter is NOT here: it is side-effect free per
+	// doc/optana/loop_fusion.md [1] ("The Iter node is itself side effect
+	// free") — that reclassification is what lets gvn fuse identical loop
+	// headers. IterCluster/ForLoop keep the conservative closure ([2.3]).
 	switch k {
-	case ir.KindIter, ir.KindIterCluster, ir.KindForLoop, ir.KindReturn:
+	case ir.KindIterCluster, ir.KindForLoop, ir.KindReturn:
 		return true // [2.3]: the conservative closure of "Iter node"
 	}
 	return false

@@ -144,7 +144,13 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 // verdict: ImpactBy bearers, the whole memory family (amendment A — loads
 // included, nil ImpactBy included), and implicit control flow ([2.3]).
 // Kept local so the closure check derives its expectation without
-// consulting the code under test.
+// consulting the code under test. KindIter was dropped here in LOCKSTEP
+// with sideeffect.baseVerdict (the doc/optana/loop_fusion.md
+// reclassification — bare iters are side-effect free, so identical loop
+// headers fuse under gvn): without this drop the closure check fails
+// loudly on every graph holding a bare iter (mirror base=true vs
+// accumulated=false). The mirror's independence is the point — it is
+// edited by hand in the same commit, never trusted to auto-derive.
 func baseVerdictMirror(n ir.Node) bool {
 	if n == nil {
 		return true
@@ -157,7 +163,7 @@ func baseVerdictMirror(n ir.Node) bool {
 		return true // [2.2] as amended by A
 	}
 	switch k {
-	case ir.KindIter, ir.KindIterCluster, ir.KindForLoop, ir.KindReturn:
+	case ir.KindIterCluster, ir.KindForLoop, ir.KindReturn:
 		return true // [2.3]
 	}
 	return false
