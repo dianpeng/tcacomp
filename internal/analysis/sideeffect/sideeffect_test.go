@@ -100,14 +100,15 @@ func TestChainedAccessEffectful(t *testing.T) {
 	}
 }
 
-// TestImplicitControlFlowEffectful pins rule [2.3]: Iter, IterCluster,
-// ForLoop, and Return are effectful (the conservative closure of the
-// skeleton's "Iter node" verdict).
+// TestImplicitControlFlowEffectful pins rule [2.3] minus the Iter:
+// IterCluster, ForLoop, and Return stay effectful (the conservative
+// closure of implicit control flow). The bare Iter was REMOVED from the
+// base verdict per doc/optana/loop_fusion.md [1] ("The Iter node is
+// itself side effect free") — TestIterIsPure pins that inversion.
 func TestImplicitControlFlowEffectful(t *testing.T) {
 	g, m, _, _, c1 := fixture()
 	f32 := ir.InternScalar(ir.TF32)
 	step := g.NewConst("ctor", f32, 1)
-	iter := g.NewIter("ctor", m, nil, c1, step)
 	cluster := g.NewIterCluster("ctor", []ir.Node{m}, c1)
 	dv := g.NewDimVar("ctor", m, c1, step)
 	loop := g.NewForLoop("ctor", dv, c1, c1)
@@ -115,7 +116,6 @@ func TestImplicitControlFlowEffectful(t *testing.T) {
 
 	se := mustAnalyze(t, g)
 	for name, n := range map[string]ir.Node{
-		"iter":        iter,
 		"itercluster": cluster,
 		"forloop":     loop,
 		"return":      ret,
@@ -126,11 +126,60 @@ func TestImplicitControlFlowEffectful(t *testing.T) {
 	}
 }
 
+// TestIterIsPure pins doc/optana/loop_fusion.md [1] ("The Iter node is
+// itself side effect free, though it is a control flow node"): a bare Iter
+// — no effectful operand — queries PURE, which is what makes identical
+// loop headers GVN-fusable, in both the unbounded 3-operand and the
+// bounded 4-operand form. (Iters fed by effectful operands still taint —
+// TestIterTaintsThroughEffectfulOperand.)
+func TestIterIsPure(t *testing.T) {
+	g, m, _, _, c1 := fixture()
+	f32 := ir.InternScalar(ir.TF32)
+	step := g.NewConst("ctor", f32, 1)
+	unbounded := g.NewIter("ctor", m, nil, c1, step)
+	bounded := g.NewIter("ctor", m, step, c1, step)
+
+	se := mustAnalyze(t, g)
+	if se.HasSideEffect(unbounded) {
+		t.Fatal("a bare unbounded Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
+	}
+	if se.HasSideEffect(bounded) {
+		t.Fatal("a bare bounded Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
+	}
+}
+
+// TestIterTaintsThroughEffectfulOperand pins the fusion soundness gate: an
+// Iter is order-sensitive (FamilyLoop) though no longer base-effectful, so
+// an iter whose operand is accumulated-effectful (here init = a MemLoad —
+// structurally legal; the analysis does not type-check) TAINTS effectful
+// and stays out of GVN, while the bare iter over consts stays pure.
+func TestIterTaintsThroughEffectfulOperand(t *testing.T) {
+	g, m, out, _, c1 := fixture()
+	f32 := ir.InternScalar(ir.TF32)
+	step := g.NewConst("ctor", f32, 1)
+	load := g.NewMemLoad("ctor", out, []ir.Node{m})
+	tainted := g.NewIter("ctor", m, nil, load, step)
+	bare := g.NewIter("ctor", m, nil, c1, step)
+
+	se := mustAnalyze(t, g)
+	if !se.HasSideEffect(load) {
+		t.Fatal("fixture setup: the MemLoad must be effectful")
+	}
+	if se.HasSideEffect(bare) {
+		t.Fatal("the bare iter (const operands) must stay pure")
+	}
+	if !se.HasSideEffect(tainted) {
+		t.Fatal("an iter with an effectful operand must taint effectful (orderSensitive FamilyLoop)")
+	}
+}
+
 // TestPureKindsNeverPropagate pins amendment C, the GVN-eligibility hinge:
 // PURE kinds never taint — a binop over an ITER value stays pure; a
-// cast/select/call chain over effectful operands stays pure; a Map piping
-// a MemLoad operand stays pure; a Map whose lambda body references
-// effectful nodes stays pure (body children do not taint a pure bearer).
+// cast/select/call chain over such math stays pure; a Map piping a
+// MemLoad operand stays pure; a Map whose lambda body references iter
+// values stays pure (body children do not taint a pure bearer — and since
+// the doc/optana/loop_fusion.md reclassification the bare iter is itself
+// pure, so the effectful-content pin rides the piped load).
 func TestPureKindsNeverPropagate(t *testing.T) {
 	g, m, out, alpha, c1 := fixture()
 	f32 := ir.InternScalar(ir.TF32)
@@ -139,25 +188,25 @@ func TestPureKindsNeverPropagate(t *testing.T) {
 	iter := g.NewIter("ctor", m, nil, c1, step)
 	load := g.NewMemLoad("ctor", out, []ir.Node{m})
 
-	bin := g.NewBinOp("ctor", ir.BinOpMul, iter, c1)          // i*2 over the iter
-	cast := g.NewCast("ctor", f32, bin)                        // cast over effectful-fed math
-	sel := g.NewSelect("ctor", bin, cast, c1)                  // select over the chain
-	call := g.NewCall("ctor", "exp", sel)                      // call over the chain
+	bin := g.NewBinOp("ctor", ir.BinOpMul, iter, c1) // i*2 over the (pure) iter
+	cast := g.NewCast("ctor", f32, bin)              // cast over the chain
+	sel := g.NewSelect("ctor", bin, cast, c1)        // select over the chain
+	call := g.NewCall("ctor", "exp", sel)            // call over the chain
 	lp := g.NewLambdaInputParam("ctor", "l", f32)
-	body := g.NewBinOp("ctor", ir.BinOpAdd, lp, iter)          // body references the effectful iter
+	body := g.NewBinOp("ctor", ir.BinOpAdd, lp, iter) // body references the iter value (pure since the reclassification)
 	mapOverLoad := g.NewMap("ctor", []ir.Node{load}, ir.NewLambda([]ir.Node{lp}, body), []ir.Node{m})
 	mapPureBody := g.NewMap("ctor", []ir.Node{c1}, ir.NewLambda([]ir.Node{lp}, body), []ir.Node{m})
 
 	se := mustAnalyze(t, g)
-	if !se.HasSideEffect(iter) || !se.HasSideEffect(load) {
-		t.Fatal("fixture setup: iter and load must be effectful")
+	if se.HasSideEffect(iter) || !se.HasSideEffect(load) {
+		t.Fatal("fixture setup: the bare iter must be pure, the load effectful")
 	}
 	for name, n := range map[string]ir.Node{
-		"binop over iter":   bin,
-		"cast chain":        cast,
-		"select chain":      sel,
-		"call chain":        call,
-		"map piping load":   mapOverLoad,
+		"binop over iter":    bin,
+		"cast chain":         cast,
+		"select chain":       sel,
+		"call chain":         call,
+		"map piping load":    mapOverLoad,
 		"map with iter body": mapPureBody,
 	} {
 		if se.HasSideEffect(n) {
@@ -171,10 +220,13 @@ func TestPureKindsNeverPropagate(t *testing.T) {
 }
 
 // TestOrderSensitivePropagation pins the propagation MACHINERY: an
-// order-sensitive kind with an effectful child reports effectful (trivial
-// via the base verdicts today — the clause future-arms collective kinds),
-// and the result is a deterministic fixpoint equal to the base set on
-// standard fixtures (base ⊇ order-sensitive today).
+// order-sensitive kind with an effectful child reports effectful, and the
+// result is a deterministic fixpoint. The propagation clause is no longer
+// vacuous in general — since the doc/optana/loop_fusion.md
+// reclassification, KindIter is order-sensitive (FamilyLoop) but NOT
+// base-effectful, so it is LIVE for Iter-with-effectful-operand (pinned
+// by TestIterTaintsThroughEffectfulOperand) — but no Iter on this fixture
+// has an effectful child, so accumulated == base-set still holds here.
 func TestOrderSensitivePropagation(t *testing.T) {
 	g, m, out, _, c1 := fixture()
 	f32 := ir.InternScalar(ir.TF32)
@@ -198,16 +250,16 @@ func TestOrderSensitivePropagation(t *testing.T) {
 	if !se1.HasSideEffect(loop) || !se1.HasSideEffect(end) || !se1.HasSideEffect(st) {
 		t.Fatal("loop/end/store must be effectful")
 	}
-	// Determinism + base-set equality on the fixture: loop kinds are the
-	// only order-sensitive non-memory members, and they are base-effectful
-	// today, so the propagation clause adds nothing (vacuity pin).
+	// Determinism + base-set equality on the fixture: no Iter here has an
+	// effectful child, so the (now live) propagation clause adds nothing
+	// and accumulated == base set.
 	for _, n := range nodes {
 		want := len(ir.ImpactBy(n)) > 0 ||
 			n.KindOf().Family() == ir.FamilyMemory ||
-			n.KindOf() == ir.KindIter || n.KindOf() == ir.KindIterCluster ||
+			n.KindOf() == ir.KindIterCluster ||
 			n.KindOf() == ir.KindForLoop || n.KindOf() == ir.KindReturn
 		if se1.HasSideEffect(n) != want {
-			t.Fatalf("node %d (%s): accumulated verdict %v differs from the base set %v (propagation must be vacuous today)",
+			t.Fatalf("node %d (%s): accumulated verdict %v differs from the base set %v (no iter on this fixture has an effectful child)",
 				n.BasePtr().ID(), n.KindOf(), se1.HasSideEffect(n), want)
 		}
 	}
