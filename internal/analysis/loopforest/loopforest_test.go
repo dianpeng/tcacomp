@@ -270,7 +270,7 @@ func TestDeterministicAndReadOnly(t *testing.T) {
 	}
 
 	count := len(g.AllocatedNodes())
-	usesBefore := make(map[int]int)
+	usesBefore := make(map[uint64]int)
 	for _, n := range g.AllocatedNodes() {
 		usesBefore[n.BasePtr().ID()] = len(ir.UsesOf(n))
 	}
