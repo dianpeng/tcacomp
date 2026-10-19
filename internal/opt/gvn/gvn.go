@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"tcacomp/internal/analysis"
+	"tcacomp/internal/analysis/sideeffect"
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 )
@@ -35,8 +35,8 @@ func init() {
 // ValueEqual with IDENTITY keying (amendment D — operands key by SSA node
 // identity, never structural recursion) and the one-of-a-kind sentinel
 // ([3].3 — side-effect nodes never participate). The accumulated
-// side-effect analysis (internal/analysis, amendment F) supplies the
-// gate.
+// side-effect analysis (internal/analysis/sideeffect, amendment F)
+// supplies the gate.
 //
 // Determinism: nodes are processed in AllocatedNodes() order — the
 // construction registry is def-before-use topological, so a node's
@@ -98,7 +98,7 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 		return errors.New("gvn: graph already materialized (gvn runs on the Level-1 sea)")
 	}
 
-	se := analysis.Analyze(g)
+	se := sideeffect.Analyze(g)
 	bodyRoots := lambdaBodyRoots(g)
 	table := make(map[uint64][]ir.Node)
 	mctx := &ir.MutContext{Pass: "gvn"}

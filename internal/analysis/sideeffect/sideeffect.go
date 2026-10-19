@@ -1,16 +1,13 @@
-package analysis
-
-import "tcacomp/internal/ir"
-
-// sideeffect.go is the ACCUMULATED side-effect analysis of the sea of
-// nodes (quick-261018-nga): the gatekeeper GVN consults through
-// ir.SideEffectAnalysis before value-numbering a node. It lives here, in
-// the EXISTING internal/analysis package (amendment F), because that
-// package already hosts the Analysis contract internal/opt's cache builds
-// on; its only new import edge is internal/analysis → internal/ir (no
-// cycle: ir never imports analysis — the query face
-// ir.SideEffectAnalysis is defined in ir precisely so this file can
-// implement it).
+// Package sideeffect implements the ACCUMULATED side-effect analysis of
+// the sea of nodes (quick-261018-nga): the gatekeeper GVN consults
+// through ir.SideEffectAnalysis before value-numbering a node. It lives
+// in its OWN sub-module folder under internal/analysis (quick-261019-jck),
+// still implementing the analysis.Analysis contract internal/opt's cache
+// builds on; its import edges are internal/analysis/sideeffect →
+// {internal/analysis, internal/ir} (no cycle: ir never imports analysis,
+// and the top-level analysis package never imports its sub-modules — the
+// query face ir.SideEffectAnalysis is defined in ir precisely so this
+// file can implement it).
 //
 // Two effect models coexist by design:
 //
@@ -35,6 +32,23 @@ import "tcacomp/internal/ir"
 // is pinned by the negative tests (pure kinds with effectful operands and
 // bodies stay pure). gvn-verify independently re-derives this fixpoint
 // and checks the analysis against it.
+package sideeffect
+
+import (
+	"tcacomp/internal/analysis"
+	"tcacomp/internal/ir"
+)
+
+// init self-registers the analysis in the global analysis registry
+// (quick-261019-jck): importing this package — directly or through
+// internal/analysis/all — is the single act that makes it visible to
+// analysis.Lookup/Registered/BuildAll.
+func init() {
+	analysis.Register(analysis.AnalysisSpec{
+		Name:    "side-effect", // MUST stay "side-effect": opt.Cache key + SideEffects.Name()
+		Factory: func(g *ir.Graph) analysis.Analysis { return Analyze(g) },
+	})
+}
 
 // SideEffects is the accumulated side-effect analysis over one graph
 // snapshot: a memoized verdict per live node. It implements BOTH

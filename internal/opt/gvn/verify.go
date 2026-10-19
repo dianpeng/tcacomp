@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"tcacomp/internal/analysis"
+	"tcacomp/internal/analysis/sideeffect"
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 )
@@ -40,8 +40,8 @@ func init() {
 //     child; every node it calls effectful has a base verdict or is an
 //     order-sensitive kind with an effectful child. The base/order-
 //     sensitive tables below are an INDEPENDENT MIRROR of
-//     internal/analysis/sideeffect.go's — drift between the two is exactly
-//     what this check exists to catch.
+//     internal/analysis/sideeffect/sideeffect.go's — drift between the two
+//     is exactly what this check exists to catch.
 //
 //   - UNIQUE-REPRESENTATIVE ([4.7] post-hoc): over the participating set
 //     (allocated, valid kind, not a body root, pure) no two distinct nodes
@@ -82,7 +82,7 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 		return errors.New("gvn-verify: graph already materialized (the post-GVN invariants are Level-1 sea invariants)")
 	}
 
-	se := analysis.Analyze(g)
+	se := sideeffect.Analyze(g)
 
 	// 1. DANGLING — post-RAUW/Erase SSA integrity.
 	for _, n := range g.AllocatedNodes() {
@@ -176,7 +176,7 @@ func orderSensitiveMirror(k ir.Kind) bool {
 // hasEffectfulChildMirror reports whether any child of n (operand defs plus
 // lambda body roots — the same child relation the analysis walks) is
 // effectful per the accumulated se.
-func hasEffectfulChildMirror(n ir.Node, se analysis.SideEffects) bool {
+func hasEffectfulChildMirror(n ir.Node, se sideeffect.SideEffects) bool {
 	for _, d := range ir.DataDeps(n) {
 		if se.HasSideEffect(d) {
 			return true

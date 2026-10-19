@@ -1,9 +1,12 @@
-package analysis_test
+package sideeffect_test
 
 import (
 	"testing"
 
+	// The top-level analysis package stays imported for the Analysis-
+	// interface satisfaction pin in TestName (opt.Cache compatibility).
 	"tcacomp/internal/analysis"
+	"tcacomp/internal/analysis/sideeffect"
 	"tcacomp/internal/ir"
 )
 
@@ -28,7 +31,7 @@ func fixture() (g *ir.Graph, m, out, alpha, c1 ir.Node) {
 
 // TestName pins the Analysis-name contract (opt.Cache compatibility).
 func TestName(t *testing.T) {
-	var zero analysis.SideEffects
+	var zero sideeffect.SideEffects
 	if got := zero.Name(); got != "side-effect" {
 		t.Fatalf("Name() = %q, want %q", got, "side-effect")
 	}
@@ -39,9 +42,9 @@ func TestName(t *testing.T) {
 }
 
 // mustAnalyze runs Analyze and fails the test on a nil graph panic guard.
-func mustAnalyze(t *testing.T, g *ir.Graph) analysis.SideEffects {
+func mustAnalyze(t *testing.T, g *ir.Graph) sideeffect.SideEffects {
 	t.Helper()
-	se := analysis.Analyze(g)
+	se := sideeffect.Analyze(g)
 	if !se.HasSideEffect(nil) {
 		t.Fatal("a nil node must query effectful (conservative)")
 	}
@@ -185,7 +188,7 @@ func TestOrderSensitivePropagation(t *testing.T) {
 	end := g.NewReturnChained("ctor", env, []ir.Node{out}, st)
 	_ = iter
 
-	se1, se2 := analysis.Analyze(g), analysis.Analyze(g)
+	se1, se2 := sideeffect.Analyze(g), sideeffect.Analyze(g)
 	nodes := g.AllocatedNodes()
 	for _, n := range nodes {
 		if se1.HasSideEffect(n) != se2.HasSideEffect(n) {
@@ -238,7 +241,7 @@ func TestConservativeQueries(t *testing.T) {
 	}
 	_ = dead2
 
-	nilSE := analysis.Analyze(nil)
+	nilSE := sideeffect.Analyze(nil)
 	for _, n := range []ir.Node{c1, st, m} {
 		if !nilSE.HasSideEffect(n) {
 			t.Fatal("Analyze(nil) must be all-conservative (every query true)")
@@ -256,7 +259,7 @@ func TestAnalyzeDoesNotMutate(t *testing.T) {
 
 	before := len(g.AllocatedNodes())
 	usesBefore := len(ir.UsesOf(c1))
-	analysis.Analyze(g)
+	sideeffect.Analyze(g)
 	if after := len(g.AllocatedNodes()); after != before {
 		t.Fatalf("Analyze must not erase/allocate: %d before, %d after", before, after)
 	}
