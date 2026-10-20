@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-20 - Completed quick task 261020-b4f: Iter (biv,parent?) restructure + loop-nest wiring in simplify-lower + prefix-fusion pins
+Last activity: 2026-10-20 - Completed quick task 261020-ejf: memory optimization pass (memopt + memopt-verify + RemoveImpactBy choke point) per doc/optana/memory-opt.md
 
 Progress: [██░░░░░░░░] 17%
 
@@ -95,6 +95,7 @@ None yet.
 | 261019-tu3 | Implement type inference pass per doc/optana/type_inf.md: IR type cell (Base.ty, TypeOf/IsErased, MutContext.SetType choke point, ir.Builtin registry) + typeinfer pass at priority 105 (DAG post-order compute-then-stamp, full 31-kind catalog rules, idempotent, fail-closed) | 2026-10-19 | 1a4beb0 | [261019-tu3-implement-type-inference-pass-from-doc-o](./quick/261019-tu3-implement-type-inference-pass-from-doc-o/) |
 | 261019-uoq | Implement loop fusion via GVN per doc/optana/loop_fusion.md: KindIter reclassified side-effect free (sideeffect baseVerdict + gvn-verify mirror in lockstep) so identical headers/bounded headers/whole parent-wired nests fuse in one run; + internal/analysis/loopforest ("loop-forest" registered analysis, doc's reversed-edge forest algorithm, on-demand forest-of-trees for future loop tiling) | 2026-10-19 | 7fc95e6 | [261019-uoq-implement-loop-fusion-via-gvn-loop-nest-](./quick/261019-uoq-implement-loop-fusion-via-gvn-loop-nest-/) |
 | 261020-b4f | Restructure KindIter to the sound 2-parameter formation NewIter(bdv, parent?) per doc/optana/{loop_fusion,induction_variable}.md (unbounded form deleted; BIV as the compared value object); simplify-lower builds wired DimVar→BIV→Iter nest chains per as-order interned (dim, parent) — forest shows real nest trees not singletons; GVN prefix fusion (ABC∩ABCD) + post-fusion forest chain pinned | 2026-10-20 | 90d66bb | [261020-b4f-pin-gvn-prefix-fusion-tests-wire-loop-ne](./quick/261020-b4f-pin-gvn-prefix-fusion-tests-wire-loop-ne/) |
+| 261020-ejf | Implement memory optimization pass per doc/optana/memory-opt.md (review verdict SOUND w/ conditions C1-C4): memopt@112 store→load forwarding + store-store + dead-store elimination over chain-eligible regions, memopt-verify@113 fixpoint checker, MutContext.RemoveImpactBy splice choke point, 10 property-test families | 2026-10-20 | 64f8413 | [261020-ejf-implement-memory-optimization-pass-from-](./quick/261020-ejf-implement-memory-optimization-pass-from-/) |
 
 ## Session Continuity
 
