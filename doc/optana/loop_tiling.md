@@ -166,6 +166,20 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
           dimension's tile_size
         - The tile size IS the cache size knob, consistent with cache size being
           decided implicitly by tile size
+    - TWO distinct levels, do NOT fuse them
+      - SET level, MemLoad Overlap Analysis: the innermost REFERENCED Iter
+        - Sets group CO-TRAVERSED loads, ie loads sharing their innermost referenced
+          dimension
+        - This level is candidate grouping + admission filtering only, it is where
+          the set-size >= 2 filter lives
+      - TIE level, per load: the innermost NON-referenced Iter, ie the operational
+        tie rule below
+        - This level is the actual cache placement, whole-dimension coverage and
+          tiling demotion per RULE 1/2/3
+      - Reuse lives ABOVE the set level: the set's co-traversed loads get their
+        caches TIED ABOVE the set level, so the shared innermost sweep, ie the
+        k-sweep, turns into SMEM hits that survive the enclosing sweeps
+
     - Derived from the rules
       - Reuse accrues across the tied iteration's sweep and everything inner to it,
         the cache re-loads once per enclosing iteration
@@ -179,14 +193,17 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
           referenced by the load
       - Loads whose INS spans the ENTIRE LNT tie above the outermost loop, ie
         whole-tensor coverage demoted to tiles by RULE 3, allowed, NOT excluded
-      - Worked check, the matmul below
-        - lhs[m][k], INS = {iterM, iterK} -> tie at iterN
+      - Worked check, the matmul below, walks BOTH levels
+        - SET level: lhs[m][k] INS = {iterM, iterK} and rhs[n][k] INS = {iterN, iterK}
+          share iterK as innermost referenced -> one set {lhs, rhs} @ iterK, which
+          passes the >= 2 set filter
+        - TIE level, the placements: lhs tie -> iterN
           - Covers [ · ][K] whole, reloaded per m, reused across n and k
-        - rhs[n][k], INS = {iterN, iterK} -> tie at iterM, above the outermost loop
+        - rhs tie -> iterM, above the outermost loop
           - Covers [N][K] whole, ie the "cover [n][k] 2 dimensions" case
-        - Ie reuse lives ABOVE the innermost referenced level: the whole-dim cache at
-          the tie is what turns k-sweep loads into SMEM hits and survives the
-          enclosing sweeps
+        - Ie the set admits the co-traversed pair AT iterK, then each load's cache
+          is tied ABOVE: the whole-dim caches at the ties are what turn k-sweep
+          loads into SMEM hits and survive the enclosing sweeps
 
 ```
 // A simple matmul vising pattern
@@ -237,25 +254,23 @@ for (auto m = 0; m < M; m++) {         // <- iterM
       - 1] For all MemLoad in set I
         - Run findINS for each element to obtain each MemLoad corresponding set
       - 2] Setup a result set O
-      - 3] Bucket each MemLoad in I at its tie level, per the Cache Tie Semantics
+      - 3] Bucket each MemLoad in I at its SET level, ie the innermost REFERENCED level
         - Scan the LNT's Iter nodes from inner most to outer most
-        - For a MemLoad p in I, its bucket is the FIRST scanned level whose Iter is
-          NOT in p's INS, ValueEqual membership
-          - NOTE this inverts the membership test: bucket at the first level the load
-            does NOT reference, the reuse level, not the first level it does
-        - Record p and remove it from I
-        - A MemLoad whose INS covers the WHOLE LNT ties above the outermost loop,
-          bucket it at that outermost-plus level
-        - All MemLoad bucketed at the same level form a set and are inserted into O
+        - For a MemLoad p in I, its bucket is the FIRST scanned level whose Iter IS
+          in p's INS, ValueEqual membership
+          - Sets group CO-TRAVERSED loads: loads sharing their innermost referenced
+            dimension land in the same set, ie the matmul gives {lhs, rhs} @ iterK
+        - Record it and remove it from I
+        - For all collected MemLoad at the same level, it forms a set and insert it into O
       - 4] O, contains all **different nested loop levels MemLoad set**
       - 5] Return O
 
     - (4) For each element in O, do final filtering
       - Setup a Candidative Set, denoted as CS
       - For each element S in O
-        - NOTES, NO set-size filter: under tie bucketing a level's set can be a
-          singleton, ie the matmul gives {lhs} @ iterN and {rhs} @ iterM, a
-          length >= 2 filter would wrongly drop them
+        - If S's length < 2, skip
+          - A singleton set = a load with NO co-traversed partner, ie a map that only
+            modifies a single operand -> no reuse at all -> not worth caching
         - For all elements e in S
           - If e has ONLY 1 dimension access, ignore it
           - Otherwise add it into CS
