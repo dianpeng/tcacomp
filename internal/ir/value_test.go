@@ -186,9 +186,14 @@ func TestValueLeafPooling(t *testing.T) {
 // nodes with side-effectful operands participate in GVN.
 func TestValuePureOverEffectfulOperand(t *testing.T) {
 	g, m, _, _, c1, _, _ := valueFixture()
+	f32 := InternScalar(TF32)
 
-	i1 := g.NewIter("ctor", m, nil, c1, c1)
-	i2 := g.NewIter("ctor", m, nil, c1, c1)
+	// Two SEPARATE DimVar -> BoundedDimVar -> Iter chains over m (fresh
+	// consts per chain): distinct defs with equal-valued tuples.
+	dv1 := g.NewDimVar("ctor", m, g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 1))
+	dv2 := g.NewDimVar("ctor", m, g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 1))
+	i1 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv1, c1), nil)
+	i2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv2, c1), nil)
 	// Both iters are one-of-a-kind (distinct defs) — the analysis decides
 	// effectfulness; identity keying keeps their consumers distinct.
 	b1 := asValue(t, g.NewBinOp("ctor", BinOpMul, i1, c1))

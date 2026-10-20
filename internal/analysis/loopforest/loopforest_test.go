@@ -44,6 +44,14 @@ func dimFixture(name string, count int) (g *ir.Graph, dims []ir.Node, out ir.Nod
 	return g, dims, out
 }
 
+// iterOver builds a normalized iter over dim bounded by max (optionally
+// parented): DimVar(dim,0,1) -> BoundedDimVar(dv,max) -> Iter(biv,parent).
+func iterOver(g *ir.Graph, dim, max, parent ir.Node) ir.Node {
+	f32 := ir.InternScalar(ir.TF32)
+	dv := g.NewDimVar("ctor", dim, g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+	return g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv, max), parent)
+}
+
 // TestName pins the Analysis-name contract (opt.Cache compatibility) and
 // the registry cross-check shape: the zero Forest and every Analyze
 // product answer "loop-forest".
@@ -58,8 +66,8 @@ func TestName(t *testing.T) {
 	}
 }
 
-// TestFlatGraphAllSingletons pins today's only builder shape: no
-// iter→iter operand edges, so every live iter is its own depth-0 root in
+// TestFlatGraphAllSingletons pins the parentless shape: no iter→iter
+// operand edges, so every live root iter is its own depth-0 root in
 // allocation order — and only KindIter is collected (IterCluster, DimVar,
 // ForLoop are not forest members).
 func TestFlatGraphAllSingletons(t *testing.T) {
@@ -67,8 +75,8 @@ func TestFlatGraphAllSingletons(t *testing.T) {
 	f32 := ir.InternScalar(ir.TF32)
 	c0 := g.NewConst("ctor", f32, 0)
 	c1 := g.NewConst("ctor", f32, 1)
-	it1 := g.NewIter("ctor", dims[0], nil, c0, c1)
-	it2 := g.NewIter("ctor", dims[1], nil, c0, c1) // same consts, distinct dim: still flat
+	it1 := iterOver(g, dims[0], c0, nil)
+	it2 := iterOver(g, dims[1], c0, nil) // distinct dim: still flat
 	cluster := g.NewIterCluster("ctor", []ir.Node{dims[0]}, c0)
 	dv := g.NewDimVar("ctor", dims[0], c0, c1)
 	loop := g.NewForLoop("ctor", dv, c1, c1)
@@ -109,18 +117,17 @@ func TestFlatGraphAllSingletons(t *testing.T) {
 	}
 }
 
-// TestNestedChain pins the reversed-edge core: parent-wired iters carry
-// the parent Iter as their FINAL operand (the layout convention shared
-// with the gvn fusion tests), so the forest parents inner at outer and
-// innermost at inner, with depths 0/1/2 counting from the single root.
+// TestNestedChain pins the reversed-edge core: nested iters carry the
+// parent Iter as operand 1 (the (biv, parent?) formation), so the forest
+// parents inner at outer and innermost at inner, with depths 0/1/2
+// counting from the single root.
 func TestNestedChain(t *testing.T) {
 	g, dims, out := dimFixture("chain", 3)
 	f32 := ir.InternScalar(ir.TF32)
-	c0 := g.NewConst("ctor", f32, 0)
-	c1 := g.NewConst("ctor", f32, 1)
-	outer := g.NewIter("ctor", dims[0], nil, c0, c1)
-	inner := g.NewNode(ir.KindIter, "ctor", dims[1], c0, c1, outer)     // parent appended LAST
-	innermost := g.NewNode(ir.KindIter, "ctor", dims[2], c0, c1, inner) // ...and again
+	c0 := g.NewConst("ctor", f32, 0) // the shared max of all three levels
+	outer := iterOver(g, dims[0], c0, nil)
+	inner := iterOver(g, dims[1], c0, outer)
+	innermost := iterOver(g, dims[2], c0, inner)
 	scaffold(g, dims[0], out, innermost)
 
 	f := loopforest.Analyze(g)
@@ -157,11 +164,10 @@ func TestTwoNestsTwoRoots(t *testing.T) {
 	g, dims, out := dimFixture("twonests", 4)
 	f32 := ir.InternScalar(ir.TF32)
 	c0 := g.NewConst("ctor", f32, 0)
-	c1 := g.NewConst("ctor", f32, 1)
-	o1 := g.NewIter("ctor", dims[0], nil, c0, c1)
-	i1 := g.NewNode(ir.KindIter, "ctor", dims[1], c0, c1, o1)
-	o2 := g.NewIter("ctor", dims[2], nil, c0, c1)
-	i2 := g.NewNode(ir.KindIter, "ctor", dims[3], c0, c1, o2)
+	o1 := iterOver(g, dims[0], c0, nil)
+	i1 := iterOver(g, dims[1], c0, o1)
+	o2 := iterOver(g, dims[2], c0, nil)
+	i2 := iterOver(g, dims[3], c0, o2)
 	scaffold(g, dims[0], out, i1)
 
 	f := loopforest.Analyze(g)
@@ -196,10 +202,9 @@ func TestErasedIterSkipped(t *testing.T) {
 	g, dims, out := dimFixture("erased", 1)
 	f32 := ir.InternScalar(ir.TF32)
 	c0 := g.NewConst("ctor", f32, 0)
-	c1 := g.NewConst("ctor", f32, 1)
-	it1 := g.NewIter("ctor", dims[0], nil, c0, c1)
-	it2 := g.NewIter("ctor", dims[0], nil, c0, c1)
-	scaffold(g, dims[0], out, c0) // iters stay user-free so Erase is legal
+	it1 := iterOver(g, dims[0], c0, nil)
+	it2 := iterOver(g, dims[0], c0, nil) // fresh value objects per call
+	scaffold(g, dims[0], out, c0)        // iters stay user-free so Erase is legal
 
 	mctx := &ir.MutContext{Pass: "t"}
 	if err := mctx.Erase(it2); err != nil {
@@ -246,10 +251,9 @@ func TestDeterministicAndReadOnly(t *testing.T) {
 	g, dims, out := dimFixture("determinism", 3)
 	f32 := ir.InternScalar(ir.TF32)
 	c0 := g.NewConst("ctor", f32, 0)
-	c1 := g.NewConst("ctor", f32, 1)
-	flat := g.NewIter("ctor", dims[2], nil, c0, c1)
-	outer := g.NewIter("ctor", dims[0], nil, c0, c1)
-	inner := g.NewNode(ir.KindIter, "ctor", dims[1], c0, c1, outer)
+	flat := iterOver(g, dims[2], c0, nil)
+	outer := iterOver(g, dims[0], c0, nil)
+	inner := iterOver(g, dims[1], c0, outer)
 	scaffold(g, dims[0], out, inner)
 	_ = flat
 
@@ -302,8 +306,8 @@ func TestForestAfterGVNFusion(t *testing.T) {
 	g, dims, out := dimFixture("fuseforest", 1)
 	f32 := ir.InternScalar(ir.TF32)
 	one := g.NewConst("ctor", f32, 1)
-	it1 := g.NewIter("ctor", dims[0], nil, one, one)
-	it2 := g.NewIter("ctor", dims[0], nil, one, one)
+	it1 := iterOver(g, dims[0], one, nil)
+	it2 := iterOver(g, dims[0], one, nil) // fresh value objects per call: gvn has duplicates to fuse
 	consumer := g.NewBinOp("ctor", ir.BinOpAdd, it1, it2)
 	scaffold(g, dims[0], out, consumer)
 

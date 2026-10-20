@@ -187,9 +187,9 @@ func TestLoopValueKindsU32(t *testing.T) {
 	c1 := g.NewConst("t", f32T(), 1)
 	tn := g.NewInputParam("t", ir.RoleTensor, "t", tensorT(ir.TF32, "a"))
 
-	it := g.NewIter("t", d, c0, c0, c1) // bounded form
 	dv := g.NewDimVar("t", d, c0, c1)
 	biv := g.NewBoundedDimVar("t", dv, c1)
+	it := g.NewIter("t", biv, nil) // (biv, parent?) formation — bounded by construction
 	iv := g.NewInductionVariable("t", it)
 	td := g.NewTensorDimOf("t", tn, 0)
 	fl := g.NewForLoop("t", dv, c1, c1)

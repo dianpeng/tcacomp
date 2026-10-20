@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"tcacomp/internal/analysis/loopforest"
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 	"tcacomp/internal/opt/simplify"
@@ -159,9 +160,9 @@ func TestLowerDocExample(t *testing.T) {
 		if it.KindOf() != ir.KindIter {
 			t.Fatalf("node %d is %s, want iter", it.BasePtr().ID(), it.KindOf())
 		}
-		// The iter's dim payload: the dim param holds a use whose user is
-		// this iter.
-		if !useWithUser(w.dim, it) {
+		// The iter binds its dim through the BIV chain: operand 0 (biv) ->
+		// operand 0 (dv) -> operand 0 (the dim param).
+		if got := iterDimOf(t, it); got.BasePtr() != w.dim.BasePtr() {
 			t.Fatalf("iter %d must bind dim node %d in as-order position %d", it.BasePtr().ID(), w.dim.BasePtr().ID(), i)
 		}
 		td := boundTensorDimOf(t, g, it)
@@ -196,7 +197,7 @@ func TestLowerDocExample(t *testing.T) {
 				t.Fatalf("load axis %d must resolve to an InductionVariable, got %s", i, iv.KindOf())
 			}
 			iter := ir.OperandsOf(iv)[0]
-			if iter.KindOf() != ir.KindIter || !useWithUser(dim, iter) {
+			if iter.KindOf() != ir.KindIter || iterDimOf(t, iter).BasePtr() != dim.BasePtr() {
 				t.Fatalf("load axis %d's IV must ride an iter binding dim %d", i, dim.BasePtr().ID())
 			}
 		}
@@ -235,14 +236,44 @@ func useWithUser(def, n ir.Node) bool {
 	return false
 }
 
-// boundTensorDimOf returns the TensorDimOf node the iter is bounded by
-// (located via the tdim's use list: its user is the iter), or nil.
+// iterDimOf chases an iter's BIV chain to its dim InputParam:
+// iter -> operand 0 (biv) -> operand 0 (dv) -> operand 0 (the dim param).
+// Fail-fatally on a wrong-kind link — a lowered iter is well-formed by
+// construction.
+func iterDimOf(t *testing.T, iter ir.Node) ir.Node {
+	t.Helper()
+	if iter.KindOf() != ir.KindIter {
+		t.Fatalf("iterDimOf: node %d is %s, want iter", iter.BasePtr().ID(), iter.KindOf())
+	}
+	biv := ir.OperandsOf(iter)[0]
+	if biv == nil || biv.KindOf() != ir.KindBoundedDimVar {
+		t.Fatalf("iterDimOf: iter %d operand 0 must be a bounded dimvar, got %v", iter.BasePtr().ID(), biv)
+	}
+	dv := ir.OperandsOf(biv)[0]
+	if dv == nil || dv.KindOf() != ir.KindDimVar {
+		t.Fatalf("iterDimOf: biv %d operand 0 must be a dimvar, got %v", biv.BasePtr().ID(), dv)
+	}
+	dim := ir.OperandsOf(dv)[0]
+	if dim == nil {
+		t.Fatalf("iterDimOf: dimvar %d carries no dim operand", dv.BasePtr().ID())
+	}
+	return dim
+}
+
+// boundTensorDimOf chases the iter's BIV to its max (operand 1), returning
+// it only when it is a TensorDimOf node (nil otherwise — the max accepts
+// any value node, D5).
 func boundTensorDimOf(t *testing.T, g *ir.Graph, iter ir.Node) ir.Node {
 	t.Helper()
-	for _, n := range nodesOfKind(g, ir.KindTensorDimOf) {
-		if useWithUser(n, iter) {
-			return n
-		}
+	if iter.KindOf() != ir.KindIter {
+		t.Fatalf("boundTensorDimOf: node %d is %s, want iter", iter.BasePtr().ID(), iter.KindOf())
+	}
+	biv := ir.OperandsOf(iter)[0]
+	if biv == nil || biv.KindOf() != ir.KindBoundedDimVar {
+		t.Fatalf("boundTensorDimOf: iter %d operand 0 must be a bounded dimvar, got %v", iter.BasePtr().ID(), biv)
+	}
+	if mx := ir.OperandsOf(biv)[1]; mx != nil && mx.KindOf() == ir.KindTensorDimOf {
+		return mx
 	}
 	return nil
 }
@@ -285,6 +316,211 @@ func TestLowerSharedDimFirstWins(t *testing.T) {
 		t.Fatal("a dim shared by two loads must share one InductionVariable")
 	}
 	assertCleanVerify(t, g, "the shared-dim lowering")
+}
+
+// TestLowerWiresNestChain pins that single-cluster lowering builds a real
+// NEST, not a flat iter set: the as-order IS the nesting order, so the doc
+// example's as [a,b,c] lowers to a 0/1/2 chain — ia the 1-operand root, ib
+// parented at ia, ic parented at ib — and loopforest sees exactly that
+// tree.
+func TestLowerWiresNestChain(t *testing.T) {
+	g, _, _, aP, bP, cP, _, _, _, _ := docExample(t)
+
+	runLower(t, g)
+
+	iters := nodesOfKind(g, ir.KindIter)
+	if len(iters) != 3 {
+		t.Fatalf("the lowered graph must hold exactly 3 iters, got %d", len(iters))
+	}
+	ia, ib, ic := iters[0], iters[1], iters[2]
+	if got := iterDimOf(t, ia); got.BasePtr() != aP.BasePtr() {
+		t.Fatalf("as-order head must bind dim a, got node %d", got.BasePtr().ID())
+	}
+	if got := iterDimOf(t, ib); got.BasePtr() != bP.BasePtr() {
+		t.Fatalf("as-order position 1 must bind dim b, got node %d", got.BasePtr().ID())
+	}
+	if got := iterDimOf(t, ic); got.BasePtr() != cP.BasePtr() {
+		t.Fatalf("as-order position 2 must bind dim c, got node %d", got.BasePtr().ID())
+	}
+	if ops := ir.OperandsOf(ia); len(ops) != 1 {
+		t.Fatalf("ia must be the 1-operand nest root, got %v", ops)
+	}
+	opsB := ir.OperandsOf(ib)
+	if len(opsB) != 2 || opsB[1] != ia {
+		t.Fatalf("ib must be parented at ia (ops [biv, ia]), got %v", opsB)
+	}
+	opsC := ir.OperandsOf(ic)
+	if len(opsC) != 2 || opsC[1] != ib {
+		t.Fatalf("ic must be parented at ib (ops [biv, ib]), got %v", opsC)
+	}
+
+	f := loopforest.Analyze(g)
+	roots := f.Roots()
+	if len(roots) != 1 || roots[0].Iter != ia {
+		t.Fatalf("the wired nest must have exactly one root (ia), got %d", len(roots))
+	}
+	ta, _ := f.NodeOf(ia)
+	tb, _ := f.NodeOf(ib)
+	tc, _ := f.NodeOf(ic)
+	if ta.Depth != 0 || tb.Depth != 1 || tc.Depth != 2 {
+		t.Fatalf("the chain depths must be 0/1/2, got %d/%d/%d", ta.Depth, tb.Depth, tc.Depth)
+	}
+	if tb.Parent != ta || tc.Parent != tb {
+		t.Fatal("the forest must chain ia <- ib <- ic")
+	}
+	assertCleanVerify(t, g, "the wired nest chain")
+}
+
+// TestLowerSharedPrefixNotFlat pins cross-cluster prefix interning: two
+// clusters whose chains share dim a ([a,b] and [a,c]) yield ONE interned
+// a-root with SEPARATE b/c children hanging off THAT SAME iter — a real
+// tree, not a flat kernel — and the forest shows one root with children
+// [ib, ic] in allocation order.
+func TestLowerSharedPrefixNotFlat(t *testing.T) {
+	g := ir.NewGraph("sharedprefix")
+	ft := f32(t)
+	a := g.NewInputParam("ctor", ir.RoleDim, "a", nil)
+	b := g.NewInputParam("ctor", ir.RoleDim, "b", nil)
+	c := g.NewInputParam("ctor", ir.RoleDim, "c", nil)
+	lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "a"}, {Name: "b"}}))
+	rhs := g.NewInputParam("ctor", ir.RoleTensor, "rhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "a"}, {Name: "c"}}))
+
+	loadL := g.NewMemLoad("ctor", lhs, []ir.Node{a, b})
+	cluster1 := g.NewIterCluster("ctor", []ir.Node{a, b}, loadL)
+	lp := g.NewLambdaInputParam("ctor", "l", ft)
+	mp1 := g.NewMap("ctor", []ir.Node{g.NewIterClusterProject("ctor", cluster1, 0)},
+		ir.NewLambda([]ir.Node{lp}, g.NewParamRef("ctor", lp)), []ir.Node{a, b})
+
+	loadR := g.NewMemLoad("ctor", rhs, []ir.Node{a, c})
+	cluster2 := g.NewIterCluster("ctor", []ir.Node{a, c}, loadR)
+	rp := g.NewLambdaInputParam("ctor", "r", ft)
+	mp2 := g.NewMap("ctor", []ir.Node{g.NewIterClusterProject("ctor", cluster2, 0)},
+		ir.NewLambda([]ir.Node{rp}, g.NewParamRef("ctor", rp)), []ir.Node{a, c})
+
+	g.NewReturn("ctor", mp1, mp2)
+	assertCleanVerify(t, g, "the shared-prefix fixture")
+
+	runLower(t, g)
+
+	iters := nodesOfKind(g, ir.KindIter)
+	if len(iters) != 3 {
+		t.Fatalf("clusters as [a,b]/[a,c] must yield exactly 3 iters, got %d", len(iters))
+	}
+	// Exactly ONE iter binds dim a — the interned shared prefix.
+	var ia ir.Node
+	bindA := 0
+	for _, it := range iters {
+		if iterDimOf(t, it).BasePtr() == a.BasePtr() {
+			ia = it
+			bindA++
+		}
+	}
+	if bindA != 1 {
+		t.Fatalf("exactly ONE iter may bind dim a, got %d", bindA)
+	}
+	if ops := ir.OperandsOf(ia); len(ops) != 1 {
+		t.Fatalf("ia must be the 1-operand nest root, got %v", ops)
+	}
+	// ib and ic BOTH parented at THAT iter — c hangs off the SAME interned
+	// a-iter, not a flat second root.
+	var ib, ic ir.Node
+	for _, it := range iters {
+		if it.BasePtr() == ia.BasePtr() {
+			continue
+		}
+		switch iterDimOf(t, it).BasePtr() {
+		case b.BasePtr():
+			ib = it
+		case c.BasePtr():
+			ic = it
+		}
+	}
+	if ib == nil || ic == nil {
+		t.Fatal("the lowering must bind one iter each for dims b and c")
+	}
+	if ops := ir.OperandsOf(ib); len(ops) != 2 || ops[1] != ia {
+		t.Fatalf("ib must be parented at the interned ia, got %v", ops)
+	}
+	if ops := ir.OperandsOf(ic); len(ops) != 2 || ops[1] != ia {
+		t.Fatalf("ic must be parented at the interned ia, got %v", ops)
+	}
+
+	f := loopforest.Analyze(g)
+	roots := f.Roots()
+	if len(roots) != 1 || roots[0].Iter != ia {
+		t.Fatalf("the forest must have exactly one root (ia), got %d", len(roots))
+	}
+	ta, _ := f.NodeOf(ia)
+	tb, _ := f.NodeOf(ib)
+	tc, _ := f.NodeOf(ic)
+	if len(ta.Children) != 2 || ta.Children[0] != tb || ta.Children[1] != tc {
+		t.Fatal("ia's children must be exactly [ib, ic] in allocation order")
+	}
+	if tb.Depth != 1 || tc.Depth != 1 {
+		t.Fatalf("the shared-prefix depths must be 0/1/1, got %d/%d", tb.Depth, tc.Depth)
+	}
+	assertCleanVerify(t, g, "the shared-prefix lowering")
+}
+
+// TestLowerAsOrderRespected pins that the NESTING order is the AS order,
+// never the dim-declaration order: a cluster as [b,a] over load axes
+// [a,b] lowers to root b with child a, and the bound pairings stay per DIM
+// (b: TensorDimOf(lhs,1), a: TensorDimOf(lhs,0)).
+func TestLowerAsOrderRespected(t *testing.T) {
+	g := ir.NewGraph("asorder")
+	ft := f32(t)
+	a := g.NewInputParam("ctor", ir.RoleDim, "a", nil)
+	b := g.NewInputParam("ctor", ir.RoleDim, "b", nil)
+	lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "a"}, {Name: "b"}}))
+
+	load := g.NewMemLoad("ctor", lhs, []ir.Node{a, b})
+	cluster := g.NewIterCluster("ctor", []ir.Node{b, a}, load) // cluster dims as [b, a]
+	lp := g.NewLambdaInputParam("ctor", "l", ft)
+	mp := g.NewMap("ctor", []ir.Node{g.NewIterClusterProject("ctor", cluster, 0)},
+		ir.NewLambda([]ir.Node{lp}, g.NewParamRef("ctor", lp)), []ir.Node{b, a}) // as [b, a]
+	g.NewReturn("ctor", mp)
+	assertCleanVerify(t, g, "the as-order fixture")
+
+	runLower(t, g)
+
+	iters := nodesOfKind(g, ir.KindIter)
+	if len(iters) != 2 {
+		t.Fatalf("as [b,a] must yield exactly 2 iters, got %d", len(iters))
+	}
+	itB, itA := iters[0], iters[1]
+	if got := iterDimOf(t, itB); got.BasePtr() != b.BasePtr() {
+		t.Fatalf("the FIRST as-dim (b) must head the chain, got node %d", got.BasePtr().ID())
+	}
+	if ops := ir.OperandsOf(itB); len(ops) != 1 {
+		t.Fatalf("b's iter must be the 1-operand nest root, got %v", ops)
+	}
+	if got := iterDimOf(t, itA); got.BasePtr() != a.BasePtr() {
+		t.Fatalf("the SECOND as-dim (a) must follow, got node %d", got.BasePtr().ID())
+	}
+	if ops := ir.OperandsOf(itA); len(ops) != 2 || ops[1] != itB {
+		t.Fatalf("a's iter must be parented at b's iter, got %v", ops)
+	}
+	// Pairings per DIM — not per chain position.
+	tdB := boundTensorDimOf(t, g, itB)
+	if tdB == nil || ir.OperandsOf(tdB)[0] != lhs {
+		t.Fatal("b's iter must be bound by TensorDimOf(lhs, ...)")
+	}
+	if got := ir.Label(ir.OperandsOf(tdB)[1], nil); got != fmt.Sprint(1) {
+		t.Fatalf("b's bound axis must be 1 (TensorDimOf(lhs, 1)), got %s", got)
+	}
+	tdA := boundTensorDimOf(t, g, itA)
+	if tdA == nil || ir.OperandsOf(tdA)[0] != lhs {
+		t.Fatal("a's iter must be bound by TensorDimOf(lhs, ...)")
+	}
+	if got := ir.Label(ir.OperandsOf(tdA)[1], nil); got != fmt.Sprint(0) {
+		t.Fatalf("a's bound axis must be 0 (TensorDimOf(lhs, 0)), got %s", got)
+	}
+
+	f := loopforest.Analyze(g)
+	if roots := f.Roots(); len(roots) != 1 || roots[0].Iter != itB {
+		t.Fatalf("the forest root must be b's iter, got %d roots", len(roots))
+	}
+	assertCleanVerify(t, g, "the as-order lowering")
 }
 
 // TestLowerLegacyNoOp pins D11: a builder-shaped graph (cluster wrapping a

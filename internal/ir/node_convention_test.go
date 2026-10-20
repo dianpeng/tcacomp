@@ -94,25 +94,29 @@ func conventionGraph(t *testing.T) *Graph {
 		t.Fatalf("paramRef operands must be [param], got %v", ops)
 	}
 
-	// iter: [dim] and [dim, bound, init, step]; TensorDimOf bounds allowed.
+	// iter: [biv] (nest root) and [biv, parent] (nested) — the BIV value
+	// object carries the ((dim, init, step), max) tuple
+	// (doc/optana/induction_variable.md); TensorDimOf maxes allowed.
 	zero := g.NewConst("ctor", f32, 0)
 	one := g.NewConst("ctor", f32, 1)
-	unbounded := g.NewIter("ctor", m, nil, zero, one)
-	if ops := OperandsOf(unbounded); len(ops) != 3 || ops[0] != m || ops[1] != zero || ops[2] != one {
-		t.Fatalf("unbounded iter operands must be [dim, init, step], got %v", ops)
-	}
 	tdim := g.NewTensorDimOf("ctor", lhs, 0)
-	bounded := g.NewIter("ctor", m, tdim, zero, one)
-	if ops := OperandsOf(bounded); len(ops) != 4 || ops[0] != m || ops[1] != tdim || ops[2] != zero || ops[3] != one {
-		t.Fatalf("bounded iter operands must be [dim, bound, init, step], got %v", ops)
+	dv := g.NewDimVar("ctor", m, zero, one)
+	biv := g.NewBoundedDimVar("ctor", dv, tdim)
+	root := g.NewIter("ctor", biv, nil)
+	if ops := OperandsOf(root); len(ops) != 1 || ops[0] != biv {
+		t.Fatalf("root iter operands must be [biv], got %v", ops)
+	}
+	dv2 := g.NewDimVar("ctor", k, zero, one)
+	biv2 := g.NewBoundedDimVar("ctor", dv2, tdim)
+	child := g.NewIter("ctor", biv2, root)
+	if ops := OperandsOf(child); len(ops) != 2 || ops[0] != biv2 || ops[1] != root {
+		t.Fatalf("nested iter operands must be [biv, parent], got %v", ops)
 	}
 
 	// dimvar: [dim, init, step].
-	dv := g.NewDimVar("ctor", m, zero, one)
 	if ops := OperandsOf(dv); len(ops) != 3 || ops[0] != m || ops[1] != zero || ops[2] != one {
 		t.Fatalf("dimvar operands must be [dim, init, step], got %v", ops)
 	}
-	_ = dv
 
 	// memstore: [value, tensor, axes...].
 	st := g.NewMemStore("ctor", out, []Node{m, k}, one)
@@ -122,14 +126,14 @@ func conventionGraph(t *testing.T) *Graph {
 
 	// itercluster: dims lead the input list; inputs follow.
 	load := g.NewMemLoad("ctor", lhs, []Node{m})
-	cl := g.NewIterCluster("ctor", []Node{m, k}, load, bounded)
-	if ops := OperandsOf(cl); len(ops) != 4 || ops[0] != m || ops[1] != k || ops[2] != load || ops[3] != bounded {
+	cl := g.NewIterCluster("ctor", []Node{m, k}, load, child)
+	if ops := OperandsOf(cl); len(ops) != 4 || ops[0] != m || ops[1] != k || ops[2] != load || ops[3] != child {
 		t.Fatalf("cluster operands must be [dims..., inputs...], got %v", ops)
 	}
 	if dims := ClusterDims(cl); len(dims) != 2 || dims[0] != m || dims[1] != k {
 		t.Fatalf("ClusterDims must read the leading dim operands, got %v", dims)
 	}
-	if ins := ClusterInputs(cl); len(ins) != 2 || ins[0] != load || ins[1] != bounded {
+	if ins := ClusterInputs(cl); len(ins) != 2 || ins[0] != load || ins[1] != child {
 		t.Fatalf("ClusterInputs must read the non-dim operands, got %v", ins)
 	}
 
@@ -140,18 +144,44 @@ func conventionGraph(t *testing.T) *Graph {
 	return g
 }
 
-// TestConventionShapeChecks pins the new fail-closed shapes: iter/dimvar
-// bind dim InputParams at operand 0, paramRefs bind InputParams, cluster
-// dims lead the input list.
+// TestConventionShapeChecks pins the new fail-closed shapes: iters hold
+// [biv] or [biv, parent] (operand 0 a bounded dimvar, operand 1 an iter),
+// dimvars bind dim InputParams at operand 0, paramRefs bind InputParams,
+// cluster dims lead the input list.
 func TestConventionShapeChecks(t *testing.T) {
 	f32 := InternScalar(TF32)
 
-	t.Run("iter rejects non-dim operand 0", func(t *testing.T) {
+	t.Run("iter rejects non-biv operand 0", func(t *testing.T) {
 		g := NewGraph("s1")
 		zero := g.NewConst("ctor", f32, 0)
-		bad := g.NewIter("ctor", zero, nil, zero, zero)
+		bad := g.NewIter("ctor", zero, nil)
 		g.NewReturn("ctor", bad)
-		assertViolation(t, g, "iter operand 0 must be a dim InputParam")
+		assertViolation(t, g, "iter operand 0 must be a bounded dimvar")
+	})
+
+	t.Run("iter rejects non-iter parent", func(t *testing.T) {
+		g := NewGraph("s1b")
+		m := g.NewInputParam("ctor", RoleDim, "m", nil)
+		zero := g.NewConst("ctor", f32, 0)
+		one := g.NewConst("ctor", f32, 1)
+		dv := g.NewDimVar("ctor", m, zero, one)
+		biv := g.NewBoundedDimVar("ctor", dv, one)
+		bad := g.NewIter("ctor", biv, zero)
+		g.NewReturn("ctor", bad)
+		assertViolation(t, g, "iter operand 1 must be the parental iter")
+	})
+
+	t.Run("iter rejects surplus operands", func(t *testing.T) {
+		g := NewGraph("s1c")
+		m := g.NewInputParam("ctor", RoleDim, "m", nil)
+		zero := g.NewConst("ctor", f32, 0)
+		one := g.NewConst("ctor", f32, 1)
+		dv := g.NewDimVar("ctor", m, zero, one)
+		biv := g.NewBoundedDimVar("ctor", dv, one)
+		root := g.NewIter("ctor", biv, nil)
+		bad := g.NewNode(KindIter, "ctor", biv, root, biv) // 3 operands
+		g.NewReturn("ctor", bad)
+		assertViolation(t, g, "iter must hold [biv] or [biv, parent]")
 	})
 
 	t.Run("dimvar rejects non-dim operand 0", func(t *testing.T) {

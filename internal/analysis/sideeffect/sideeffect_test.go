@@ -29,6 +29,14 @@ func fixture() (g *ir.Graph, m, out, alpha, c1 ir.Node) {
 	return g, m, out, alpha, c1
 }
 
+// iterOver builds a normalized iter over dim bounded by max (optionally
+// parented): DimVar(dim,0,1) -> BoundedDimVar(dv,max) -> Iter(biv,parent).
+func iterOver(g *ir.Graph, dim, max, parent ir.Node) ir.Node {
+	f32 := ir.InternScalar(ir.TF32)
+	dv := g.NewDimVar("ctor", dim, g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+	return g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv, max), parent)
+}
+
 // TestName pins the Analysis-name contract (opt.Cache compatibility).
 func TestName(t *testing.T) {
 	var zero sideeffect.SideEffects
@@ -127,49 +135,48 @@ func TestImplicitControlFlowEffectful(t *testing.T) {
 }
 
 // TestIterIsPure pins doc/optana/loop_fusion.md [1] ("The Iter node is
-// itself side effect free, though it is a control flow node"): a bare Iter
-// — no effectful operand — queries PURE, which is what makes identical
-// loop headers GVN-fusable, in both the unbounded 3-operand and the
-// bounded 4-operand form. (Iters fed by effectful operands still taint —
-// TestIterTaintsThroughEffectfulOperand.)
+// itself side effect free, though it is a control flow node"): in the
+// (biv, parent?) formation both a nest ROOT and a PARENTED iter query
+// PURE — their operands are BIV value objects and (at most) another pure
+// iter — which is what makes identical loop headers GVN-fusable.
 func TestIterIsPure(t *testing.T) {
 	g, m, _, _, c1 := fixture()
-	f32 := ir.InternScalar(ir.TF32)
-	step := g.NewConst("ctor", f32, 1)
-	unbounded := g.NewIter("ctor", m, nil, c1, step)
-	bounded := g.NewIter("ctor", m, step, c1, step)
+	bare := iterOver(g, m, c1, nil)
+	child := iterOver(g, m, c1, bare)
 
 	se := mustAnalyze(t, g)
-	if se.HasSideEffect(unbounded) {
-		t.Fatal("a bare unbounded Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
+	if se.HasSideEffect(bare) {
+		t.Fatal("a bare root Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
 	}
-	if se.HasSideEffect(bounded) {
-		t.Fatal("a bare bounded Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
+	if se.HasSideEffect(child) {
+		t.Fatal("a parented Iter must be side-effect free (doc/optana/loop_fusion.md [1])")
 	}
 }
 
-// TestIterTaintsThroughEffectfulOperand pins the fusion soundness gate: an
-// Iter is order-sensitive (FamilyLoop) though no longer base-effectful, so
-// an iter whose operand is accumulated-effectful (here init = a MemLoad —
-// structurally legal; the analysis does not type-check) TAINTS effectful
-// and stays out of GVN, while the bare iter over consts stays pure.
-func TestIterTaintsThroughEffectfulOperand(t *testing.T) {
+// TestIterStaysPureOverValueObjects pins the value-object taint quarantine
+// of the (biv, parent?) formation: a well-formed iter is
+// DimVar -> BoundedDimVar -> Iter, all FamilyAbstract VALUE OBJECTS — pure
+// and non-propagating — so even a BIV whose max is an accumulated-effectful
+// MemLoad keeps the iter (and the biv and the dv) PURE. The taint cannot
+// cross the value-object boundary, and identity keying keeps BIVs over
+// distinct load defs distinct, so this is GVN-sound. The OLD taint path —
+// an iter tainting through an effectful init operand — is structurally
+// unreachable now: no raw value operand of an iter exists anymore.
+func TestIterStaysPureOverValueObjects(t *testing.T) {
 	g, m, out, _, c1 := fixture()
 	f32 := ir.InternScalar(ir.TF32)
 	step := g.NewConst("ctor", f32, 1)
 	load := g.NewMemLoad("ctor", out, []ir.Node{m})
-	tainted := g.NewIter("ctor", m, nil, load, step)
-	bare := g.NewIter("ctor", m, nil, c1, step)
+	dv := g.NewDimVar("ctor", m, c1, step)
+	biv := g.NewBoundedDimVar("ctor", dv, load) // max = the load — structurally legal; the analysis does not type-check
+	tainted := g.NewIter("ctor", biv, nil)
 
 	se := mustAnalyze(t, g)
 	if !se.HasSideEffect(load) {
 		t.Fatal("fixture setup: the MemLoad must be effectful")
 	}
-	if se.HasSideEffect(bare) {
-		t.Fatal("the bare iter (const operands) must stay pure")
-	}
-	if !se.HasSideEffect(tainted) {
-		t.Fatal("an iter with an effectful operand must taint effectful (orderSensitive FamilyLoop)")
+	if se.HasSideEffect(dv) || se.HasSideEffect(biv) || se.HasSideEffect(tainted) {
+		t.Fatal("the value-object chain (dv/biv/iter) must stay PURE over an effectful max (FamilyAbstract quarantine)")
 	}
 }
 
@@ -178,14 +185,13 @@ func TestIterTaintsThroughEffectfulOperand(t *testing.T) {
 // cast/select/call chain over such math stays pure; a Map piping a
 // MemLoad operand stays pure; a Map whose lambda body references iter
 // values stays pure (body children do not taint a pure bearer — and since
-// the doc/optana/loop_fusion.md reclassification the bare iter is itself
+// the doc/optana/loop_fusion.md reclassification the iter is itself
 // pure, so the effectful-content pin rides the piped load).
 func TestPureKindsNeverPropagate(t *testing.T) {
 	g, m, out, alpha, c1 := fixture()
 	f32 := ir.InternScalar(ir.TF32)
 
-	step := g.NewConst("ctor", f32, 1)
-	iter := g.NewIter("ctor", m, nil, c1, step)
+	iter := iterOver(g, m, c1, nil)
 	load := g.NewMemLoad("ctor", out, []ir.Node{m})
 
 	bin := g.NewBinOp("ctor", ir.BinOpMul, iter, c1) // i*2 over the (pure) iter
@@ -221,19 +227,17 @@ func TestPureKindsNeverPropagate(t *testing.T) {
 
 // TestOrderSensitivePropagation pins the propagation MACHINERY: an
 // order-sensitive kind with an effectful child reports effectful, and the
-// result is a deterministic fixpoint. The propagation clause is no longer
-// vacuous in general — since the doc/optana/loop_fusion.md
-// reclassification, KindIter is order-sensitive (FamilyLoop) but NOT
-// base-effectful, so it is LIVE for Iter-with-effectful-operand (pinned
-// by TestIterTaintsThroughEffectfulOperand) — but no Iter on this fixture
-// has an effectful child, so accumulated == base-set still holds here.
+// result is a deterministic fixpoint. Since the doc/optana/loop_fusion.md
+// reclassification the order-sensitive kinds (FamilyLoop) are NOT
+// base-effectful, so the clause is LIVE for FamilyLoop-with-effectful-
+// child — but in the (biv, parent?) formation no WELL-FORMED iter feeds
+// it anymore (its operands are pure value objects), so accumulated ==
+// base-set still holds on this fixture.
 func TestOrderSensitivePropagation(t *testing.T) {
 	g, m, out, _, c1 := fixture()
-	f32 := ir.InternScalar(ir.TF32)
 
-	step := g.NewConst("ctor", f32, 1)
-	iter := g.NewIter("ctor", m, nil, c1, step)
-	dv := g.NewDimVar("ctor", m, c1, step)
+	iter := iterOver(g, m, c1, nil)
+	dv := g.NewDimVar("ctor", m, c1, c1)
 	loop := g.NewForLoop("ctor", dv, c1, c1) // loop kind with effectful-child machinery in scope
 	env := ir.NewEnv()
 	st := g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, c1)

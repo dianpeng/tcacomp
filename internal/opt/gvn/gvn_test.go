@@ -251,9 +251,10 @@ func TestGVNLeafPooling(t *testing.T) {
 // TestGVNIterArithmetic pins the amendment's named case (C+D) as
 // inverted by doc/optana/loop_fusion.md: `i*2` built twice over the SAME
 // iter node dedups (the iter survives untouched); and two IDENTICAL iter
-// headers now FUSE (the duplicate iter is erased), after which `i1*2` vs
-// `i2*2` — keyed over the same surviving iter def — cascade-fuse in ONE
-// run.
+// headers — separately-built DimVar -> BoundedDimVar value-object chains —
+// FUSE through the cascade (consts, dimvars, bivs, then the iter), after
+// which `i1*2` vs `i2*2` — keyed over the same surviving iter def —
+// cascade-fuse in ONE run.
 func TestGVNIterArithmetic(t *testing.T) {
 	g := ir.NewGraph("iterarith")
 	f32 := ir.InternScalar(ir.TF32)
@@ -261,8 +262,10 @@ func TestGVNIterArithmetic(t *testing.T) {
 	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	one := g.NewConst("ctor", f32, 1)
 	two := g.NewConst("ctor", f32, 2)
+	ext := g.NewConst("ctor", f32, 64)
 
-	i := g.NewIter("ctor", m, nil, one, one)
+	dv := g.NewDimVar("ctor", m, one, one)
+	i := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv, ext), nil)
 	b1 := g.NewBinOp("ctor", ir.BinOpMul, i, two)
 	b2 := g.NewBinOp("ctor", ir.BinOpMul, i, two)
 	consumer := g.NewBinOp("ctor", ir.BinOpAdd, b1, b2)
@@ -276,16 +279,22 @@ func TestGVNIterArithmetic(t *testing.T) {
 		t.Fatalf("consumer's operands must both resolve to b1, got %v", ops)
 	}
 
-	// The fusion mirror (doc/optana/loop_fusion.md): i1 and i2 are
-	// identical headers, so the duplicate iter fuses; the x2 arithmetic
-	// then cascades onto x1 in the same run.
+	// The fusion mirror (doc/optana/loop_fusion.md): i1 and i2 ride
+	// separately-built equal value-object chains, so the cascade fuses the
+	// duplicate chain and its iter; the x2 arithmetic then cascades onto
+	// x1 in the same run.
 	g2 := ir.NewGraph("iterarith2")
 	m2 := g2.NewInputParam("ctor", ir.RoleDim, "m", nil)
 	out2 := g2.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	one2 := g2.NewConst("ctor", f32, 1)
 	two2 := g2.NewConst("ctor", f32, 2)
-	i1 := g2.NewIter("ctor", m2, nil, one2, one2)
-	i2 := g2.NewIter("ctor", m2, nil, one2, one2)
+	ext2 := g2.NewConst("ctor", f32, 64)
+	dv1 := g2.NewDimVar("ctor", m2, one2, one2)
+	dv2 := g2.NewDimVar("ctor", m2, one2, one2)
+	biv1 := g2.NewBoundedDimVar("ctor", dv1, ext2)
+	biv2 := g2.NewBoundedDimVar("ctor", dv2, ext2)
+	i1 := g2.NewIter("ctor", biv1, nil)
+	i2 := g2.NewIter("ctor", biv2, nil)
 	x1 := g2.NewBinOp("ctor", ir.BinOpMul, i1, two2)
 	x2 := g2.NewBinOp("ctor", ir.BinOpMul, i2, two2)
 	cons2 := g2.NewBinOp("ctor", ir.BinOpAdd, x1, x2)
@@ -293,7 +302,7 @@ func TestGVNIterArithmetic(t *testing.T) {
 
 	runGVN(t, g2)
 
-	assertGone(t, g2, i2, x2)
+	assertGone(t, g2, i2, x2, dv2, biv2)
 	assertKept(t, g2, i1, x1, cons2)
 	if ops := ir.OperandsOf(cons2); len(ops) != 2 || ops[0] != x1 || ops[1] != x1 {
 		t.Fatalf("cons2's operands must both resolve to x1, got %v", ops)
@@ -301,32 +310,37 @@ func TestGVNIterArithmetic(t *testing.T) {
 	runGvnVerify(t, g2)
 }
 
-// TestGVNIterFusionBounded pins bounded-iter fusion: two 4-operand iters
-// whose bounds are equal-valued but DISTINCT const nodes fuse because the
-// bounds CSE first (doc/optana/loop_fusion.md: "DimVar and Bounds are both
-// equal" — via equal-valued const CSE), in ONE run; and an unbounded
-// 3-operand iter never fuses with a bounded 4-operand one over the same
-// dim/init/step (slot-count mismatch).
+// TestGVNIterFusionBounded pins bounded-iter fusion on the (biv, parent?)
+// formation: two root iters whose BIVs carry equal-valued but DISTINCT
+// const maxes fuse because the maxes CSE first
+// (doc/optana/loop_fusion.md: "DimVar and Bounds are both equal" — via
+// equal-valued const CSE), in ONE run; and a nest ROOT [biv] never fuses
+// with a PARENTED iter [biv, parent] even after their equal BIVs merge
+// (operand-count mismatch — the count rides the hash).
 func TestGVNIterFusionBounded(t *testing.T) {
-	// (a) Equal-valued distinct bounds: const CSE, then iter fusion, in
-	// one run.
+	// (a) Equal-valued distinct maxes: const CSE, then dv/biv, then iter
+	// fusion, in one run.
 	g := ir.NewGraph("iterbounded")
 	f32 := ir.InternScalar(ir.TF32)
 	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
 	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	zero := g.NewConst("ctor", f32, 0)
 	one := g.NewConst("ctor", f32, 1)
-	b1 := g.NewConst("ctor", f32, 64)
-	b2 := g.NewConst("ctor", f32, 64)
-	it1 := g.NewIter("ctor", m, b1, zero, one)
-	it2 := g.NewIter("ctor", m, b2, zero, one)
+	max1 := g.NewConst("ctor", f32, 64)
+	max2 := g.NewConst("ctor", f32, 64)
+	dv1 := g.NewDimVar("ctor", m, zero, one)
+	dv2 := g.NewDimVar("ctor", m, zero, one)
+	biv1 := g.NewBoundedDimVar("ctor", dv1, max1)
+	biv2 := g.NewBoundedDimVar("ctor", dv2, max2)
+	it1 := g.NewIter("ctor", biv1, nil)
+	it2 := g.NewIter("ctor", biv2, nil)
 	consumer := g.NewBinOp("ctor", ir.BinOpAdd, it1, it2)
 	scaffold(g, m, out, consumer)
 
 	runGVN(t, g)
 
-	assertGone(t, g, b2, it2)
-	assertKept(t, g, b1, it1, consumer)
+	assertGone(t, g, max2, dv2, biv2, it2)
+	assertKept(t, g, max1, it1, consumer)
 	if ops := ir.OperandsOf(consumer); len(ops) != 2 || ops[0] != it1 || ops[1] != it1 {
 		t.Fatalf("consumer's operands must both resolve to it1, got %v", ops)
 	}
@@ -335,56 +349,80 @@ func TestGVNIterFusionBounded(t *testing.T) {
 	}
 	runGvnVerify(t, g)
 
-	// (b) Unbounded (3-operand) vs bounded (4-operand): never fuse.
+	// (b) Root [biv] vs parented [biv, parent]: gvn fuses the second equal
+	// BIV into the first, yet the 1-op root and the 2-op child NEVER merge
+	// (operand-count mismatch).
 	g2 := ir.NewGraph("iterarity")
 	m2 := g2.NewInputParam("ctor", ir.RoleDim, "m", nil)
 	out2 := g2.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
-	zero2 := g2.NewConst("ctor", f32, 0)
-	one2 := g2.NewConst("ctor", f32, 1)
-	bnd := g2.NewConst("ctor", f32, 64)
-	itU := g2.NewIter("ctor", m2, nil, zero2, one2)
-	itB := g2.NewIter("ctor", m2, bnd, zero2, one2)
+	z := g2.NewConst("ctor", f32, 0)
+	s := g2.NewConst("ctor", f32, 1)
+	mx := g2.NewConst("ctor", f32, 64)
+	dvM := g2.NewDimVar("ctor", m2, z, s)
+	bivM := g2.NewBoundedDimVar("ctor", dvM, mx)
+	itU := g2.NewIter("ctor", bivM, nil)
+	z2 := g2.NewConst("ctor", f32, 0)
+	s2 := g2.NewConst("ctor", f32, 1)
+	mx2 := g2.NewConst("ctor", f32, 64)
+	dvM2 := g2.NewDimVar("ctor", m2, z2, s2)
+	bivM2 := g2.NewBoundedDimVar("ctor", dvM2, mx2)
+	itB := g2.NewIter("ctor", bivM2, itU)
 	sum := g2.NewBinOp("ctor", ir.BinOpAdd, itU, itB)
 	scaffold(g2, m2, out2, sum)
 
 	runGVN(t, g2)
 
-	assertKept(t, g2, itU, itB)
+	assertGone(t, g2, z2, s2, mx2, dvM2, bivM2) // the equal value objects fuse...
+	assertKept(t, g2, itU, itB)                 // ...but root and parented never merge
 	runGvnVerify(t, g2)
 }
 
-// TestGVNIterFusionNestedAwareness pins whole-nest fusion and its block:
-// parent-wired iters carry the parent Iter as the FINAL operand (appended
-// after the standard slots), so identity keying is nested-aware — two
-// identical parent-wired chains fuse level by level in ONE run (consts,
-// parents, then children through the rewired parent slot), while children
-// wired to DIFFERENT parents never fuse (their parent-slot def identity
-// differs).
+// TestGVNIterFusionNestedAwareness pins whole-nest fusion and its block on
+// the (biv, parent?) formation: the parent Iter is operand 1, so identity
+// keying is nested-aware — two identical parent-wired chains (separately
+// built consts, dimvars, bivs, maxes) fuse level by level in ONE run
+// (consts, parents, then children through the rewired parent slot), while
+// children wired to DIFFERENT parents never fuse (their parent-slot def
+// identity differs).
 func TestGVNIterFusionNestedAwareness(t *testing.T) {
-	// (a) Whole-nest fusion: the RAUW cascade fuses z2/s2, then p2, then
-	// c2 (whose parent slot rewired to p1) — one run, whole nest.
+	// (a) Whole-nest fusion: the RAUW cascade fuses nest2's consts/maxes,
+	// then its dimvars/bivs, then P2, then C2 (whose parent slot rewired
+	// to P1) — one run, whole nest.
 	g := ir.NewGraph("nestfuse")
 	f32 := ir.InternScalar(ir.TF32)
 	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
 	n := g.NewInputParam("ctor", ir.RoleDim, "n", nil)
 	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 	z1 := g.NewConst("ctor", f32, 0)
-	z2 := g.NewConst("ctor", f32, 0)
 	s1 := g.NewConst("ctor", f32, 1)
+	mP1 := g.NewConst("ctor", f32, 64)
+	mC1 := g.NewConst("ctor", f32, 128)
+	dvP1 := g.NewDimVar("ctor", m, z1, s1)
+	bivP1 := g.NewBoundedDimVar("ctor", dvP1, mP1)
+	P1 := g.NewIter("ctor", bivP1, nil)
+	dvC1 := g.NewDimVar("ctor", n, z1, s1)
+	bivC1 := g.NewBoundedDimVar("ctor", dvC1, mC1)
+	C1 := g.NewIter("ctor", bivC1, P1)
+	// nest 2: separately-built equal value objects (fresh consts + maxes).
+	z2 := g.NewConst("ctor", f32, 0)
 	s2 := g.NewConst("ctor", f32, 1)
-	p1 := g.NewIter("ctor", m, nil, z1, s1)
-	p2 := g.NewIter("ctor", m, nil, z2, s2)
-	c1 := g.NewNode(ir.KindIter, "ctor", n, z1, s1, p1) // parent appended LAST
-	c2 := g.NewNode(ir.KindIter, "ctor", n, z2, s2, p2)
-	consumer := g.NewBinOp("ctor", ir.BinOpAdd, c1, c2)
+	mP2 := g.NewConst("ctor", f32, 64)
+	mC2 := g.NewConst("ctor", f32, 128)
+	dvP2 := g.NewDimVar("ctor", m, z2, s2)
+	bivP2 := g.NewBoundedDimVar("ctor", dvP2, mP2)
+	P2 := g.NewIter("ctor", bivP2, nil)
+	dvC2 := g.NewDimVar("ctor", n, z2, s2)
+	bivC2 := g.NewBoundedDimVar("ctor", dvC2, mC2)
+	C2 := g.NewIter("ctor", bivC2, P2)
+	consumer := g.NewBinOp("ctor", ir.BinOpAdd, C1, C2)
 	scaffold(g, m, out, consumer)
 
 	runGVN(t, g)
 
-	assertGone(t, g, z2, s2, p2, c2)
-	assertKept(t, g, z1, s1, p1, c1, consumer)
-	if ops := ir.OperandsOf(consumer); len(ops) != 2 || ops[0] != c1 || ops[1] != c1 {
-		t.Fatalf("consumer's operands must both resolve to c1, got %v", ops)
+	assertGone(t, g, z2, s2, mP2, mC2, dvP2, bivP2, P2, dvC2, bivC2, C2)
+	assertKept(t, g, z1, s1, mP1, mC1, dvP1, bivP1, P1, dvC1, bivC1, C1, consumer)
+	if ops := ir.OperandsOf(consumer); len(ops) != 2 || ops[0] != C1 || ops[1] != C1 {
+		t.Fatalf("consumer's operands must both resolve to C1, got %v", ops)
 	}
 	if vs := ir.Verify(g); len(vs) != 0 {
 		t.Fatalf("graph must verify: %v", vs)
@@ -401,10 +439,13 @@ func TestGVNIterFusionNestedAwareness(t *testing.T) {
 	z := g2.NewConst("ctor", f32, 0)
 	sA := g2.NewConst("ctor", f32, 1)
 	sB := g2.NewConst("ctor", f32, 2)
-	pA := g2.NewIter("ctor", m2, nil, z, sA)
-	pB := g2.NewIter("ctor", m2, nil, z, sB)
-	childA := g2.NewNode(ir.KindIter, "ctor", n2, z, sA, pA)
-	childB := g2.NewNode(ir.KindIter, "ctor", n2, z, sA, pB)
+	mP := g2.NewConst("ctor", f32, 64)
+	mC := g2.NewConst("ctor", f32, 128)
+	pA := g2.NewIter("ctor", g2.NewBoundedDimVar("ctor", g2.NewDimVar("ctor", m2, z, sA), mP), nil)
+	pB := g2.NewIter("ctor", g2.NewBoundedDimVar("ctor", g2.NewDimVar("ctor", m2, z, sB), mP), nil)
+	bivC := g2.NewBoundedDimVar("ctor", g2.NewDimVar("ctor", n2, z, sA), mC) // shared by both children
+	childA := g2.NewIter("ctor", bivC, pA)
+	childB := g2.NewIter("ctor", bivC, pB)
 	sum := g2.NewBinOp("ctor", ir.BinOpAdd, childA, childB)
 	scaffold(g2, m2, out2, sum)
 
@@ -441,8 +482,9 @@ func TestGVNNeverMergesSideEffects(t *testing.T) {
 	st2 := g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, val)
 
 	one := g.NewConst("ctor", f32, 7) // distinct from val: the exclusion-set probe must not trip const pooling
-	it1 := g.NewIter("ctor", m, nil, one, one)
-	it2 := g.NewIter("ctor", m, nil, one, one)
+	biv := g.NewBoundedDimVar("ctor", g.NewDimVar("ctor", m, one, one), one)
+	it1 := g.NewIter("ctor", biv, nil)
+	it2 := g.NewIter("ctor", biv, nil)
 
 	ext := g.NewConst("ctor", f32, 64)
 	alloc1 := g.NewMemNew("ctor", ext)

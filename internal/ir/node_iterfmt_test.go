@@ -79,7 +79,9 @@ func TestIterfmtNodesConstructAndVerify(t *testing.T) {
 
 	zero := g.NewConst("ctor", f32, 0)
 	one := g.NewConst("ctor", f32, 1)
-	iter := g.NewIter("ctor", a, tdim, zero, one)
+	dv := g.NewDimVar("ctor", a, zero, one)
+	biv := g.NewBoundedDimVar("ctor", dv, tdim)
+	iter := g.NewIter("ctor", biv, nil)
 	iv := g.NewInductionVariable("ctor", iter)
 	if ops := OperandsOf(iv); len(ops) != 1 || ops[0] != iter {
 		t.Fatalf("inductionvariable operand 0 must be the iter, got %v", ops)
@@ -263,22 +265,28 @@ func TestIterfmtPrintUnwrap(t *testing.T) {
 		}
 	}
 
-	// A TensorDimOf-bounded iter renders @a/tensordimof(lhs, 0) — no "?".
+	// A TensorDimOf-max iter renders @a/tensordimof(lhs, 0) — no "?".
 	tdim := g.NewTensorDimOf("ctor", lhs, 0)
 	zero := g.NewConst("ctor", f32, 0)
 	one := g.NewConst("ctor", f32, 1)
-	iter := g.NewIter("ctor", a, tdim, zero, one)
+	dv := g.NewDimVar("ctor", a, zero, one)
+	biv := g.NewBoundedDimVar("ctor", dv, tdim)
+	iter := g.NewIter("ctor", biv, nil)
 	if got, want := (&renderer{}).value(iter), "@a/tensordimof(lhs, 0)"; got != want {
-		t.Fatalf("tensordimof-bounded iter renders %q, want %q", got, want)
+		t.Fatalf("tensordimof-max iter renders %q, want %q", got, want)
 	}
-	// A param-bounded iter keeps the legacy @a/@b spelling, and the nil
-	// bound stays bare.
+	// A dim-param max keeps the @a/bbound spelling (through the BIV).
 	bb := g.NewInputParam("ctor", RoleDim, "bbound", nil)
-	if got, want := (&renderer{}).value(g.NewIter("ctor", a, bb, zero, one)), "@a/bbound"; got != want {
-		t.Fatalf("param-bounded iter renders %q, want %q", got, want)
+	dvB := g.NewDimVar("ctor", a, zero, one)
+	if got, want := (&renderer{}).value(g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvB, bb), nil)), "@a/bbound"; got != want {
+		t.Fatalf("param-max iter renders %q, want %q", got, want)
 	}
-	if got, want := (&renderer{}).value(g.NewIter("ctor", a, nil, zero, one)), "@a"; got != want {
-		t.Fatalf("unbounded iter renders %q, want %q", got, want)
+	// A parented iter renders identically to its root: the parent edge is
+	// nest structure (loopforest's face), not inline syntax.
+	root := g.NewIter("ctor", biv, nil)
+	parented := g.NewIter("ctor", biv, root)
+	if got, want := (&renderer{}).value(parented), (&renderer{}).value(root); got != want {
+		t.Fatalf("a parented iter must render like its root: %q vs %q", got, want)
 	}
 }
 
@@ -326,7 +334,8 @@ func TestIterfmtValueIdentity(t *testing.T) {
 
 	// InductionVariables dedupe by operand identity: same iter ⇒ one value.
 	tdim := g.NewTensorDimOf("ctor", lhs, 0)
-	iter := g.NewIter("ctor", a, tdim, g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+	dv := g.NewDimVar("ctor", a, g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+	iter := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dv, tdim), nil)
 	iv1 := asValue(t, g.NewInductionVariable("ctor", iter))
 	iv2 := asValue(t, g.NewInductionVariable("ctor", iter))
 	if !iv1.ValueEqual(iv2, pureAll{}) || iv1.ValueHash(pureAll{}) != iv2.ValueHash(pureAll{}) {
