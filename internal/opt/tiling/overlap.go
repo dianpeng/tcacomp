@@ -55,6 +55,9 @@ type SiteFacts struct {
 	// INS is every LNT iter the load references (ValueEqual-deduped,
 	// tree-restricted).
 	INS []ir.Node
+	// Levels is the owning LNT's full iter list, inner -> outer — the
+	// reuse-dim derivation walks it.
+	Levels []ir.Node
 	// AxesIters holds, per subscript position in order, the LNT iters
 	// appearing in that axis's chased expression — the promotion judge's
 	// per-position view.
@@ -271,7 +274,7 @@ func (lf *lntFacts) admit(f loopforest.Forest, se sideeffect.SideEffects, p Para
 // tie; all tree-restricted INS for nil), and the CacheDims clamp. levels is
 // the tree's inner->outer level order (the caller's lf.Levels).
 func newSiteFacts(f loopforest.Forest, se sideeffect.SideEffects, p Params, ol ownedLoad, level ir.Node, levels []ir.Node, memberOf func(ir.Node) bool) SiteFacts {
-	sf := SiteFacts{Load: ol.load, SetLevel: level}
+	sf := SiteFacts{Load: ol.load, SetLevel: level, Levels: append([]ir.Node(nil), levels...)}
 	ops := ir.OperandsOf(ol.load)
 	if len(ops) > 0 {
 		sf.Tensor = ops[0]

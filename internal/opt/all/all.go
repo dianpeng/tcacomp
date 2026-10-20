@@ -14,5 +14,6 @@ import (
 	_ "tcacomp/internal/opt/memopt"
 	_ "tcacomp/internal/opt/schedule"
 	_ "tcacomp/internal/opt/simplify"
+	_ "tcacomp/internal/opt/tiling"
 	_ "tcacomp/internal/opt/typeinfer"
 )

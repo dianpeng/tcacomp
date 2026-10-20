@@ -27,6 +27,8 @@ import (
 //	111   gvn-verify (the post-dedup invariant check)
 //	112   memory optimization (memopt — store-to-load forwarding + store-store/dead-store elimination, post-GVN)
 //	113   memopt-verify (the post-memopt invariant/fixpoint check)
+//	114   loop tiling (decide: overlap analysis + PSched search + decision record)
+//	115   tiling-verify (the post-decide record consistency check)
 //	...   transformation passes slot between as they land
 //	900   late scheduling (schedule — the pre-codegen ordering fixup)
 //
