@@ -5,7 +5,7 @@ milestone_name: milestone
 status: executing
 stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
 last_updated: "2026-10-16T02:30:00.000Z"
-last_activity: 2026-10-20 - Completed quick task 261020-b4f: Iter (biv,parent?) restructure + nest wiring + prefix-fusion pins
+last_activity: 2026-10-20 - Completed quick task 261020-ve6: implement loop-tiling decide pass per doc/optana/loop_tiling.md
 progress:
   total_phases: 6
   completed_phases: 1
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-20 - Completed fast task 261020-fd2: Issue #1 resolved in loop_tile_lower.md (runtime loop materialization bailout + mask contract); only D3 allocator vocabulary remains open
+Last activity: 2026-10-20 - Completed quick task 261020-ve6: Implement loop-tiling decide pass per doc/optana/loop_tiling.md — internal/opt/tiling (tiling@114 + tiling-verify@115): overlap analysis, TIE placement, PSched 3^K search, D2 decision-record side table (no ctaCache, zero IR mutation), matmul worked example pinned
 
 Progress: [██░░░░░░░░] 17%
 
@@ -101,6 +101,7 @@ None yet.
 | 261020-fd1 | fast: Cache.dims configurable cached-dimension count (dimension level reuse, default 2) + tensor-rank < Cache.dims filter at candidate set formation in doc/optana/loop_tiling.md | 2026-10-20 | 9f09a8b | — |
 | 261020-ux8 | Draft doc/optana/loop_tile_lower.md — merged loop-tile-lower pass spec (tile rewrite + DoSoC numbering + intrinsics + SMEM/FRAG insertion) at opt.md's "loop tiling rewrite" slot; 11 author rulings normative (side-table decision record, FRAG unroll+budget, u32 min/max/ceildiv, string intrinsic payload + 6 companions, LoadTileCta/Thread rule, runtime-owns-sync, halve-then-drop fallback, cross-LNT dedupe, dynamic shapes, LIR KindForLoop); Issue #1 control-flow register (Q1-Q5) + D3 allocator vocabulary OPEN; smem_insertion.md → pointer stub | 2026-10-20 | 26a1288 | [261020-ux8-draft-doc-optana-loop-tile-lower-md-merg](./quick/261020-ux8-draft-doc-optana-loop-tile-lower-md-merg/) |
 | 261020-fd2 | fast: resolve loop_tile_lower.md Issue #1 — runtime loop materialization owns the bounds bailout (thr_loop whole-body no-op / cta_loop exact / seq_loop native); one-BB permanent; tile-level cooperative ops outside bailing loops; mask contract (exact, uniformly-derived, per-iteration, lane-prefix closed form from thread_map); reducer Init/Combine placement; Q1-Q5 all resolved — only D3 allocator vocabulary remains OPEN | 2026-10-20 | 9b124ff | — |
+| 261020-ve6 | Implement loop-tiling decide pass per doc/optana/loop_tiling.md — internal/opt/tiling (tiling@114 + tiling-verify@115): MemLoad overlap analysis (findINS via Input-chase to InductionVariable, SET bucketing at innermost referenced iter, rank<Cache.dims + set-size≥2 + Max.cs filters), TIE placement (innermost non-referenced iter, above-outermost allowed), PSched 3^K flat search over innermost-K=5 window (LoC presets, tile presets, CTA-product ≤ Max.cta / warp-sum×32 ≤ Max.threads_per_cta / SMEM-bytes ≤ Max.cache feasibility, parallelism + traffic-avoided weighted objective), D2 decision-record side table (per-Iter by BIV identity, per-site by MemLoad id, NO ctaCache field, zero IR mutation) exposed via analysis cache with Preserved ["tiling-record"]; matmul worked example pinned (SET {lhs,rhs}@iterK, lhs tie iterN covers [·][K], rhs above-outermost covers [N][K]); 17 packages green, 18 new tests | 2026-10-20 | 2a776aa | [261020-ve6-implement-loop-tiling](./quick/261020-ve6-implement-loop-tiling/) |
 
 ## Session Continuity
 
