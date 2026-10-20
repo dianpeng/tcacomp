@@ -132,6 +132,45 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
   - This small pass is responsible for
     - Deciding sets of iterations to own/reuse the cache
 
+  - Cache Tie Semantics
+    - The author's rules, stated normatively
+      - RULE 1, TIE: a cache site is TIED to a specific Iteration of the LNT
+        - The tie IS the placement: the MemLoad is hoisted to sit DIRECTLY ABOVE the
+          tied iteration's loop
+      - RULE 2, WHOLE DIMENSION LOAD: moving a MemLoad UP past an iteration LOSES
+        that iteration's dimension, ie the cache loads that WHOLE dimension
+        - Hoisting past an iteration that indexes the load, ie is in its INS, the
+          cache loads that whole dimension into SMEM at fixed enclosing indices
+        - Hoisting past an iteration NOT in the load's INS is free, footprint unchanged
+      - RULE 3, TILING DEMOTION: tiling automatically demotes the cache from full
+        dimension to a tile of that dimension
+        - At tie time the coverage is the FULL dimension, when loop tiling applies,
+          each covered dimension is automatically demoted from full extent to that
+          dimension's tile_size
+        - The tile size IS the cache size knob, consistent with cache size being
+          decided implicitly by tile size
+    - Derived from the rules
+      - Reuse accrues across the tied iteration's sweep and everything inner to it,
+        the cache re-loads once per enclosing iteration
+        - Placement trades covered footprint, product of covered extents, against
+          reload frequency
+      - Operational tie rule: tie(p) = the innermost Iter of the LNT that is NOT in
+        INS(p)
+        - All INS members end up at-or-inside the tie, outer INS members are fixed
+          scalar selections for the whole-dim load
+        - Equivalently, scan the LNT inner -> outer and stop at the first level NOT
+          referenced by the load
+      - Loads whose INS spans the ENTIRE LNT tie above the outermost loop, ie
+        whole-tensor coverage demoted to tiles by RULE 3, allowed, NOT excluded
+      - Worked check, the matmul below
+        - lhs[m][k], INS = {iterM, iterK} -> tie at iterN
+          - Covers [ · ][K] whole, reloaded per m, reused across n and k
+        - rhs[n][k], INS = {iterN, iterK} -> tie at iterM, above the outermost loop
+          - Covers [N][K] whole, ie the "cover [n][k] 2 dimensions" case
+        - Ie reuse lives ABOVE the innermost referenced level: the whole-dim cache at
+          the tie is what turns k-sweep loads into SMEM hits and survives the
+          enclosing sweeps
+
 ```
 // A simple matmul vising pattern
 
@@ -149,8 +188,10 @@ for (auto m = 0; m < M; m++) {         // <- iterM
 // the SMEM cache must be able to decide that it should place SMEM cache for lhs/rhs
 // in the inner loop. Which need to generate cache placement strategy as following
 //
-// (1) place lhs cache at iterN, since it needs to cover [n][k] 2 dimensions
-// (2) place rhs cache at iterM, since it needs to cover [m][2] 2 dimensions
+// (1) place lhs cache at iterN, it must cover the k dimension, whole, later
+//     demoted to the k tile by tiling
+// (2) place rhs cache at iterM, it must cover the n and k dimensions, [n][k],
+//     whole, later demoted to the n/k tiles by tiling
 //
 // After the tiling, the SMEM's local size will be automatically become tile size for
 // each loop correspondingly
@@ -179,18 +220,25 @@ for (auto m = 0; m < M; m++) {         // <- iterM
       - 1] For all MemLoad in set I
         - Run findINS for each element to obtain each MemLoad corresponding set
       - 2] Setup a result set O
-      - 3] For the LNT, visiting backwards, from inner most Iter node to outer most Iter node
-        - With the given Iter node, scan all element in I
-        - For any MemLoad in I, if it contains a Iter node in its INS, that ValueEqual to current given Iter node
-          - Record it and remove it from I
-        - For all collected MemLoad, it forms a set and insert it into O
+      - 3] Bucket each MemLoad in I at its tie level, per the Cache Tie Semantics
+        - Scan the LNT's Iter nodes from inner most to outer most
+        - For a MemLoad p in I, its bucket is the FIRST scanned level whose Iter is
+          NOT in p's INS, ValueEqual membership
+          - NOTE this inverts the membership test: bucket at the first level the load
+            does NOT reference, the reuse level, not the first level it does
+        - Record p and remove it from I
+        - A MemLoad whose INS covers the WHOLE LNT ties above the outermost loop,
+          bucket it at that outermost-plus level
+        - All MemLoad bucketed at the same level form a set and are inserted into O
       - 4] O, contains all **different nested loop levels MemLoad set**
       - 5] Return O
 
     - (4) For each element in O, do final filtering
       - Setup a Candidative Set, denoted as CS
       - For each element S in O
-        - If S's length < 2, skip
+        - NOTES, NO set-size filter: under tie bucketing a level's set can be a
+          singleton, ie the matmul gives {lhs} @ iterN and {rhs} @ iterM, a
+          length >= 2 filter would wrongly drop them
         - For all elements e in S
           - If e has ONLY 1 dimension access, ignore it
           - Otherwise add it into CS
