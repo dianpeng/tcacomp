@@ -37,11 +37,12 @@ func init() {
 // the as-order riding a trailing As node. The pass rewrites it into
 // data-dependency form:
 //
-//	one Iter per as-dim, bounded by TensorDimOf(<first pairing's tensor>,
-//	<axis>), init/step 0/1 (D5);
-//	one InductionVariable per dim (interned: a dim shared by several loads
-//	yields ONE iv, first-wins);
-//	each MemLoad axis slot rewired to the dim's iv;
+//	per as-order chain position, materialize DimVar -> BoundedDimVar(TensorDimOf
+//	<first pairing's tensor, axis>) -> Iter(biv, parent), interned per
+//	(dim, parent-chain-position): shared prefixes fuse at construction,
+//	differing as-orders stay separate nests for GVN to decide; one
+//	InductionVariable per record; MemLoad axes resolve through the
+//	cluster-local chain;
 //	each project-bearing stage input slot rewired to the cluster's input
 //	def directly;
 //	projects and processed clusters erased.
@@ -68,11 +69,36 @@ func (LowerPass) Produces() opt.Stage { return opt.StageConstructed }
 // Preserved: nothing — every analysis is invalidated.
 func (LowerPass) Preserved() []string { return nil }
 
-// dimLowering is the per-dim interned triple of the Iter format.
+// dimKey is the interning key of a lowered (dim, chain-position) pair:
+// the dim node plus its chain parent's iter (nil for a chain root). A
+// dim heading two clusters' chains interns to ONE nest node (shared
+// prefix); the same dim at DIFFERENT chain positions lowers to separate
+// nest nodes (different parents — different loops).
+type dimKey struct {
+	dim    *ir.Base
+	parent *ir.Base // nil when the dim heads the as-order chain
+}
+
+// dimLowering is the per-(dim, parent) interned nest record: the value
+// objects DimVar(dim, 0, 1) -> BoundedDimVar(dv, TensorDimOf(first
+// pairing)) -> Iter(biv, parent), plus the InductionVariable the load
+// axes resolve to. All pure FamilyAbstract value objects — GVN-CSE-able,
+// so equal chains across clusters collapse after lowering.
 type dimLowering struct {
+	dv   ir.Node
 	tdim ir.Node
+	biv  ir.Node
 	iter ir.Node
 	iv   ir.Node
+}
+
+// clusterLowering is one processed cluster's resolution state: the
+// cluster node (for sweeps 2a/3) plus the cluster-LOCAL dim->record
+// chain. Sweep 2a resolves each MemLoad axis through THIS map — never
+// the global (dim,parent) table.
+type clusterLowering struct {
+	cluster ir.Node
+	byDim   map[*ir.Base]*dimLowering
 }
 
 // Run performs the lowering over the Level-1 sea. Gates first (nil and
@@ -82,12 +108,14 @@ type dimLowering struct {
 //
 //	(1) per cluster with projecting maps: derive the ordered dim list from
 //	    the projecting maps' As operands (map allocation order, As order,
-//	    dedup), intern the TensorDimOf/Iter/InductionVariable triple per
-//	    dim (first MemLoad axis pairing wins), fail closed on a dim no
-//	    axis covers;
-//	(2) rewire every processed cluster's MemLoad axis slots to their dim's
-//	    iv, and every project's uses to the project's cluster input def
-//	    (bounds-checked, fail closed);
+//	    dedup), then walk it as the NESTING chain — each dim materializes
+//	    DimVar(dim,0,1) -> BoundedDimVar(dv, TensorDimOf(first pairing))
+//	    -> Iter(biv, parent=previous position's iter), interned per
+//	    (dim, parent) so shared prefixes fuse across clusters — failing
+//	    closed on a dim no axis covers;
+//	(2) rewire every processed cluster's MemLoad axis slots through the
+//	    CLUSTER-LOCAL chain to their record's iv, and every project's uses
+//	    to the project's cluster input def (bounds-checked, fail closed);
 //	(3) erase the projects (now use-free), then the processed clusters —
 //	    Erase refusals propagate (a hybrid graph still piping a cluster
 //	    surfaces the refusal; never force-erase).
@@ -137,11 +165,11 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 
 	mctx := &ir.MutContext{Pass: "simplify-lower"}
 
-	// Interning tables for the Run: one lowering per dim node, shared
-	// const0/const1 (TF32 per the DimVar test convention, D5) — created
-	// LAZILY on the first lowered dim so legacy no-op graphs allocate
-	// nothing.
-	lowered := make(map[*ir.Base]*dimLowering)
+	// Interning table for the Run: one lowering per (dim, parent) key,
+	// shared const0/const1 (TF32 per the DimVar test convention, D5) —
+	// created LAZILY on the first lowered dim so legacy no-op graphs
+	// allocate nothing.
+	lowered := make(map[dimKey]*dimLowering)
 	var const0, const1 ir.Node
 
 	// memLoadInputs returns the cluster's MemLoad input defs, in input order.
@@ -155,32 +183,34 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 		return loads
 	}
 
-	// lowerDim interns (or returns) the triple for dim, bound by the given
-	// first pairing (tensor, axisIdx).
-	lowerDim := func(dim, tensor ir.Node, axisIdx int) *dimLowering {
-		if dl, ok := lowered[dim.BasePtr()]; ok {
+	// lowerDim interns (or returns) the record for dim at chain position
+	// parent (nil = the chain root), bound by the given first pairing
+	// (tensor, axisIdx).
+	lowerDim := func(dim, parent, tensor ir.Node, axisIdx int) *dimLowering {
+		key := dimKey{dim: dim.BasePtr()}
+		if parent != nil {
+			key.parent = parent.BasePtr()
+		}
+		if dl, ok := lowered[key]; ok {
 			return dl
 		}
 		if const0 == nil {
 			const0 = g.NewConst("simplify-lower", ir.InternScalar(ir.TF32), 0)
 			const1 = g.NewConst("simplify-lower", ir.InternScalar(ir.TF32), 1)
 		}
-		tdim := g.NewTensorDimOf("simplify-lower", tensor, axisIdx)
-		// MINIMAL formation compliance (quick-261020-b4f Task 2): build the
-		// value-object chain inline so the package compiles against the
-		// (biv, parent?) constructor. The real chain/keying work —
-		// (dim, parent)-interned nest wiring — lands in Task 3.
-		dv := g.NewDimVar("simplify-lower", dim, const0, const1)
-		biv := g.NewBoundedDimVar("simplify-lower", dv, tdim)
-		iter := g.NewIter("simplify-lower", biv, nil)
+		dv := g.NewDimVar("simplify-lower", dim, const0, const1)    // normalized IV: (0, 1)
+		tdim := g.NewTensorDimOf("simplify-lower", tensor, axisIdx) // the learned max (first pairing)
+		biv := g.NewBoundedDimVar("simplify-lower", dv, tdim)       // ((iv tuple), Max)
+		iter := g.NewIter("simplify-lower", biv, parent)            // the wired header
 		iv := g.NewInductionVariable("simplify-lower", iter)
-		dl := &dimLowering{tdim: tdim, iter: iter, iv: iv}
-		lowered[dim.BasePtr()] = dl
+		dl := &dimLowering{dv: dv, tdim: tdim, biv: biv, iter: iter, iv: iv}
+		lowered[key] = dl
 		return dl
 	}
 
-	// Sweep 1: derive dims per processed cluster and intern the triples.
-	var processed []ir.Node
+	// Sweep 1: derive dims per processed cluster and intern the wired nest
+	// records.
+	var processed []clusterLowering
 	for _, cl := range clusters {
 		stages := projectingStages[cl.BasePtr()]
 		if len(stages) == 0 {
@@ -261,25 +291,37 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 					dim.BasePtr().ID(), dim.KindOf())
 			}
 		}
+		// The chain wiring (the mechanical core): the as-order IS the
+		// nesting order — dims[0] lowers parentless, dims[i] parented at
+		// dims[i-1]'s iter. First-wins applies per (dim, parent) key: the
+		// first cluster to lower a given (dim, parent) wins the bound
+		// pairing — the deterministic generalization of the shared-dim
+		// rule, so shared prefixes intern across clusters.
+		clLow := clusterLowering{cluster: cl, byDim: make(map[*ir.Base]*dimLowering, len(dims))}
+		var parentIter ir.Node
 		for i, dim := range dims {
-			lowerDim(dim, pairs[i].tensor, pairs[i].axis)
+			dl := lowerDim(dim, parentIter, pairs[i].tensor, pairs[i].axis)
+			clLow.byDim[dim.BasePtr()] = dl
+			parentIter = dl.iter
 		}
-		processed = append(processed, cl)
+		processed = append(processed, clLow)
 	}
 
-	// Sweep 2a: rewire each processed cluster's MemLoad axis slots whose
-	// def has an interned iter to the dim's iv.
-	for _, cl := range processed {
-		for _, ld := range memLoadInputs(cl) {
+	// Sweep 2a: rewire each processed cluster's MemLoad axis slots to the
+	// CLUSTER-LOCAL chain record's iv — a dim can hold several (dim,
+	// parent) records across clusters, so resolution goes through
+	// clusterLowering.byDim, never the global table.
+	for _, pl := range processed {
+		for _, ld := range memLoadInputs(pl.cluster) {
 			axisDefs := ir.OperandsOf(ld) // snapshot: slots hold these defs now
 			for slot := 1; slot < len(axisDefs); slot++ {
 				dim := axisDefs[slot]
 				if dim == nil {
 					continue
 				}
-				dl, ok := lowered[dim.BasePtr()]
+				dl, ok := pl.byDim[dim.BasePtr()]
 				if !ok {
-					continue // not a lowered dim (e.g. a constant axis): untouched
+					continue // not a lowered dim of THIS cluster's chain (e.g. a constant axis)
 				}
 				for _, u := range ir.UsesOf(dim) {
 					if user := u.User(); user != nil && user.BasePtr() == ld.BasePtr() {
@@ -322,9 +364,9 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 			return fmt.Errorf("simplify-lower: erase project %d: %w", p.BasePtr().ID(), err)
 		}
 	}
-	for _, cl := range processed {
-		if err := mctx.Erase(cl); err != nil {
-			return fmt.Errorf("simplify-lower: erase cluster %d: %w", cl.BasePtr().ID(), err)
+	for _, pl := range processed {
+		if err := mctx.Erase(pl.cluster); err != nil {
+			return fmt.Errorf("simplify-lower: erase cluster %d: %w", pl.cluster.BasePtr().ID(), err)
 		}
 	}
 	return nil
