@@ -33,14 +33,19 @@ for (auto i = 0; i < I; i++) {
 // After tiling rewrite
 
 // [1] tile outside loop
-for (auto i = 0; i < ceil(I/i_tile_size) ; i+=i_tile_size) {
-  for (auto j = 0; j < ceil(J/j_tile_size) ; j+=j_tile_size) {
+//     tile-id enumeration: the between loops count TILES, one iteration per tile,
+//     each tile's base offset is tile_id * tile_size
+for (auto i = 0; i < ceil(I/i_tile_size); i++) {
+  for (auto j = 0; j < ceil(J/j_tile_size); j++) {
     // [2] tile inside loop
+
+    const auto i_offset = i * i_tile_size;
+    const auto j_offset = j * j_tile_size;
 
     // the following materialized tile size for tile loop will save branch and have
     // much better generated code structure.
-    const auto max_tile_size_i = min(i_tile_size, M - i * tile_size);
-    const auto max_tile_size_j = min(j_tile_size, J - j * tile_size);
+    const auto max_tile_size_i = min(i_tile_size, I - i_offset);
+    const auto max_tile_size_j = min(j_tile_size, J - j_offset);
 
     for (auto tile_i = 0; tile_i < max_tile_size_i; tile_i++) {
       for (auto tile_j = 0; tile_j < max_tile_size_j; tile_j++) {
@@ -84,6 +89,14 @@ for (auto i = 0; i < ceil(I/i_tile_size) ; i+=i_tile_size) {
   - Runtime allows **arbitary fine grained slice for different spaces of concurrency**
     - For all spaces of concurrency, we allow multi-dimension style mapping
       - NOT only x/y/z as normal cuda kernel
+  - The map objects are PER-LNT scoped ordinary C++ template objects
+    - Constructed at the very start of the loop nests generated for that LNT
+    - Lifetime is that LNT's scope: once the LNT is done its maps are gone, the
+      next LNT constructs its own remap
+    - This per-LNT remapping is exactly WHY different mappings of the provided
+      totals are needed
+  - The optimization pass guarantees every LNT obeys the SAME constraint bounds
+    and all LNT schedules combined stay under the total upper bounds
 
 ```
 
@@ -122,6 +135,10 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
   // translated loop nest forests
 }
 
+// LNT section #2, ie the next LNT: constructs its OWN fresh maps, LNT #1's
+// GridConcurrencyMap/ThreadMap are out of scope and gone by now
+// ...
+
 ```
 
 - Assignment SMEM/FRAG cache
@@ -131,6 +148,62 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
     - For 2), it is decided implicitly by tile size, not controled by this pass
   - This small pass is responsible for
     - Deciding sets of iterations to own/reuse the cache
+
+  - Cache Tie Semantics
+    - The author's rules, stated normatively
+      - RULE 1, TIE: a cache site is TIED to a specific Iteration of the LNT
+        - The tie IS the placement: the MemLoad is hoisted to sit DIRECTLY ABOVE the
+          tied iteration's loop
+      - RULE 2, WHOLE DIMENSION LOAD: moving a MemLoad UP past an iteration LOSES
+        that iteration's dimension, ie the cache loads that WHOLE dimension
+        - Hoisting past an iteration that indexes the load, ie is in its INS, the
+          cache loads that whole dimension into SMEM at fixed enclosing indices
+        - Hoisting past an iteration NOT in the load's INS is free, footprint unchanged
+      - RULE 3, TILING DEMOTION: tiling automatically demotes the cache from full
+        dimension to a tile of that dimension
+        - At tie time the coverage is the FULL dimension, when loop tiling applies,
+          each covered dimension is automatically demoted from full extent to that
+          dimension's tile_size
+        - The tile size IS the cache size knob, consistent with cache size being
+          decided implicitly by tile size
+    - TWO distinct levels, do NOT fuse them
+      - SET level, MemLoad Overlap Analysis: the innermost REFERENCED Iter
+        - Sets group CO-TRAVERSED loads, ie loads sharing their innermost referenced
+          dimension
+        - This level is candidate grouping + admission filtering only, it is where
+          the set-size >= 2 filter lives
+      - TIE level, per load: the innermost NON-referenced Iter, ie the operational
+        tie rule below
+        - This level is the actual cache placement, whole-dimension coverage and
+          tiling demotion per RULE 1/2/3
+      - Reuse lives ABOVE the set level: the set's co-traversed loads get their
+        caches TIED ABOVE the set level, so the shared innermost sweep, ie the
+        k-sweep, turns into SMEM hits that survive the enclosing sweeps
+
+    - Derived from the rules
+      - Reuse accrues across the tied iteration's sweep and everything inner to it,
+        the cache re-loads once per enclosing iteration
+        - Placement trades covered footprint, product of covered extents, against
+          reload frequency
+      - Operational tie rule: tie(p) = the innermost Iter of the LNT that is NOT in
+        INS(p)
+        - All INS members end up at-or-inside the tie, outer INS members are fixed
+          scalar selections for the whole-dim load
+        - Equivalently, scan the LNT inner -> outer and stop at the first level NOT
+          referenced by the load
+      - Loads whose INS spans the ENTIRE LNT tie above the outermost loop, ie
+        whole-tensor coverage demoted to tiles by RULE 3, allowed, NOT excluded
+      - Worked check, the matmul below, walks BOTH levels
+        - SET level: lhs[m][k] INS = {iterM, iterK} and rhs[n][k] INS = {iterN, iterK}
+          share iterK as innermost referenced -> one set {lhs, rhs} @ iterK, which
+          passes the >= 2 set filter
+        - TIE level, the placements: lhs tie -> iterN
+          - Covers [ · ][K] whole, reloaded per m, reused across n and k
+        - rhs tie -> iterM, above the outermost loop
+          - Covers [N][K] whole, ie the "cover [n][k] 2 dimensions" case
+        - Ie the set admits the co-traversed pair AT iterK, then each load's cache
+          is tied ABOVE: the whole-dim caches at the ties are what turn k-sweep
+          loads into SMEM hits and survive the enclosing sweeps
 
 ```
 // A simple matmul vising pattern
@@ -149,8 +222,10 @@ for (auto m = 0; m < M; m++) {         // <- iterM
 // the SMEM cache must be able to decide that it should place SMEM cache for lhs/rhs
 // in the inner loop. Which need to generate cache placement strategy as following
 //
-// (1) place lhs cache at iterN, since it needs to cover [n][k] 2 dimensions
-// (2) place rhs cache at iterM, since it needs to cover [m][2] 2 dimensions
+// (1) place lhs cache at iterN, it must cover the k dimension, whole, later
+//     demoted to the k tile by tiling
+// (2) place rhs cache at iterM, it must cover the n and k dimensions, [n][k],
+//     whole, later demoted to the n/k tiles by tiling
 //
 // After the tiling, the SMEM's local size will be automatically become tile size for
 // each loop correspondingly
@@ -179,11 +254,14 @@ for (auto m = 0; m < M; m++) {         // <- iterM
       - 1] For all MemLoad in set I
         - Run findINS for each element to obtain each MemLoad corresponding set
       - 2] Setup a result set O
-      - 3] For the LNT, visiting backwards, from inner most Iter node to outer most Iter node
-        - With the given Iter node, scan all element in I
-        - For any MemLoad in I, if it contains a Iter node in its INS, that ValueEqual to current given Iter node
-          - Record it and remove it from I
-        - For all collected MemLoad, it forms a set and insert it into O
+      - 3] Bucket each MemLoad in I at its SET level, ie the innermost REFERENCED level
+        - Scan the LNT's Iter nodes from inner most to outer most
+        - For a MemLoad p in I, its bucket is the FIRST scanned level whose Iter IS
+          in p's INS, ValueEqual membership
+          - Sets group CO-TRAVERSED loads: loads sharing their innermost referenced
+            dimension land in the same set, ie the matmul gives {lhs, rhs} @ iterK
+        - Record it and remove it from I
+        - For all collected MemLoad at the same level, it forms a set and insert it into O
       - 4] O, contains all **different nested loop levels MemLoad set**
       - 5] Return O
 
@@ -191,6 +269,8 @@ for (auto m = 0; m < M; m++) {         // <- iterM
       - Setup a Candidative Set, denoted as CS
       - For each element S in O
         - If S's length < 2, skip
+          - A singleton set = a load with NO co-traversed partner, ie a map that only
+            modifies a single operand -> no reuse at all -> not worth caching
         - For all elements e in S
           - If e has ONLY 1 dimension access, ignore it
           - Otherwise add it into CS
@@ -263,10 +343,27 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
       - 3) For each such assignment, we call it a ParallelSchedule ie PSched
       - 4) For PSched, it must satisfy following constraints
         - (1) At least a single CTA assignment must show up
-        - (2) For each LoC concurrency
-          - 2.1) ALL LoC added for CTA level must be less than CTA.max_loc
-          - 2.2) ALL LoC added for WARP/TRHEADS level must be less than WARP.max_loc
-          - 2.3) ALL LoC for each sequential loop must be 1
+        - (2) LoC concurrency bounds, the thresholds are EXTERNALLY PROVIDED to the pass
+          - Max.cta: total CTA allocation bound, ie gridDim.x
+          - Max.threads_per_cta: total threads per CTA bound, ie blockDim.x
+            - MUST be a multiple of WARP, ie 32
+          - CTA accounting: for one LNT, the total CTA allocation is the PRODUCT of
+            the LoC over all CTA-assigned dimensions
+            - Each CTA owns a tuple of tile ids across those dimensions
+            - Product over all CTA-assigned dims of nCTA_d <= Max.cta
+          - WARP/THREAD accounting: warp groups are DISJOINT whole-warp shards of
+            one CTA's thread budget
+            - Per CTA, SUM over warp-assigned dims of (warp LoC * 32) <= Max.threads_per_cta
+          - Sequential loops keep LoC = 1
+          - EVERY LNT in the kernel is optimized under the SAME bounds
+            - The combined scheduling of ALL LNTs must stay within the total upper
+              bounds, ie gridDim.x / blockDim.x
+            - In v0 LNTs execute sequentially, each remapping the same launch, so
+              this reduces to every LNT individually satisfying the bounds
+          - The one dimensional CUDA mapping, gridDim.x = total # of CTAs and
+            blockDim.x = # of threads per CTA, is a RUNTIME CONTRACT
+            - It is how the per-LNT runtime map objects learn the totals they remap
+            - It is NOT a compiler-side launch decision
         - (3) SMEM constraints
           - The Candidate Set generated by previous analysis pass forms **potential cache site**
           - For each cache, we will ONLY allow **LAST 2 dimensions** for each MemLoad to be promoted as SMEM cache
@@ -291,11 +388,28 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
         - 1) Maximize parallism
         - 2) Maximize SMEM reuse
         - We can use a simple weighted sum
-          - (1) parallism can be given by summation of all LoC
-          - (2) SMEM reuse can be given by 
+          - (1) parallism can be given by summation of all LoC across the assignment
+          - (2) SMEM reuse can be given by GMEM TRAFFIC AVOIDED by the cache decisions
+            - traffic_avoided = SUM over cache sites of
+              bytes_per_tile(site) * (reuse_count(site) - 1)
+              - bytes_per_tile(site) = element size * product of the site's covered
+                tile sizes, AFTER demotion per the Cache Tie Semantics
+              - reuse_count(site) = # of times the cached tile is re-read before
+                reload = PRODUCT over the reuse dimensions, ie the tie level and the
+                inner non-covered loop dims, of ceil(extent_d / tile_d)
+            - Both terms are computed statically from the LNT plus the tie/tile decisions
+            - NOTES: maximize traffic AVOIDED, NOT cache bytes
+              - Footprint is bounded by the budget constraint, it is not an objective
+          - score = parallel_weight * parallelism + reuse_weight * traffic_avoided
+            - Larger is better
 
     - Algorithm to solve the above formentioned optimization problem
       - 1) Using a simple hardcoded search loop
+        - NOTES, depth-limited search: the assignment search runs ONLY over the
+          INNERMOST K consecutive loops of each LNT, K default 5
+          - Every loop OUTSIDE the searched window defaults to SEQUENTIAL, LoC 1,
+            no tile beyond trivial
+          - 3 ^ K with K <= 5 is tractable for flat enumeration
         - 1] Setup a list of preset for each SoC types' LoC
           - A list of CTA LoC
           - A list of Warp LoC
@@ -303,7 +417,7 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
           - 32/64/128/256 etc ...
           - U can using # of potential cache to heuristically infer different sets to search tile_size
         - 3] Hardcoded loop for each iteration for SoC assignment
-          - for (all loops in loop nest)
+          - for (all loops in the innermost-K window of the loop nest)
             - for (all SoC types) // sequential, CTA, WARP/THREAD
 
         - Sample code
@@ -311,27 +425,29 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
 ```
 
 // for each permutation of thread x SoC type
+// NOTE, only the INNERMOST K consecutive loops per LNT are searched, K default 5,
+// all outer loops default to sequential, so 3 ^ K with K <= 5 is tractable
 for (auto each_sched in psched) { // an incremental permutation iterator that dumps 3 ^ K solution space
 
-  if (is_feasiable(each_sched)) continue; // checking feasibility
+  if (!is_feasiable(each_sched)) continue; // checking feasibility
 
   // (1) calculating parallism
   auto p = 0;
   for (auto soc in each_sched) {
-    p += get_soc(p); // obtain a iteration corresponding SoC's LoC value
+    p += loc_of(soc); // obtain a iteration corresponding SoC's LoC value
   }
 
-  // (2) calculating SMEM
-  auto total_cache = 0;
+  // (2) calculating GMEM traffic avoided, ie SMEM reuse
+  auto traffic_avoided = 0;
   for (auto cache_cand in candidate_set) {
-    total_cache += get_cache(each_sched, cache_cand); // based on schedule, decide a cache cand's SMEM/FGRA size in bytes
+    traffic_avoided += get_traffic_avoided(each_sched, cache_cand); // bytes_per_tile(site) * (reuse_count(site) - 1), computed statically from LNT + tie/tile decisions
   }
 
   // (3) weighted sum
-  auto score = cache_weight * total_cache + parall_weight * p;
+  auto score = parallel_weight * p + reuse_weight * traffic_avoided;
   if (score > current_max_score) {
     current_max_score = score;
-    currrent_sched  = each_sched;
+    current_sched = each_sched;
   }
 }
 
@@ -384,6 +500,11 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
         - For WARP/Thread, same thing
       - After the numbering pass, each CTA and WARP/THREADs SoC object will have its designated dimension binding
       - The **dimension of SoC** is denoted as DoSoC
+      - The per-LNT counters are correct BECAUSE the runtime maps are per-LNT scoped
+        - Dimension indices are LNT-local, they are consumed by that LNT's
+          IntrinsicGridMap/IntrinsicThreadMap nodes only
+        - No cross-LNT collision: two LNTs both using CTA dimension 0 bind to
+          DIFFERENT map object instances, they never alias
 
 - Mechanical rewrite for tiling
   - Rewrite the loop to tile loop is straitforward
@@ -433,24 +554,24 @@ for (auto a = 0; a < A; a++) {
 
 // (1) sequential loop
 
-// (1.1) tile between part
-for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
-  for (auto b = 0; b < ceil(B/tile_size_b); b += tile_size_b) {
+// (1.1) tile between part, tile-id enumeration: a/b count TILES
+for (auto a = 0; a < ceil(A/tile_size_a); a++) {
+  for (auto b = 0; b < ceil(B/tile_size_b); b++) {
 
     // (1.2) tile inside part
+    const auto a_tile_offset = a * tile_size_a;
     const auto a_tile_max = min(
       tile_size_a,
-      A - tile_size_a * a,
+      A - a_tile_offset,
     );
-    const auto a_tile_offset = a * tile_size_a;
-      
+
     for (auto a_tile = 0; a_tile < a_tile_max; a_tile++) {
 
-      const auto b_tile_max = min(
-        tile_size_a,
-        B - tile_size_b * b,
-      );
       const auto b_tile_offset = b * tile_size_b;
+      const auto b_tile_max = min(
+        tile_size_b,
+        B - b_tile_offset,
+      );
 
       for (auto b_tile = 0; b_tile < b_tile_max; b_tile++) {
         mem[a_tile_offset + a_tile][b_tile_offset + b_tile]
@@ -466,7 +587,9 @@ for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
 
 // notes the only difference here
 //
-// [1] the tile between part's stripe, needs to factor in level of concurrency
+// [1] the tile between part is a tile-id enumeration driven by the grid map: each
+//     CTA's grid_map index IS its tile id, the stride is the map dimension, ie
+//     the CTA LoC of this dimension
 // [2] the tile inside part, since CTA will implicitly assigned with a WARP schedule
 //     which means that part needs to count in the WARP schedule, ie the stride in the
 //     tile will factor in WARP's level of concurrency
@@ -498,26 +621,32 @@ for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
 //
 // For simplicity, we use grid_map<DoSoC> to represent corresponding grid_map runtime object
 
+// tile between part: tile-id enumeration driven by the grid map
 for (
-  auto a = 0;
+  auto a = grid_map<IterA.CTA.DoSoC>.index;
   a < ceil(A/tile_size_a);
-  a += tile_size_a * grid_map<IterA.CTA.DoSoC>.dimension
+  a += grid_map<IterA.CTA.DoSoC>.dimension
 ) {
 
   // (1.2) tile inside part
+  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - tile_size_a * a,
+    A - a_tile_offset,
   );
 
-  const auto a_tile_offset = grid_map<IterA.CTA.DoSoC>.index * tile_size_a;
-
+  // thread-parallel strided walk over the tile, the WARP half of the CTA assignment
+  // nThreads = total # of threads mapped to this dimension, ie warp LoC * 32
   for (
       auto a_tile = 0;
-      a_tile < tile_size_a;
-      a += warp_loc * 32 * thread_map<IterA.WARP.DoSoC>.dimension
+      a_tile < a_tile_max;
+      a_tile += nThreads
   ) {
-    const auto a_index = a_tile_offset + thread_map<IterA.WARP.DoSoC>.index;
+    const auto a_index = a_tile_offset + a_tile + thread_map<IterA.WARP.DoSoC>.index;
+
+    // notes, on a tail tile some threads' a_index can exceed A: per-element bounds
+    // guarding is handled by the predication discipline (one basic block), open
+    // item from the review (F11), not specced here
 
     ...
     // notes, the memory access within the tile is of same shape, ie using the
@@ -538,49 +667,30 @@ for (
 //
 // Notes, for each **LNT, it will have its corresponding runtime mapping object described
 // before to remap the grid dimension and thread/cta dimension based on the LNT scheduling
-// **
-// 2 runtime object will be provided, using special IRNode to access it,
-//
-// The IR node must provide corresponding object for the IR graph to use it
-//
-// List of new IR nodes
-//
-// [1] IntrinsicGridMap(<DoSoC for the SoC>, <name of field>)
-//
-//     - get the index of the grid_map: IntrinsicGridMap(<DoSoC>, "index")
-//     - get the dimension of the grid_map, ie all CTA #: IntrinsicGridMap(<DoSoC>, "dimension")
-//       - ie LoC for the corresponding assigned CTA SoC
-//
-//
-// [2] IntrinsicThreadMap(<DoSoC for the SoC>, <name of field>)
-//
-//     - get the index of thread_map: IntrinsicThreadMap(<DoSoC>, "index")
-//     - get the dimension of thread_map, ie all thread #: IntrinsicThreadMap(<DoSoC>, "dimension")
-//       - ie LoC for the corresponding assigned Thread SoC
-//
-//
-// For simplicity, we use grid_map<DoSoC> to represent corresponding grid_map runtime object
+// The IntrinsicGridMap/IntrinsicThreadMap IR node list is the SAME as listed in the
+// CTA section above, not repeated here
 
+// tile between part: tile-id enumeration driven by the thread map, same form as
+// the CTA case but via thread_map, each thread group's map index IS its tile id
 for (
-  auto a = 0;
+  auto a = thread_map<IterA.DoSoC>.index;
   a < ceil(A/tile_size_a);
-  a += tile_size_a * thread_map<IterA.DoSoC>.dimension
+  a += thread_map<IterA.DoSoC>.dimension
 ) {
 
   // (1.2) tile inside part
+  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - tile_size_a * a,
+    A - a_tile_offset,
   );
-
-  const auto a_tile_offset = thread_map<IterA.DoSoC>.index * tile_size_a;
 
   // loop must be sequential here. The allocation is really per tile/stride is assigned
   // to a thread, within that tile/stride, it is sequential again
   for (
       auto a_tile = 0;
-      a_tile < tile_size_a;
-      a++
+      a_tile < a_tile_max;
+      a_tile++
   ) {
     const auto a_index = a_tile_offset + a_tile;
 
