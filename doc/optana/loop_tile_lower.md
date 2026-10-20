@@ -73,8 +73,10 @@
   - (b) parallel-inside loops (CTA-companion warp inside loops, warp loops)
     - the strided tile coverage of [0, a_tile_max) is normative
     - the materialized uniform bound is normative
-    - the TAIL-GUARD MECHANISM (how per-thread out-of-range elements are
-      suppressed) is OPEN — see §4; nothing here may assume an answer
+    - the TAIL-GUARD is the loop primitive's OWN bailout — RESOLVED (§4,
+      ruled 2026-10-20): the thr_loop materialization checks the offset
+      global index against the allowed iteration space and skips the WHOLE
+      body as a no-op; the compiler emits no guard and no branch
   - (c) every generated loop is emitted as LIR KindForLoop
     - so the NEXT pipeline stage (scheduling, which includes LICM) can hoist
       the tile-bound min/ceildiv expressions out of the tile loops
@@ -98,69 +100,81 @@
     - typeinfer rule for each new builtin
     - codegen mapping
 
-## §4 OPEN DESIGN — Control Flow / Parallel Tails (Issue #1)
+## §4 Loop Materialization & Parallel Tails (Issue #1 — RESOLVED 2026-10-20)
 
-- STATUS: OPEN, author-designated SERIOUS, explicitly UNDECIDED
-  - This section is an open-questions register, NOT a decision record
-  - No resolution is baked in anywhere in this spec; every tail-dependent
-    obligation elsewhere cross-references this section instead of assuming
-- Ground that is D1-independent (NORMATIVE — safe regardless of resolution)
-  - (a) parallel tile-inside loops cover [0, a_tile_max) as a STRIDED range of
-    the tile; per-thread element counts differ whenever a_tile_max is not a
-    multiple of nThreads
-    - two sources of raggedness: remainder tiles (extent not divisible by tile
-      size) and non-divisible full tiles (a_tile_max not divisible by nThreads)
-  - (b) the materialized uniform bound a_tile_max = min(T, A − offset) clamps
-    the tile extent AND the global extent into ONE comparison
-    - whatever mechanism guards tails can be expressed against this bound
-- The five open facets
-  - Q1 IR model
-    - Question: does v0 stay strictly one-BB (predication-only), or does real
-      control flow enter the IR later?
-    - Option space: one-BB permanent (tails ride predication only) vs one-BB
-      provisional (branches arrive in a later IR version)
-    - Consequence: whether the verifier/scheduler/one-BB invariants are
-      permanent commitments or provisional scaffolding — the largest-scoped
-      consequence of the five
-  - Q2 Uniformity
-    - Question: are CTA-uniform trip counts a HARD invariant, or may threads
-      diverge in iteration count?
-    - Option space: hard invariant (every thread of the CTA executes the same
-      trip count) vs relaxed (ragged participation allowed)
-    - Consequence: the collective/reducer model depends on uniform trip counts;
-      relaxing them reopens the deadlock-freedom argument for CTA-scope calls
-  - Q3 Mask ownership
-    - Question: who owns the active predicate — the compiler (KindSelect
-      wrapping, value-level) or the runtime (bounds-checked tile ops,
-      effect-level)?
-    - Option space: compiler-owned value masks; runtime-owned effect guards;
-      split ownership (values by compiler, effects by runtime)
-    - Consequence: pure values and effects may have DIFFERENT owners; decides
-      how much of the guard appears in the IR at all
-  - Q4 Effects
-    - Question: a predicated GMEM STORE cannot be expressed as a value-select —
-      is a masked/bounds-checked store variant a runtime-API obligation?
-    - Option space: runtime bounds-checked store variant; masked-store
-      intrinsic; excluding direct GMEM stores from parallel tails
-    - Consequence: the runtime API surface and what the compiler must
-      guarantee about store operands in tail iterations
-  - Q5 Collectives
-    - Question: are Init/Combine/cooperative tile ops executed
-      UNCONDITIONALLY by every thread, with inactive lanes contributing
-      identity?
-    - Option space: unconditional execution (ragged warp participation =
-      undefined) vs conditional execution with defined ragged semantics
-    - Consequence: the uniform-call rule of §6/§7bis and the reducer
-      contribution semantics for inactive lanes
-- Separability
-  - Q2–Q5 are separable from Q1: mask ownership (Q3), effect guarding (Q4),
-    and collective rules (Q5) can each be decided while keeping one-BB (Q1
-    still open)
-- What this spec does while Q1–Q5 are open
-  - Bounds (§3), DoSoC numbering (§2), intrinsics (§5), cache insertion (§6)
-    are D1-independent and normative as written
-  - The cache copy lowering (§6) references the uniform bound WITHOUT
-    specifying the tail-guard mechanism
+- RULING: the bounds bailout is an operation of the RUNTIME LOOP
+  MATERIALIZATION, NOT of the IR
+  - The pass lowers loops to three primitive forms
+    - thr_loop — thread-parallel element loop; its materialization checks
+      whether the offset global index lies within the allowed iteration
+      space; out-of-range iterations become a NO-OP for the ENTIRE iteration
+      body (whole-body skip, compiler-inlined pure computation included)
+    - cta_loop — CTA-parallel tile loop; EXACT by launch construction
+      (grid = ceil(ext/T), every launched CTA owns a tile) — no bailout
+      needed; a multi-tile grid-stride variant adds only a CTA-uniform
+      tile-id comparison
+    - seq_loop — single-thread sequential; native bounds, no cross-thread
+      concerns
+  - Branches NEVER enter the IR: divergence exists only inside the
+    materialized loop primitives of the generated code
+  - Generated shape: the body is wrapped AS A UNIT (thr_loop(map, lo, hi,
+    body)); codegen may inline the guard into the primitive's fixed template
+    or emit the body as a __device__ function — the unit of no-op is the
+    WHOLE body, never individual ops
+- Uniformity: CTA-uniform trip counts remain the HARD invariant, enforced by
+  construction
+  - The bailout lives INSIDE a loop whose iteration count every thread of the
+    group agrees on (ceil(tile_max / nThreads))
+  - The scaffolding stays convergent; only bodies diverge; the next iteration
+    reconverges
+- Layering constraint (tile-level vs element-level) — REQUIRED for soundness
+  - Tile-level cooperative ops (SMEM buffer fill, tile store-back) are
+    emitted OUTSIDE the bailing element loop — a cooperative loadtile needs
+    ALL threads of the group to participate (this is how a partial tile gets
+    filled), with bounds CLAMPING inside the loader
+  - Element-level ops live inside the bailing thr_loop body
+  - A cooperative tile op emitted inside a thr_loop body is a spec violation
+- Mask contract (the "sane mask" rule for warp-synchronous operations)
+  - __shfl_down_sync(mask, ...) is UB if any lane named in mask does not
+    execute the instruction — a naive full-warp mask on a tail iteration is
+    exactly the deadlock/UB case
+  - thread_map is the SINGLE supplier of masks: ANY runtime object that needs
+    a participation mask gets it from the map
+  - Sane-mask properties (all three REQUIRED)
+    - EXACT — names precisely the lanes that will execute the collective
+    - UNIFORMLY DERIVED — computed only from map-uniform quantities (base,
+      tile_max), so lanes can never disagree about the mask; disagreement is
+      the actual UB mechanism
+    - PER-ITERATION — a function of the CURRENT iteration's (base, tile_max),
+      read from loop-scaffolding state, not a loop-invariant
+  - Closed form: ownership is lane-strided and the bound is warp-uniform, so
+    the active set is always a LANE PREFIX
+    - mask = (tile_max − base ≥ 32) ? 0xFFFFFFFF : ((1u << (tile_max − base)) − 1)
+    - pure arithmetic — NO __ballot_sync/__activemask needed to derive it;
+      deterministic, divergence-proof, CPU-testable
+  - Full-warp fast path: within a full tile the mask is 0xFFFFFFFF — the
+    warp-multiple LoC rule guarantees non-tail iterations get the fast path
+    for free
+  - Warp down-reduce over a prefix mask uses the standard tree pattern
+    (boundary lanes may pull undefined values from outside the mask; only
+    lane 0's accumulation is consumed)
+- Reducer placement (composes with the above)
+  - Init BEFORE the element loop; Combine AFTER it
+  - Warp down-reduce at Combine time runs over the OWNERSHIP mask (which
+    lanes own ≥ 1 partial) — also a prefix, since accumulation is
+    lane-strided
+- Resolution of the former open facets
+  - Q1 IR model: one-BB is PERMANENT — control flow exists only inside
+    runtime-materialized loop primitives, never in the IR
+  - Q2 uniformity: hard invariant, enforced by the primitive's structure
+  - Q3 mask/guard ownership: the loop materialization owns it — wholesale
+    body skip; NO compiler predication at all (not even KindSelect wrapping)
+  - Q4 predicated stores: DISSOLVED — an element-level store inside a bailing
+    body does not execute; only tile-level loaders need internal clamping
+    (layering constraint above)
+  - Q5 collectives: tile-level collectives UNCONDITIONAL (outside the bailout
+    scope); warp-level shuffles use EXACT map masks; together these give
+    deadlock freedom
 
 ## §5 Intrinsic Nodes
 
@@ -232,8 +246,8 @@
 
 - Dynamic shapes
   - Tile/group sizes are compile-time constants
-  - Extents may be runtime values — handled by the remainder guard + §4
-    predication (mechanism open there)
+  - Extents may be runtime values — handled by the remainder guard + the §4
+    thr_loop bailout (whole-body skip in the loop materialization)
 - Cross-LNT sites
   - Dedupe candidate sites kernel-wide by MemLoad node identity
   - A load whose INS spans multiple LNTs is evaluated against the UNION of the
@@ -268,8 +282,12 @@
   - Visibility: SMEM writes visible to the whole CTA after the op returns
   - Reuse safety: a refill waits for prior reads (write-after-read)
   - Store ordering
-  - Bounds checking — this is where Issue #1's effect-guarding physically
-    lives; mechanism OPEN per §4
+  - Bounds checking — element-level guarding physically lives in the §4
+    thr_loop bailout; tile-level partial-tile clamping lives INSIDE the
+    cooperative loaders (both RULED per §4)
+  - Masks: warp-synchronous runtime ops obtain participation masks from
+    thread_map only, per the §4 mask contract (exact, uniformly derived,
+    per-iteration)
   - Uniform call: cooperative ops called by every thread of the CTA the same
     number of times
 - Sync ownership (RULED)
@@ -292,5 +310,6 @@
     (offset + inside) form — no stale original-IV uses remain
   - Every FRAG site satisfies the fully-unroll condition (§6)
   - The budget fallback terminates (§6)
-  - Every D1-dependent obligation is cross-referenced to the §4 open register
-    rather than asserted as decided
+  - Every parallel-inside loop lowers to thr_loop carrying the §4 bailout
+  - No cooperative tile op sits inside a bailing element loop (§4 layering)
+  - Every warp-synchronous op's mask comes from thread_map (§4 mask contract)
