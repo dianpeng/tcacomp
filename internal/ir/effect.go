@@ -1,5 +1,7 @@
 package ir
 
+import "slices"
+
 // This file is the side-effect model of the two-level IR (quick-261017-vdj,
 // tinycudaopto skeleton effect.go/memory.go adapted tcacomp-local — reference
 // only, NOT an import).
@@ -127,9 +129,33 @@ func ImpactBy(n Node) []SSAUse {
 
 // effectBearer is implemented by nodes carrying ImpactBy effect inputs; the
 // payloadBearer enumeration exposes the same records to the verifier and
-// Walk, this accessor exposes them to scheduling and tests.
+// Walk, this accessor exposes them to scheduling and tests, and the removal
+// hook lets the MutContext.RemoveImpactBy choke point drop one record by
+// identity (quick-261020-ejf condition C3) — the effect-chain twin of
+// operandList.removeSlot.
 type effectBearer interface {
 	impactBy() []SSAUse
+	// removeImpactUse drops the effectIns handle whose record identity
+	// matches u.rec, reporting whether one was held. Only the HANDLE COPY
+	// is dropped (CR-01/CR-02): the record's life cycle belongs to the
+	// choke point that calls this hook.
+	removeImpactUse(u SSAUse) bool
+}
+
+// dropImpactHandle is the shared body of every bearer's removeImpactUse: a
+// record-identity scan over the bearer's effectIns slice, mirroring
+// operandList.removeSlot's slices.Delete drop of a handle copy.
+func dropImpactHandle(ins *[]SSAUse, u SSAUse) bool {
+	if u.rec == nil {
+		return false
+	}
+	for i, s := range *ins {
+		if s.rec == u.rec { // record-identity comparison
+			*ins = slices.Delete(*ins, i, i+1)
+			return true
+		}
+	}
+	return false
 }
 
 // Env is the construction-time side-effect environment (skeleton memory.go's
