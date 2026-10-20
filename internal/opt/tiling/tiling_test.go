@@ -518,25 +518,31 @@ func TestRunMutatesNothing(t *testing.T) {
 }
 
 // TestRegistryOrder pins the default pipeline position: tiling (114) lands
-// immediately after memopt-verify (113). The memopt sub-module is imported
-// directly — the same registration opt/all accumulates (opt/all itself
-// cannot be imported from this package-internal test: import cycle).
+// immediately after memopt-verify (113), and tiling-verify (115)
+// immediately after tiling. The memopt sub-module is imported directly —
+// the same registration opt/all accumulates (opt/all itself cannot be
+// imported from this package-internal test: import cycle).
 func TestRegistryOrder(t *testing.T) {
 	_ = memopt.Pass{} // side import: fires memopt + memopt-verify registration
 	pipe := opt.BuildPipeline()
-	mv, til := -1, -1
+	mv, til, tv := -1, -1, -1
 	for i, p := range pipe {
 		switch p.ID() {
 		case "memopt-verify":
 			mv = i
 		case "tiling":
 			til = i
+		case "tiling-verify":
+			tv = i
 		}
 	}
-	if mv < 0 || til < 0 {
-		t.Fatalf("default pipeline missing memopt-verify (%d) or tiling (%d)", mv, til)
+	if mv < 0 || til < 0 || tv < 0 {
+		t.Fatalf("default pipeline missing memopt-verify (%d), tiling (%d), or tiling-verify (%d)", mv, til, tv)
 	}
 	if til != mv+1 {
 		t.Fatalf("tiling (index %d) must land immediately after memopt-verify (index %d)", til, mv)
+	}
+	if tv != til+1 {
+		t.Fatalf("tiling-verify (index %d) must land immediately after tiling (index %d)", tv, til)
 	}
 }
