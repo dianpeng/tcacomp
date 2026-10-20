@@ -370,10 +370,11 @@ func forwardLoad(mctx *ir.MutContext, se sideeffect.SideEffects, l ir.Node) (boo
 // one walk. An unequal-position store is walked PAST — sound under the
 // restrict-alias rule: any later load whose coordinate aliases s0's must
 // also alias s's, and s is later (the review's argument 2).
-func eliminateShadowedStores(mctx *ir.MutContext, se sideeffect.SideEffects, s ir.Node) (bool, error) {
+func eliminateShadowedStores(mctx *ir.MutContext, se sideeffect.SideEffects, origin ir.Node) (bool, error) {
 	progress := false
+	cur := origin // the walk cursor; origin stays the comparison anchor
 	for {
-		edges := ir.ImpactBy(s)
+		edges := ir.ImpactBy(cur)
 		if len(edges) != 1 {
 			return progress, nil // chain head reached, or a forked region
 		}
@@ -384,8 +385,8 @@ func eliminateShadowedStores(mctx *ir.MutContext, se sideeffect.SideEffects, s i
 		if s0.KindOf() == ir.KindMemLoad {
 			return progress, nil // a read may observe the position
 		}
-		if !sameProvenPath(se, s, s0) {
-			s = s0 // walk PAST the unequal-position store
+		if !sameProvenPath(se, origin, s0) {
+			cur = s0 // walk PAST the unequal-position store
 			continue
 		}
 		var pred ir.Node

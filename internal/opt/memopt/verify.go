@@ -161,9 +161,10 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 // one remains: walking s's ImpactBy backwards, the first load stops the
 // walk (it may read the position), and any store reached with the same
 // proven path (only stores in between, C2b) should have been erased.
-func shadowingStoreBehind(se sideeffect.SideEffects, s ir.Node) (ir.Node, bool) {
+func shadowingStoreBehind(se sideeffect.SideEffects, origin ir.Node) (ir.Node, bool) {
+	cur := origin // the walk cursor; origin stays the comparison anchor
 	for {
-		edges := ir.ImpactBy(s)
+		edges := ir.ImpactBy(cur)
 		if len(edges) != 1 {
 			return nil, false
 		}
@@ -174,9 +175,9 @@ func shadowingStoreBehind(se sideeffect.SideEffects, s ir.Node) (ir.Node, bool) 
 		if s0.KindOf() == ir.KindMemLoad {
 			return nil, false
 		}
-		if sameProvenPath(se, s, s0) {
+		if sameProvenPath(se, origin, s0) {
 			return s0, true
 		}
-		s = s0 // walk past the unequal-position store
+		cur = s0 // walk past the unequal-position store
 	}
 }
