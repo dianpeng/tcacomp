@@ -368,11 +368,28 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
         - 1) Maximize parallism
         - 2) Maximize SMEM reuse
         - We can use a simple weighted sum
-          - (1) parallism can be given by summation of all LoC
-          - (2) SMEM reuse can be given by 
+          - (1) parallism can be given by summation of all LoC across the assignment
+          - (2) SMEM reuse can be given by GMEM TRAFFIC AVOIDED by the cache decisions
+            - traffic_avoided = SUM over cache sites of
+              bytes_per_tile(site) * (reuse_count(site) - 1)
+              - bytes_per_tile(site) = element size * product of the site's covered
+                tile sizes, AFTER demotion per the Cache Tie Semantics
+              - reuse_count(site) = # of times the cached tile is re-read before
+                reload = PRODUCT over the reuse dimensions, ie the tie level and the
+                inner non-covered loop dims, of ceil(extent_d / tile_d)
+            - Both terms are computed statically from the LNT plus the tie/tile decisions
+            - NOTES: maximize traffic AVOIDED, NOT cache bytes
+              - Footprint is bounded by the budget constraint, it is not an objective
+          - score = parallel_weight * parallelism + reuse_weight * traffic_avoided
+            - Larger is better
 
     - Algorithm to solve the above formentioned optimization problem
       - 1) Using a simple hardcoded search loop
+        - NOTES, depth-limited search: the assignment search runs ONLY over the
+          INNERMOST K consecutive loops of each LNT, K default 5
+          - Every loop OUTSIDE the searched window defaults to SEQUENTIAL, LoC 1,
+            no tile beyond trivial
+          - 3 ^ K with K <= 5 is tractable for flat enumeration
         - 1] Setup a list of preset for each SoC types' LoC
           - A list of CTA LoC
           - A list of Warp LoC
@@ -380,7 +397,7 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
           - 32/64/128/256 etc ...
           - U can using # of potential cache to heuristically infer different sets to search tile_size
         - 3] Hardcoded loop for each iteration for SoC assignment
-          - for (all loops in loop nest)
+          - for (all loops in the innermost-K window of the loop nest)
             - for (all SoC types) // sequential, CTA, WARP/THREAD
 
         - Sample code
@@ -388,27 +405,29 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
 ```
 
 // for each permutation of thread x SoC type
+// NOTE, only the INNERMOST K consecutive loops per LNT are searched, K default 5,
+// all outer loops default to sequential, so 3 ^ K with K <= 5 is tractable
 for (auto each_sched in psched) { // an incremental permutation iterator that dumps 3 ^ K solution space
 
-  if (is_feasiable(each_sched)) continue; // checking feasibility
+  if (!is_feasiable(each_sched)) continue; // checking feasibility
 
   // (1) calculating parallism
   auto p = 0;
   for (auto soc in each_sched) {
-    p += get_soc(p); // obtain a iteration corresponding SoC's LoC value
+    p += loc_of(soc); // obtain a iteration corresponding SoC's LoC value
   }
 
-  // (2) calculating SMEM
-  auto total_cache = 0;
+  // (2) calculating GMEM traffic avoided, ie SMEM reuse
+  auto traffic_avoided = 0;
   for (auto cache_cand in candidate_set) {
-    total_cache += get_cache(each_sched, cache_cand); // based on schedule, decide a cache cand's SMEM/FGRA size in bytes
+    traffic_avoided += get_traffic_avoided(each_sched, cache_cand); // bytes_per_tile(site) * (reuse_count(site) - 1), computed statically from LNT + tie/tile decisions
   }
 
   // (3) weighted sum
-  auto score = cache_weight * total_cache + parall_weight * p;
+  auto score = parallel_weight * p + reuse_weight * traffic_avoided;
   if (score > current_max_score) {
     current_max_score = score;
-    currrent_sched  = each_sched;
+    current_sched = each_sched;
   }
 }
 
