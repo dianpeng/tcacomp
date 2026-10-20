@@ -231,6 +231,19 @@ func ConstTypeOf(n Node) Type {
 	return nil
 }
 
+// ConstValueOf returns the const's payload value and true, or (0, false)
+// for any other node kind (including nil) — the exported twin of the
+// package-private constValueOf in node_dimvar.go, so analysis passes
+// outside package ir (e.g. the tiling decide pass reading static BIV
+// extents) never assert the concrete node type. Read face only: no new
+// mutation surface.
+func ConstValueOf(n Node) (float64, bool) {
+	if c, ok := n.(*constNode); ok {
+		return c.val, true
+	}
+	return 0, false
+}
+
 // CastTypeOf returns the cast's interned target payload type, or nil for
 // any other node kind.
 func CastTypeOf(n Node) Type {
