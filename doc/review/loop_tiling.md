@@ -352,11 +352,11 @@ fully tests for this dedicated goal") — but its own Cache Mark section (L352�
 records ONLY `MemLoad.ctaCache`, so as written the split cannot work: the rewrite needs
 more state than one mark.
 
-### 5.1 State that must cross the pass boundary
+### 5.1 State that must cross the pass boundary (finding F14)
 
 | State | Producing pass | Consumed by | Storage recommendation |
 |---|---|---|---|
-| SoC type per Iter (CTA/WARP/seq) | tiling-decide | DoSoC numbering + rewrite | side table keyed by BIV node (see 5.2) |
+| SoC type per Iter (CTA/WARP/seq) | tiling-decide | DoSoC numbering + rewrite | side table keyed by BIV node (see below) |
 | LoC per SoC | tiling-decide | rewrite (strides), launch accounting | side table |
 | tile_size per Iter | tiling-decide | rewrite (bounds/offsets), cache sizing | side table |
 | Promoted cache sites + placement level + FRAG/SMEM class | tiling-decide (from §2 analysis + F6 criterion) | smem insertion | side table keyed by MemLoad node id |
@@ -379,7 +379,7 @@ more state than one mark.
   transform between decide and lower, the `Requires` mechanism (`internal/opt/manager.go`
   checkPreconditions) must pin `tile-lower requires tiling` — already enforceable today.
 
-### 5.2 The `ctaCache` field interface risk — settled: GVN is NOT at risk; the choke-point rule is
+### 5.2 The `ctaCache` field interface risk (finding F13) — settled: GVN is NOT at risk; the choke-point rule is
 
 - Doc: L356–L357 ("Refactory MemLoad to include a new field ctaCache… Mark the
   MemLoad's ctaCache to be true").
@@ -402,7 +402,7 @@ more state than one mark.
   IR-visible mark is ever required, add a MutContext choke point for it, following the
   `SetType` precedent.
 
-### 5.3 Pipeline slots — reconciled with doc/opt.md, tca.md, and ROADMAP phases 3–4
+### 5.3 Pipeline slots (finding F15) — reconciled with doc/opt.md, tca.md, and ROADMAP phases 3–4
 
 Three orderings are in tension:
 - `doc/opt.md` L18–L29: … loop tiling → smem/frag insertion → scheduling.
@@ -527,7 +527,7 @@ lives after 5.3) must define, at minimum:
   loop-invariant per tile loop and hoistable, PROVIDED the rewrite emits LIR ForLoop
   (5.3) and PROVIDED the min/ceil primitives exist (F18).
 
-### 6.4 Runtime compatibility
+### 6.4 Runtime compatibility (finding F16)
 
 - The GridConcurrencyMap/ThreadMap runtime objects (target L83–L125) presuppose: (a)
   arbitrary multi-dimensional remap of one normalized 1-D launch; (b) per-LNT map
@@ -551,3 +551,206 @@ lives after 5.3) must define, at minimum:
   101,376 B SMEM ceiling; assert ≥ the 64 KB design budget). The compiler emits code +
   runtime files and does NOT drive nvcc (CLAUDE.md Backend constraint) — the doc's
   runtime objects must ship as runtime-library API, not compiler-side launches.
+
+## 7. Missing but easy to add (user point 5)
+
+Consolidating the gaps from §2–§6 plus the additions below. Each item: what is missing,
+why it matters, the minimal addition.
+
+1. **FRAG/register budget constraint** (F7; target L284–L288 has only the SMEM sum).
+   Matters: FRAG tiles that do not fully unroll spill to local memory — worse than the
+   GMEM load replaced (tca.md §5.8 L608). Minimal addition: a per-thread FRAG-bytes cap
+   (× threads/CTA) beside Max.cache + a "FRAG tile must fully unroll" condition on the
+   promotion criterion.
+2. **min/ceil/max primitives for bound materialization** (F18). Ground:
+   `internal/ir/builtins.go` L21–L28 — the registry has ONLY f32 `fminf`/`fmaxf`; there
+   is no integer min, no ceil, on u32. Matters: every rewrite template materializes
+   `a_tile_max = min(T, A − T*a)` and `ceil(A/T)` (target L441–L453 etc.); without
+   primitives the lower pass cannot build these expressions. Minimal addition: extend the
+   `ir.Builtin` registry with u32 `min`/`max` (+ a `ceildiv` or express ceil via the
+   integer identity `(A + T − 1) / T` using existing BinOp div), add the typeinfer
+   rules, and map them in codegen. This is the same three-place extension pattern as
+   F12's kind additions.
+3. **Determinism / tie-breaking in the search** (F19). Target L332 uses strict `>`
+   (first-max wins) — deterministic ONLY if the enumeration order is deterministic; the
+   3^K iterator is, but any preset lists built from map iteration would not be. Minimal
+   addition: pin "presets are ordered slices; candidate enumeration is allocation-order"
+   and keep strict `>` (also fixes the `currrent_sched` typo, L334). Reproducible builds
+   depend on this.
+4. **Max.cs truncation determinism** (F17; target L197–L198 "If CS contains more than
+   Max.cs # of elements, exit loop"). Matters: truncation-by-iteration-order is only
+   deterministic if the order is pinned. Minimal addition: sort candidates by (LNT root
+   allocation order, level, MemLoad node id) before truncation, then truncate.
+5. **Dynamic-shape policy** (F20). Target treats tile sizes as compile-time constants
+   (L302–L304) while `TensorDimOf` bounds are runtime values
+   (`doc/optana/lower_itercluster.md` L113). Minimal addition: state tca.md §5.7.6 L544's
+   existing policy verbatim — tile/thread-group sizes are compile-time constants;
+   extents may be dynamic and are handled by the remainder guard + predication (F11).
+   The parametric-tile alternative is future work, not needed now.
+6. **Multi-LNT grid accounting** (F5). Minimal addition: the kernel-global DoSoC
+   namespace + budget allocator (tca.md §5.7.1 percentage sharding) before the
+   numbering pass.
+7. **Search-space guardrail** (F9). Minimal addition: prefix-pruned DFS binding with an
+   evaluation cap (e.g. 10^5 scored schedules per LNT, deterministic early exit) until
+   the MIP backend lands.
+8. **LNT-depth guard**: the doc assumes a depth-K nest; the union algorithm's step (3)
+   walk (L182–L187) is O(|I| × K) — fine; but the search's 3^K (L314) needs a stated
+   K cap (e.g. K ≤ 8) with a fallback to sequential-only schedules beyond it.
+
+## 8. Future-proofing the formulation (user point 6)
+
+### 8a. LP/MIP-solver-ready reshaping (finding F21)
+
+design.md L92–L94 already names the direction ("For parallisation/tile assignment:
+Introduce integer programming or ployhedra framework") and tca.md §5.7.6 L510–L514
+shapes the seam (the `select() -> Assignment` interface a solver can replace). The
+doc's own L339–L341 gestures at linearity ("Ensure all formulation is linear, then we
+can use MIP or ILP"). Enumerated non-linearities in the CURRENT formulation, each with
+its standard linearization:
+
+1. **tile_size × tile_size products in the SMEM budget** (L285–L288): cache bytes =
+   tile_x × tile_y × elem_size is bilinear in decision variables. Linearization:
+   categorical tile variables — per dim d, binary z_{d,t} selecting t from a small
+   discrete preset set with exactly-one (Σ_t z_{d,t} = 1); once the category is fixed,
+   bytes(site) = Σ_t z_{x,t}·z_{y,t}·(t_x·t_y·e) is still quadratic across TWO dims —
+   linearize per-SITE instead: y_{s,(tx,ty)} binary over the site's (tx,ty) pair grid
+   with exactly-one per site; then bytes(site) = Σ y_{s,(tx,ty)} · (tx·ty·e) is linear.
+2. **Promotion criterion as a logical implication over assignment variables**
+   (L274–L283): promote(site) ⇒ (no CTA at last subscript position) ∧ (class = FRAG iff
+   last two positions sequential). Linearization: indicator/big-M constraints —
+   x_promote(s) ≤ Σ_{dims at position n} (1 − xCTA_d) and xFrag(s) ≤ Σ (1 −
+   xThread_d)(1 − xSeq is free) etc.; standard big-M with M = 1 suffices at binary
+   scale.
+3. **LoC launch totals** (L264–L269, F4): totals are PRODUCTS across dims (CTA) —
+   non-linear. Linearization options: (a) restrict to ≤1 CTA dim per LNT (v0, tca.md
+   §5.7.6 L547) making the product degenerate to the single LoC — linear for free;
+   (b) log-linearization is wrong for integers — prefer per-dim enumeration: since the
+   CTA-dim count is tiny, enumerate WHICH dims are CTA (that is the 3^K part) and keep
+   LoC per chosen dim as bounded integers under a sum budget (the launch total for one
+   CTA dim IS its LoC).
+4. **Objective reuse ratios** (L290–L295, F8): reuse-metric ratios are non-linear;
+   the traffic-avoided form Σ_sites bytes(site) × (reuse_count(site) − 1) is linear
+   because reuse_count is a CONSTANT per (site, placement-level) — the extents and
+   tile sizes are known once the category variables are fixed: reuse_count(site) =
+   Π_{reuse dims} (ext_d / tile_d) evaluated per tile-category assignment, folding
+   into the y_{s,(tx,ty)} coefficients exactly like item 1.
+5. **Sequential ⇒ LoC = 1** (L261, L269): an implication — xSeq_d = 1 ⇒ loc_d = 1;
+   big-M: loc_d ≤ 1 + M·(1 − xSeq_d).
+
+**Key architectural recommendation:** define PSched feasibility and score as a
+DECOPLED CONSTRAINT INTERFACE — a predicate `feasible(decision vector) error` plus
+`objectiveTerms(decision vector) []term` — so the current hardcoded enumeration
+(L297–L338) and a future MIP backend are interchangeable implementations of the same
+interface. The formulation stays solver-friendly (every constraint/objective term
+already phrased linearly per the table above) with NO solver dependency today
+(stdlib-only constraint, CLAUDE.md Tech stack). This also keeps tca.md §5.7.6's
+selector seam intact: the preset table, the enumeration, and the MIP are three
+implementations of `select()`.
+
+### 8b. TMMA / tensor-core awareness (finding F22)
+
+Near-future requirements and the restructuring needed NOW so they land as added
+constraints rather than a reformulation. Ground: CLAUDE.md's sm_86-vs-sm_90 ceiling
+rules — `cp.async` is the Ampere ceiling for v0 (TMA/`cp.async.bulk` is sm_90+ and out
+of scope today); design.md L96–L99 names "Recognize tensor core instructions" and
+"fast bulk load" as future development.
+
+1. **Instruction-shape compatibility classes on tile categories**: hardware MMA (and
+   later TMMA copy) instruction shapes constrain tile sizes to multiples/compatibility
+   sets (e.g. 16×8×16-class fragments). Restructure NOW: tag each per-dim tile preset
+   category with an instruction-shape compatibility class id; then "tile shape must
+   match an MMA shape" becomes a linear constraint Σ over category pairs allowed — a
+   coefficient mask on the existing y_{s,(tx,ty)} variables, no new variable class.
+2. **Stage-count decision variables for multi-stage copies**: async multi-stage copies
+   (cp.async-style staging today per CLAUDE.md; TMMA multi-stage on sm_90+) multiply
+   the SMEM a site consumes by its buffer stage count. Restructure NOW: add a small
+   categorical stage variable st_s ∈ {1, 2, 3, 4} per promoted site; cache-size
+   constraints expressed PER (site, layout, stage) — multi-buffering then just
+   multiplies a linear term: bytes(s) = Σ_{(tx,ty),st} y'_{s,(tx,ty,st)} ·
+   (tx·ty·e·st), still linear in the extended category binaries.
+3. **Layout/swizzle constraints**: alignment and bank-conflict-avoiding swizzles
+   constrain (tile shape × element size) combos — expressible as another coefficient
+   mask over the same category variables (padding rounds sizes up; tca.md §5.11 L762
+   already allows "extra space, for example for padding" — fold padding into the
+   per-category byte coefficients).
+4. **Producer/consumer tile-shape coupling through the SMEM/FRAG tier**: with tensor
+   cores, the GMEM→SMEM tile shape and the SMEM→FRAG (register) tile shape are coupled
+   (the MMA operand layout). Restructure NOW: keep the decision record's per-site
+   variables split by TIER (smem_site vs frag_site with a coupling constraint
+   frag_shape ∈ compatible(smem_shape)) — again a coefficient mask, provided the two
+   tiers are separate variable families from day one rather than one fused "cache"
+   decision.
+5. **Keep the runtime contract forward-compatible**: tca.md §5.11 L775 already notes
+   double buffering "can later be added inside the runtime without IR changes" — the
+   stage-count variables of item 2 belong to the DECISION record (sizing), not to new
+   IR nodes, preserving that property.
+
+## 9. Verdict, findings table, coverage
+
+### 9.1 Overall verdict
+
+**Feasible-with-required-changes.** The four-responsibility structure, the loopforest
+consumer relationship, the SoC/tile/LoC decision vocabulary, and the
+tile-between/tile-inside rewrite shape are all sound and grounded in the existing
+system (loopforest.go, the mutation choke points, tca.md §5.9). But the doc is not
+implementable as written: the candidate analysis computes a different placement than
+its own example requires (F1), the constraint model mis-accounts the launch it exists
+to satisfy (F4/F5), the objective is truncated and its stub maximizes the wrong
+quantity (F8), the solver pseudo-code inverts its filter (F9), the parallel rewrite
+templates contain wrong-variable increments up to infinite loops and drop the tail
+guard entirely (F10/F11), and the pass split as sketched persists only one of the five
+pieces of state the lower pass needs (§5). Every one of these has a concrete, local
+fix sketched above; none require abandoning the approach. The mandated decide/rewrite
+split is compatible with the system and the ROADMAP once the state table of §5.1 and
+the slot assignment of §5.3 are adopted.
+
+### 9.2 Findings summary table
+
+| ID | Severity | Section | One-line description |
+|----|----------|---------|----------------------|
+| F1 | BLOCKING | 2 | findINS buckets at innermost-REFERENCED level; the doc's own matmul commentary requires innermost-NON-referenced (reuse) level; the length≥2 filter is coupled to the bug |
+| F2 | COMPAT | 2 | ValueEqual-on-Iter INS membership is sound (identity-keyed operands, side-effect-free Iter); subscript chase is 1-step today — pin the post-simplify assumption and the fail-closed affine traversal |
+| F3 | SOUNDNESS | 2 | Cross-LNT loads double-collected per tree, never reconciled; never-bucketed loads silently vanish from O |
+| F4 | BLOCKING | 3 | LoC constraints use SUM semantics; thread totals are sums (disjoint warp shards) but CTA totals are PRODUCTS across CTA-assigned dims; multi-CTA-dim also exceeds tca.md v0 single-grid-dim limit |
+| F5 | BLOCKING | 3 | No kernel-wide CTA/warp accounting across LNTs; per-LNT DoSoC counters both start at 0 → dimension-index collisions in the one runtime map |
+| F6 | SOUNDNESS | 3 | Promotion criterion notation ambiguous; coherent under subscript-position reading + tca.md 5.7.3 two-level CTA(BlockJ,ThreadK) semantics; must be spelled out |
+| F7 | MISSING-EASY | 3 | No FRAG/register budget — FRAG tiles that do not unroll spill to local memory (tca.md 5.8 note) |
+| F8 | BLOCKING | 3 | Objective truncated at L295; stub maximizes cache BYTES (footprint) under a budget cap — replace with linear traffic-avoided metric |
+| F9 | BLOCKING | 3 | Solver: inverted feasibility filter (L316), get_soc(p) sloppiness (L321), 3^K × presets enumeration ≈ 10^8+ for K=6 — needs prefix pruning or MIP |
+| F10 | BLOCKING | 4 | Rewrite templates: tile-vs-element unit mismatch, wrong tile variable in b_tile_max, CTA/warp inside loops increment the wrong variable (infinite loops) and ignore a_tile_max, outer construct grid-stride/tile-id inconsistency |
+| F11 | BLOCKING | 4 | One-BB parallel tails need PREDICATION (KindSelect + runtime bounds in tile ops; collectives never suppressed) — "Ensure bounds check" covers only the sequential uniform case |
+| F12 | COMPAT | 4 | IntrinsicGridMap/IntrinsicThreadMap legal under KindVersion-5 append-only rules but need catalog/allocNode/verify/typeinfer/legality companions; doc duplicates the node list twice (L483-496, L546-559) |
+| F13 | COMPAT | 5 | ctaCache field: GVN risk is a non-issue (MemLoad never value-numbered); real risks are the choke-point discipline and print/verify awareness — prefer the side table |
+| F14 | SOUNDNESS | 5 | Decision persistence: only ctaCache is recorded; SoC type, LoC, tile_size, promotion decisions must cross the boundary — side table keyed by BIV identity, passes adjacent |
+| F15 | COMPAT | 5 | Pipeline slots: merged tile-rewrite+smem-insertion violates either iter-lower-before-reduce-lower or cache-alloc-after-reduce-lower; recommended 3-slot settlement |
+| F16 | COMPAT | 6 | Runtime presuppositions unspecced and unbuilt (no runtime/ dir); GridConcurrencyMap vs tca.md 5.7.1 percentage-sharding vocabulary must be reconciled |
+| F17 | MISSING-EASY | 7 | Max.cs truncation and search tie-breaking need pinned deterministic order |
+| F18 | MISSING-EASY | 7 | No integer min/ceil/max builtins — bound materialization impossible without registry extension (builtins.go has only f32 fminf/fmaxf) |
+| F19 | MISSING-EASY | 7 | Determinism guarantees of the search must be pinned (ordered presets, strict >) |
+| F20 | MISSING-EASY | 7 | Dynamic-shape policy unstated — adopt tca.md 5.7.6's constants+remainder-guard policy |
+| F21 | FUTURE | 8 | LP/MIP reshaping: five non-linearities enumerated with linearizations; decoupled constraint interface recommendation |
+| F22 | FUTURE | 8 | TMMA restructuring: shape-compatibility classes, per-(site,layout,stage) sizing variables, tier-split decisions |
+
+### 9.3 User-point coverage table
+
+| # | User point (verbatim intent) | Review section |
+|---|------------------------------|----------------|
+| 1 | Target doc identified | Header + §1 (doc/optana/loop_tiling.md, 593 lines) |
+| 2 | Feasibility of the design as written | §1 (verdict: feasible-with-required-changes, per-section justification) |
+| 3 | Pass split: tiling decides/records vs loop-tile-lower merged with smem_insertion | §5 (state table, storage, slots; the merge itself gets a conditional settlement in §5.3) |
+| 4 | Soundness (findINS/union, PSched, rewrite) + compatibility (IR/verifier/one-BB/neighbors/runtime) | §2, §3, §4 (soundness); §4 F11, §6 (compatibility) |
+| 5 | Missing but easy to add | §7 (8 items with minimal additions) |
+| 6 | LP/MIP-solver + TMMA/tensor-core future-proofing | §8a (non-linearities + linearizations + interface), §8b (decision-variable restructuring) |
+
+### 9.4 Self-check
+
+- Every finding cites target line numbers plus a grounding artifact (internal/ path or
+  doc/ section) — verified per finding in §2–§8.
+- The four hard questions settled definitively: findINS-vs-example (F1: contradiction,
+  fix sketched); sum-vs-product LoC (F4: threads sum, CTAs product); one-BB parallel
+  tails (F11: predication via KindSelect + runtime bounds, collectives exempt);
+  cross-pass persistence (§5.1: side table keyed by BIV identity, adjacent passes,
+  Requires-pinned).
+- No unresolved open items; severities consistent across sections (every findings-table
+  ID now appears in its section heading); style follows doc/review/phase1_1.md
+  (terse, bullet-driven) extended with severity tags and the findings table.
