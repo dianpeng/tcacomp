@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-20 - Completed quick task 261020-svu: review loop tiling design doc (doc/review/loop_tiling.md — verdict feasible-with-required-changes, 22 findings / 6 BLOCKING)
+Last activity: 2026-10-20 - Completed quick task 261020-u2i: revise doc/optana/loop_tiling.md per author rulings on review findings F1/F4/F5/F8/F9/F10 (cache-tie semantics with set-vs-tie two-level model, external CTA/WARP thresholds, per-LNT runtime maps, traffic-avoided objective, innermost-K=5 search window, coherent tile-id templates)
 
 Progress: [██░░░░░░░░] 17%
 
@@ -97,6 +97,7 @@ None yet.
 | 261020-b4f | Restructure KindIter to the sound 2-parameter formation NewIter(bdv, parent?) per doc/optana/{loop_fusion,induction_variable}.md (unbounded form deleted; BIV as the compared value object); simplify-lower builds wired DimVar→BIV→Iter nest chains per as-order interned (dim, parent) — forest shows real nest trees not singletons; GVN prefix fusion (ABC∩ABCD) + post-fusion forest chain pinned | 2026-10-20 | 90d66bb | [261020-b4f-pin-gvn-prefix-fusion-tests-wire-loop-ne](./quick/261020-b4f-pin-gvn-prefix-fusion-tests-wire-loop-ne/) |
 | 261020-ejf | Implement memory optimization pass per doc/optana/memory-opt.md (review verdict SOUND w/ conditions C1-C4): memopt@112 store→load forwarding + store-store + dead-store elimination over chain-eligible regions, memopt-verify@113 fixpoint checker, MutContext.RemoveImpactBy splice choke point, 10 property-test families | 2026-10-20 | 64f8413 | [261020-ejf-implement-memory-optimization-pass-from-](./quick/261020-ejf-implement-memory-optimization-pass-from-/) |
 | 261020-svu | Review loop tiling design doc doc/optana/loop_tiling.md (verdict: feasible-with-required-changes; 22 findings, 6 BLOCKING — findINS bucketing bug vs matmul example, sum-vs-product LoC, one-BB predication, decide-vs-lower pass split + decision persistence; LP/MIP-solver + TMMA/tensor-core future-proofing section) → doc/review/loop_tiling.md | 2026-10-20 | deb5888 | [261020-svu-review-loop-tiling-design-doc-doc-optana](./quick/261020-svu-review-loop-tiling-design-doc-doc-optana/) |
+| 261020-u2i | Revise doc/optana/loop_tiling.md per author rulings on review 261020-svu findings: F1 cache-tie semantics (TIE/WHOLE-DIM-LOAD/DEMOTION rules + set-vs-tie two-level model: SET=innermost referenced for co-traversal grouping + length≥2 filter, TIE=innermost non-referenced for placement), F4 external Max.cta/Max.threads_per_cta thresholds (product CTA / sum warp accounting, 1-D mapping as runtime contract), F5 per-LNT scoped runtime maps, F8 traffic-avoided objective, F9 innermost-K=5 search window, F10 coherent tile-id rewrite templates | 2026-10-20 | 943712d | [261020-u2i-revise-doc-optana-loop-tiling-md-per-use](./quick/261020-u2i-revise-doc-optana-loop-tiling-md-per-use/) |
 
 ## Session Continuity
 
