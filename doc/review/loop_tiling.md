@@ -341,3 +341,213 @@ templates; under the split they become REQUIRED content of the loop-tile-lower s
   a legality-window row for the stage the lower pass produces + contentHash/contentEqual
   cases mixing DoSoC and the field name so GVN buckets stay faithful. GVN-CSE of these
   intrinsics is sound (per-launch deterministic pure values) and desirable.
+
+## 5. Pass-split evaluation: tiling-decide vs loop-tile-lower (user point 3)
+
+The split: **loop tiling** = analysis + decision recording only; **loop tile lower** =
+the new pass combining (a) the tile rewrite (target L359–L591), (b) the SoC
+numbering/DoSoC pass (L364–L386), and (c) SMEM/FRAG insertion. The doc itself
+half-anticipates the separation at L413–L417 ("Separate a specific pass, well written,
+fully tests for this dedicated goal") — but its own Cache Mark section (L352–L358)
+records ONLY `MemLoad.ctaCache`, so as written the split cannot work: the rewrite needs
+more state than one mark.
+
+### 5.1 State that must cross the pass boundary
+
+| State | Producing pass | Consumed by | Storage recommendation |
+|---|---|---|---|
+| SoC type per Iter (CTA/WARP/seq) | tiling-decide | DoSoC numbering + rewrite | side table keyed by BIV node (see 5.2) |
+| LoC per SoC | tiling-decide | rewrite (strides), launch accounting | side table |
+| tile_size per Iter | tiling-decide | rewrite (bounds/offsets), cache sizing | side table |
+| Promoted cache sites + placement level + FRAG/SMEM class | tiling-decide (from §2 analysis + F6 criterion) | smem insertion | side table keyed by MemLoad node id |
+| DoSoC binding | computed at lower time (L364–L386) — correctly NOT a crossing decision | intrinsic nodes | derived, no storage |
+
+- `internal/opt/cache.go` L26–L46 + `internal/opt/manager.go` Run loop: the analysis
+  cache is invalidate-all-by-default — a side table `Put` under a stable name survives
+  only while every intervening pass's `Preserved()` whitelist keeps it. Therefore the two
+  passes must be ADJACENT in the pipeline, with tiling-decide Putting the decision record
+  and loop-tile-lower (the immediately following pass) consuming it.
+- Node-identity stability across the boundary: gvn@110 and memopt@112 run BEFORE any
+  sane tiling slot (post-memopt-verify@113, per `internal/opt/registry.go` L20–L31);
+  with adjacency, no pass between decide and lower mutates Iter/load nodes — the
+  mutation choke points (`internal/ir/mutate.go`, `doc/ir.md` §5.3) are only reachable by
+  running passes, and none run in between. Recommendation: key the side table by BIV
+  (dimvar value-object) identity for per-Iter decisions and by MemLoad node id for site
+  decisions — BIV identity is GVN-canonicalized before tiling and immune to a hypothetical
+  later fusion re-run erasing Iter prefix nodes (`doc/optana/loop_fusion.md` L86–L89:
+  fusion replaces prefix Iters and deletes them). If a future pipeline ever inserts a
+  transform between decide and lower, the `Requires` mechanism (`internal/opt/manager.go`
+  checkPreconditions) must pin `tile-lower requires tiling` — already enforceable today.
+
+### 5.2 The `ctaCache` field interface risk — settled: GVN is NOT at risk; the choke-point rule is
+
+- Doc: L356–L357 ("Refactory MemLoad to include a new field ctaCache… Mark the
+  MemLoad's ctaCache to be true").
+- Ground: `internal/ir/effect.go` L106–L115 (`EffectOf`: EVERY `FamilyMemory` node is
+  EffectFull — MemLoad included) + `internal/analysis/sideeffect/sideeffect.go` L172–L192
+  (baseVerdict: FamilyMemory effectful, [2.2] amendment A); `internal/ir/value.go`
+  L105–L108 (effectful nodes hash to `ValueHashOneOfAKind` and compare false to
+  everything — MemLoad NEVER enters a GVN bucket).
+- Analysis: the suspected hazard (marked and unmarked loads of the same address
+  GVN-merging) is a NON-issue: MemLoad is excluded from value numbering entirely by the
+  side-effect gate, so no ValueHash/ValueEqual contract change is needed. (Note:
+  `doc/ir.md` §6.1's contrary claim that the SMEM/FRAG family is effect-free is stale
+  drift — the implementation is authoritative.) The REAL issues: (1) a post-construction
+  content-field write bypasses the mutation-choke-point discipline (all sanctioned
+  mutations ride `MutContext`, `doc/ir.md` §5.3 — construction is exempt, a later pass
+  writing a field is not); (2) print/verify/typeinfer would need awareness of the new
+  content. Recommendation: under the split, DON'T add the field at all — keep the
+  promotion mark in the decision side table and let the lower pass do the node surgery
+  (rewrite to the LIR cache nodes or annotate) when it consumes the record. If an
+  IR-visible mark is ever required, add a MutContext choke point for it, following the
+  `SetType` precedent.
+
+### 5.3 Pipeline slots — reconciled with doc/opt.md, tca.md, and ROADMAP phases 3–4
+
+Three orderings are in tension:
+- `doc/opt.md` L18–L29: … loop tiling → smem/frag insertion → scheduling.
+- `.planning/ROADMAP.md` L23–L29 (the pass-order contract): … parallelize → iter-lower →
+  reduce-lower → cache-alloc → cache-lower → codegen, with hard orderings "iteration
+  lowering before reduce lowering; cache allocation after reduce lowering".
+- `doc/tca.md` §5.8/§5.9: cache MARKING (loadtile + storage class) exists before
+  iteration lowering (§5.9.1 L670–L673: "Objects that reference these variables, such as
+  loadtile/storetile, remain valid" through the rewrite), while §5.9/§5.10 make reduce
+  lowering depend on the FINAL tile structure (§5.9.1 L636: Init/Combine surround @n_o;
+  the accumulator tile shape [T_m][T_k] derives from tile sizes).
+
+Settlement: the tile REWRITE cannot merge with smem insertion without breaking one of
+the two hard orderings — cache allocation decisions (buffer shapes, what is SMEM vs
+FRAG, sync placement) depend on reducer placement (Init/Combine around the reduced dim's
+tile-between loop, §5.9.1), which is only known after reduce lowering sees the tiled
+nest. Concretely:
+1. **tiling-decide** occupies the `parallelize` slot (ROADMAP Phase 3: "apply only
+   annotations — compute structure is never rewritten", ROADMAP L88) — it records SoC,
+   LoC, tile_size, promotion decisions in the side table. This also subsumes tca.md
+   §5.7.6's `select()` interface (L510–L514), which was explicitly designed to be
+   replaceable by "ILP/LP or another combinatorial solver" — the search becomes the
+   selector's implementation.
+2. **loop-tile-lower** occupies the `iter-lower` slot — tile rewrite ONLY (plus DoSoC
+   numbering and the IntrinsicGridMap/IntrinsicThreadMap materialization), emitting the
+   LIR `KindForLoop` suite so the scheduler's LICM (`internal/opt/schedule/scheduler.go`
+   L15–L18: LICM runs "over lowered for-loops") can hoist the tile-bound computations.
+3. **smem insertion stays split** across the `cache-alloc`/`cache-lower` slots (after
+   reduce-lower), consuming the recorded promotion decisions. If the user-mandated merge
+   is kept regardless, the merged pass must run at the iter-lower slot and absorb reduce
+   lowering too (Init/Combine placement needs the tiled nest) — that is a scope
+   expansion the review recommends against; the two-pass-decide/rewrite + separate cache
+   passes reading one shared decision record achieves the same coupling with none of the
+   ordering violations.
+
+### 5.4 What the merged loop-tile-lower spec must contain that smem_insertion.md lacks
+
+`doc/optana/smem_insertion.md` is a 3-line stub ("happens after the loop tiling… to try
+to place the final the SMEM/FRAG cache"). The spec for the cache half (wherever it
+lives after 5.3) must define, at minimum:
+- Buffer materialization: `MemNewSMem`/`FragNew` allocation sites, extents from tile
+  shapes (`internal/ir/node_lir_memory.go` — the LIR memory family and StorageClass
+  payload already exist as the target representation).
+- Copy lowering: cooperative vs per-thread variant selection per `doc/tca.md` §5.11
+  L765–L770 (cta_for/thread_for → SMEM `LoadTileCta`; seq_for → FRAG
+  `LoadTileThread`), with the runtime contract (visibility, reuse safety, store
+  ordering, bounds, uniform call — §5.11 L772–L778) restated as compiler obligations.
+- Sync policy: the runtime owns ALL synchronization (§5.11 L760 — "codegen never emits
+  barriers for caches"); the pass must not insert barriers itself.
+- Predication interplay with F11: bounds-checked tile variants + never-suppressed
+  collectives.
+- Budget enforcement with the §5.7.6 L546 fallback (halve T(R), then drop caches to
+  GMEM — "selection never fails").
+- Post-pass re-typing: newly inserted lowered nodes need the second typeinfer run
+  (`doc/opt.md` L31–L32; the pass at 105 is idempotent and re-runnable per
+  `internal/opt/typeinfer/rules.go` and its spec).
+
+## 6. Compatibility audit (user point 4)
+
+### 6.1 IR node surface — new kinds (extends F12)
+
+- Kind catalog: `internal/ir/kind.go` L12–L30 (KindVersion 5, append-only before
+  `KindEnd` L80, tier boundary HIR < KindForLoop); the three-place landing rule
+  (`doc/ir.md` §2 L103–L106: node struct + catalog.go row + allocNode case). The two
+  intrinsics are LIR-tier (they exist only post-lowering). Compatible, with the F12
+  companions (verify case, typeinfer rule, legality row).
+- Input/ImpactBy-only convention: `internal/ir/convention.go` machine-checks that no
+  node struct carries reference-bearing fields outside Input/ImpactBy (wired into
+  `Verify`, `doc/ir.md` §5.2). An intrinsic carrying (u32 DoSoC operand, string field
+  name) is convention-legal (string is not a reference; the `callNode.name` precedent).
+- Verifier: `internal/ir/verify.go` L146–L310 per-kind shape checks — new kinds without
+  a case fall through unvalidated; add a shape case (operand count, DoSoC const-ness,
+  field-name vocabulary).
+- typeinfer: `internal/opt/typeinfer/rules.go` L275–L276 — the catalog is CLOSED, an
+  unknown kind errors ("the catalog is closed"). Two new rules are REQUIRED (both
+  intrinsics: result u32, per `KindInductionVariable`'s u32 precedent at rules.go L193).
+- GVN / side effects: intrinsics classify `FamilyAbstract` (pure) — GVN CSE of
+  `IntrinsicGridMap(k, "index")` is sound (per-launch deterministic) and beneficial;
+  requires the contentHash/contentEqual cases of F12. `internal/analysis/sideeffect/sideeffect.go`
+  L172–L200 (baseVerdict/orderSensitive): pure leaves taint-free.
+- DCE two-root-set liveness: roots are the RoleTensor params + the ONE end node
+  (`internal/ir/effect.go` L13–L19, `internal/ir/mark.go`, `doc/ir.md` §7). Intrinsics
+  are pure values — live exactly when a live consumer chains to them; dead index
+  queries sweep correctly. The rewritten loop headers stay live via their
+  InductionVariable consumers. Compatible.
+- Poset/scheduling: `internal/ir/poset.go` (DataDeps/EffectDeps/SeaRoots) treats the
+  intrinsics as pure leaves — no new edge classes needed. LICM compatibility requires
+  the rewrite to emit `KindForLoop` (LIR), per 5.3.
+
+### 6.2 SSA / one-BB / verifier invariants of the rewrite
+
+- The rewrite preserves SSA by construction if it uses the sanctioned machinery: new
+  tile DimVar/BoundedDimVar/ForLoop chains are NEW defs; every old
+  `InductionVariable(iter)` use is rewritten to `offset + inside-tile` expressions by
+  RAUW over each IV's uses (`internal/ir/mutate.go` ReplaceAllUsesWith L150+, plus
+  SetDef/AddUse for the new expression wiring; the eight choke points of
+  `doc/ir.md` §5.3 cover this scale of patch — nothing bigger is needed).
+- The doc's "large IRGraph patch… declarative way" note (L413–L416) is satisfiable with
+  existing choke points; no new mutation primitives are required.
+- One-BB: no branch nodes are introduced — tails ride predication (F11). The verifier's
+  use-def/def-use chain checks (`internal/ir/verify.go` L29–L30) then cover the rewired
+  graph with zero new invariant classes.
+
+### 6.3 Neighboring passes
+
+- Loop fusion (inside gvn@110): runs BEFORE tiling; the forest is computed fresh per
+  Analyze (`internal/analysis/loopforest/loopforest.go` L74–L137, one snapshot per
+  call), so fusion-before-tiling is fine. Post-fusion prefix Iters are deleted
+  (`doc/optana/loop_fusion.md` L86–L89) — decisions must be keyed on BIV identity, not
+  Iter node identity (5.1), because a fused-away Iter is erased.
+- memopt (112): store→load forwarding removes redundant loads BEFORE tiling decides —
+  tiling should see post-memopt loads (a forwarded-away load needs no cache decision).
+  Slot tiling after memopt-verify@113. The open memopt dead-load gap (documented in the
+  opt-pipeline audit rulings memory, 2026-10-20) is a performance gap only; loads
+  memopt misses still get tiling decisions — no correctness interaction.
+- typeinfer: the second run for lowered nodes is already planned (`doc/opt.md` L31–L32);
+  the pass is idempotent (`internal/opt/typeinfer` per its spec), so a post-lower rerun
+  is safe — but see F12: without the two new rules the rerun FAILS CLOSED on the
+  intrinsics.
+- scheduling/LICM (900): `internal/opt/schedule/scheduler.go` L15–L18 — topo sort +
+  LICM over lowered for-loops. Tile-bound computations (`min`, div-up arithmetic) are
+  loop-invariant per tile loop and hoistable, PROVIDED the rewrite emits LIR ForLoop
+  (5.3) and PROVIDED the min/ceil primitives exist (F18).
+
+### 6.4 Runtime compatibility
+
+- The GridConcurrencyMap/ThreadMap runtime objects (target L83–L125) presuppose: (a)
+  arbitrary multi-dimensional remap of one normalized 1-D launch; (b) per-LNT map
+  sections; (c) index + dimension queries. NONE of this exists yet — there is no
+  `runtime/` directory and `pkg/` contains only the builder/oracle/determinism Go code;
+  the C++ runtime is future work per `doc/design.md` L12–L13 (runtime library to be
+  created, scalfold as reference scaffold).
+- The specced counterpart is `doc/tca.md` §5.7.1 L432–L452: CBLId/CTLId linearization,
+  block shards by percentage (cumulative-start + remainder-last so rounding never loses
+  blocks), thread shards in whole warps. loop_tiling.md's dimension-count model
+  (GridConcurrencyMap<3>(total, 32, 32, 32)) is a DIFFERENT allocator vocabulary — the
+  two must be reconciled: tca.md's percentage scheme is the kernel-wide budget allocator
+  this review proposes as the fix carrier for F5.
+- Whole-warp granularity: target L80/L343–L345 matches CLAUDE.md's constraint and tca.md
+  §5.7.2's resolved ruling (whole-warp flat groups only, L465) — compatible.
+- Normalized 1-D launch (target L73–L81) matches tca.md §5.7.1's linearization intent —
+  compatible, with the F4/F5 budget accounting fixed.
+- Launch/shape validation: tca.md §5.7.6 L543–L544 (grid = ceil(ext/T) computed at
+  launch; tile sizes compile-time constants, extents dynamic with remainder guard) — the
+  runtime must expose the device-attribute queries (CLAUDE.md: never hardcode the sm_86
+  101,376 B SMEM ceiling; assert ≥ the 64 KB design budget). The compiler emits code +
+  runtime files and does NOT drive nvcc (CLAUDE.md Backend constraint) — the doc's
+  runtime objects must ship as runtime-library API, not compiler-side launches.
