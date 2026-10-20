@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-20 - Completed quick task 261020-ux8: draft doc/optana/loop_tile_lower.md — merged loop-tile-lower pass spec (11 rulings normative; Issue #1 control-flow register Q1-Q5 and D3 allocator vocabulary explicitly OPEN); smem_insertion.md → pointer stub
+Last activity: 2026-10-20 - Completed fast task 261020-fd2: Issue #1 resolved in loop_tile_lower.md (runtime loop materialization bailout + mask contract); only D3 allocator vocabulary remains open
 
 Progress: [██░░░░░░░░] 17%
 
@@ -100,6 +100,7 @@ None yet.
 | 261020-u2i | Revise doc/optana/loop_tiling.md per author rulings on review 261020-svu findings: F1 cache-tie semantics (TIE/WHOLE-DIM-LOAD/DEMOTION rules + set-vs-tie two-level model: SET=innermost referenced for co-traversal grouping + length≥2 filter, TIE=innermost non-referenced for placement), F4 external Max.cta/Max.threads_per_cta thresholds (product CTA / sum warp accounting, 1-D mapping as runtime contract), F5 per-LNT scoped runtime maps, F8 traffic-avoided objective, F9 innermost-K=5 search window, F10 coherent tile-id rewrite templates | 2026-10-20 | 943712d | [261020-u2i-revise-doc-optana-loop-tiling-md-per-use](./quick/261020-u2i-revise-doc-optana-loop-tiling-md-per-use/) |
 | 261020-fd1 | fast: Cache.dims configurable cached-dimension count (dimension level reuse, default 2) + tensor-rank < Cache.dims filter at candidate set formation in doc/optana/loop_tiling.md | 2026-10-20 | 9f09a8b | — |
 | 261020-ux8 | Draft doc/optana/loop_tile_lower.md — merged loop-tile-lower pass spec (tile rewrite + DoSoC numbering + intrinsics + SMEM/FRAG insertion) at opt.md's "loop tiling rewrite" slot; 11 author rulings normative (side-table decision record, FRAG unroll+budget, u32 min/max/ceildiv, string intrinsic payload + 6 companions, LoadTileCta/Thread rule, runtime-owns-sync, halve-then-drop fallback, cross-LNT dedupe, dynamic shapes, LIR KindForLoop); Issue #1 control-flow register (Q1-Q5) + D3 allocator vocabulary OPEN; smem_insertion.md → pointer stub | 2026-10-20 | 26a1288 | [261020-ux8-draft-doc-optana-loop-tile-lower-md-merg](./quick/261020-ux8-draft-doc-optana-loop-tile-lower-md-merg/) |
+| 261020-fd2 | fast: resolve loop_tile_lower.md Issue #1 — runtime loop materialization owns the bounds bailout (thr_loop whole-body no-op / cta_loop exact / seq_loop native); one-BB permanent; tile-level cooperative ops outside bailing loops; mask contract (exact, uniformly-derived, per-iteration, lane-prefix closed form from thread_map); reducer Init/Combine placement; Q1-Q5 all resolved — only D3 allocator vocabulary remains OPEN | 2026-10-20 | 9b124ff | — |
 
 ## Session Continuity
 
