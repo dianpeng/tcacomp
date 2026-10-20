@@ -33,14 +33,19 @@ for (auto i = 0; i < I; i++) {
 // After tiling rewrite
 
 // [1] tile outside loop
-for (auto i = 0; i < ceil(I/i_tile_size) ; i+=i_tile_size) {
-  for (auto j = 0; j < ceil(J/j_tile_size) ; j+=j_tile_size) {
+//     tile-id enumeration: the between loops count TILES, one iteration per tile,
+//     each tile's base offset is tile_id * tile_size
+for (auto i = 0; i < ceil(I/i_tile_size); i++) {
+  for (auto j = 0; j < ceil(J/j_tile_size); j++) {
     // [2] tile inside loop
+
+    const auto i_offset = i * i_tile_size;
+    const auto j_offset = j * j_tile_size;
 
     // the following materialized tile size for tile loop will save branch and have
     // much better generated code structure.
-    const auto max_tile_size_i = min(i_tile_size, M - i * tile_size);
-    const auto max_tile_size_j = min(j_tile_size, J - j * tile_size);
+    const auto max_tile_size_i = min(i_tile_size, I - i_offset);
+    const auto max_tile_size_j = min(j_tile_size, J - j_offset);
 
     for (auto tile_i = 0; tile_i < max_tile_size_i; tile_i++) {
       for (auto tile_j = 0; tile_j < max_tile_size_j; tile_j++) {
@@ -534,24 +539,24 @@ for (auto a = 0; a < A; a++) {
 
 // (1) sequential loop
 
-// (1.1) tile between part
-for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
-  for (auto b = 0; b < ceil(B/tile_size_b); b += tile_size_b) {
+// (1.1) tile between part, tile-id enumeration: a/b count TILES
+for (auto a = 0; a < ceil(A/tile_size_a); a++) {
+  for (auto b = 0; b < ceil(B/tile_size_b); b++) {
 
     // (1.2) tile inside part
+    const auto a_tile_offset = a * tile_size_a;
     const auto a_tile_max = min(
       tile_size_a,
-      A - tile_size_a * a,
+      A - a_tile_offset,
     );
-    const auto a_tile_offset = a * tile_size_a;
-      
+
     for (auto a_tile = 0; a_tile < a_tile_max; a_tile++) {
 
-      const auto b_tile_max = min(
-        tile_size_a,
-        B - tile_size_b * b,
-      );
       const auto b_tile_offset = b * tile_size_b;
+      const auto b_tile_max = min(
+        tile_size_b,
+        B - b_tile_offset,
+      );
 
       for (auto b_tile = 0; b_tile < b_tile_max; b_tile++) {
         mem[a_tile_offset + a_tile][b_tile_offset + b_tile]
@@ -567,7 +572,9 @@ for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
 
 // notes the only difference here
 //
-// [1] the tile between part's stripe, needs to factor in level of concurrency
+// [1] the tile between part is a tile-id enumeration driven by the grid map: each
+//     CTA's grid_map index IS its tile id, the stride is the map dimension, ie
+//     the CTA LoC of this dimension
 // [2] the tile inside part, since CTA will implicitly assigned with a WARP schedule
 //     which means that part needs to count in the WARP schedule, ie the stride in the
 //     tile will factor in WARP's level of concurrency
@@ -599,26 +606,32 @@ for (auto a = 0; a < ceil(A/tile_size_a); a += tile_size_a) {
 //
 // For simplicity, we use grid_map<DoSoC> to represent corresponding grid_map runtime object
 
+// tile between part: tile-id enumeration driven by the grid map
 for (
-  auto a = 0;
+  auto a = grid_map<IterA.CTA.DoSoC>.index;
   a < ceil(A/tile_size_a);
-  a += tile_size_a * grid_map<IterA.CTA.DoSoC>.dimension
+  a += grid_map<IterA.CTA.DoSoC>.dimension
 ) {
 
   // (1.2) tile inside part
+  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - tile_size_a * a,
+    A - a_tile_offset,
   );
 
-  const auto a_tile_offset = grid_map<IterA.CTA.DoSoC>.index * tile_size_a;
-
+  // thread-parallel strided walk over the tile, the WARP half of the CTA assignment
+  // nThreads = total # of threads mapped to this dimension, ie warp LoC * 32
   for (
       auto a_tile = 0;
-      a_tile < tile_size_a;
-      a += warp_loc * 32 * thread_map<IterA.WARP.DoSoC>.dimension
+      a_tile < a_tile_max;
+      a_tile += nThreads
   ) {
-    const auto a_index = a_tile_offset + thread_map<IterA.WARP.DoSoC>.index;
+    const auto a_index = a_tile_offset + a_tile + thread_map<IterA.WARP.DoSoC>.index;
+
+    // notes, on a tail tile some threads' a_index can exceed A: per-element bounds
+    // guarding is handled by the predication discipline (one basic block), open
+    // item from the review (F11), not specced here
 
     ...
     // notes, the memory access within the tile is of same shape, ie using the
@@ -639,49 +652,30 @@ for (
 //
 // Notes, for each **LNT, it will have its corresponding runtime mapping object described
 // before to remap the grid dimension and thread/cta dimension based on the LNT scheduling
-// **
-// 2 runtime object will be provided, using special IRNode to access it,
-//
-// The IR node must provide corresponding object for the IR graph to use it
-//
-// List of new IR nodes
-//
-// [1] IntrinsicGridMap(<DoSoC for the SoC>, <name of field>)
-//
-//     - get the index of the grid_map: IntrinsicGridMap(<DoSoC>, "index")
-//     - get the dimension of the grid_map, ie all CTA #: IntrinsicGridMap(<DoSoC>, "dimension")
-//       - ie LoC for the corresponding assigned CTA SoC
-//
-//
-// [2] IntrinsicThreadMap(<DoSoC for the SoC>, <name of field>)
-//
-//     - get the index of thread_map: IntrinsicThreadMap(<DoSoC>, "index")
-//     - get the dimension of thread_map, ie all thread #: IntrinsicThreadMap(<DoSoC>, "dimension")
-//       - ie LoC for the corresponding assigned Thread SoC
-//
-//
-// For simplicity, we use grid_map<DoSoC> to represent corresponding grid_map runtime object
+// The IntrinsicGridMap/IntrinsicThreadMap IR node list is the SAME as listed in the
+// CTA section above, not repeated here
 
+// tile between part: tile-id enumeration driven by the thread map, same form as
+// the CTA case but via thread_map, each thread group's map index IS its tile id
 for (
-  auto a = 0;
+  auto a = thread_map<IterA.DoSoC>.index;
   a < ceil(A/tile_size_a);
-  a += tile_size_a * thread_map<IterA.DoSoC>.dimension
+  a += thread_map<IterA.DoSoC>.dimension
 ) {
 
   // (1.2) tile inside part
+  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - tile_size_a * a,
+    A - a_tile_offset,
   );
-
-  const auto a_tile_offset = thread_map<IterA.DoSoC>.index * tile_size_a;
 
   // loop must be sequential here. The allocation is really per tile/stride is assigned
   // to a thread, within that tile/stride, it is sequential again
   for (
       auto a_tile = 0;
-      a_tile < tile_size_a;
-      a++
+      a_tile < a_tile_max;
+      a_tile++
   ) {
     const auto a_index = a_tile_offset + a_tile;
 
