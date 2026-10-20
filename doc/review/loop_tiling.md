@@ -16,6 +16,9 @@
   consumer — `internal/analysis/loopforest/loopforest.go` L4–L5) and the MemLoad overlap
   analysis local to the pass (target L166). That split is fine; the findings below are
   about the algorithms, not the placement.
+- Citation convention: every bare `L<n>` (e.g. L168, L437–L438) refers to the target
+  doc — doc/optana/loop_tiling.md: L1–L593. `§` cites another doc by section;
+  `path/file.go` cites source files.
 - The doc is NOT modified by this review.
 
 ## 1. Feasibility verdict
