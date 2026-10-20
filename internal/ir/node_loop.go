@@ -6,26 +6,26 @@ package ir
 // KindBoundedDimVar) are value-level material, not loop-nest structure — they
 // live with their relations in node_dimvar.go.
 
-// iterNode: abstract induction variable; ops = [dim, bound?, init, step].
-// The dim binding and the bound ride the Input list (Input/ImpactBy-only
-// convention, quick-261019-ktm revision) — the bound slot EXISTS only in
-// the bounded form (`@x/M`), so the unbounded form (`@x`) is a 3-operand
-// node [dim, init, step]. The bound accepts any value node (D5: dim params
-// and lowered TensorDimOf bounds alike).
+// iterNode: the loop header; ops = [biv] or [biv, parent]. Operand 0 is
+// the BoundedDimVar value object (((dim, init, step), max),
+// doc/optana/induction_variable.md) — every iter is bounded by
+// construction; the unbounded form is gone. Operand 1 is the parental
+// iter, PRESENT ONLY when nested (doc/optana/loop_fusion.md: "Iter node
+// will have its parental loop, if any, as its second input").
 type iterNode struct {
 	*Base
 	operandList
 }
 
-// NewIter creates an abstract induction-variable node over the dim
-// InputParam node dim, bounded by bound (nil = the unbounded form @x, a
-// 3-operand node), with init and step operands. The verifier's shape check
-// pins operand 0 to a dim InputParam.
-func (g *Graph) NewIter(origin string, dim, bound Node, init, step Node) Node {
-	if bound == nil {
-		return g.NewNode(KindIter, origin, dim, init, step)
+// NewIter creates a loop header over the bounded induction variable bdv,
+// optionally nested in the parental iter (nil = a nest root). The
+// verifier's shape check pins operand 0 to a bounded dimvar, operand 1
+// to an iter, and the operand count to {1, 2}.
+func (g *Graph) NewIter(origin string, bdv, parent Node) Node {
+	if parent == nil {
+		return g.NewNode(KindIter, origin, bdv)
 	}
-	return g.NewNode(KindIter, origin, dim, bound, init, step)
+	return g.NewNode(KindIter, origin, bdv, parent)
 }
 
 // iterClusterNode: abstract compound header; ops = [dims..., inputs...] —

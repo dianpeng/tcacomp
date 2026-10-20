@@ -40,7 +40,7 @@ const (
 	KindMemLoad     // GMEM: load tensor[axes...] (tensor operand + axes, ImpactBy)
 	KindMemStore    // GMEM: store(target access, value) — the HIR stage store
 	KindMemNew      // GMEM: create a new global memory extent (extent value)
-	KindIter        // loop: induction variable @m (dim/bound payload, init, step)
+	KindIter        // loop: header (biv value object, parental iter when nested)
 	KindIterCluster // loop: compound iter(@m, @k, @n) header (dims payload, inputs...)
 	KindConst       // scalar-expr: typed constant
 	KindParam       // scalar-expr: lambda parameter reference

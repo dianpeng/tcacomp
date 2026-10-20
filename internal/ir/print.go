@@ -681,25 +681,23 @@ func (r *renderer) value(n Node) string {
 		b.WriteString(")")
 		return b.String()
 	case *iterNode:
-		// D14: ops = [dim, bound?, init, step] — the bound slot exists only
-		// in the bounded form.
-		ops := OperandsOf(t)
-		if len(ops) == 0 || ops[0] == nil {
-			return "@?"
-		}
-		s := "@" + paramNameOfNode(ops[0])
-		if len(ops) == 4 {
-			// Bounded induction variable, doc §2.3. The bound accepts any
-			// value node (D5): a dim InputParam keeps the `@name` spelling,
-			// any other def (a lowered TensorDimOf) renders through the
-			// value renderer.
-			if ip, ok := ops[1].(*inputParamNode); ok {
-				s += "/" + ip.name
-			} else {
-				s += "/" + r.value(ops[1])
+		// ops = [biv] (nest root) or [biv, parent] (nested): the loop
+		// header IS the bounded IV value object — render through it. The
+		// parent edge is nest structure (loopforest's face), not inline
+		// syntax: a parented iter renders exactly like its root.
+		if biv := opAt(t, 0); biv != nil {
+			if bv, ok := biv.(*boundedDimVarNode); ok {
+				if mx := opAt(bv, 1); mx != nil {
+					if ip, ok := mx.(*inputParamNode); ok {
+						if dv, ok := opAt(bv, 0).(*dimVarNode); ok {
+							return "@" + paramNameOfNode(opAt(dv, 0)) + "/" + ip.name
+						}
+					}
+				}
 			}
+			return r.value(biv) // "@x/max" via the boundedDimVarNode case
 		}
-		return s
+		return "@?"
 	case *tensorDimOfNode:
 		// `tensordimof(lhs, 1)` — the tensor's debug name (its value
 		// rendering when not a param) and the axis const's typed spelling.

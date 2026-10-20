@@ -166,7 +166,13 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 			const1 = g.NewConst("simplify-lower", ir.InternScalar(ir.TF32), 1)
 		}
 		tdim := g.NewTensorDimOf("simplify-lower", tensor, axisIdx)
-		iter := g.NewIter("simplify-lower", dim, tdim, const0, const1)
+		// MINIMAL formation compliance (quick-261020-b4f Task 2): build the
+		// value-object chain inline so the package compiles against the
+		// (biv, parent?) constructor. The real chain/keying work —
+		// (dim, parent)-interned nest wiring — lands in Task 3.
+		dv := g.NewDimVar("simplify-lower", dim, const0, const1)
+		biv := g.NewBoundedDimVar("simplify-lower", dv, tdim)
+		iter := g.NewIter("simplify-lower", biv, nil)
 		iv := g.NewInductionVariable("simplify-lower", iter)
 		dl := &dimLowering{tdim: tdim, iter: iter, iv: iv}
 		lowered[dim.BasePtr()] = dl

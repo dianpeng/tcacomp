@@ -37,7 +37,7 @@ var catalog = []kindEntry{
 	{KindMemLoad, TierHIR, FamilyMemory, -1, "GMEM load: tensor operand + axes; chains via ImpactBy"},
 	{KindMemStore, TierHIR, FamilyMemory, -1, "GMEM store: (value, tensor, axes...) — the HIR stage store"},
 	{KindMemNew, TierHIR, FamilyMemory, 1, "GMEM allocation: (extent value)"},
-	{KindIter, TierHIR, FamilyLoop, -1, "induction variable @m: (dim, bound?, init, step) — the bound slot is present only when bounded"},
+	{KindIter, TierHIR, FamilyLoop, -1, "loop header: (biv, parent?) — the BoundedDimVar value object, plus the parental iter only when nested"},
 	{KindIterCluster, TierHIR, FamilyLoop, -1, "compound iter(@m, @k, @n) header: (dims..., inputs...) — dims lead the input list"},
 	{KindConst, TierHIR, FamilyScalarExpr, 0, "typed scalar constant"},
 	{KindParam, TierHIR, FamilyScalarExpr, 1, "lambda/kernel parameter reference: (the InputParam)"},

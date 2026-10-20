@@ -145,7 +145,8 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 
 // checkNodeShape enforces the per-kind operand-shape invariants of the
 // memory and loop node suites, fail-closed: a bounded dimvar binds a
-// dimvar; an iter's and a dimvar's operand 0 is a dim InputParam; a
+// dimvar; an iter's operand 0 is a bounded dimvar and operand 1, when
+// present, an iter; a dimvar's operand 0 is a dim InputParam; a
 // paramRef's operand 0 is an InputParam; a cluster's dim operands LEAD its
 // input list; HIR GMEM load/store tensors bind a RoleTensor InputParam;
 // LIR SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a
@@ -167,9 +168,23 @@ func checkNodeShape(n Node, vs *[]Violation) {
 			}
 		}
 	case *iterNode:
-		if d := operandAt(t, 0); d != nil && !isDimParam(d) {
+		ops := OperandsOf(t)
+		if len(ops) < 1 || len(ops) > 2 {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				"iter operand 0 must be a dim InputParam"))
+				"iter must hold [biv] or [biv, parent]"))
+			break
+		}
+		if b := operandAt(t, 0); b != nil {
+			if _, ok := b.(*boundedDimVarNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"iter operand 0 must be a bounded dimvar"))
+			}
+		}
+		if p := operandAt(t, 1); p != nil {
+			if _, ok := p.(*iterNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"iter operand 1 must be the parental iter"))
+			}
 		}
 	case *dimVarNode:
 		if d := operandAt(t, 0); d != nil && !isDimParam(d) {
