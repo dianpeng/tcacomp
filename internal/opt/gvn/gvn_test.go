@@ -455,6 +455,68 @@ func TestGVNIterFusionNestedAwareness(t *testing.T) {
 	runGvnVerify(t, g2)
 }
 
+// TestGVNIterFusionPrefix pins PREFIX fusion of different-depth nests
+// (doc/optana/loop_fusion.md): nest1 A1<-B1<-C1 and nest2 A2<-B2<-C2<-D2
+// over the SAME dims with separately-built equal value objects — one gvn
+// run erases nest2's common prefix (iters, dimvars, bivs, duplicate
+// consts/maxes), while D2 (the deeper nest's extra level) survives
+// RE-PARENTED onto C1: its parent slot — operand 1 — resolves to C1
+// after the prefix RAUW cascade.
+func TestGVNIterFusionPrefix(t *testing.T) {
+	g := ir.NewGraph("prefixfuse")
+	f32 := ir.InternScalar(ir.TF32)
+	x := g.NewInputParam("ctor", ir.RoleDim, "x", nil)
+	y := g.NewInputParam("ctor", ir.RoleDim, "y", nil)
+	z := g.NewInputParam("ctor", ir.RoleDim, "z", nil)
+	w := g.NewInputParam("ctor", ir.RoleDim, "w", nil)
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "x"}}))
+
+	// nest 1: A1 <- B1 <- C1 (consts z1/s1; per-level maxes 64/128/256).
+	z1, s1 := g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1)
+	mA1, mB1, mC1 := g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 128), g.NewConst("ctor", f32, 256)
+	dvA1 := g.NewDimVar("ctor", x, z1, s1)
+	A1 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvA1, mA1), nil)
+	dvB1 := g.NewDimVar("ctor", y, z1, s1)
+	B1 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvB1, mB1), A1)
+	dvC1 := g.NewDimVar("ctor", z, z1, s1)
+	bivC1 := g.NewBoundedDimVar("ctor", dvC1, mC1)
+	C1 := g.NewIter("ctor", bivC1, B1)
+
+	// nest 2: A2 <- B2 <- C2 <- D2 — separately-built equal value objects.
+	z2, s2 := g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1)
+	mA2, mB2 := g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 128)
+	mC2, mD2 := g.NewConst("ctor", f32, 256), g.NewConst("ctor", f32, 512)
+	dvA2 := g.NewDimVar("ctor", x, z2, s2)
+	A2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvA2, mA2), nil)
+	dvB2 := g.NewDimVar("ctor", y, z2, s2)
+	B2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvB2, mB2), A2)
+	dvC2 := g.NewDimVar("ctor", z, z2, s2)
+	C2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvC2, mC2), B2)
+	dvD2 := g.NewDimVar("ctor", w, z2, s2)
+	bivD2 := g.NewBoundedDimVar("ctor", dvD2, mD2)
+	D2 := g.NewIter("ctor", bivD2, C2)
+
+	consumer := g.NewBinOp("ctor", ir.BinOpAdd, C1, D2)
+	scaffold(g, x, out, consumer)
+
+	runGVN(t, g)
+
+	assertGone(t, g, A2, B2, C2, z2, s2, mA2, mB2, mC2, dvA2, dvB2, dvC2)
+	assertKept(t, g, A1, B1, C1, D2, z1, s1, mA1, mB1, mC1, mD2, dvD2, bivD2, consumer)
+	// D2 survives, re-parented onto C1 (parent = operand 1).
+	if ops := ir.OperandsOf(D2); len(ops) != 2 || ops[1] != C1 {
+		t.Fatalf("D2 must survive re-parented onto C1 (ops[1]), got %v", ops)
+	}
+	if ops := ir.OperandsOf(consumer); len(ops) != 2 || ops[0] != C1 || ops[1] != D2 {
+		t.Fatalf("consumer must keep [C1, D2], got %v", ops)
+	}
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("graph must verify: %v", vs)
+	}
+	runGvnVerify(t, g)
+}
+
 // ---------------------------------------------------------------------------
 // Side-effect safety ([2.5]/[4.7 as amended]; amendments A+B)
 // ---------------------------------------------------------------------------

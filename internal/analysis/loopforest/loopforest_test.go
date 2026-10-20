@@ -324,3 +324,74 @@ func TestForestAfterGVNFusion(t *testing.T) {
 		t.Fatal("the erased duplicate must not be a forest member")
 	}
 }
+
+// TestForestAfterGVNPrefixFusion pins the forest consequence of PREFIX
+// fusion (doc/optana/loop_fusion.md): gvn fuses nest2's common prefix
+// into nest1 and re-parents the deeper level D2 onto C1, so the forest
+// holds ONE root with a 0/1/2/3 chain — D2 is a member (re-parented),
+// the fused-away A2 is not.
+func TestForestAfterGVNPrefixFusion(t *testing.T) {
+	g := ir.NewGraph("prefixforest")
+	f32 := ir.InternScalar(ir.TF32)
+	x := g.NewInputParam("ctor", ir.RoleDim, "x", nil)
+	y := g.NewInputParam("ctor", ir.RoleDim, "y", nil)
+	z := g.NewInputParam("ctor", ir.RoleDim, "z", nil)
+	w := g.NewInputParam("ctor", ir.RoleDim, "w", nil)
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "x"}}))
+
+	// nest 1: A1 <- B1 <- C1 (consts z1/s1; per-level maxes 64/128/256).
+	z1, s1 := g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1)
+	mA1, mB1, mC1 := g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 128), g.NewConst("ctor", f32, 256)
+	dvA1 := g.NewDimVar("ctor", x, z1, s1)
+	A1 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvA1, mA1), nil)
+	dvB1 := g.NewDimVar("ctor", y, z1, s1)
+	B1 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvB1, mB1), A1)
+	dvC1 := g.NewDimVar("ctor", z, z1, s1)
+	bivC1 := g.NewBoundedDimVar("ctor", dvC1, mC1)
+	C1 := g.NewIter("ctor", bivC1, B1)
+
+	// nest 2: A2 <- B2 <- C2 <- D2 — separately-built equal value objects.
+	z2, s2 := g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1)
+	mA2, mB2 := g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 128)
+	mC2, mD2 := g.NewConst("ctor", f32, 256), g.NewConst("ctor", f32, 512)
+	dvA2 := g.NewDimVar("ctor", x, z2, s2)
+	A2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvA2, mA2), nil)
+	dvB2 := g.NewDimVar("ctor", y, z2, s2)
+	B2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvB2, mB2), A2)
+	dvC2 := g.NewDimVar("ctor", z, z2, s2)
+	C2 := g.NewIter("ctor", g.NewBoundedDimVar("ctor", dvC2, mC2), B2)
+	dvD2 := g.NewDimVar("ctor", w, z2, s2)
+	bivD2 := g.NewBoundedDimVar("ctor", dvD2, mD2)
+	D2 := g.NewIter("ctor", bivD2, C2)
+
+	consumer := g.NewBinOp("ctor", ir.BinOpAdd, C1, D2)
+	scaffold(g, x, out, consumer)
+
+	if err := (gvn.Pass{}).Run(nil, g); err != nil {
+		t.Fatalf("gvn.Run: %v", err)
+	}
+
+	f := loopforest.Analyze(g)
+	roots := f.Roots()
+	if len(roots) != 1 || roots[0].Iter != A1 {
+		t.Fatalf("the prefix-fused forest must have exactly one root (A1), got %d", len(roots))
+	}
+	ta, _ := f.NodeOf(A1)
+	tb, _ := f.NodeOf(B1)
+	tc, _ := f.NodeOf(C1)
+	td, okd := f.NodeOf(D2)
+	if !okd {
+		t.Fatal("D2 must survive as a forest member")
+	}
+	if ta.Depth != 0 || tb.Depth != 1 || tc.Depth != 2 || td.Depth != 3 {
+		t.Fatalf("the chain depths must be 0/1/2/3, got %d/%d/%d/%d",
+			ta.Depth, tb.Depth, tc.Depth, td.Depth)
+	}
+	if tb.Parent != ta || tc.Parent != tb || td.Parent != tc {
+		t.Fatal("the chain must link A1 <- B1 <- C1 <- D2 (D2 re-parented onto C1)")
+	}
+	if _, ok := f.NodeOf(A2); ok {
+		t.Fatal("the fused-away prefix iter must not be a forest member")
+	}
+}
