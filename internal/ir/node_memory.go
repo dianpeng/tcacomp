@@ -37,6 +37,11 @@ func (n *memLoadNode) forEachPayloadUse(fn func(SSAUse)) {
 // impactBy implements effectBearer: a copy of the load's ordering edges.
 func (n *memLoadNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
 
+// removeImpactUse implements effectBearer: drop one ordering-edge handle by
+// record identity (C3, quick-261020-ejf). The hook only removes — the
+// chained constructor keeps its direct append wiring.
+func (n *memLoadNode) removeImpactUse(u SSAUse) bool { return dropImpactHandle(&n.effectIns, u) }
+
 // NewMemLoad creates a HIR GMEM load of tensor (a RoleTensor InputParam) at
 // the dim InputParams axes (subscript order), un-chained. The verifier's
 // shape check enforces the tensor operand kind.
@@ -87,6 +92,11 @@ func (n *memStoreNode) forEachPayloadUse(fn func(SSAUse)) {
 
 // impactBy implements effectBearer: a copy of the store's ordering edges.
 func (n *memStoreNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
+
+// removeImpactUse implements effectBearer: drop one ordering-edge handle by
+// record identity (C3, quick-261020-ejf). The hook only removes — the
+// chained constructor keeps its direct append wiring.
+func (n *memStoreNode) removeImpactUse(u SSAUse) bool { return dropImpactHandle(&n.effectIns, u) }
 
 // NewMemStore creates a HIR GMEM structural store node writing value through
 // the target access: tensor is the tensor InputParam node and axes its dim

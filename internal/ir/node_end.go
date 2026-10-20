@@ -33,6 +33,12 @@ func (n *returnNode) forEachPayloadUse(fn func(SSAUse)) {
 // impactBy implements effectBearer: a copy of the end node's ordering edges.
 func (n *returnNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
 
+// removeImpactUse implements effectBearer: drop one final-chain-state edge
+// handle by record identity (C3, quick-261020-ejf) — the same uniform hook
+// the memory accesses implement, so a region's Return observation is
+// droppable exactly like an interior chain edge.
+func (n *returnNode) removeImpactUse(u SSAUse) bool { return dropImpactHandle(&n.effectIns, u) }
+
 // NewReturn creates the graph's end node over the returned values. The FIRST
 // return created on a graph becomes its end node (R2 — Graph.End); later
 // returns allocate ordinary nodes, which the verifier rejects under its

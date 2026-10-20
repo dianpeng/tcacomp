@@ -25,6 +25,8 @@ import (
 //	105   type inference (typeinfer — every node typed after Simplification, before gvn)
 //	110   global CSE (gvn — dedup pure computations graph-wide)
 //	111   gvn-verify (the post-dedup invariant check)
+//	112   memory optimization (memopt — store-to-load forwarding + store-store/dead-store elimination, post-GVN)
+//	113   memopt-verify (the post-memopt invariant/fixpoint check)
 //	...   transformation passes slot between as they land
 //	900   late scheduling (schedule — the pre-codegen ordering fixup)
 //

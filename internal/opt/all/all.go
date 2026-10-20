@@ -11,6 +11,7 @@ package all
 import (
 	_ "tcacomp/internal/opt/dce"
 	_ "tcacomp/internal/opt/gvn"
+	_ "tcacomp/internal/opt/memopt"
 	_ "tcacomp/internal/opt/schedule"
 	_ "tcacomp/internal/opt/simplify"
 	_ "tcacomp/internal/opt/typeinfer"

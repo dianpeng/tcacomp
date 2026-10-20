@@ -100,6 +100,48 @@ func (ctx *MutContext) RemoveUse(u SSAUse) {
 	ctx.stamp(user)
 }
 
+// RemoveImpactBy drops u — an effect-input (ImpactBy) use — from its user's
+// effectIns payload, detaching the record from its def's ref list and
+// killing it (quick-261020-ejf condition C3). This is the chain-splicing
+// half DCE's hinge-6 documented as deliberately missing ("removing it would
+// need chain splicing"): RemoveUse cannot do this job — it kills the record
+// but drops the handle only from OPERAND storage, so the killed record
+// would linger in the bearer's effectIns and Verify flags it as "holds a
+// killed use record".
+//
+// Division of labor: RemoveImpactBy only DROPS an edge — the case where the
+// removed node is the chain head and its successor's ordering constraint
+// vanishes with it. Re-pointing a successor's edge at the removed node's
+// PREDECESSOR stays a plain SetDef splice: SetDef(succEdge, pred) moves the
+// same record; RemoveImpactBy is only for edges that must not survive.
+//
+// Fail-closed (IR-04): a nil record errors; a record the user does not hold
+// in its effectIns — an ordinary operand-slot use, or a use of a non-bearer
+// — errors naming the user's node ID and kind, with the graph untouched.
+func (ctx *MutContext) RemoveImpactBy(u SSAUse) error {
+	if u.rec == nil {
+		return errors.New("ir: RemoveImpactBy on nil use")
+	}
+	user := u.rec.user
+	if user == nil {
+		return errors.New("ir: RemoveImpactBy on use with nil user")
+	}
+	eb, ok := user.(effectBearer)
+	if !ok || !eb.removeImpactUse(u) {
+		return fmt.Errorf("ir: RemoveImpactBy on node %d (%s): the use record is not an ImpactBy effect input held by this node",
+			user.BasePtr().ID(), user.KindOf())
+	}
+	if def := u.rec.def; def != nil {
+		def.removeRef(u.rec)
+		if def.node != nil {
+			ctx.stamp(def.node)
+		}
+	}
+	u.rec.killed = true
+	ctx.stamp(user)
+	return nil
+}
+
 // ReplaceAllUsesWith moves every live use of old onto newVal in O(uses),
 // mirroring LLVM's replaceAllUsesWith: each ref record is rewired into
 // newVal's var in one pass over a snapshot, so the walk survives its own
