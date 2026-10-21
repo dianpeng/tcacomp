@@ -1,9 +1,9 @@
 // search.go is the parallelization-schedule (PSched) machinery of
 // doc/optana/loop_tiling.md ("Assignment of Parallisation" + "Algorithm to
 // solve the above formentioned optimization problem"): the innermost-K
-// search window, the flat 3^K x tiles enumeration, the greedy LoC
-// completion, the feasibility gates, the promotion judge, and the weighted
-// parallelism + traffic-avoided objective.
+// search window, the flat 3^K x tiles enumeration, the portion-grammar LoC
+// completion, the feasibility gates, the promotion judge, and the
+// single-term traffic-avoided objective.
 //
 // Documented interpretations (each cited where it fires):
 //   - Spine window: "the INNERMOST K consecutive loops" of a TREE is the
@@ -15,11 +15,24 @@
 //     over {1} ∪ TileSizes (t=1 = tiling disabled). Per-cache-count
 //     heuristic tile sets are future work. This keeps the doc's 3^K
 //     tractability claim literally true: total <= 3^K * (|TileSizes|+1)
-//     <= 1215 schedules per LNT at defaults.
-//   - Greedy LoC completion is EXACT for the LoC sub-problem: LoC enters
-//     feasibility and the parallelism term only — never traffic — so
-//     maximizing each dim's LoC greedily (subject to the running bounds)
-//     maximizes both the feasibility slack and the parallelism term.
+//     <= 1215 schedules per LNT at defaults (the v0 policy filter only
+//     skips more of them).
+//   - Portion completion replaces the legacy greedy LoC presets: under the
+//     v0 policy there is at most one CTA dim (portion -1/full, LoC =
+//     MaxCTA) and at most one independent warp dim (LoC = warp portion x
+//     warpsPerPortion); the CTA dim's coupled tile-inside walk implicitly
+//     consumes the remaining warp portions, its stride derived by the
+//     lower pass, not recorded.
+//   - v0 POLICY (loop_tiling.md "Composition Semantics, CTA x WARP", the
+//     "v0 default searcher POLICY" bullet): at most ONE CTA-assigned dim
+//     and at most ONE independent WARP dim per LNT. Same-category
+//     multi-dim composition (CTA+CTA, WARP+WARP) is FUTURE pending the
+//     combined-slicing arithmetic, so vectors violating the policy are
+//     skipped outright.
+//   - Single-term objective (loop_tiling.md "Objective Function ...,
+//     SINGLE-TERM"): score = traffic avoided; the parallelism term is
+//     deleted — under mandatory per-LNT exhaustion total parallelism is
+//     CONSTANT, so it carries no ranking signal.
 //   - SMEM-only budget: the doc's Max.cache gate counts SMEM caches; FRAG
 //     sites are register-budgeted by the LOWER pass per its spec's ruling.
 package tiling
@@ -51,7 +64,14 @@ func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
 	var best schedResult
 	found := false
 	for {
-		if hasCTALevel(soc) {
+		// Feasibility gates: >= 1 CTA dim ("an assignment is feasible when
+		// it at least has one CTA assignment") AND the v0 policy (at most
+		// one CTA dim, at most one independent warp dim — loop_tiling.md
+		// "Composition Semantics": same-category multi-dim is FUTURE
+		// pending the combined-slicing arithmetic). The odometer keeps
+		// running over all 3^K and skips violators — simpler than pruning
+		// the enumeration.
+		if hasCTALevel(soc) && v0PolicyClean(soc) {
 			for _, tile := range tileCandidates(p) {
 				res, ok := evalSchedule(f, lf, window, soc, tile, p)
 				if !ok {
@@ -80,49 +100,67 @@ func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
 		// Defensive: the t=1 point of any CTA-carrying vector is always
 		// feasible (nothing promotes at tile 1, so the SMEM sum is 0), so
 		// this is unreachable for validated Params — but a search that
-		// found nothing still owes every LNT a schedule: return the
-		// all-sequential t=1 point.
-		res, _ := evalSchedule(f, lf, window, make([]SoCType, len(window)), 1, p)
+		// found nothing still owes every LNT a schedule. The legacy
+		// all-sequential fallback is INVALID under the >= 1-CTA ruling (an
+		// LNT without a CTA dim cannot execute under the CUDA thread
+		// model), so the fallback CARRIES a CTA dim: the outermost window
+		// level is SoCTA, the rest sequential, t=1.
+		fb := make([]SoCType, len(window))
+		if len(fb) > 0 {
+			fb[0] = SoCTA
+		}
+		res, _ := evalSchedule(f, lf, window, fb, 1, p)
 		return res
 	}
 	return best
 }
 
 // evalSchedule scores one candidate (window SoC vector + uniform tile):
-// greedy LoC completion, full per-iter decision map (window assignments
-// plus the sequential defaults for every non-window iter), the promotion
-// judge + traffic over the candidate sites, and the SMEM feasibility gate.
-// The CTA product and warp-sum bounds hold by construction of the greedy
-// completion.
+// portion-grammar LoC completion, full per-iter decision map (window
+// assignments plus the sequential defaults for every non-window iter), the
+// promotion judge + traffic over the candidate sites, and the SMEM
+// feasibility gate. The portion grammar holds by construction: the (at
+// most one) CTA dim exhausts the CTA space (portion -1/full) and the (at
+// most one) independent warp dim takes its portion of the warp space.
 func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCType, tile int, p Params) (schedResult, bool) {
 	treeIters := treeItersOf(lf.Tree)
 	iters := make(map[ir.Node]IterDecision, len(treeIters))
 	for _, it := range treeIters {
 		iters[it] = IterDecision{SoC: SoCSequential, LoC: 1, TileSize: 1}
 	}
-	// GREEDY LoC COMPLETION, window inner -> outer: CTA dims take the
-	// largest preset keeping the running product <= MaxCTA; warp dims the
-	// largest keeping the warp sum <= MaxThreadsPerCTA/32. Fallback 1
-	// (every validated preset list holds positive values, and 1 always
-	// fits the validated bounds).
-	prod, warpSum := 1, 0
-	for i := len(window) - 1; i >= 0; i-- {
+	// PORTION COMPLETION (the final model, replacing the legacy greedy
+	// preset loops; loop_tiling.md "Portion grammar"). With the v0 policy
+	// there is at most one CTA dim and at most one independent warp dim, so
+	// no running product/sum accounting is needed — each dim's LoC follows
+	// from its portion directly, and the walk order is irrelevant:
+	//
+	//   - SoCTA: portion -1/full — the single CTA dim exhausts the CTA
+	//     space, so LoC = MaxCTA.
+	//   - SoCWARP: LoC = warpPortion x warpsPerPortion warps, where
+	//     warpsPerPortion = (MaxThreadsPerCTA/32)/PortionWarp. The CTA
+	//     dim's coupled tile-inside walk implicitly consumes the REMAINING
+	//     warp portions; its stride is derived by the lower pass, not
+	//     recorded. warpPortion is p.WarpPortion, or auto (0):
+	//     AutoWarpPortion when the vector carries a CTA dim (the coupled
+	//     inside needs the remaining portions, >= 1), else PortionWarp
+	//     (full).
+	//   - Sequential: LoC 1.
+	warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
+	warpPortion := p.WarpPortion
+	if warpPortion == 0 {
+		if hasCTALevel(soc) {
+			warpPortion = AutoWarpPortion
+		} else {
+			warpPortion = PortionWarp
+		}
+	}
+	for i := range window {
 		d := IterDecision{SoC: soc[i], LoC: 1, TileSize: tile}
 		switch soc[i] {
 		case SoCTA:
-			for _, c := range p.CTALoCs {
-				if prod*c <= p.MaxCTA && c > d.LoC {
-					d.LoC = c
-				}
-			}
-			prod *= d.LoC
+			d.LoC = p.MaxCTA
 		case SoCWARP:
-			for _, w := range p.WarpLoCs {
-				if warpSum+w <= p.MaxThreadsPerCTA/32 && w > d.LoC {
-					d.LoC = w
-				}
-			}
-			warpSum += d.LoC
+			d.LoC = warpPortion * warpsPerPortion
 		}
 		iters[window[i]] = d
 	}
@@ -144,11 +182,11 @@ func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCT
 		return schedResult{}, false // SMEM budget gate
 	}
 
-	locSum := 0
-	for _, it := range treeIters { // slice order: deterministic summation
-		locSum += iters[it].LoC
-	}
-	res.score = p.ParallelWeight*float64(locSum) + p.ReuseWeight*float64(traffic)
+	// SINGLE-TERM OBJECTIVE (loop_tiling.md "Objective Function ...,
+	// SINGLE-TERM"): score is the GMEM traffic avoided alone — parallelism
+	// is CONSTANT under mandatory per-LNT exhaustion, so the deleted
+	// weighted parallelism term carried no ranking signal.
+	res.score = float64(traffic)
 	return res, true
 }
 
@@ -367,4 +405,25 @@ func hasCTALevel(soc []SoCType) bool {
 		}
 	}
 	return false
+}
+
+// v0PolicyClean reports whether the SoC vector obeys the v0 searcher
+// policy (loop_tiling.md "Composition Semantics, CTA x WARP", the "v0
+// default searcher POLICY" bullet): at most ONE CTA-assigned dim and at
+// most ONE independent WARP dim per LNT. Same-category multi-dim
+// composition (CTA+CTA or independent WARP+WARP) is FUTURE pending the
+// combined-slicing arithmetic — product factors of the level's space and
+// portions as the selection grammar — so the searcher never emits such
+// schedules in v0.
+func v0PolicyClean(soc []SoCType) bool {
+	cta, warp := 0, 0
+	for _, s := range soc {
+		switch s {
+		case SoCTA:
+			cta++
+		case SoCWARP:
+			warp++
+		}
+	}
+	return cta <= 1 && warp <= 1
 }

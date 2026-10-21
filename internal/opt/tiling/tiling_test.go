@@ -14,10 +14,11 @@ import (
 )
 
 // tiling_test.go pins the DECIDE pass (priority 114) per
-// doc/optana/loop_tiling.md: the PSched search (innermost-K window, flat
-// 3^K x tiles enumeration, greedy LoC completion, feasibility gates), the
-// promotion judge, the parallelism + traffic-avoided objective, and the
-// pass plumbing (registry, record publication, determinism, no mutation).
+// doc/optana/loop_tiling.md's final model: the PSched search (innermost-K
+// window, flat 3^K x tiles enumeration, portion-grammar LoC completion,
+// feasibility gates, v0 policy), the promotion judge, the single-term
+// traffic-avoided objective, and the pass plumbing (registry, record
+// publication, determinism, no mutation).
 //
 // The package-internal test position is deliberate: the judge and the
 // search's shared helpers are exercised directly. The opt/all composition
@@ -57,6 +58,7 @@ func decisionOf(t *testing.T, rec *Record, iter ir.Node) IterDecision {
 type feas struct {
 	ctaCount   int
 	ctaProduct int
+	warpCount  int
 	warpSum    int
 	locSum     int
 }
@@ -70,6 +72,7 @@ func feasibilityOf(rec *Record) feas {
 			f.ctaCount++
 			f.ctaProduct *= d.LoC
 		case SoCWARP:
+			f.warpCount++
 			f.warpSum += d.LoC
 		}
 	}
@@ -175,32 +178,33 @@ func TestMatmulEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFeasibilityBounds pins the greedy LoC completion and the accounting
-// gates: a tight MaxCTA caps the CTA product, a tight thread budget caps
-// the warp sum, and a zero-CTA schedule is never selected.
+// TestFeasibilityBounds pins the portion completion and the accounting
+// gates: a minimal MaxCTA is exhausted exactly, a minimal (PortionWarp-warp)
+// thread budget caps the warp sum, and a zero-CTA schedule is never
+// selected.
 func TestFeasibilityBounds(t *testing.T) {
 	fx, _, _ := matmul()
 
-	t.Run("tight cta budget", func(t *testing.T) {
+	t.Run("minimal cta budget", func(t *testing.T) {
 		p := DefaultParams()
-		p.MaxCTA = 4
+		p.MaxCTA = PortionCTA // one CTA portion
 		rec := runPass(t, fx.g, p)
 		f := feasibilityOf(rec)
 		if f.ctaCount < 1 {
 			t.Fatal("at least one CTA assignment is required even under a tight budget")
 		}
-		if f.ctaProduct > 4 {
-			t.Fatalf("CTA LoC product %d exceeds the tight MaxCTA 4", f.ctaProduct)
+		if f.ctaProduct != PortionCTA {
+			t.Fatalf("the single CTA dim must exhaust the minimal MaxCTA %d, got LoC product %d", PortionCTA, f.ctaProduct)
 		}
 	})
 
-	t.Run("tight warp budget", func(t *testing.T) {
+	t.Run("minimal warp budget", func(t *testing.T) {
 		p := DefaultParams()
-		p.MaxThreadsPerCTA = 64 // two warps
+		p.MaxThreadsPerCTA = PortionWarp * 32 // eight warps: the assert-and-trap minimum
 		rec := runPass(t, fx.g, p)
 		f := feasibilityOf(rec)
-		if f.warpSum*32 > 64 {
-			t.Fatalf("warp LoC sum %d x 32 exceeds the 64-thread budget", f.warpSum)
+		if f.warpSum*32 > PortionWarp*32 {
+			t.Fatalf("warp LoC sum %d x 32 exceeds the %d-thread budget", f.warpSum, PortionWarp*32)
 		}
 	})
 
@@ -324,7 +328,8 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	if smem > p.MaxCache {
 		t.Fatalf("chosen schedule's SMEM footprint %d exceeds MaxCache %d", smem, p.MaxCache)
 	}
-	score := float64(feasibilityOf(rec).locSum) + float64(traffic)
+	// SINGLE-TERM objective: score is the traffic avoided alone.
+	score := float64(traffic)
 
 	best := enumerateBest(t, fx, p)
 	if score != best {
@@ -368,31 +373,29 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 				hasCTA = true
 			}
 		}
-		if hasCTA {
+		if hasCTA && v0PolicyClean(soc) { // the search's feasibility + v0 policy gates
+			warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
+			warpPortion := p.WarpPortion
+			if warpPortion == 0 {
+				if hasCTA {
+					warpPortion = AutoWarpPortion
+				} else {
+					warpPortion = PortionWarp
+				}
+			}
 			for _, tile := range tiles {
 				iters := make(map[ir.Node]IterDecision, len(treeIters))
 				for _, it := range treeIters {
 					iters[it] = IterDecision{SoCSequential, 1, 1}
 				}
-				prod, warpSum := 1, 0
 				feasible := true
-				for i := len(window) - 1; i >= 0; i-- { // greedy inner -> outer
+				for i := range window { // portion completion
 					d := IterDecision{SoC: soc[i], LoC: 1, TileSize: tile}
 					switch soc[i] {
 					case SoCTA:
-						for _, c := range p.CTALoCs {
-							if prod*c <= p.MaxCTA && c > d.LoC {
-								d.LoC = c
-							}
-						}
-						prod *= d.LoC
+						d.LoC = p.MaxCTA
 					case SoCWARP:
-						for _, w := range p.WarpLoCs {
-							if warpSum+w <= p.MaxThreadsPerCTA/32 && w > d.LoC {
-								d.LoC = w
-							}
-						}
-						warpSum += d.LoC
+						d.LoC = warpPortion * warpsPerPortion
 					}
 					iters[window[i]] = d
 				}
@@ -419,11 +422,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 				if smem > p.MaxCache {
 					feasible = false
 				}
-				locSum := 0
-				for _, d := range iters {
-					locSum += d.LoC
-				}
-				score := p.ParallelWeight*float64(locSum) + p.ReuseWeight*float64(traffic)
+				score := float64(traffic) // single-term objective
 				if feasible && score > best {
 					best = score
 				}

@@ -1,9 +1,20 @@
 // Package tiling implements the DECIDE half of the loop-tiling pair per
-// doc/optana/loop_tiling.md (as revised by rulings F1/F4/F5/F8/F9 and
-// 261020-fd1) plus the record interface of doc/optana/loop_tile_lower.md §1:
-// the MemLoad overlap analysis, the parallelization-schedule (PSched)
-// search, the SMEM/FRAG cache-promotion decisions, and the decision-record
-// side table the future loop-tile-lower pass consumes.
+// doc/optana/loop_tiling.md (final model, as patched by 261021-gca) plus
+// the record interface of doc/optana/loop_tile_lower.md §1: the MemLoad
+// overlap analysis, the parallelization-schedule (PSched) search, the
+// SMEM/FRAG cache-promotion decisions, and the decision-record side table
+// the future loop-tile-lower pass consumes.
+//
+// The FINAL constraint/objective model (loop_tiling.md "LoC concurrency
+// bounds, the FINAL MODEL" + "Objective Function: for a specific PSched,
+// SINGLE-TERM"): the constraints are the PORTION GRAMMAR — the named
+// PortionCTA/PortionWarp constants, per-LNT exhaustion of the launch
+// totals, and the runtime assert-and-trap divisibility pre-conditions —
+// while the objective is single-term traffic avoided: parallelism is
+// CONSTANT under mandatory per-LNT exhaustion, so it carries no ranking
+// signal. The searcher additionally obeys the v0 POLICY ("Composition
+// Semantics, CTA x WARP"): at most one CTA dim and at most one independent
+// WARP dim per LNT.
 //
 // Ruling D2 (2026-10-20, overriding the stale "Cache Mark" section of
 // loop_tiling.md): the pass NEVER mutates the IR graph — no MemLoad.ctaCache
@@ -156,16 +167,44 @@ func (r Record) SiteDecisionOf(load ir.Node) (SiteDecision, bool) {
 // EXTERNALLY PROVIDED to the pass").
 // ---------------------------------------------------------------------------
 
-// Params carries the pass thresholds with the doc-mandated defaults
-// (quick-261020-ve6). Every field is validated by Validate before any
-// computation — external input is never trusted (fail-fast at the
-// boundary).
+// The named portion constants of loop_tiling.md ("Named portion constants,
+// future adaptation points"): the grammar the launch totals are divided
+// into, and the compiler-side mirror of the runtime assert-and-trap
+// pre-conditions.
+const (
+	// PortionCTA is PORTION_CTA: the CTA space is sharded into 10 portions,
+	// and the runtime ASSERT-AND-TRAP pre-condition demands the provided CTA
+	// count be a multiple of it.
+	PortionCTA = 10
+	// PortionWarp is PORTION_WARP: the warp space is sharded into 8
+	// portions. It is NOT itself a warp count — at the minimum config each
+	// portion is exactly ONE warp (the 8-warp / 256-thread minimum).
+	PortionWarp = 8
+	// AutoWarpPortion is the auto-selected WarpPortion when the LNT's
+	// vector carries a CTA dim: the independent warp dim takes half the
+	// warp portions (4 of 8) and the CTA dim's coupled tile-inside walk
+	// implicitly consumes the remaining 4 — per-LNT exhaustion holds either
+	// way (loop_tiling.md "Portion grammar").
+	AutoWarpPortion = 4
+)
+
+// Params carries the pass thresholds with the final-design defaults
+// (loop_tiling.md "LoC concurrency bounds, the FINAL MODEL"). Every field
+// is validated by Validate before any computation — external input is
+// never trusted (fail-fast at the boundary).
 type Params struct {
-	// MaxCTA is the total CTA allocation bound (gridDim.x).
+	// MaxCTA is the total CTA allocation (gridDim.x), a multiple of
+	// PortionCTA per the runtime assert-and-trap contract.
 	MaxCTA int
 	// MaxThreadsPerCTA is the per-CTA thread budget (blockDim.x); MUST be a
-	// multiple of WARP (32) per the doc.
+	// multiple of WARP (32) whose warp count is a multiple of PortionWarp
+	// per the runtime assert-and-trap contract.
 	MaxThreadsPerCTA int
+	// WarpPortion is the independent warp dim's portion of the warp space;
+	// 0 = auto: AutoWarpPortion when the LNT's vector carries a CTA dim
+	// (the coupled tile-inside walk needs the remaining portions, >= 1),
+	// else PortionWarp (full).
+	WarpPortion int
 	// MaxCache is the SMEM budget in bytes (the project's 64 KB SMEM
 	// budget; only promoted ClassSMEM sites count — FRAG sites are
 	// register-budgeted by the lower pass).
@@ -178,17 +217,9 @@ type Params struct {
 	MaxCS int
 	// WindowK is the innermost-K search window depth (K default 5).
 	WindowK int
-	// CTALoCs / WarpLoCs are the LoC presets the greedy completion draws
-	// from; every list must contain 1 (the always-feasible fallback).
-	CTALoCs  []int
-	WarpLoCs []int
 	// TileSizes is the common tile-size search set; the uniform sweep also
 	// includes t=1 (tiling disabled).
 	TileSizes []int
-	// ParallelWeight / ReuseWeight weight the objective
-	// score = ParallelWeight*ΣLoC + ReuseWeight*trafficAvoided.
-	ParallelWeight float64
-	ReuseWeight    float64
 	// NominalExtent is the documented stand-in extent for a reuse dimension
 	// whose BIV max operand is NOT a constant: the doc demands static
 	// arithmetic, and real tensors bound by TensorDimOf have symbolic
@@ -198,40 +229,45 @@ type Params struct {
 	NominalExtent int
 }
 
-// DefaultParams returns the doc-pinned defaults: 65535 CTAs, 1024 threads
-// per CTA, 64 KB SMEM, CacheDims 2, MaxCS 16, window K=5, CTA LoC presets
-// {1,2,4,8,16}, warp LoC presets {1,2,4,8}, tile sizes {32,64,128,256},
-// unit weights, nominal extent 4096.
+// DefaultParams returns the final-design defaults (loop_tiling.md "LoC
+// concurrency bounds, the FINAL MODEL"): 100 CTAs (Ampere's 108 SMs
+// rounded DOWN to the PortionCTA multiple), 512 threads per CTA (= 16
+// warps), 64 KB SMEM, CacheDims 2, MaxCS 16, window K=5, tile sizes
+// {32,64,128,256}, nominal extent 4096, WarpPortion auto. The legacy LoC
+// presets and objective weights are gone — the portion grammar replaces
+// them.
 func DefaultParams() Params {
 	return Params{
-		MaxCTA:           65535,
-		MaxThreadsPerCTA: 1024,
+		MaxCTA:           100,
+		MaxThreadsPerCTA: 512,
 		MaxCache:         65536,
 		CacheDims:        2,
 		MaxCS:            16,
 		WindowK:          5,
-		CTALoCs:          []int{1, 2, 4, 8, 16},
-		WarpLoCs:         []int{1, 2, 4, 8},
 		TileSizes:        []int{32, 64, 128, 256},
-		ParallelWeight:   1,
-		ReuseWeight:      1,
+		WarpPortion:      0,
 		NominalExtent:    4096,
 	}
 }
 
-// Validate fail-fasts on malformed thresholds: MaxThreadsPerCTA not a
-// positive multiple of WARP (32, the doc's "MUST be a multiple of WARP"),
-// any non-positive bound (MaxCTA, MaxCache, CacheDims, MaxCS, WindowK,
-// NominalExtent), non-positive weights, and preset/tile lists that are
-// empty or contain a non-positive entry (the greedy completion's fallback
-// of 1 must always be available, and a non-positive LoC or tile would
+// Validate fail-fasts on malformed thresholds. The first two checks are the
+// compiler-side mirror of the runtime ASSERT-AND-TRAP pre-conditions
+// (loop_tiling.md "Runtime hard pre-condition, ASSERT-AND-TRAP"): MaxCTA a
+// positive multiple of PortionCTA, and MaxThreadsPerCTA a multiple of WARP
+// (32) whose warp count is a multiple of PortionWarp (8 warps, i.e. the
+// 256-thread minimum). WarpPortion must be a legal portion ([0,
+// PortionWarp], 0 = auto); the remaining bounds must be positive; the tile
+// list must be non-empty with positive entries (a non-positive tile would
 // poison the arithmetic).
 func (p Params) Validate() error {
-	if p.MaxThreadsPerCTA <= 0 || p.MaxThreadsPerCTA%32 != 0 {
-		return fmt.Errorf("tiling: MaxThreadsPerCTA %d must be a positive multiple of WARP (32)", p.MaxThreadsPerCTA)
+	if p.MaxCTA <= 0 || p.MaxCTA%PortionCTA != 0 {
+		return fmt.Errorf("tiling: MaxCTA %d must be a positive multiple of PortionCTA %d (the runtime assert-and-trap pre-condition)", p.MaxCTA, PortionCTA)
 	}
-	if p.MaxCTA < 1 {
-		return fmt.Errorf("tiling: MaxCTA %d must be >= 1", p.MaxCTA)
+	if p.MaxThreadsPerCTA <= 0 || p.MaxThreadsPerCTA%32 != 0 || (p.MaxThreadsPerCTA/32)%PortionWarp != 0 {
+		return fmt.Errorf("tiling: MaxThreadsPerCTA %d must be a positive multiple of WARP (32) with a warp count that is a multiple of PortionWarp %d (the runtime assert-and-trap pre-condition, 256-thread minimum)", p.MaxThreadsPerCTA, PortionWarp)
+	}
+	if p.WarpPortion < 0 || p.WarpPortion > PortionWarp {
+		return fmt.Errorf("tiling: WarpPortion %d must be within [0, PortionWarp %d] (0 = auto)", p.WarpPortion, PortionWarp)
 	}
 	if p.MaxCache < 1 {
 		return fmt.Errorf("tiling: MaxCache %d must be >= 1", p.MaxCache)
@@ -248,20 +284,12 @@ func (p Params) Validate() error {
 	if p.NominalExtent < 1 {
 		return fmt.Errorf("tiling: NominalExtent %d must be >= 1", p.NominalExtent)
 	}
-	if p.ParallelWeight <= 0 {
-		return fmt.Errorf("tiling: ParallelWeight %v must be positive", p.ParallelWeight)
+	if len(p.TileSizes) == 0 {
+		return fmt.Errorf("tiling: TileSizes must not be empty")
 	}
-	if p.ReuseWeight <= 0 {
-		return fmt.Errorf("tiling: ReuseWeight %v must be positive", p.ReuseWeight)
-	}
-	for name, list := range map[string][]int{"CTALoCs": p.CTALoCs, "WarpLoCs": p.WarpLoCs, "TileSizes": p.TileSizes} {
-		if len(list) == 0 {
-			return fmt.Errorf("tiling: %s must not be empty", name)
-		}
-		for _, v := range list {
-			if v < 1 {
-				return fmt.Errorf("tiling: %s contains non-positive entry %d", name, v)
-			}
+	for _, v := range p.TileSizes {
+		if v < 1 {
+			return fmt.Errorf("tiling: TileSizes contains non-positive entry %d", v)
 		}
 	}
 	return nil
