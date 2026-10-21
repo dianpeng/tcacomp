@@ -335,6 +335,10 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	if err := checkForLoopSteps(g); err != nil {
 		return err
 	}
+	// F7 stamp (261021-o61 T3): the record passed the full consistency
+	// sweep — tile-lower consumes this mark and refuses unstamped records
+	// fail-closed (a corrupted record must not reach the rewrite).
+	rec.Verified = true
 	return nil
 }
 

@@ -90,10 +90,38 @@ func (lr *lowerRun) attr(key string, v float64) ir.Node {
 // rewriteLNT performs PHASE 2-3 for one forest root: numbering, per-dim
 // expression generation, inside-out loop construction, body placement, IV
 // RAUW, original retirement, and the P6 chain re-pointing.
+//
+// F3 (ruled 2026-10-21): a BRANCHED LNT — any tree node with > 1 child — is
+// REJECTED fail-closed before anything is built. treeItersOf's DFS preorder
+// would feed sibling iters to buildNest as one linear chain, silently
+// rewriting "B1 then B2 under A" into "A{ B1{ B2{ body }}}": the body would
+// execute the siblings' CROSS PRODUCT, and B2's body ops would end up
+// outside the nest while their IVs were RAUW'd to loops they are not inside
+// (HI-05). Per-branch sub-nests are future work.
 func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 	iters := treeItersOf(root)
 	if len(iters) == 0 {
 		return nil
+	}
+	var branchErr error
+	var walk func(t *loopforest.Tree)
+	walk = func(t *loopforest.Tree) {
+		if branchErr != nil {
+			return
+		}
+		if len(t.Children) > 1 {
+			branchErr = fmt.Errorf(
+				"tile-lower: branched LNT not supported by the v0 rewrite: iter node %d carries %d children (sibling iters must never be silently linearized into one nested chain — their spaces would execute as a cross product, F3/HI-05)",
+				t.Iter.BasePtr().ID(), len(t.Children))
+			return
+		}
+		for _, c := range t.Children {
+			walk(c)
+		}
+	}
+	walk(root)
+	if branchErr != nil {
+		return branchErr
 	}
 	dims, err := lr.numberDims(iters)
 	if err != nil {
@@ -188,12 +216,28 @@ func dimOfIter(iter ir.Node) (ir.Node, error) {
 // extentOfBiv resolves the iter's static extent: the BIV's max operand
 // (operand 1). The 0-based between loops eliminate ceil entirely — the
 // bound IS the raw extent (§6bis PHASE 3 note).
+//
+// LO-05 (261021-o61 T3): the whole materialized-bound chain (sub, umin) is
+// u32 — an extent of any other type would emit ill-typed nodes that only
+// the pipeline's later typeinfer re-run catches, so a non-u32 max operand
+// fails closed HERE with a named error. The type is read from the computed
+// cell first (the real pipeline's TensorDimOf extents type u32 there) and
+// falls back to a const's interned payload type (the fixture vocabulary).
 func extentOfBiv(biv ir.Node) (ir.Node, error) {
 	ops := ir.DataDeps(biv)
 	if len(ops) < 2 || ops[1] == nil {
 		return nil, fmt.Errorf("tile-lower: BIV node %d carries no max operand (the extent)", biv.BasePtr().ID())
 	}
-	return ops[1], nil
+	extent := ops[1]
+	ty := ir.TypeOf(extent)
+	if ty == nil {
+		ty = ir.ConstTypeOf(extent)
+	}
+	if ty == nil || !ty.Equal(ir.InternScalar(ir.TU32)) {
+		return nil, fmt.Errorf("tile-lower: BIV node %d carries a non-u32 extent (the umin bound chain requires u32 extents, LO-05)",
+			biv.BasePtr().ID())
+	}
+	return extent, nil
 }
 
 // coupledThreads derives the CTA dim's coupled tile-inside walk thread
@@ -224,13 +268,23 @@ func hasCTADim(dims []*dimRewrite) bool {
 	return false
 }
 
-// tileMax materializes the per-tile uniform bound (§6bis PHASE 3):
-// d_tile_max = umin(T_d, extent_d − d_offset) — bounds ONLY; tail guarding
-// is the runtime loop primitive's whole-body no-op (§4), never an IR
-// branch.
+// tileMax materializes the per-tile uniform bound (§6bis PHASE 3) in the
+// SATURATING form (F1, ruled 2026-10-21):
+//
+//	d_tile_max = umin(T_d, extent_d − umin(d_offset, extent_d))
+//
+// The clamp BEFORE the subtract is load-bearing: the whole chain is u32, so
+// the plain `extent − offset` WRAPS on tail rounds (an out-of-range CTA
+// rank 3168 against extent 1024 computes 4294965152, the min picks T, and
+// the inside loop RUNS its body out of bounds instead of no-op'ing — CR-01).
+// With the clamp the arithmetic is pure u32, wraps nowhere, and
+// d_tile_max == 0 exactly when the rank is out of range — bounds ONLY; tail
+// guarding stays the runtime loop primitive's whole-body no-op (§4), never
+// an IR branch.
 func (lr *lowerRun) tileMax(tile int, extent, offset ir.Node) ir.Node {
-	sub := lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, extent, offset)
-	return lr.g.NewCall(lowerOrigin, "umin", lr.u32c(float64(tile)), sub)
+	clamped := lr.g.NewCall(lowerOrigin, "umin", offset, extent)
+	rem := lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, extent, clamped)
+	return lr.g.NewCall(lowerOrigin, "umin", lr.u32c(float64(tile)), rem)
 }
 
 // generateDimExprs builds every dim's dimvars, bounds, ranks, offsets, and
@@ -305,6 +359,14 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
 			d.insideBound = lr.tileMax(d.tile, extent, offset)
 			coupled := lr.coupledThreads(cta)
+			if coupled < 1 {
+				// F2 defensive floor (the decide pass's Validate/evalSchedule
+				// reject the configuration first; this is the rewrite-side
+				// backstop): a zero-portion coupled walk emits a zero-stride
+				// inside ForLoop — an infinite loop.
+				return fmt.Errorf("tile-lower: CTA dim (iter node %d) coupled inside walk computes %d threads — the coupled-portion floor (F2) demands >= 1",
+					d.iter.BasePtr().ID(), coupled)
+			}
 			d.coupledThreads = coupled
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(coupled)))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc))}

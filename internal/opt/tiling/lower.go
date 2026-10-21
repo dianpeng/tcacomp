@@ -45,13 +45,18 @@ import (
 const lowerOrigin = "tile-lower"
 
 // init self-registers the pass: Priority 116 — doc/opt.md's "loop tiling
-// rewrite" slot, immediately after tiling-verify (115). The registry scale
-// in internal/opt/registry.go documents the anchor.
+// rewrite" slot, immediately after tiling-verify (115). Requires BOTH
+// tiling and tiling-verify (F7, ruled 2026-10-21): the per-iter feasibility
+// re-checks live in tiling-verify, and a corrupted record must NOT reach
+// the rewrite unvalidated — the pass-manager precondition (PASS-01) plus
+// the record's Verified stamp (checked in Run, below) close the gate from
+// both sides. The registry scale in internal/opt/registry.go documents the
+// anchor.
 func init() {
 	opt.Register(opt.PassSpec{
 		ID:       "tile-lower",
 		Priority: 116,
-		Requires: []string{"tiling"},
+		Requires: []string{"tiling", "tiling-verify"},
 		Factory:  func() opt.Pass { return LowerPass{Params: DefaultParams()} },
 	})
 }
@@ -66,10 +71,11 @@ type LowerPass struct {
 // ID returns the pipeline name "tile-lower".
 func (LowerPass) ID() string { return "tile-lower" }
 
-// Requires: the decide pass must have run earlier — the record this pass
-// consumes is its product, and the cache invalidation contract only keeps
-// the record alive while nothing runs in between (§1).
-func (LowerPass) Requires() []string { return []string{"tiling"} }
+// Requires: the decide pass AND its verification must have run earlier —
+// the record this pass consumes is their product, the cache invalidation
+// contract only keeps the record alive while nothing runs in between (§1),
+// and F7 demands the record reach the rewrite validated.
+func (LowerPass) Requires() []string { return []string{"tiling", "tiling-verify"} }
 
 // Produces: builder-output stage — like every current pass; the new LIR
 // kinds' catalog rows ARE their legality row today (P9: constructedWindow
@@ -124,6 +130,15 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	rec, ok := got.(*Record)
 	if !ok {
 		return fmt.Errorf("tile-lower: cache entry under %q is %T, want *Record", RecordName, got)
+	}
+	// F7 (ruled 2026-10-21): the record must carry tiling-verify's stamp —
+	// the per-iter feasibility re-checks (CTA LoC == MaxCTA, warp-portion
+	// multiples, the F2 coupled floor, the v0 policy, the kernel-wide
+	// budgets) live there, and an unvalidated record must not reach the
+	// rewrite. Direct Run callers bypass the pass-manager precondition, so
+	// the stamp is checked here too — fail closed.
+	if !rec.Verified {
+		return errors.New("tile-lower: the tiling record carries no tiling-verify stamp — run tiling-verify before tile-lower (F7: a corrupted record must not reach the rewrite unvalidated)")
 	}
 
 	f := loopforest.Analyze(g)
@@ -182,7 +197,7 @@ type lowerRun struct {
 	byIter    map[ir.Node]*dimRewrite
 	claimed   map[*ir.Base]bool // effectful body ops already owned by an LNT
 	rewrites  []*lntRewrite     // per-root products, Roots() order
-	fills     []*siteFill       // PHASE 4 products, for the §8 layering checks
+	fills     []*siteFill       // PHASE 4 products, for the §8 placement/scope checks
 }
 
 // effectiveTile returns the iter's tile size after budget overrides.
@@ -208,7 +223,7 @@ func (lr *lowerRun) epilogue(rec *Record, dropped map[uint64]bool) error {
 	if err := lr.checkLoopAnnotations(); err != nil {
 		return err
 	}
-	if err := lr.checkFillLayering(); err != nil {
+	if err := lr.checkFillPlacement(); err != nil {
 		return err
 	}
 	if err := lr.checkNoStaleLoads(rec, dropped); err != nil {
@@ -291,49 +306,141 @@ func loopAnnotations(loop ir.Node) map[string]float64 {
 	return out
 }
 
-// checkFillLayering pins "no cooperative tile op sits inside a bailing
-// element loop (§4 layering)": a fill's coordinates may reference the full
-// index expressions of dims OUTER than the fill point (the worked check:
-// the lhs fill's m coordinate IS the enclosing m index expression) and the
-// covered dims' round bases — but never the covered dims' own inside-loop
-// coordinates (the fill covers a WHOLE tile; its covered coordinates ride
-// round bases, placed immediately before the tile-inside loops). A
-// violation means the fill was placed inside a tile-inside loop.
-func (lr *lowerRun) checkFillLayering() error {
-	for _, fill := range lr.fills {
-		// The covered dims' inside coordinates are the reachable violation
-		// class: every coordinate the fill carries comes from the load's
-		// axes, whose iters are covered or above-tie (outer than the fill
-		// point) by construction.
-		coveredInside := make(map[*ir.Base]bool, len(fill.covered))
-		for _, d := range fill.covered {
+// checkFillPlacement pins the §8 FILL PLACEMENT + FILL SCOPE + layering
+// exit conditions STRUCTURALLY (F5, ruled 2026-10-21: every check is
+// computed from the emitted graph and must be able to fail on a
+// plausibly-emitted graph). Per emitted fill:
+//
+//   - PLACEMENT: the fill is data-reachable from its mandated host loop's
+//     BODY OPERAND (operand + ImpactBy walk — loop membership in this IR is
+//     "inside the ForLoop body operand subtree", and the fill reaches it
+//     through the per-buffer chain of its readers; a fill wired nowhere
+//     trips). LoadTileThread fills host at the element loop defining the
+//     fill key; LoadTileCta fills host at the innermost covered dim's
+//     between-round loop.
+//   - LAYERING: a cooperative LoadTileCta fill is NEVER an operand-
+//     descendant of an element (tile-inside) loop's body — the HI-02 class:
+//     a cooperative loader must be callable by every thread of the CTA the
+//     same number of times, which an element-loop body position breaks
+//     (§4). Per-thread LoadTileThread fills are exempt (R1: they ARE
+//     element-level ops).
+//   - SCOPE: every loop dimvar reachable from the fill's coordinates (the
+//     source load's axes and the fill store's round bases) is defined by a
+//     loop that encloses the fill's host — no fill reads a loop dimvar from
+//     outside that loop (the CR-02/HI-01 leakage class). A host's own
+//     dimvar is in scope (the fill sits inside its body).
+//   - UNIFORMITY: a LoadTileCta fill's coordinates carry NO ThreadMap
+//     query — a per-thread term in a cooperative fill's source base is
+//     incoherent (each participating thread would compute a different
+//     source region into the same buffer, HI-03). GridMap queries are
+//     CTA-uniform and allowed.
+func (lr *lowerRun) checkFillPlacement() error {
+	// dimvar -> defining loop, over every rewritten dim.
+	ivLoop := make(map[*ir.Base]ir.Node)
+	for _, lw := range lr.rewrites {
+		for _, d := range lw.dims {
+			if d.betweenIV != nil {
+				ivLoop[d.betweenIV.BasePtr()] = d.between
+			}
 			if d.insideIV != nil {
-				coveredInside[d.insideIV.BasePtr()] = true
+				ivLoop[d.insideIV.BasePtr()] = d.inside
+			}
+			if d.singleIV != nil {
+				ivLoop[d.singleIV.BasePtr()] = d.between
 			}
 		}
-		var bad ir.Node
-		var visit func(n ir.Node)
-		visit = func(n ir.Node) {
-			if n == nil || bad != nil || n.BasePtr() == nil || ir.IsErased(n) {
-				return
-			}
-			if coveredInside[n.BasePtr()] {
-				bad = n
-				return
-			}
-			for _, dep := range ir.DataDeps(n) {
-				visit(dep)
+	}
+	// encloses reports whether loop's body-operand subtree contains host
+	// (host == loop: the fill sits inside the loop's own body, whose IV is
+	// in scope there). Loops nest purely through body operand slots, so an
+	// operand-only walk is exact for loop containment.
+	encloses := func(loop, host ir.Node) bool {
+		if loop == nil || host == nil {
+			return false
+		}
+		if loop.BasePtr() == host.BasePtr() {
+			return true
+		}
+		return lr.operandSubtreeOf(ir.OperandsOf(loop)[2])[host.BasePtr()]
+	}
+	for _, fill := range lr.fills {
+		// PLACEMENT: reachable from the host's body operand.
+		hostBody := ir.OperandsOf(fill.host)[2]
+		if !lr.reachableFrom(hostBody)[fill.store.BasePtr()] {
+			return fmt.Errorf("tile-lower: fill for site %d is not reachable from its fill-position loop %d's body operand (the F8 splice must place the fill inside the mandated host, R1)",
+				fill.siteID, fill.host.BasePtr().ID())
+		}
+		// LAYERING: cooperative fills never inside an element loop's body
+		// operand subtree (operand edges — the dedicated body-slot carrier;
+		// the per-buffer ordering chain is placement-neutral by design).
+		if fill.variant == loadTileCta {
+			for _, lw := range lr.rewrites {
+				for _, d := range lw.dims {
+					if d.inside == nil {
+						continue
+					}
+					if lr.operandSubtreeOf(ir.OperandsOf(d.inside)[2])[fill.store.BasePtr()] {
+						return fmt.Errorf("tile-lower: cooperative fill for site %d sits inside element loop %d's body (§4 layering: a LoadTileCta op must be callable uniformly by the whole CTA)",
+							fill.siteID, d.inside.BasePtr().ID())
+					}
+				}
 			}
 		}
-		for _, ax := range ir.OperandsOf(fill.src)[1:] {
-			visit(ax)
-		}
-		if bad != nil {
-			return fmt.Errorf("tile-lower: fill for site %d references covered dim inside-loop dimvar node %d (a fill must sit outside the tile-inside loops, §4 layering)",
-				fill.siteID, bad.BasePtr().ID())
+		// SCOPE + UNIFORMITY over the fill's coordinates: the source load's
+		// axes and the fill store's trailing round bases.
+		coords := append(append([]ir.Node(nil), ir.OperandsOf(fill.src)[1:]...), ir.OperandsOf(fill.store)[2:]...)
+		for _, coord := range coords {
+			for _, n := range flattenSubtree(coord) {
+				if def, ok := ivLoop[n.BasePtr()]; ok && !encloses(def, fill.host) {
+					return fmt.Errorf("tile-lower: fill for site %d references dimvar node %d of loop %d, which does not enclose its fill position (host loop %d) — a fill may only reference dimvars of enclosing loops",
+						fill.siteID, n.BasePtr().ID(), def.BasePtr().ID(), fill.host.BasePtr().ID())
+				}
+				if fill.variant == loadTileCta && n.KindOf() == ir.KindIntrinsicThreadMap {
+					return fmt.Errorf("tile-lower: cooperative fill for site %d carries a ThreadMap (per-thread) term in its coordinates — LoadTileCta source bases must be CTA-uniform (R1/HI-03)",
+						fill.siteID)
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// operandSubtreeOf returns the operand-only descendant set of n (DataDeps
+// walk, no payload/effect edges): the nodes n's operand slots reference,
+// transitively. This is the dedicated body-slot containment carrier — a
+// loop's body operand subtree in the strict sense.
+func (lr *lowerRun) operandSubtreeOf(n ir.Node) map[*ir.Base]bool {
+	seen := make(map[*ir.Base]bool)
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || seen[x.BasePtr()] || x.BasePtr().Erased() {
+			return
+		}
+		seen[x.BasePtr()] = true
+		for _, dep := range ir.DataDeps(x) {
+			visit(dep)
+		}
+	}
+	visit(n)
+	return seen
+}
+
+// flattenSubtree returns n's data-subtree nodes (self first) — the shared
+// coordinate-walk helper of the §8 checks and the tests.
+func flattenSubtree(n ir.Node) []ir.Node {
+	var out []ir.Node
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() {
+			return
+		}
+		out = append(out, x)
+		for _, dep := range ir.DataDeps(x) {
+			visit(dep)
+		}
+	}
+	visit(n)
+	return out
 }
 
 // checkNoStaleLoads pins "no stale MemLoad remains for any promoted site":
@@ -355,16 +462,35 @@ func (lr *lowerRun) checkNoStaleLoads(rec *Record, dropped map[uint64]bool) erro
 	return nil
 }
 
-// checkNoBarriers pins "ZERO barriers emitted (§6 sync)": the pass
-// constructs no barrier-emitting node — v0's suite has no sync kinds at
-// all, so the constructive half is by construction; the check asserts the
-// fill-store inventory carries its loadtile variant annotation (the
-// runtime owns ALL synchronization — visibility, reuse safety, and store
-// ordering are runtime contract items, §7bis).
+// checkNoBarriers pins "ZERO barriers emitted (§6 sync)" as a REAL check
+// (F5/ME-04, ruled 2026-10-21 — a check that re-reads a baked constant is
+// vacuous and forbidden): the pass constructs no barrier-emitting node
+// (v0's kind suite has no sync kinds — the constructive half), and the
+// operative half PARSES the live `loadtile` KeyedAttribute back out of
+// every emitted fill store's operand list — the attribute is the runtime's
+// loader-selection contract, and a fill that lost it (or carries a
+// non-const value) must fail the pass, not surface at codegen time.
 func (lr *lowerRun) checkNoBarriers() error {
 	for _, fill := range lr.fills {
-		if !fill.annotated {
-			return fmt.Errorf("tile-lower: fill for site %d carries no loadtile variant annotation", fill.siteID)
+		found := false
+		ops := ir.OperandsOf(fill.store)
+		for i := 2; i < len(ops); i++ { // stores: trailing operands after [value, dst]
+			op := ops[i]
+			if op == nil || op.KindOf() != ir.KindKeyedAttribute {
+				continue
+			}
+			key, val := ir.KeyedAttributeOf(op)
+			if key != "loadtile" {
+				continue
+			}
+			if _, ok := ir.ConstValueOf(val); !ok {
+				return fmt.Errorf("tile-lower: fill for site %d carries a non-const loadtile variant value", fill.siteID)
+			}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("tile-lower: fill for site %d carries no live loadtile variant annotation (the runtime's loader-selection contract, §6)",
+				fill.siteID)
 		}
 	}
 	return nil

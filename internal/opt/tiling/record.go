@@ -177,9 +177,21 @@ const (
 // A MISSING Iters entry means the iter was not part of any forest tree the
 // pass saw; a MISSING Sites entry means the load was not admitted to the
 // candidate set — the lower pass treats the load as untouched.
+//
+// Verified is the tiling-verify stamp (F7, ruled 2026-10-21): tiling-verify
+// sets it on a record that passed its consistency sweep, and tile-lower
+// refuses an unstamped record fail-closed — the per-iter feasibility
+// re-checks (CTA LoC == MaxCTA, warp-portion multiples, the F2 floor, the
+// v0 policy) live in tiling-verify, and a corrupted record must NOT reach
+// the rewrite unvalidated. It is the one field tiling-verify mutates on the
+// published record (261021-o61 T3; the decide-half surface is otherwise
+// untouched).
 type Record struct {
 	Iters map[ir.Node]IterDecision
 	Sites map[uint64]SiteDecision
+	// Verified reports that tiling-verify ran to completion over THIS
+	// record (the F7 gate tile-lower consumes).
+	Verified bool
 }
 
 // Name satisfies analysis.Analysis structurally (the single-method Name()
