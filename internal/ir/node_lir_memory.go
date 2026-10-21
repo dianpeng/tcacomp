@@ -68,12 +68,35 @@ func StorageClassOf(n Node) (StorageClass, bool) {
 	return StorageGMEM, false
 }
 
-// memLoadSMemNode: lowered SMEM load; ops = [src, bivs...].
+// memLoadSMemNode: lowered SMEM load; ops = [src, bivs...]. effectIns is the
+// ImpactBy list — the per-buffer ordering edge wired by the env-aware
+// construction path (NewMemLoadSMemChained, quick-261021-jay: the
+// tile-lower pass chains the buffer accesses after the site's fill so the
+// fill dominates its reads in the sea's explicit effect order). The
+// memLoadNode precedent (node_memory.go) applies verbatim: payload uses
+// ride the ordinary payloadBearer enumeration, so the verifier's chain
+// checks and Walk cover them with zero new checkers.
 type memLoadSMemNode struct {
 	*Base
 	operandList
 	class StorageClass
+
+	effectIns []SSAUse
 }
+
+// forEachPayloadUse implements payloadBearer: the ImpactBy effect inputs.
+func (n *memLoadSMemNode) forEachPayloadUse(fn func(SSAUse)) {
+	for _, u := range n.effectIns {
+		fn(u)
+	}
+}
+
+// impactBy implements effectBearer: a copy of the load's ordering edges.
+func (n *memLoadSMemNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
+
+// removeImpactUse implements effectBearer: drop one ordering-edge handle by
+// record identity (C3, quick-261020-ejf).
+func (n *memLoadSMemNode) removeImpactUse(u SSAUse) bool { return dropImpactHandle(&n.effectIns, u) }
 
 // NewMemLoadSMem creates an SMEM load from the smem buffer src at the
 // bounded induction variables bivs (axis order). The verifier's shape check
@@ -85,6 +108,22 @@ func (g *Graph) NewMemLoadSMem(origin string, src Node, bivs ...Node) Node {
 	ops = append(ops, src)
 	ops = append(ops, bivs...)
 	wireOperands(n, ops...)
+	return n
+}
+
+// NewMemLoadSMemChained creates an SMEM load exactly like NewMemLoadSMem
+// and additionally wires it into the construction environment's
+// per-buffer effect chain: when src (the buffer node) has a known chain
+// head, the load's ImpactBy payload points at it; the load then becomes
+// the new head (skeleton memory.go chaining, applied to the SMEM tier by
+// quick-261021-jay's tile-lower pass). A nil env (or a buffer with no
+// prior access) leaves the load un-chained — identical to NewMemLoadSMem.
+func (g *Graph) NewMemLoadSMemChained(origin string, env *Env, src Node, bivs ...Node) Node {
+	n := g.NewMemLoadSMem(origin, src, bivs...).(*memLoadSMemNode)
+	if head := env.ChainHead(src); head != nil {
+		n.effectIns = append(n.effectIns, wirePayloadUse(n, head))
+	}
+	env.NoteStore(src, n)
 	return n
 }
 
@@ -123,12 +162,31 @@ func (g *Graph) NewMemNewSMem(origin string, extent Node) Node {
 	return n
 }
 
-// fragLoadNode: lowered fragment load; ops = [src, bivs...].
+// fragLoadNode: lowered fragment load; ops = [src, bivs...]. effectIns is
+// the ImpactBy list — the per-buffer ordering edge of the env-chained
+// construction path (NewFragLoadChained, quick-261021-jay); same payload
+// contract as memLoadSMemNode.
 type fragLoadNode struct {
 	*Base
 	operandList
 	class StorageClass
+
+	effectIns []SSAUse
 }
+
+// forEachPayloadUse implements payloadBearer: the ImpactBy effect inputs.
+func (n *fragLoadNode) forEachPayloadUse(fn func(SSAUse)) {
+	for _, u := range n.effectIns {
+		fn(u)
+	}
+}
+
+// impactBy implements effectBearer: a copy of the load's ordering edges.
+func (n *fragLoadNode) impactBy() []SSAUse { return append([]SSAUse(nil), n.effectIns...) }
+
+// removeImpactUse implements effectBearer: drop one ordering-edge handle by
+// record identity (C3, quick-261020-ejf).
+func (n *fragLoadNode) removeImpactUse(u SSAUse) bool { return dropImpactHandle(&n.effectIns, u) }
 
 // NewFragLoad creates a fragment load from the frag buffer src at the
 // bounded induction variables bivs (axis order). The verifier's shape check
@@ -140,6 +198,18 @@ func (g *Graph) NewFragLoad(origin string, src Node, bivs ...Node) Node {
 	ops = append(ops, src)
 	ops = append(ops, bivs...)
 	wireOperands(n, ops...)
+	return n
+}
+
+// NewFragLoadChained creates a fragment load exactly like NewFragLoad and
+// additionally wires it into the construction environment's per-buffer
+// effect chain (the NewMemLoadSMemChained contract, FRAG tier).
+func (g *Graph) NewFragLoadChained(origin string, env *Env, src Node, bivs ...Node) Node {
+	n := g.NewFragLoad(origin, src, bivs...).(*fragLoadNode)
+	if head := env.ChainHead(src); head != nil {
+		n.effectIns = append(n.effectIns, wirePayloadUse(n, head))
+	}
+	env.NoteStore(src, n)
 	return n
 }
 

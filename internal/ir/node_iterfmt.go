@@ -74,6 +74,18 @@ func (g *Graph) NewKeyedAttribute(origin, key string, value Node) Node {
 	return n
 }
 
+// KeyedAttributeOf returns the attribute's key payload and its value
+// operand, or ("", nil) for any other node kind — the exported read face
+// (payload read faces precedent, node_expr.go), so passes outside package
+// ir (e.g. tile-lower reading its for-loop soc/dosoc/loc annotations)
+// inspect attributes without asserting the concrete node type.
+func KeyedAttributeOf(n Node) (string, Node) {
+	if ka, ok := n.(*keyedAttributeNode); ok {
+		return ka.key, operandAt(ka, 0)
+	}
+	return "", nil
+}
+
 // asNode: HIR as-order clause — ops = the dim InputParam nodes in
 // as-order. Carried as the LAST Input-list element of a Map (and, when it
 // arrives, a Reduce); the verifier enforces unique-and-last placement plus

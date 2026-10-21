@@ -29,6 +29,8 @@ import (
 //	113   memopt-verify (the post-memopt invariant/fixpoint check)
 //	114   loop tiling (decide: overlap analysis + PSched search + decision record)
 //	115   tiling-verify (the post-decide record consistency check)
+//	116   tile-lower (the decide→lower pair's lowering half: annotated tiled
+//	      loop nests + map-query intrinsics + SMEM/FRAG cache insertion)
 //	...   transformation passes slot between as they land
 //	900   late scheduling (schedule — the pre-codegen ordering fixup)
 //
