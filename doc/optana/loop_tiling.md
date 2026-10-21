@@ -204,6 +204,11 @@ const auto total_thread_per_cta = blockDim.x; // # of threads per CTA
         - Ie the set admits the co-traversed pair AT iterK, then each load's cache
           is tied ABOVE: the whole-dim caches at the ties are what turn k-sweep
           loads into SMEM hits and survive the enclosing sweeps
+        - Promotion OUTCOME at default shapes (ruled 2026-10-21): lhs is
+          promoted as a 128 B per-thread FRAG (reuse = its n-walk = 32);
+          rhs's [N][K] SMEM window — 256 threads x 32 x 32 x 4 B = 1 MB —
+          exceeds the 64 KB kernel-wide budget and is DECLINED by the
+          fallback. Intentional; see loop_tile_lower.md §6bis PHASE 4
 
 ```
 // A simple matmul vising pattern
@@ -278,6 +283,18 @@ for (auto m = 0; m < M; m++) {         // <- iterM
           - Otherwise add it into CS
         - If CS contains more than Max.cs # of elements, exit loop
           - ie do not consider too many MemLoad to be replaced by cache
+
+    - Cross-LNT loads (RULED 2026-10-21 — R4, v0 fail-closed)
+      - A load whose INS spans >= 2 LNTs is NOT a v0 candidate: it gets
+        an EXPLICIT non-candidate SiteDecision entry in the record
+        (Promoted = false, reason "cross-LNT INS")
+      - Never-bucketed loads (empty INS, no bucket) are likewise
+        declared non-candidates with explicit record entries — never
+        silently skipped
+      - The UNION-of-assignments evaluation (judge such a load against
+        the union of the referenced iters' assignments across LNTs) is
+        FUTURE; foreign iters must NEVER be silently dropped from a
+        candidate's INS to force single-tree ownership
 
 - Assignment of Parallisation
   - Assignment means attach a **space of concurrency** to a specific iteration
@@ -370,6 +387,15 @@ for (auto j = 0; j < J; j += j_tile_size * <# of threads in WARP assignment, nTh
               SUM to PORTION_WARP, ie 8
             - The LAST assignment in each category may be -1 = derived remainder
               - The searcher decides the leading n-1, the last is the remainder
+            - COUPLED-PORTION FLOOR (F2, ruled 2026-10-21): whenever the
+              LNT carries a CTA dim, the independent WarpPortion must
+              leave >= 1 warp portion for that CTA dim's coupled inside
+              walk, ie WarpPortion <= PORTION_WARP - 1 in that case
+              - Params.Validate and evalSchedule REJECT schedules that
+                violate the floor — a zero-portion coupled walk emits a
+                zero-stride inside loop, an infinite loop
+              - "the coupled tile-inside walk implicitly consumes the
+                remaining >= 1" is a CONSTRAINT, never an assumption
             - LoC of a dim = portion x quantum
               - quantum = total CTAs / 10 for CTA dims, total warps / 8 for warp dims
           - Sequential loops keep LoC = 1
@@ -389,19 +415,46 @@ for (auto j = 0; j < J; j += j_tile_size * <# of threads in WARP assignment, nTh
             - For example: mem[a][b][...][x][y], we ONLY cache the last x/y 2 dimensions
           - A MemLoad will be promoted to SMEM/FRAG iff
             - 1) For a MemLoad, denote all its subscript access as list of [x0][x1][...][xn-1][xn]
-            - 2) Judge Criterial
-              - If all CTA assignment happens at iteration <= xn-1
-                - If xn-1 and xn are sequential => ALL in FRAGs
-                  - Since xn-1 and xn access are in a single thread, hence using FRAGMENTS
-                - Otherwise                     => SMEM
-                  - xn-1 and xn is within a CTA but also not in a single thread, using SMEM
-              - Otherwise cannot be promoted into CACHE
+            - 2) Judge Criterial — TIER RULE (amended 2026-10-21, R2:
+              classify by the SoC of the site's COVERED dims, ie the
+              cached trailing dimensions)
+              - ANY covered dim CTA-assigned => cannot be promoted into CACHE
+                - A CTA-covered tile has no coherent fill variant under
+                  the v0 mechanics; the site is refused
+                - Supersedes the former "all CTA assignment happens at
+                  iteration <= xn-1 => SMEM" allowance — RETRACTED
+              - Else ANY covered dim WARP-assigned => SMEM WINDOW
+                - Cooperative LoadTileCta fill, window-sized buffer,
+                  see the window-bytes model in 3)
+              - Else, xn-1 and xn both sequential => ALL in FRAGs
+                - Since xn-1 and xn access are in a single thread, hence using FRAGMENTS
               - NOTES: additionally, if tile_size == 1 for a specific iteration, cache is NOT promoted
+                - The budget fallback uses the matching drop rule: a
+                  site is dropped when ANY covered iter's tile reaches
+                  1 (F4, ruled 2026-10-21), not only when all do
             - 3) For MemLoad that can be promoted to cache
+              - WINDOW-BYTES feasibility model (amended 2026-10-21, R2 —
+                rank-in-index => window-in-shape): SMEM bytes per site =
+                element size x PRODUCT over the covered dims of
+                - WARP dim d => #threads_d x tile_size_d, the whole
+                  group's round window, NOT the single-thread chunk
+                - SEQ dim    => tile_size_d
               - Since only the last Cache.dims dimensions are cached, 2 by default, each MemLoad uses tile_size_x * tile_size_y
                 - each tile_size corresponds to given iteration
+                - Per-dim size follows the window-bytes model above, a
+                  WARP-covered dim contributes #threads_d x tile_size_d
               - It setups a constraints that SUMMATION of all cache size CANNOT be larger than SMEM size of SM on CUDA
-                - Assuming as a known const as Max.cache
+                - Assuming as a known const as Max.cache (default 64 KB)
+                - The sum is KERNEL-WIDE (R3, ruled 2026-10-21):
+                  accumulated across ALL LNTs' promoted sites — decide's
+                  feasibility, tiling-verify and tile-lower's budget
+                  resolution all gate the SAME kernel-wide sum, never a
+                  per-LNT one
+              - FRAG sites are additionally bounded by MaxFragPerThread
+                (F6, ruled 2026-10-21): SUM of per-thread FRAG bytes <=
+                MaxFragPerThread, default 256 bytes/thread; it
+                participates in the same halve/drop fallback as the
+                SMEM budget
 
       - Objective Function: for a specific PSched, SINGLE-TERM
         - Maximize memory reuse = GMEM traffic avoided
@@ -409,9 +462,25 @@ for (auto j = 0; j < J; j += j_tile_size * <# of threads in WARP assignment, nTh
             bytes_per_tile(site) * (reuse_count(site) - 1)
             - bytes_per_tile(site) = element size * product of the site's covered
               tile sizes, AFTER demotion per the Cache Tie Semantics
-            - reuse_count(site) = # of times the cached tile is re-read before
-              reload = PRODUCT over the reuse dimensions, ie the tie level and the
-              inner non-covered loop dims, of ceil(extent_d / tile_d)
+              - Per-dim sizes follow the window-bytes model (2026-10-21,
+                R2): a WARP-covered dim contributes #threads_d x tile_size_d,
+                a SEQ dim contributes tile_size_d
+            - reuse_count(site) = PER-THREAD (amended 2026-10-21): # of
+              times the cached bytes are re-traversed by the OWNING
+              thread before reload = PRODUCT over the reuse dimensions,
+              ie the tie level and the inner non-covered loop dims, of
+              the OWNING thread's own trip count of that dim,
+              ceil(extent_d / tile_d) for a sequential per-thread walk
+              - Re-traversal by OTHER threads does NOT count toward a
+                site's reuse — bytes loaded once and read once per
+                thread avoid no traffic on the owning thread's behalf
+              - PROMOTION GATE: a site with per-thread reuse < 2 is NOT
+                promoted
+              - Worked check (defaults): lhs reuse = its n-walk = 32 ->
+                promoted; rhs reuse = per-thread m-count <= 1 ->
+                declined, consistent with its 1 MB window exceeding the
+                64 KB budget (intentional, loop_tile_lower.md §6bis
+                PHASE 4)
           - Computed statically from the LNT plus the tie/tile decisions
           - NOTES: maximize traffic AVOIDED, NOT cache bytes
             - Footprint is bounded by the budget constraint, it is not an objective
@@ -581,6 +650,13 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
         - Ensure bounds check
           - Calculate actual tile inside loop's bound before entering into the loop
         - Tail guard
+          - SATURATING bound form (F1, ruled 2026-10-21):
+            off' = umin(offset, extent), tile_max = umin(T, extent - off')
+            - Pure u32, wraps nowhere; tile_max == 0 exactly when out
+              of range. The bare min(T, extent - offset) is WRONG in
+              u32: extent - offset underflows toward 4e9 on tail rounds
+              and the min picks T, so out-of-range ranks RUN instead
+              of no-op'ing
           - Out-of-range ranks/threads become WHOLE-BODY no-ops via the loop
             materialization, loop_tile_lower.md §4
 
@@ -689,15 +765,20 @@ for (
   // in-body offset local: rank scaled by tile size + round base
   const auto a_offset = cta_rank * tile_size_a + a;
 
-  // (1.2) tile inside part
+  // (1.2) tile inside part — SATURATING tail guard (F1, ruled 2026-10-21)
+  const auto a_offset_sat = min(a_offset, A);
   const auto a_tile_max = min(
     tile_size_a,
-    A - a_offset,
+    A - a_offset_sat,
   );
 
-  // notes, on a tail round an out-of-range CTA rank gives a_tile_max <= 0: the
+  // notes, on a tail round an out-of-range CTA rank gives a_tile_max == 0: the
   // WHOLE body becomes a no-op via the loop materialization, loop_tile_lower.md
   // §4 (RULED 2026-10-20), the compiler emits no guard and no branch
+  // (F1, ruled 2026-10-21): the bound is computed in two saturating steps —
+  // umin(a_offset, A) first, then umin(T, A - off') — because the bare
+  // A - a_offset UNDERFLOWS in u32 for out-of-range ranks and the plain min
+  // would pick tile_size_a, letting the body run out of bounds
 
   // thread-parallel strided walk over the tile, the WARP half of the CTA assignment
   // nThreads = total # of threads mapped to this dimension, ie warp LoC * 32
@@ -750,15 +831,19 @@ for (
   // the thread's OWNED tile chunk
   const auto a_offset = thread_rank * tile_size_a + a;
 
-  // (1.2) tile inside part
+  // (1.2) tile inside part — SATURATING tail guard (F1, ruled 2026-10-21)
+  const auto a_offset_sat = min(a_offset, A);
   const auto a_tile_max = min(
     tile_size_a,
-    A - a_offset,
+    A - a_offset_sat,
   );
 
-  // notes, on a tail round an out-of-range thread gives a_tile_max <= 0: the
+  // notes, on a tail round an out-of-range thread gives a_tile_max == 0: the
   // WHOLE body becomes a no-op via the loop materialization, loop_tile_lower.md
   // §4 (RULED 2026-10-20)
+  // (F1, ruled 2026-10-21): same saturating two-step form as the CTA rewrite —
+  // umin(a_offset, A) first, then umin(T, A - off'); the bare A - a_offset
+  // UNDERFLOWS in u32 for out-of-range thread ranks
 
   // loop must be sequential here. The allocation is really per tile/stride is assigned
   // to a thread, within that tile/stride, it is sequential again

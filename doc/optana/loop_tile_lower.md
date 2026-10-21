@@ -40,7 +40,11 @@
   - The analysis cache is invalidate-all-by-default
   - The record survives ONLY because no pass runs between decide and lower
   - If a pass is ever inserted between them, pin
-    Requires: tile-lower requires tiling
+    Requires: tile-lower requires tiling AND tiling-verify
+    - F7 (ruled 2026-10-21): the per-iter feasibility re-checks (CTA
+      LoC == MaxCTA, warp-portion multiples, v0 policy) live in
+      tiling-verify; a corrupted record must NOT reach the rewrite
+      unvalidated
     - the mechanism exists today (pass-manager precondition checks,
       internal/opt/manager.go)
 - No MemLoad.ctaCache field
@@ -67,7 +71,8 @@
   loops (induction starts at 0, stride LoC × T, NO map index in any induction
   variable, CTA-uniform trip counts), ranks appearing only as in-body offset
   locals (offset = rank × tile_size + round base), materialized per-tile
-  uniform bounds (a_tile_max = min(tile_size, A − a_offset))
+  uniform bounds in the SATURATING form (off' = umin(a_offset, A);
+  a_tile_max = umin(tile_size, A − off') — F1, ruled 2026-10-21)
   - This spec does NOT duplicate those templates wholesale; it states the
     pass's obligations on top of them
 - Obligations
@@ -143,6 +148,11 @@
     filled), with bounds CLAMPING inside the loader
   - Element-level ops live inside the bailing thr_loop body
   - A cooperative tile op emitted inside a thr_loop body is a spec violation
+  - CLARIFIED (R1, 2026-10-21): a PER-THREAD fill (tca::rt::LoadTileThread,
+    FRAG class) is NOT a cooperative op — it is an element-level op and sits
+    INSIDE the element loop defining its per-thread coordinate (§6bis
+    PHASE 4); only cooperative LoadTileCta fills are bound by the
+    outside-the-element-loop rule
 - Mask contract (the "sane mask" rule for warp-synchronous operations)
   - __shfl_down_sync(mask, ...) is UB if any lane named in mask does not
     execute the instruction — a naive full-warp mask on a tail iteration is
@@ -220,46 +230,77 @@
 ## §6 SMEM/FRAG Cache Insertion (merged smem-insertion content)
 
 - Buffer materialization
-  - MemNewSMem / FragNew allocation sites at each promoted site's TIE LEVEL
-    (the LIR memory family, internal/ir/node_lir_memory.go)
-  - Extents from the covered tile shapes AFTER demotion
-    (the Cache.dims trailing dimensions, per the decide pass's cache-tie
-    semantics)
+  - MemNewSMem / FragNew allocation sites at each promoted site's FILL
+    POINT, variant-dependent per R1 (the LIR memory family,
+    internal/ir/node_lir_memory.go; M3 — one buffer, refilled)
+  - Extents per covered dim AFTER demotion (the Cache.dims trailing
+    dimensions, per the decide pass's cache-tie semantics), sized by
+    the R2 WINDOW rule (ruled 2026-10-21)
+    - WARP dim d -> #threads_d x T_d (the whole group's round window,
+      NOT the single-thread chunk)
+    - SEQ dim -> T_d
+    - total buffer bytes = product over covered dims x element size
   - StorageClass payload carried on the LIR memory nodes
 - Site Rewrite Mechanics (how a promoted load is lowered)
   - Load-site surgery: the MemLoad's uses are RAUW'd to buffer
     accesses (MemLoadSMem/FragLoad with the covered dims' in-tile
     coordinates); the MemLoad is retired by Erase — this is the "node
     surgery" §1 defers to this pass
-  - Fill emission point: inside the innermost covered dim's
-    between-round body, immediately before the tile-inside loops
-    (§6bis Phase 4); one fill per round
+  - Fill emission point (RULED 2026-10-21, R1 — VARIANT-DEPENDENT; the
+    former unconditional "immediately before the tile-inside loops"
+    rule is SUPERSEDED: it placed fills whose coordinates contain
+    tile-INSIDE dimvars OUTSIDE the loops defining them — undefined at
+    the mandated position, the HI-01 inconsistency)
+    - LoadTileThread (FRAG): INSIDE the element loop that DEFINES its
+      per-thread coordinate — refills once per epoch of its fill key
+    - LoadTileCta (SMEM window): at the innermost covered dim's
+      between-round body, immediately before the tile-inside loops;
+      CTA-UNIFORM coordinates (round bases) ONLY
+    - Full placement mechanics: §6bis Phase 4
   - Buffer lifetime: ONE buffer per site, declared at the fill point
-    (M3), refilled every round — the SMEM buffer is a static
-    declaration reused across rounds, never re-allocated
+    (M3), refilled per fill-key epoch — per round for LoadTileCta, per
+    fill-key element for LoadTileThread (R1); the SMEM buffer is a
+    static declaration reused across refills, never re-allocated
   - Loads-only scope: v0 candidate sites are MemLoads only; stores
     never route through the cache (storetile/write-through is not in
     scope)
   - Buffer layout: plain row-major tile, NO padding/swizzle in v0
     (swizzle deferred to the TMMA future, F22)
-- Copy variant selection (per doc/tca.md §5.11's variant table)
-  - dims covered by cta_for/thread_for → SMEM cooperative copy:
-    tca::rt::LoadTileCta
-  - dims under seq_for → FRAG per-thread copy: tca::rt::LoadTileThread
+- Copy variant selection / TIER rule (RULED 2026-10-21, R2; per
+  doc/tca.md §5.11's variant table) — classify by the SoC of the
+  site's COVERED dims
+  - ANY covered dim CTA-assigned -> site REFUSED (not promoted): a
+    CTA-covered tile has no coherent fill variant under the v0
+    mechanics
+  - ANY covered dim WARP-assigned -> SMEM WINDOW class: cooperative
+    tca::rt::LoadTileCta, window-sized buffer (R2 sizing above)
+  - ALL covered dims sequential -> FRAG class: per-thread
+    tca::rt::LoadTileThread, fill key per-thread (e.g. matmul lhs)
 - Sync
   - The runtime owns ALL synchronization — this pass NEVER emits barriers
   - Visibility, reuse safety, store ordering are runtime contract items (§7bis)
   - Compiler obligations: the uniform-call rule + bounds
-- Budget enforcement
-  - Σ SMEM bytes ≤ Max.cache
+- Budget enforcement (RULED 2026-10-21: R3 scope + F6 constant)
+  - Σ SMEM bytes ≤ Max.cache, KERNEL-WIDE: the sum accumulates over ALL
+    LNTs' promoted sites — the decide pass, tiling-verify and this
+    pass's budget resolution gate the SAME kernel-wide sum; a per-LNT
+    scope is WRONG (two LNTs each at the cap would publish an
+    infeasible record)
   - FRAG sites additionally require:
     - the covered tile dimensions fully unroll — register arrays stay in
       registers only when all indices are compile-time constants after
       unrolling; a non-unrolled FRAG tile spills to local memory, strictly
       worse than the GMEM load it replaced (doc/tca.md §5.8)
-    - a per-thread FRAG byte budget (× threads/CTA) beside Max.cache
+    - Σ per-thread FRAG bytes ≤ MaxFragPerThread (F6), default 256
+      bytes/thread — participates in the same halve/drop fallback as
+      the SMEM budget
 - Fallback (selection never fails)
   - Halve the reuse tile sizes; if still over budget, drop sites back to GMEM
+  - DROP RULE (F4, ruled 2026-10-21): a site is dropped when ANY of its
+    covered iters reaches tile 1 — NOT only when all of them do
+    (matches the judge's promotion gate; the all-1 variant can strand a
+    promoted site at a covered tile of 1 and make the site lowering
+    fail closed on feasible input)
   - Terminates: halving reaches 1, dropping empties the set
 - Post-pass epilogue
   - Relies on the pipeline's typeinfer re-run for newly inserted lowered nodes
@@ -281,7 +322,8 @@ introduces a new decision.
     row, contentHash/contentEqual)
   - u32 min builtin (registry + typeinfer + codegen; ceildiv via
     (A + T − 1)/T over existing BinOp div): every materialized
-    tile_max = min(T, extent − offset) needs it
+    tile_max = umin(T, extent − umin(offset, extent)) needs it (the
+    SATURATING form, F1, ruled 2026-10-21)
     - NOTE: the 0-based element-stride between loops eliminate ceil
       entirely from the loop bounds (bound = the raw extent); only min
       and the primitives' internal ceildiv remain
@@ -290,9 +332,12 @@ introduces a new decision.
     codegen selects the cta_loop / thr_loop / seq_loop materialization
     (§4)
 - PHASE 1 — record fetch + skeleton
-  - Requires: tile-lower requires tiling (pin now — the mechanism
-    exists in the pass manager); fetch tiling-record from the analysis
-    cache; FAIL CLOSED if absent
+  - Requires: tile-lower requires tiling AND tiling-verify (F7, ruled
+    2026-10-21 — the per-iter feasibility re-checks live in
+    tiling-verify and a corrupted record must NOT reach the rewrite
+    unvalidated; pin both preconditions now, the mechanism exists in
+    the pass manager); fetch tiling-record from the analysis cache;
+    FAIL CLOSED if absent
   - Re-derive the loopforest; per LNT (Roots() order) resolve every
     Iter -> BIV (DataDeps(iter)[0]) -> {SoC, LoC, TileSize}
     (internal/opt/tiling Record.Iters); a missing entry is an ERROR
@@ -321,10 +366,27 @@ introduces a new decision.
       in-body thread_rank = IntrinsicThreadMap(DoSoC_d, "index");
       b_offset = thread_rank*T + b. Inside = SEQUENTIAL walk of the
       owned chunk
-  - Materialized bounds before the inside loops:
-    d_tile_max = min(T_d, extent_d − d_offset) — bounds ONLY; tail
-    guarding is the primitive's whole-body no-op (§4), never an IR
-    branch
+  - Materialized bounds before the inside loops — SATURATING form
+    (F1, ruled 2026-10-21; the plain min(T, extent − offset) WRAPS in
+    u32 on tail rounds — extent − offset underflows toward 4e9 and the
+    min picks T, so out-of-range ranks RUN their bodies out of bounds
+    instead of no-op'ing):
+    - off' = umin(d_offset, extent_d)
+    - d_tile_max = umin(T_d, extent_d − off')
+    - pure u32, wraps nowhere; d_tile_max == 0 exactly when the rank
+      is out of range — bounds ONLY; tail guarding stays the
+      primitive's whole-body no-op (§4), never an IR branch
+  - Coupled-portion floor (F2, ruled 2026-10-21): an LNT carrying a
+    CTA dim must leave >= 1 warp portion for its coupled inside walk
+    (WarpPortion <= PORTION_WARP − 1 there); the decide pass's
+    Validate/evalSchedule reject violations, and this phase fails
+    closed if the coupled thread count < 1 (a zero-stride ForLoop is
+    an infinite loop)
+  - Branched LNTs (F3, ruled 2026-10-21): if any node of the LNT tree
+    has > 1 child, REJECT the rewrite fail-closed — sibling iters must
+    NEVER be silently linearized into one nested chain (the body would
+    execute a cross product of the siblings' spaces); per-branch
+    sub-nests are future work
   - Body rewiring: RAUW every InductionVariable use to the
     (d_offset + d_inside) expression (new defs); retire the original
     Iter chains through the MutContext choke points; zero new
@@ -334,25 +396,86 @@ introduces a new decision.
     inner than the recorded Tie, the CacheDims clamp) with the SAME
     deterministic chase as the decide pass — adjacency makes the
     results identical; the record needs no extension
-  - FILL POINT: inside the innermost COVERED dim's between-round body,
-    immediately before the tile-inside loops (Tie == nil -> the same
-    rule at the outermost position). The tie position fixes WHICH
-    rounds refill; the covered rounds fix WHERE the fill sits.
-    Worked check: matmul lhs [T_k] is filled per k_o round and re-read
-    by every m_i row
-  - Buffer + fill AT that point: MemNewSMem (SMEM class) or FragNew
-    (FRAG class), extents = product of covered tile sizes x element
-    bytes; fill = tca::rt::LoadTileCta (any covered dim group-parallel)
-    or LoadTileThread (all covered dims sequential) per §6's variant
-    rule; source = the original tensor at the current round offsets
-    (INS dims above the tie are baked-in fixed indices); the loader
-    owns partial-tile clamping and runs under §4's uniform-call rule.
-    NO barriers, ever (§6 sync)
+  - Tier classification (RULED 2026-10-21, R2): classify the site by
+    the SoC of its COVERED dims
+    - ANY covered dim CTA-assigned -> site REFUSED (never rewritten)
+    - ANY covered dim WARP-assigned -> SMEM window class
+    - ALL covered dims sequential -> FRAG class (per-thread)
+  - FILL PLACEMENT (RULED 2026-10-21, R1 — VARIANT-DEPENDENT; the
+    former unconditional rule "inside the innermost covered dim's
+    between-round body, immediately before the tile-inside loops" is
+    SUPERSEDED — it mandated a position at which the fill's own
+    per-thread coordinates (tile-INSIDE dimvars) are undefined, the
+    HI-01 inconsistency)
+    - LoadTileThread (FRAG class): splice the fill INSIDE the element
+      loop that DEFINES its per-thread coordinate; it refills once per
+      epoch of the fill key — the innermost loop dim whose change
+      invalidates the fragment (e.g. lhs refills per m-element inside
+      M.inside)
+    - LoadTileCta (SMEM window class): splice the fill at the
+      innermost covered dim's BETWEEN-round body, immediately before
+      the tile-inside loops (Tie == nil -> the same rule at the
+      outermost position); its source coordinates are CTA-UNIFORM
+      round bases ONLY — never a per-thread offset
+    - ONE structural splice mechanism for BOTH variants: re-point the
+      chosen position's body chain so the fill is its body-prefix;
+      there is NO bodyRoot == load special case (that path placed a
+      cooperative fill INSIDE an element loop — a §4 layering
+      violation — while the buffer access sat outside the nest reading
+      loop-private dimvars)
+    - The tie position fixes WHICH rounds/epochs refill; the fill
+      VARIANT fixes WHERE the fill sits
+  - SMEM WINDOW sizing + access (RULED 2026-10-21, R2 — the access for
+    a memory index inside the tile must use the runtime object
+    thread_map.index(d) to obtain the thread index mapping for that
+    dimension; a SEQ-assigned dim is a sequential tile loop.
+    Rank-in-index => window-in-shape)
+    - Buffer extent per covered dim: WARP dim -> #threads_d x T_d (the
+      whole group's round window, NOT the single-thread chunk); SEQ
+      dim -> T_d; total buffer bytes = product over covered dims x
+      element size
+    - Access index on a WARP dim d = thread_map.index(d) · T_d + i,
+      where d is that dim's SLOT in the LNT's ThreadMap (one map per
+      LNT, tuple coordinates, §7bis) — NOT a hardcoded 0 and NOT the
+      bare inside-coordinate; access on a SEQ dim = its
+      inside-coordinate
+    - Fill = ONE cooperative LoadTileCta per round over the group
+      window: CTA-UNIFORM source base (the round bases), DISJOINT
+      per-thread stripes enumerating the window, tail clamping INSIDE
+      the loader
+  - Buffer + fill AT the fill point: MemNewSMem (SMEM class) or
+    FragNew (FRAG class), extents per the R2 window rule above;
+    variant per the tier rule; source = the original tensor at the
+    LIVE coordinates of every INS dim in scope at the fill position
+    (dims above the fill point contribute their current round/element
+    coordinates; the fill key epochs the refill — under R1 nothing is
+    "baked above the tie" that is not in scope where the fill sits);
+    the loader owns partial-tile clamping and runs under §4's
+    uniform-call rule. NO barriers, ever (§6 sync)
   - Access rewrite: RAUW the MemLoad's uses to
-    MemLoadSMem(buf, [covered dims' inside-coords]) / FragLoad(...)
+    MemLoadSMem(buf, [per-dim access index per R2]) / FragLoad(...)
     (both kinds already exist in the LIR catalog — M4); retire the
     MemLoad. Uncovered inner INS dims stay live loop indices BELOW the
     buffer — that re-read IS the reuse
+  - Cross-LNT guard (RULED 2026-10-21, R4): sites recorded as
+    non-candidates because their INS spans >= 2 LNTs (Promoted =
+    false, explicit reason) are NEVER rewritten; the rewrite REFUSES
+    any body referencing foreign iters (another LNT's loop dimvars) —
+    fail closed
+  - Worked example, ACCEPTED OUTCOME (ruled 2026-10-21; matmul
+    M=1024/N=2048/K=512 at defaults — M CTA LoC=100 T=32, N WARP
+    8 warps = 256 threads T=32, K SEQ T=32, 100 CTAs/512 threads,
+    Max.cache = 64 KB):
+    - lhs (tie=iterN, covered={K} all-SEQ) -> FRAG class: 32 x 4 B =
+      128 B per thread, LoadTileThread filled INSIDE M.inside — it
+      refills per m-element and its reuse is the owning thread's
+      32-step n walk. PROMOTED
+    - rhs (tie=nil, covered={N WARP, K SEQ}) -> SMEM window class:
+      the R2 window is 256 threads x 32 x 32 x 4 B = 1 MB against the
+      64 KB kernel-wide budget -> DECLINED by the budget fallback
+    - This outcome is INTENTIONAL (R2's accepted consequence): the
+      WARP-window rule prices group-level windows honestly; rhs
+      returns at smaller shapes or larger budgets
   - Loads-only: the candidate set is MemLoad-based; v0 NEVER routes
     stores through the cache
 - PHASE 5 — epilogue
@@ -365,7 +488,8 @@ introduces a new decision.
   - M2 empty covered set (degenerate scalar cache): filter at the
     DECIDE pass — no reuse value, avoids a degenerate fill
   - M3 buffer node placement: at the fill point (one buffer, refilled
-    per round)
+    per fill-key epoch — per round for LoadTileCta, per fill-key
+    element for LoadTileThread; R1)
   - M4 access node kinds: reuse the existing KindMemLoadSMem /
     KindFragLoad
 
@@ -377,9 +501,16 @@ introduces a new decision.
     thr_loop bailout (whole-body skip in the loop materialization)
 - Cross-LNT sites
   - Dedupe candidate sites kernel-wide by MemLoad node identity
-  - A load whose INS spans multiple LNTs is evaluated against the UNION of the
-    referenced iters' assignments
-  - Never-bucketed loads are declared non-candidates (explicit, not silent)
+  - V0 RULED 2026-10-21 (R4 — fail-closed): a load whose INS spans
+    >= 2 LNTs is NOT evaluated in v0; it gets an EXPLICIT non-candidate
+    SiteDecision entry in the record (Promoted = false, reason), and
+    the rewrite REFUSES to rewrite bodies referencing foreign iters
+  - The UNION-of-assignments evaluation (judge such a load against the
+    union of the referenced iters' assignments) remains the FUTURE
+    model — it must NOT be silently approximated by assigning the load
+    to one tree and dropping the foreign iters from its INS
+  - Never-bucketed loads are declared non-candidates (explicit record
+    entries, not silent skips)
 - Determinism
   - DoSoC numbering order (outer → inner per LNT, §2) and the decide pass's
     preset ordering are inherited; this pass ADDS NO SEARCH of its own
@@ -463,17 +594,42 @@ introduces a new decision.
     chains consistent)
   - The intrinsics are pure leaves for the poset — no new edge classes
   - DCE two-root liveness handles them (pure values, live via consumers)
-- Self-check list (pass exit conditions)
+- Self-check list (pass exit conditions) — STRUCTURAL (F5, ruled
+  2026-10-21: every check is computed from the EMITTED graph structure
+  and must be able to FAIL on a plausibly-emitted graph; a check that
+  inspects a baked constant or a synthetic run-state is vacuous and
+  forbidden)
   - Every rewritten InductionVariable use has exactly the RAUW'd
     (offset + inside) form — no stale original-IV uses remain
-  - Every FRAG site satisfies the fully-unroll condition (§6)
+  - Every FRAG site satisfies the fully-unroll condition (§6) and the
+    MaxFragPerThread budget
   - The budget fallback terminates (§6)
   - Every parallel-inside loop lowers to thr_loop carrying the §4 bailout
-  - No cooperative tile op sits inside a bailing element loop (§4 layering)
+  - FILL PLACEMENT (structural): every fill is data-reachable from its
+    fill-position loop's body operand — LoadTileThread fills sit
+    inside the element loop defining their per-thread coordinate;
+    LoadTileCta fills sit at the innermost covered dim's between-round
+    body, OUTSIDE every bailing element loop (§4 layering), with
+    CTA-uniform source coordinates only (R1)
+  - FILL SCOPE (structural): every dimvar reachable from a fill's
+    source coordinates is defined by a loop that ENCLOSES the fill's
+    structural position — no fill reads a loop dimvar from outside
+    that loop (the CR-02/HI-01 leakage class)
   - Every warp-synchronous op's mask comes from thread_map (§4 mask contract)
   - No stale MemLoad remains for any promoted site (its uses are buffer
     accesses; the node is erased)
   - No original InductionVariable use survives (all RAUW'd to
     offset + inside expressions)
-  - Every fill sits OUTSIDE bailing element loops (§4 layering)
-  - ZERO barriers emitted (§6 sync)
+  - No cooperative tile op sits inside a bailing element loop (§4
+    layering) — checked structurally over the emitted fills
+  - ZERO barriers emitted (§6 sync) — verified by parsing the loadtile
+    attribute back out of every emitted fill's operand list and
+    asserting none is live; NEVER by re-reading a baked flag
+- Downstream IR verifier invariants (same fix wave, landing AFTER this
+  pass's output is corrected): a scoping invariant — a loop's
+  IV/dimvar may be used only by nodes reachable from that loop's body
+  operand subtree plus the loop's own structure — and a ForLoop dimvar
+  positive-const step pin; together they make the fill/rewrite leakage
+  class permanently unrepresentable. They are pipeline-level IR
+  invariants, not pass-local checks — §8's zero-new-invariant-classes
+  rule for THIS pass is unchanged
