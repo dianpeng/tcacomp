@@ -192,11 +192,11 @@ added `lambda` after `as` — one deliberate LIR-side renumber. From v3 onward
 the rule is **append-only within a tier**: new kinds insert before `KindEnd`
 in their tier and never renumber existing constants (v4/v5's HIR additions
 sit before `KindForLoop`, keeping the tier boundary at the enum boundary).
-`KindInvalid` (0) and `KindEnd` (32) are sentinels with no catalog row; the
+`KindInvalid` (0) and `KindEnd` (34) are sentinels with no catalog row; the
 pass manager's legality windows and the verifier reject both, and any kind
 `>= KindEnd` (IR-03/IR-07).
 
-All 31 kinds, exactly as listed in `catalog.go` (enum order; arity `-1` =
+All 33 kinds, exactly as listed in `catalog.go` (enum order; arity `-1` =
 variadic, slots allocated from the operand list). **Every row is
 Input/ImpactBy-only** (§1.1's requirement): the "Operands" column below IS
 the node's complete input surface — the only payload storage left in the
@@ -227,11 +227,11 @@ suite is the `effectIns` ImpactBy list of the three effect bearers.
 | 19 | `as` | Abstract | -1 | ops = `[dim params in order]` | The as-order clause, carried as the LAST VALUE operand of its Map/Reduce (before the trailing lambda) — `AsOf(n)` scans the Input list, no stored pointer. Shape check: operands are dim InputParams; at most one, placed last. |
 | 20 | `lambda` | Abstract | -1 | ops = `[param declarations..., body]` | The lambda expression, carried as the TRAILING operand of its Map/Reduce. The params (RoleLambda InputParams) bind positionally to the stage's Input-list value bindings; the body is the closing operand. The verifier permits only Map/Reduce to carry one. |
 
-### LIR tier — the lowered suite introduced by optimization passes (11 kinds)
+### LIR tier — the lowered suite introduced by optimization passes (13 kinds)
 
 | # | Kind (spelling) | Family | Arity | Operands | Semantics |
 |---|---|---|---|---|---|
-| 21 | `forloop` | Loop | 3 | ops = `[iv(dimvar), bound, body]` | Explicit lowered loop nest. Shape check: operand 0 must be a dimvar. |
+| 21 | `forloop` | Loop | -1 | ops = `[iv(dimvar), bound, body, KeyedAttribute annotations...]` | Explicit lowered loop nest. Shape check: operand 0 must be a dimvar; trailing operands beyond slot 2 must be KeyedAttribute annotations (M1, quick-261021-jay — the tile-lower pass's soc/dosoc/loc materialization metadata). |
 | 22 | `dimvar` | Abstract | -1 | ops = `[dim, init, step]` | Lowered induction variable — a value object; identity is the `(init, step)` tuple, never the name (doc/optana/induction_variable.md). Prints `@x(init=…, step=…)`. Shape check: operand 0 is a dim InputParam. |
 | 23 | `bdimvar` | Abstract | 2 | ops = `[iv(dimvar), max]` | Bounded IV `((iv tuple), Max)`; prints `@x/M`. Shape check: operand 0 must be a dimvar. |
 | 24 | `memloadsmem` | Memory | -1 | ops = `[src smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM load. Shape check: src must be a `memnewsmem`. |
@@ -242,6 +242,8 @@ suite is the `effectIns` ImpactBy list of the three effect bearers.
 | 29 | `fragnew` | Memory | 1 | ops = `[extent]`; class = `StorageFrag` | Fragment allocation. |
 | 30 | `tensordimof` | Abstract | 2 | ops = `[tensor param, TU32 axis const]` | A tensor dimension's upper bound — the bound the lowering gives an `iter`. Shape checks: operand 0 a RoleTensor InputParam, operand 1 a const. |
 | 31 | `inductionvariable` | Abstract | 1 | ops = `[iter]` | The u32 current-iteration value of an iter — what a lowered `MemLoad`'s axes become. Shape check: operand 0 is an iter. |
+| 32 | `intrinsicgridmap` | Abstract | 1 | ops = `[DoSoC const u32]`; payload = field string | Launch-map query `IntrinsicGridMap(field, DoSoC)` (quick-261021-jay, §5 of the loop-tile-lower spec): the enclosing LNT's GridConcurrencyMap, field ∈ {index, dimension}, result u32. Shape checks: exactly one const-u32 operand, field vocabulary. Exists only between tile-lower and codegen. |
+| 33 | `intrinsicthreadmap` | Abstract | 1 | ops = `[DoSoC const u32]`; payload = field string | The same query over the LNT's ThreadMap. Same shape contract as `intrinsicgridmap`. |
 
 Notes:
 
@@ -261,7 +263,8 @@ Notes:
   `Verify` — see §5.2.
 - The **families** (D-15): `FamilyScalarExpr` (8–14), `FamilyMemory` (3–5,
   24–29), `FamilyLoop` (6, 7, 21), `FamilyAbstract` (1, 2, 15–20, 22, 23,
-  30, 31 — the lowered dimvars/IVs/bounds are value-level objects, not
+  30–33 — the lowered dimvars/IVs/bounds and the launch-map queries are
+  value-level objects, not
   loop-nest structure; the restructure kinds are value-level Input-list
   citizens), `FamilyCollective` (reserved, no members until reduce lowering
   lands).

@@ -6,10 +6,12 @@ import "testing"
 // (quick-261019-tu3 Task 1): the single source of truth moved from
 // pkg/expr.go's pureBuiltins table, consulted by pkg.Call and the
 // typeinfer pass alike. Every entry is (f32, ...f32) -> f32 per
-// syntax.md §6.4.
+// syntax.md §6.4, EXCEPT the u32 min/max pair quick-261021-jay added for
+// the tile-lower pass's materialized bounds (doc/optana/loop_tile_lower.md
+// §3's integer-bounds recipe).
 
 // TestBuiltinTable pins the exact name/arity set (the table previously in
-// pkg/expr.go) and the uniform f32 signature.
+// pkg/expr.go) and the uniform f32 signature of the f32 family.
 func TestBuiltinTable(t *testing.T) {
 	want := map[string]int{
 		"expf": 1, "logf": 1, "sqrtf": 1, "rsqrtf": 1,
@@ -17,22 +19,51 @@ func TestBuiltinTable(t *testing.T) {
 		"fminf": 2, "fmaxf": 2,
 		"fmaf": 3,
 	}
-	got := map[string]int{}
-	for name := range want {
+	for name, arity := range want {
 		sig, ok := Builtin(name)
 		if !ok {
 			t.Fatalf("Builtin(%q) must be registered", name)
 		}
-		if sig.Arity != want[name] {
-			t.Fatalf("Builtin(%q).Arity = %d, want %d", name, sig.Arity, want[name])
+		if sig.Arity != arity {
+			t.Fatalf("Builtin(%q).Arity = %d, want %d", name, sig.Arity, arity)
 		}
 		if sig.Arg != TF32 || sig.Result != TF32 {
 			t.Fatalf("Builtin(%q) = (arg %s, result %s), want (f32, f32)", name, sig.Arg, sig.Result)
 		}
-		got[name] = sig.Arity
 	}
-	if len(got) != len(want) {
-		t.Fatalf("registry holds %d entries, want exactly %d", len(got), len(want))
+}
+
+// TestBuiltinU32MinMax pins the integer-bounds pair (quick-261021-jay):
+// "umin"/"umax" are (u32, u32) -> u32 — the tile-lower pass emits umin for
+// every materialized tile_max = umin(T, extent − offset).
+func TestBuiltinU32MinMax(t *testing.T) {
+	for _, name := range []string{"umin", "umax"} {
+		sig, ok := Builtin(name)
+		if !ok {
+			t.Fatalf("Builtin(%q) must be registered", name)
+		}
+		if sig.Arity != 2 || sig.Arg != TU32 || sig.Result != TU32 {
+			t.Fatalf("Builtin(%q) = %+v, want arity 2, u32 -> u32", name, sig)
+		}
+	}
+}
+
+// TestBuiltinRegistrySize pins the total entry count: 11 f32-family entries
+// plus the two u32 bounds builtins — a registry drift tripwire.
+func TestBuiltinRegistrySize(t *testing.T) {
+	count := 0
+	for name := range map[string]struct{}{
+		"expf": {}, "logf": {}, "sqrtf": {}, "rsqrtf": {},
+		"fabsf": {}, "tanhf": {}, "sinf": {}, "cosf": {},
+		"fminf": {}, "fmaxf": {}, "fmaf": {},
+		"umin": {}, "umax": {},
+	} {
+		if _, ok := Builtin(name); ok {
+			count++
+		}
+	}
+	if count != 13 {
+		t.Fatalf("registry must hold exactly 13 entries, got %d", count)
 	}
 }
 

@@ -82,19 +82,30 @@ func ClusterInputs(n Node) []Node {
 	return append([]Node(nil), ops[dims:]...)
 }
 
-// forLoopNode: lowered loop nest; ops = [iv, bound, body] — the bounded
-// induction variable, its bound, and the body subtree (an LIR memory store, a
-// nested forloop, or another effect-carrying stage).
+// forLoopNode: lowered loop nest; ops = [iv, bound, body, attrs...] — the
+// bounded induction variable, its bound, the body subtree (an LIR memory
+// store, a nested forloop, or another effect-carrying stage), and trailing
+// KeyedAttribute annotations (M1, quick-261021-jay: the tile-lower pass's
+// soc/dosoc/loc materialization metadata — the catalog arity is variadic
+// and the verifier pins every trailing operand to a KeyedAttribute).
 type forLoopNode struct {
 	*Base
 	operandList
 }
 
 // NewForLoop creates an explicit lowered loop over the bounded induction
-// variable iv, bounded by bound, with body as the loop body subtree. The
-// verifier's shape check enforces the iv operand kind.
-func (g *Graph) NewForLoop(origin string, iv, bound, body Node) Node {
-	n := g.allocNode(KindForLoop, origin, 3).(*forLoopNode)
-	wireOperands(n, iv, bound, body)
+// variable iv, bounded by bound, with body as the loop body subtree. attrs
+// are optional trailing KeyedAttribute annotations (M1): the annotation
+// vocabulary the loop-tile-lower pass emits is "soc" (0=seq, 1=cta,
+// 2=thr — the materialization primitive selector), "dosoc" (the loop's
+// map dimension), and "loc" (that loop's materialization concurrency).
+// The verifier's shape check enforces the iv operand kind and the
+// annotation operand kinds.
+func (g *Graph) NewForLoop(origin string, iv, bound, body Node, attrs ...Node) Node {
+	n := g.allocNode(KindForLoop, origin, 3+len(attrs)).(*forLoopNode)
+	ops := make([]Node, 0, 3+len(attrs))
+	ops = append(ops, iv, bound, body)
+	ops = append(ops, attrs...)
+	wireOperands(n, ops...)
 	return n
 }

@@ -559,6 +559,13 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(r.value(opAt(t, 1)))
 		b.WriteString(") ")
 		b.WriteString(r.value(opAt(t, 2)))
+		// M1 trailing annotations (quick-261021-jay): the tile-lower
+		// pass's soc/dosoc/loc KeyedAttribute inputs render after the
+		// body, each through the keyedattribute value rendering.
+		for i := 3; i < len(OperandsOf(t)); i++ {
+			b.WriteString(" ")
+			b.WriteString(r.value(operandAt(t, i)))
+		}
 		return b.String()
 	default:
 		return r.value(n)
@@ -726,6 +733,22 @@ func (r *renderer) value(n Node) string {
 		return b.String()
 	case *inductionVariableNode:
 		return "inductionvariable(" + r.value(opAt(t, 0)) + ")"
+	case *intrinsicNode:
+		// The launch-map queries render like calls with the field as the
+		// leading selector: intrinsicgridmap(index, %N) (quick-261021-jay).
+		var b strings.Builder
+		if t.KindOf() == KindIntrinsicGridMap {
+			b.WriteString("intrinsicgridmap(")
+		} else {
+			b.WriteString("intrinsicthreadmap(")
+		}
+		b.WriteString(t.field)
+		if d := opAt(t, 0); d != nil {
+			b.WriteString(", ")
+			b.WriteString(r.value(d))
+		}
+		b.WriteString(")")
+		return b.String()
 	case *keyedAttributeNode:
 		return "keyedattribute(" + t.key + "=" + r.value(opAt(t, 0)) + ")"
 	case *dimVarNode:

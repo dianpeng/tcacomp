@@ -77,6 +77,14 @@ const (
 	KindTensorDimOf       // lowered shape upper bound: TensorDimOf(tensor, axis const)
 	KindInductionVariable // lowered u32 iteration value: InductionVariable(iter)
 
+	// --- LIR tier, loop-tile-lower additions (quick-261021-jay) ---
+	// Append-only within the tier (no KindVersion bump): the map-query
+	// intrinsics the loop-tile-lower pass materializes exist only between
+	// that pass and codegen.
+
+	KindIntrinsicGridMap  // lowered launch-map query: IntrinsicGridMap(field, DoSoC const)
+	KindIntrinsicThreadMap // lowered launch-map query: IntrinsicThreadMap(field, DoSoC const)
+
 	KindEnd // sentinel: all kinds < KindEnd
 )
 
@@ -148,6 +156,10 @@ func (k Kind) String() string {
 		return "tensordimof"
 	case KindInductionVariable:
 		return "inductionvariable"
+	case KindIntrinsicGridMap:
+		return "intrinsicgridmap"
+	case KindIntrinsicThreadMap:
+		return "intrinsicthreadmap"
 	case KindEnd:
 		return "end"
 	default:
@@ -188,7 +200,10 @@ func (k Kind) Family() Family {
 		// (IterClusterProject, KeyedAttribute, As, Lambda — reference-carrier
 		// and expression-carrier nodes, quick-261019-ktm), the lowered
 		// shape/iteration VALUE nodes (TensorDimOf, InductionVariable — pure
-		// value nodes per the DimVar precedent), and the sentinel values
+		// value nodes per the DimVar precedent), the loop-tile-lower map
+		// queries (IntrinsicGridMap/IntrinsicThreadMap — the same pure-value
+		// precedent, quick-261021-jay: per-launch deterministic queries, so
+		// EffectOf is free and GVN-CSE sound), and the sentinel values
 		// belong to the abstract suite
 		// (the lowered dimvars are value-level IV objects, doc/optana/
 		// induction_variable.md, not loop-nest structure).

@@ -6,13 +6,14 @@ import (
 	"tcacomp/internal/ir"
 )
 
-// rules.go is the per-kind typing rule switch over the full 31-kind
+// rules.go is the per-kind typing rule switch over the full 33-kind
 // catalog, faithful to doc/optana/type_inf.md's rules (1)-(5) and extended
 // to the implemented suite (bdimvar joins the dimvar class; the LIR memory
-// family, keyedattribute/as/lambda covered; itercluster is the legacy
-// transparent wrapper; iterclusterproject fails on sight). The switch is
-// CLOSED: an unknown kind errors (T-ti-03 — the catalog is closed, no
-// silent nil-typing of unrecognized kinds).
+// family, keyedattribute/as/lambda covered; the launch-map query intrinsics
+// join the u32 class, quick-261021-jay §5 companion 4; itercluster is the
+// legacy transparent wrapper; iterclusterproject fails on sight). The
+// switch is CLOSED: an unknown kind errors (T-ti-03 — the catalog is
+// closed, no silent nil-typing of unrecognized kinds).
 //
 // Element-view convention (the spec's "Expr node CAN ONLY work on scalar
 // type" meets this IR's shape): a rank-0 numeric operand contributes
@@ -191,7 +192,11 @@ func typeOfNode(n ir.Node, memo map[*ir.Base]ir.Type) (ir.Type, error) {
 	// --- loop / IV value kinds (spec (2)) ---
 
 	case ir.KindIter, ir.KindForLoop, ir.KindDimVar, ir.KindBoundedDimVar,
-		ir.KindInductionVariable, ir.KindTensorDimOf:
+		ir.KindInductionVariable, ir.KindTensorDimOf,
+		ir.KindIntrinsicGridMap, ir.KindIntrinsicThreadMap:
+		// §5 companion 4 (quick-261021-jay): the launch-map queries type
+		// u32 — without this arm the post-tile-lower typeinfer re-run
+		// fails closed on the closed catalog.
 		return u32(), nil
 
 	// --- iteration clusters (spec (2): lowered before TI) ---

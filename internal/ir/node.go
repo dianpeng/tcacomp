@@ -350,6 +350,8 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &tensorDimOfNode{Base: b}
 	case KindInductionVariable:
 		n = &inductionVariableNode{Base: b}
+	case KindIntrinsicGridMap, KindIntrinsicThreadMap:
+		n = &intrinsicNode{Base: b}
 	default:
 		n = &rawNode{Base: b}
 	}

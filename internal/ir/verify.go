@@ -150,8 +150,11 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // paramRef's operand 0 is an InputParam; a cluster's dim operands LEAD its
 // input list; HIR GMEM load/store tensors bind a RoleTensor InputParam;
 // LIR SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a
-// FragNew buffer; a for-loop binds a dimvar; an IterClusterProject's
-// operand 0 is an itercluster; an InductionVariable's operand 0 is an
+// FragNew buffer; a for-loop binds a dimvar, with trailing operands beyond
+// (iv, bound, body) pinned to KeyedAttribute annotations (M1,
+// quick-261021-jay); an intrinsic map query holds exactly one const-u32
+// DoSoC operand and a field in {index, dimension} (§5 companion 3); an
+// IterClusterProject's operand 0 is an itercluster; an InductionVariable's operand 0 is an
 // iter; a TensorDimOf binds a RoleTensor tensor and a const axis; an As
 // binds dim InputParams; a Reduce's operand 1 is its KeyedAttribute init;
 // and a Map/Reduce's optional As is unique and last, with the map's
@@ -235,6 +238,43 @@ func checkNodeShape(n Node, vs *[]Violation) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					"for-loop operand 0 must be a dimvar"))
 			}
+		}
+		// M1 (quick-261021-jay): trailing operands beyond (iv, bound, body)
+		// are KeyedAttribute annotations — the tile-lower pass's soc/dosoc/
+		// loc materialization metadata. Anything else is a shape violation.
+		for i, op := range OperandsOf(t) {
+			if i < 3 || op == nil {
+				continue // the generic slot check owns nil operands
+			}
+			if _, ok := op.(*keyedAttributeNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"for-loop trailing operands must be KeyedAttribute annotations (M1)"))
+				break
+			}
+		}
+	case *intrinsicNode:
+		// §5 companion 3 (quick-261021-jay): exactly one operand — the DoSoC
+		// const u32; the field payload must be a known query selector.
+		if len(OperandsOf(t)) != 1 {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"intrinsic map query must hold exactly one operand (the DoSoC const)"))
+			break
+		}
+		if d := operandAt(t, 0); d != nil {
+			c, ok := d.(*constNode)
+			if !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"intrinsic map query operand 0 must be a const-u32 DoSoC"))
+			} else if typ := c.typ; typ == nil || !typ.Equal(InternScalar(TU32)) {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"intrinsic map query operand 0 must be a const-u32 DoSoC"))
+			}
+		}
+		switch t.field {
+		case "index", "dimension":
+		default:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("intrinsic map query field %q must be \"index\" or \"dimension\"", t.field)))
 		}
 	case *iterClusterProjectNode:
 		if cl := operandAt(t, 0); cl != nil {

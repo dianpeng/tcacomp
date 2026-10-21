@@ -54,7 +54,7 @@ var catalog = []kindEntry{
 	{KindLambda, TierHIR, FamilyAbstract, -1, "lambda expression: (param declarations..., body); map/reduce carry it as their trailing input"},
 
 	// --- LIR tier ---
-	{KindForLoop, TierLIR, FamilyLoop, 3, "lowered loop nest: (iv dimvar, bound bdimvar, body)"},
+	{KindForLoop, TierLIR, FamilyLoop, -1, "lowered loop nest: (iv dimvar, bound bdimvar, body, KeyedAttribute annotations... (M1, quick-261021-jay))"},
 	{KindDimVar, TierLIR, FamilyAbstract, 3, "lowered induction variable: (dim, init, step) value object"},
 	{KindBoundedDimVar, TierLIR, FamilyAbstract, 2, "dimvar bound to a max: ((iv tuple), max)"},
 	{KindMemLoadSMem, TierLIR, FamilyMemory, -1, "SMEM load: (src smem buffer, bivs...)"},
@@ -65,6 +65,8 @@ var catalog = []kindEntry{
 	{KindFragNew, TierLIR, FamilyMemory, 1, "fragment allocation: (extent)"},
 	{KindTensorDimOf, TierLIR, FamilyAbstract, 2, "shape upper bound: (tensor param, TU32 axis const)"},
 	{KindInductionVariable, TierLIR, FamilyAbstract, 1, "u32 current-iteration value of an iter: (iter)"},
+	{KindIntrinsicGridMap, TierLIR, FamilyAbstract, 1, "grid-map query: (DoSoC const u32); string field payload index|dimension; result u32. LIR, exists only between tile-lower and codegen; Legal at StageConstructed by the catalog-iteration rule — the revision point when stage windows land (legality.go precedent)"},
+	{KindIntrinsicThreadMap, TierLIR, FamilyAbstract, 1, "thread-map query: (DoSoC const u32); string field payload index|dimension; result u32. LIR, exists only between tile-lower and codegen; Legal at StageConstructed by the catalog-iteration rule — the revision point when stage windows land (legality.go precedent)"},
 }
 
 // HIRKinds returns the HIR-tier kinds in enum order.

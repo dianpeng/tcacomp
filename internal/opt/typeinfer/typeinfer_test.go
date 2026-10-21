@@ -17,7 +17,7 @@ import (
 )
 
 // typeinfer_test.go pins the type inference pass (quick-261019-tu3,
-// doc/optana/type_inf.md rules (1)-(5) extended to the 31-kind catalog):
+// doc/optana/type_inf.md rules (1)-(5) extended to the 33-kind catalog):
 // per-kind typing rules, idempotency (types AND LastTouchedBy stable),
 // fail-closed errors naming the offending node, the matmul_scale oracle
 // through the simplify+typeinfer pipeline, and the 105 registration.
@@ -197,6 +197,39 @@ func TestLoopValueKindsU32(t *testing.T) {
 	mustRun(t, g)
 	for _, n := range []ir.Node{it, dv, biv, iv, td, fl} {
 		wantType(t, n, n.KindOf().String(), u32T())
+	}
+}
+
+// TestIntrinsicAndUminRules pins quick-261021-jay's §5 companion 4 and §3's
+// integer-bounds recipe: the launch-map query intrinsics type u32, and a
+// u32-arg "umin" call types u32 through the existing registry-driven KindCall
+// rule (the tile-lower pass's materialized tile_max form).
+func TestIntrinsicAndUminRules(t *testing.T) {
+	g := ir.NewGraph("tilelower-types")
+	d0 := g.NewConst("t", u32T(), 0)
+	d1 := g.NewConst("t", u32T(), 1)
+	gm := g.NewIntrinsicGridMap("t", "index", d0)
+	tm := g.NewIntrinsicThreadMap("t", "dimension", d1)
+	extent := g.NewTensorDimOf("t",
+		g.NewInputParam("t", ir.RoleTensor, "lhs", tensorT(ir.TF32, "m", "k")), 1)
+	tileMax := g.NewCall("t", "umin", d1, extent)
+
+	mustRun(t, g)
+	for _, n := range []ir.Node{gm, tm, tileMax} {
+		wantType(t, n, n.KindOf().String(), u32T())
+	}
+
+	// Fail-closed neighbors: a wrong-arity umin and an f32-arg umin both
+	// error through the closed KindCall rule.
+	badArity := ir.NewGraph("bad-arity")
+	badArity.NewCall("t", "umin", badArity.NewConst("t", u32T(), 1))
+	if err := runTI(badArity); err == nil || !strings.Contains(err.Error(), "umin") {
+		t.Fatalf("wrong-arity umin must fail closed naming the builtin, got %v", err)
+	}
+	badArg := ir.NewGraph("bad-arg")
+	badArg.NewCall("t", "umin", badArg.NewConst("t", u32T(), 1), badArg.NewConst("t", f32T(), 1))
+	if err := runTI(badArg); err == nil || !strings.Contains(err.Error(), "umin") {
+		t.Fatalf("f32-arg umin must fail closed naming the builtin, got %v", err)
 	}
 }
 

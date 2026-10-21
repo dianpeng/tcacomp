@@ -74,8 +74,9 @@ func mixUint32(h uint64, v uint32) uint64 {
 	return mixUint64(h, uint64(v)<<32|uint64(^v)) // both the value and its complement: 0 mixes non-trivially
 }
 
-// mixString folds a string bytewise in FNV-1a order. Only callNode.name
-// reaches this (names are debug payload everywhere else, P1R-01).
+// mixString folds a string bytewise in FNV-1a order. The string payload
+// kinds reach this (callNode.name, keyedAttributeNode.key, and the
+// intrinsic map-query field, quick-261021-jay).
 func mixString(h uint64, s string) uint64 {
 	for i := 0; i < len(s); i++ {
 		h = (h ^ uint64(s[i])) * valueHashPrime
@@ -268,6 +269,11 @@ func contentHash(n Node) uint64 {
 		// D2/D13: the attribute key is identity content ("init" vs any
 		// other key distinguishes attributes wrapping the same value).
 		return mixString(valueHashOffset, t.key)
+	case *intrinsicNode:
+		// §5 companion 6 (quick-261021-jay): the field selector is
+		// identity content (the callNode.name precedent) — the DoSoC is
+		// an operand and identity-keyed automatically.
+		return mixString(valueHashOffset, t.field)
 	case *memLoadSMemNode:
 		return mixUint32(valueHashOffset, uint32(t.class))
 	case *memStoreSMemNode:
@@ -313,6 +319,9 @@ func contentEqual(a, b Node) bool {
 	case *keyedAttributeNode:
 		tb, ok := b.(*keyedAttributeNode)
 		return ok && ta.key == tb.key
+	case *intrinsicNode:
+		tb, ok := b.(*intrinsicNode)
+		return ok && ta.field == tb.field
 	case *memLoadSMemNode:
 		tb, ok := b.(*memLoadSMemNode)
 		return ok && ta.class == tb.class
