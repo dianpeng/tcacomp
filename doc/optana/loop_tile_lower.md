@@ -226,6 +226,22 @@
     (the Cache.dims trailing dimensions, per the decide pass's cache-tie
     semantics)
   - StorageClass payload carried on the LIR memory nodes
+- Site Rewrite Mechanics (how a promoted load is lowered)
+  - Load-site surgery: the MemLoad's uses are RAUW'd to buffer
+    accesses (MemLoadSMem/FragLoad with the covered dims' in-tile
+    coordinates); the MemLoad is retired by Erase — this is the "node
+    surgery" §1 defers to this pass
+  - Fill emission point: inside the innermost covered dim's
+    between-round body, immediately before the tile-inside loops
+    (§6bis Phase 4); one fill per round
+  - Buffer lifetime: ONE buffer per site, declared at the fill point
+    (M3), refilled every round — the SMEM buffer is a static
+    declaration reused across rounds, never re-allocated
+  - Loads-only scope: v0 candidate sites are MemLoads only; stores
+    never route through the cache (storetile/write-through is not in
+    scope)
+  - Buffer layout: plain row-major tile, NO padding/swizzle in v0
+    (swizzle deferred to the TMMA future, F22)
 - Copy variant selection (per doc/tca.md §5.11's variant table)
   - dims covered by cta_for/thread_for → SMEM cooperative copy:
     tca::rt::LoadTileCta
@@ -250,6 +266,108 @@
     (doc/opt.md "type inference — for newly inserted lowered node"; the pass
     is idempotent)
   - Which REQUIRES §5's typeinfer rules to exist, else the re-run fails closed
+
+## §6bis Mechanical Lowering Procedure (phase by phase)
+
+The full pass algorithm. Every step cites its ruling home; nothing here
+introduces a new decision.
+
+- PHASE 0 — IR prerequisites (before this pass can exist)
+  - Intrinsic kinds: IntrinsicGridMap(DoSoC, field) /
+    IntrinsicThreadMap(DoSoC, field) — LIR tier, string payload
+    (callNode.name precedent), result u32, plus ALL SIX companions of
+    §5 (node struct + catalog row, allocNode case, verify shape case,
+    typeinfer rules — the closed catalog fails without them, legality
+    row, contentHash/contentEqual)
+  - u32 min builtin (registry + typeinfer + codegen; ceildiv via
+    (A + T − 1)/T over existing BinOp div): every materialized
+    tile_max = min(T, extent − offset) needs it
+    - NOTE: the 0-based element-stride between loops eliminate ceil
+      entirely from the loop bounds (bound = the raw extent); only min
+      and the primitives' internal ceildiv remain
+  - Loop annotations: the rewritten KindForLoop nodes carry their
+    SoC / DoSoC / LoC as Input-list KeyedAttribute inputs (M1), so
+    codegen selects the cta_loop / thr_loop / seq_loop materialization
+    (§4)
+- PHASE 1 — record fetch + skeleton
+  - Requires: tile-lower requires tiling (pin now — the mechanism
+    exists in the pass manager); fetch tiling-record from the analysis
+    cache; FAIL CLOSED if absent
+  - Re-derive the loopforest; per LNT (Roots() order) resolve every
+    Iter -> BIV (DataDeps(iter)[0]) -> {SoC, LoC, TileSize}
+    (internal/opt/tiling Record.Iters); a missing entry is an ERROR
+    (adjacency guarantees completeness)
+- PHASE 2 — DoSoC numbering (§2)
+  - Per tree, walk outer -> inner; two counters (CTA dims, warp dims),
+    both restarting per LNT; sequential iters get no dimension
+- PHASE 3 — loop rewrite (per dim, original order)
+  - TileSize == 1 -> NO tiling for that dim: it keeps a single loop
+    and its IV maps directly to the global index
+  - Otherwise the dim becomes between-round + inside loops; ALL between
+    loops nest in dim order, ALL inside loops nest inside them, also in
+    dim order (the loop_tiling.md template layout):
+    - SEQ dim: between for (a = 0; a < A; a += T) (element stride,
+      LoC = 1); inside sequential, bounded by the materialized
+      a_tile_max
+    - CTA dim: between for (a = 0; a < A; a += LoC*T) with LoC = MaxCTA
+      (portion -1/full); in-body cta_rank =
+      IntrinsicGridMap(DoSoC_d, "index"); a_offset = cta_rank*T + a.
+      Inside = the COUPLED warp walk, ELEMENT stride:
+      for (a_i = …; a_i += nThreads_coupled) with
+      a_idx = a_offset + a_i + thread_rank_coupled — the coupled
+      group's thread count = remaining warp portions x quantum x 32
+    - WARP dim: between for (b = 0; b < B; b += nThreads*T) (each
+      thread owns a whole T-chunk — the composition-semantics ruling);
+      in-body thread_rank = IntrinsicThreadMap(DoSoC_d, "index");
+      b_offset = thread_rank*T + b. Inside = SEQUENTIAL walk of the
+      owned chunk
+  - Materialized bounds before the inside loops:
+    d_tile_max = min(T_d, extent_d − d_offset) — bounds ONLY; tail
+    guarding is the primitive's whole-body no-op (§4), never an IR
+    branch
+  - Body rewiring: RAUW every InductionVariable use to the
+    (d_offset + d_inside) expression (new defs); retire the original
+    Iter chains through the MutContext choke points; zero new
+    verifier invariant classes (§8)
+- PHASE 4 — cache insertion (per promoted site, keyed by MemLoad id)
+  - Recompute the site facts (INS chase, covered set = INS strictly
+    inner than the recorded Tie, the CacheDims clamp) with the SAME
+    deterministic chase as the decide pass — adjacency makes the
+    results identical; the record needs no extension
+  - FILL POINT: inside the innermost COVERED dim's between-round body,
+    immediately before the tile-inside loops (Tie == nil -> the same
+    rule at the outermost position). The tie position fixes WHICH
+    rounds refill; the covered rounds fix WHERE the fill sits.
+    Worked check: matmul lhs [T_k] is filled per k_o round and re-read
+    by every m_i row
+  - Buffer + fill AT that point: MemNewSMem (SMEM class) or FragNew
+    (FRAG class), extents = product of covered tile sizes x element
+    bytes; fill = tca::rt::LoadTileCta (any covered dim group-parallel)
+    or LoadTileThread (all covered dims sequential) per §6's variant
+    rule; source = the original tensor at the current round offsets
+    (INS dims above the tie are baked-in fixed indices); the loader
+    owns partial-tile clamping and runs under §4's uniform-call rule.
+    NO barriers, ever (§6 sync)
+  - Access rewrite: RAUW the MemLoad's uses to
+    MemLoadSMem(buf, [covered dims' inside-coords]) / FragLoad(...)
+    (both kinds already exist in the LIR catalog — M4); retire the
+    MemLoad. Uncovered inner INS dims stay live loop indices BELOW the
+    buffer — that re-read IS the reuse
+  - Loads-only: the candidate set is MemLoad-based; v0 NEVER routes
+    stores through the cache
+- PHASE 5 — epilogue
+  - Run the verifier (zero new invariant classes); rely on the
+    pipeline's typeinfer re-run (Phase 0's rules make it pass);
+    deterministic throughout (allocation-order walks, no search — §7)
+
+- IMPLEMENTER DEFAULTS (M1-M4) — normative unless the author overrides
+  - M1 loop-annotation mechanism: KeyedAttribute inputs on KindForLoop
+  - M2 empty covered set (degenerate scalar cache): filter at the
+    DECIDE pass — no reuse value, avoids a degenerate fill
+  - M3 buffer node placement: at the fill point (one buffer, refilled
+    per round)
+  - M4 access node kinds: reuse the existing KindMemLoadSMem /
+    KindFragLoad
 
 ## §7 Policies
 
@@ -353,3 +471,9 @@
   - Every parallel-inside loop lowers to thr_loop carrying the §4 bailout
   - No cooperative tile op sits inside a bailing element loop (§4 layering)
   - Every warp-synchronous op's mask comes from thread_map (§4 mask contract)
+  - No stale MemLoad remains for any promoted site (its uses are buffer
+    accesses; the node is erased)
+  - No original InductionVariable use survives (all RAUW'd to
+    offset + inside expressions)
+  - Every fill sits OUTSIDE bailing element loops (§4 layering)
+  - ZERO barriers emitted (§6 sync)
