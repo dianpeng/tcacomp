@@ -356,6 +356,18 @@ func buildLBBN(t *forNest) (*ir.ASTBlock, []ir.ASTLoopMeta, error) {
 	}
 	t.block = blk
 	t.loop.BasePtr().SetSched(t.depth, blk) // the loop node lives in its own Loop block
+	// The anchored header (iv/bound, ops[0]/ops[1]) belongs to the Loop
+	// block too — the spec's header part of the loop structure. A header
+	// shared by nested loops anchors at the MAX depth (max-wins anchoring),
+	// so it lands at the deepest sharing loop: only the loop whose depth
+	// equals the header's anchored SN stamps it.
+	if ops := ir.OperandsOf(t.loop); len(ops) >= 2 {
+		for _, h := range ops[:2] {
+			if h != nil && h.BasePtr().SchedSN() == t.depth && h.BasePtr().SchedBlock() == nil {
+				h.BasePtr().SetSched(t.depth, blk)
+			}
+		}
+	}
 	metas := []ir.ASTLoopMeta{{
 		Loop:  t.loop,
 		Soc:   socOf(blk.Kind()),
