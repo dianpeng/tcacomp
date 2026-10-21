@@ -125,6 +125,30 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 			}
 			overrides[it] = next
 		}
+		// Any site whose covered tiles ALL reach 1 drops back to GMEM (§6:
+		// "when a tile size reaches 1 drop that site back to GMEM") — a
+		// 1-element tile has no reuse to cache. Shared covered iters can
+		// drive a non-picked site to 1, so the sweep covers every promoted
+		// SMEM site, in facts order (deterministic).
+		for _, lf := range facts {
+			for _, sf := range lf.CS {
+				id := sf.Load.BasePtr().ID()
+				sd, ok := rec.Sites[id]
+				if !ok || !sd.Promoted || sd.Class != ClassSMEM || dropped[id] {
+					continue
+				}
+				allOne := true
+				for _, it := range sf.Covered {
+					if dec(it).TileSize > 1 {
+						allOne = false
+						break
+					}
+				}
+				if allOne {
+					dropped[id] = true
+				}
+			}
+		}
 	}
 	return overrides, dropped, nil
 }
@@ -242,32 +266,44 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		return fmt.Errorf("tile-lower: binding site %d buffer type: %w", id, err)
 	}
 
-	// Fill source: the original tensor at the current round offsets —
-	// covered dims at their round bases (the loader enumerates the tile
-	// interior and clamps partial tiles at runtime, §4/§6), INS dims above
-	// the tie at their enclosing rewritten index expressions (post-RAUW
-	// original axes reference them already), unreferenced positions absent
-	// (the partial deref keeps them as the slice's trailing dims).
+	// Fill source: the original tensor at the current round offsets. The
+	// covered dims are the TILE — the loader enumerates them internally
+	// (the compiler emits no loop for the fill, §6bis), so a position
+	// referencing only covered iters contributes NO axis; the tile's
+	// covered round bases ride the FILL STORE's biv operands (P5). INS
+	// dims above the tie keep their enclosing rewritten index expressions
+	// (post-RAUW original axes reference them already — baked-in fixed
+	// indices per round); a compound position mixing covered and above-tie
+	// iters substitutes the covered index expressions with their round
+	// bases; unreferenced positions stay absent (the partial deref keeps
+	// them as the slice's trailing dims). The result is the P5 tile-shaped
+	// partial deref: k < rank axes over the fixed coordinates.
 	origAxes := ir.OperandsOf(sf.Load)[1:]
 	fillAxes := make([]ir.Node, 0, len(origAxes))
-	substitutions := 0
 	for pos, axis := range origAxes {
 		if pos >= len(sf.AxesIters) || len(sf.AxesIters[pos]) == 0 {
 			continue // unreferenced position: absent
 		}
-		if !axisReferencesCovered(axis, covered) {
+		coveredHere, aboveHere := false, false
+		for _, it := range sf.AxesIters[pos] {
+			if coveredSet[it] {
+				coveredHere = true
+			} else {
+				aboveHere = true // INS at or outer than the tie
+			}
+		}
+		switch {
+		case coveredHere && !aboveHere:
+			continue // the loader enumerates the covered tile dim
+		case coveredHere && aboveHere:
+			rebuilt, n := lr.rebuildAxis(axis, covered)
+			if n == 0 {
+				return fmt.Errorf("tile-lower: site %d axis %d mixes covered and above-tie iters but holds no covered index expression (corrupted rewrite?)", id, pos)
+			}
+			fillAxes = append(fillAxes, rebuilt)
+		default:
 			fillAxes = append(fillAxes, axis) // above-tie INS index: bake as-is
-			continue
 		}
-		rebuilt, n := lr.rebuildAxis(axis, covered)
-		if n == 0 {
-			return fmt.Errorf("tile-lower: site %d axis %d references a covered iter but holds no covered index expression (corrupted rewrite?)", id, pos)
-		}
-		substitutions += n
-		fillAxes = append(fillAxes, rebuilt)
-	}
-	if substitutions == 0 {
-		return fmt.Errorf("tile-lower: site %d fill has no covered coordinate (corrupted rewrite?)", id)
 	}
 
 	// The fill's source load chains on the source tensor exactly as
@@ -366,34 +402,6 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		annotated: true,
 	})
 	return nil
-}
-
-// axisReferencesCovered reports whether the (post-RAUW) axis subtree holds
-// any covered dim's index expression.
-func axisReferencesCovered(axis ir.Node, covered []*dimRewrite) bool {
-	for _, d := range covered {
-		if subtreeContains(axis, d.indexExpr) {
-			return true
-		}
-	}
-	return false
-}
-
-// subtreeContains reports whether target appears in n's data-dependency
-// subtree.
-func subtreeContains(n, target ir.Node) bool {
-	if n == nil || target == nil {
-		return false
-	}
-	if n.BasePtr() == target.BasePtr() {
-		return true
-	}
-	for _, dep := range ir.DataDeps(n) {
-		if subtreeContains(dep, target) {
-			return true
-		}
-	}
-	return false
 }
 
 // rebuildAxis clones the axis expression, replacing every covered dim's

@@ -292,29 +292,32 @@ func loopAnnotations(loop ir.Node) map[string]float64 {
 }
 
 // checkFillLayering pins "no cooperative tile op sits inside a bailing
-// element loop (§4 layering)" as implemented by the plan: no fill's
-// coordinate subtree may reference the inside-loop dimvar of a parallel
-// (soc=2 coupled-walk) inside loop. Fills ride round bases by construction;
-// a violation means the fill was placed inside a tile-inside loop.
+// element loop (§4 layering)": a fill's coordinates may reference the full
+// index expressions of dims OUTER than the fill point (the worked check:
+// the lhs fill's m coordinate IS the enclosing m index expression) and the
+// covered dims' round bases — but never the covered dims' own inside-loop
+// coordinates (the fill covers a WHOLE tile; its covered coordinates ride
+// round bases, placed immediately before the tile-inside loops). A
+// violation means the fill was placed inside a tile-inside loop.
 func (lr *lowerRun) checkFillLayering() error {
-	parallelInside := make(map[*ir.Base]bool)
-	for _, lw := range lr.rewrites {
-		for _, d := range lw.dims {
-			if d.inside != nil && d.soc != SoCSequential {
-				if d.insideIV != nil {
-					parallelInside[d.insideIV.BasePtr()] = true
-				}
+	for _, fill := range lr.fills {
+		// The covered dims' inside coordinates are the reachable violation
+		// class: every coordinate the fill carries comes from the load's
+		// axes, whose iters are covered or above-tie (outer than the fill
+		// point) by construction.
+		coveredInside := make(map[*ir.Base]bool, len(fill.covered))
+		for _, d := range fill.covered {
+			if d.insideIV != nil {
+				coveredInside[d.insideIV.BasePtr()] = true
 			}
 		}
-	}
-	for _, fill := range lr.fills {
 		var bad ir.Node
 		var visit func(n ir.Node)
 		visit = func(n ir.Node) {
 			if n == nil || bad != nil || n.BasePtr() == nil || ir.IsErased(n) {
 				return
 			}
-			if parallelInside[n.BasePtr()] {
+			if coveredInside[n.BasePtr()] {
 				bad = n
 				return
 			}
@@ -326,7 +329,7 @@ func (lr *lowerRun) checkFillLayering() error {
 			visit(ax)
 		}
 		if bad != nil {
-			return fmt.Errorf("tile-lower: fill for site %d references inside-loop dimvar node %d (a fill must sit outside the tile-inside loops, §4 layering)",
+			return fmt.Errorf("tile-lower: fill for site %d references covered dim inside-loop dimvar node %d (a fill must sit outside the tile-inside loops, §4 layering)",
 				fill.siteID, bad.BasePtr().ID())
 		}
 	}

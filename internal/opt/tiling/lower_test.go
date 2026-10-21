@@ -649,3 +649,380 @@ func sortedKeys(m map[uint64]SiteDecision) []uint64 {
 type fakeAnalysis string
 
 func (f fakeAnalysis) Name() string { return RecordName }
+
+// ---------------------------------------------------------------------------
+// Task 3: cache insertion — matmul end-to-end, budget fallback, self-checks
+// ---------------------------------------------------------------------------
+
+// matmulUsed builds the doc's worked example with the loads FEEDING the
+// store (real data flow — the accesses anchor the fills through the
+// effect chains): M→N→K chain, lhs[m][k], rhs[n][k],
+// out[m][n][k] = lhs[m][k] * rhs[n][k].
+func matmulUsed() (fx fixture, lhs, rhs, store ir.Node) {
+	fx = newChain32("mm", 1024, 2048, 512) // M, N, K
+	lhs = fx.g.NewMemLoad("ctor", tensorParam(fx.g, "lhs", 2),
+		[]ir.Node{iv(fx.g, fx.iters[0]), iv(fx.g, fx.iters[2])})
+	rhs = fx.g.NewMemLoad("ctor", tensorParam(fx.g, "rhs", 2),
+		[]ir.Node{iv(fx.g, fx.iters[1]), iv(fx.g, fx.iters[2])})
+	prod := fx.g.NewBinOp("ctor", ir.BinOpMul, lhs, rhs)
+	env := ir.NewEnv()
+	axes := []ir.Node{iv(fx.g, fx.iters[0]), iv(fx.g, fx.iters[1]), iv(fx.g, fx.iters[2])}
+	store = fx.g.NewMemStoreChained("ctor", env, fx.out, axes, prod)
+	fx.g.NewReturnChained("ctor", env, []ir.Node{fx.out}, store)
+	return fx, lhs, rhs, store
+}
+
+// matmulRecord crafts the decide record for matmulUsed: M=CTA(T32),
+// N=WARP(T32), K=SEQ(T32); SET {lhs,rhs}@K — lhs tie N covering [·][K]
+// (SMEM), rhs above the outermost covering [N][K] (SMEM).
+func matmulRecord(t *testing.T, fx fixture, lhs, rhs ir.Node) *Record {
+	t.Helper()
+	return recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
+		1: {SoC: SoCWARP, LoC: 8, TileSize: 32},
+		2: {SoC: SoCSequential, LoC: 1, TileSize: 32},
+	}, map[uint64]SiteDecision{
+		lhs.BasePtr().ID(): {Promoted: true, Tie: fx.iters[1], Class: ClassSMEM},
+		rhs.BasePtr().ID(): {Promoted: true, Tie: nil, Class: ClassSMEM},
+	})
+}
+
+// findBuffer returns the unique live buffer allocation of the given kind
+// whose extent equals wantBytes, or fails.
+func findBuffer(t *testing.T, g *ir.Graph, kind ir.Kind, wantBytes float64) ir.Node {
+	t.Helper()
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != kind {
+			continue
+		}
+		if v, ok := ir.ConstValueOf(ir.OperandsOf(n)[0]); ok && v == wantBytes {
+			return n
+		}
+	}
+	t.Fatalf("no live %s buffer with extent %v", kind, wantBytes)
+	return nil
+}
+
+// TestMatmulEndToEnd pins the PHASE 4 surgery over the doc's worked
+// example: both loads erased with their uses RAUW'd to buffer accesses,
+// one buffer per site at the fill point, one annotation-carrying fill per
+// site, verify-clean, typeinfer re-run clean.
+func TestLowerMatmulEndToEnd(t *testing.T) {
+	fx, lhs, rhs, store := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec)
+
+	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
+		t.Fatal("both promoted loads must be erased")
+	}
+	// Buffers: lhs [T_k] = 4×32 = 128 bytes; rhs [T_n][T_k] = 4×32×32.
+	lbuf := findBuffer(t, fx.g, ir.KindMemNewSMem, 128)
+	rbuf := findBuffer(t, fx.g, ir.KindMemNewSMem, 4096)
+	if ir.TypeOf(lbuf) == nil || ir.TypeOf(rbuf) == nil {
+		t.Fatal("buffers must carry their bound tile tensor types")
+	}
+	// The store's value subtree reads the buffers (access rewrite).
+	accesses := 0
+	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
+		if n.KindOf() != ir.KindMemLoadSMem {
+			continue
+		}
+		accesses++
+		src := ir.OperandsOf(n)[0]
+		if src.BasePtr() != lbuf.BasePtr() && src.BasePtr() != rbuf.BasePtr() {
+			t.Fatalf("access node %d reads a foreign buffer %d", n.BasePtr().ID(), src.BasePtr().ID())
+		}
+	}
+	if accesses != 2 {
+		t.Fatalf("the multiply must read exactly the two buffer accesses, got %d", accesses)
+	}
+	// Fills: one MemStoreSMem per buffer, carrying the loadtile variant
+	// annotation — lhs all-sequential covered → 2 (LoadTileThread); rhs
+	// covers the WARP dim → 1 (LoadTileCta).
+	fills := 0
+	variants := map[float64]bool{}
+	for _, n := range fx.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStoreSMem {
+			continue
+		}
+		fills++
+		attrs := loopAnnotations(n)
+		v, ok := attrs["loadtile"]
+		if !ok {
+			t.Fatalf("fill node %d carries no loadtile annotation", n.BasePtr().ID())
+		}
+		variants[v] = true
+		if dst := ir.OperandsOf(n)[1]; dst.BasePtr() != lbuf.BasePtr() && dst.BasePtr() != rbuf.BasePtr() {
+			t.Fatalf("fill node %d targets a foreign buffer", n.BasePtr().ID())
+		}
+	}
+	if fills != 2 || !variants[1] || !variants[2] {
+		t.Fatalf("fills = %d variants %v, want 2 fills with variants {1, 2}", fills, variants)
+	}
+	// Loads-only: the out store survives as a GMEM MemStore.
+	if store.BasePtr().Erased() || store.KindOf() != ir.KindMemStore {
+		t.Fatal("stores never route through the cache: the GMEM store must survive")
+	}
+	// Graph health + P8.
+	assertVerifyAndRootReachable(t, fx.g)
+	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
+		t.Fatalf("typeinfer re-run over the lowered matmul must succeed (P8): %v", err)
+	}
+	// Fill anchoring: with real data flow every fill is reachable from the
+	// end node through its accesses' effect chains.
+	assertReachable(t, fx.g, ir.KindMemStoreSMem, 2)
+}
+
+// TestMatmulWorkedCheck pins §6bis's worked check: the lhs [T_k] buffer
+// fills per k_o round — the fill's k coordinate is the K between loop's
+// round-base dimvar, and the m coordinate is the enclosing m index
+// expression (INS above the tie baked as per-round fixed values), NOT a
+// loop over the buffer.
+func TestMatmulWorkedCheck(t *testing.T) {
+	fx, lhs, rhs, _ := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec)
+
+	lbuf := findBuffer(t, fx.g, ir.KindMemNewSMem, 128)
+	var lhsFill ir.Node
+	for _, n := range fx.g.AllocatedNodes() {
+		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindMemStoreSMem &&
+			ir.OperandsOf(n)[1].BasePtr() == lbuf.BasePtr() {
+			lhsFill = n
+		}
+	}
+	if lhsFill == nil {
+		t.Fatal("lhs fill not found")
+	}
+	src := ir.OperandsOf(lhsFill)[0] // the tile-shaped source MemLoad
+	axes := ir.OperandsOf(src)[1:]
+	if len(axes) != 1 {
+		t.Fatalf("lhs fill source must be the 1-axis partial deref lhs[m], got %d axes", len(axes))
+	}
+	// The m coordinate is the enclosing index expression: it references
+	// the launch-map machinery (M is the CTA dim), not a bare buffer loop.
+	if !subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicGridMap) {
+		t.Fatal("the lhs fill's m coordinate must be the enclosing m index expression")
+	}
+	// The fill store's covered round base is the K between loop's dimvar.
+	nest := nestOf(t, fx.g) // M.b, N.b, K.b, M.i, N.i, K.i
+	kBetweenIV := ir.OperandsOf(nest[2])[0]
+	fillBivs := ir.OperandsOf(lhsFill)[2:]
+	if len(fillBivs) != 2 { // covered round base + the loadtile annotation
+		t.Fatalf("lhs fill must carry its covered round base plus the variant annotation, got %d trailing operands", len(fillBivs))
+	}
+	if fillBivs[0].BasePtr() != kBetweenIV.BasePtr() {
+		t.Fatal("the lhs fill's round base must be the K between loop's dimvar (filled per k_o round)")
+	}
+}
+
+// TestBudgetFallback pins §6: with a forced-tiny MaxCache the halving loop
+// terminates — tile sizes halve while over budget, sites drop back to GMEM
+// when halving reaches 1; with DefaultParams the fallback is a no-op.
+func TestBudgetFallback(t *testing.T) {
+	// No-op case: both sites promote at their full tiles.
+	fx, lhs, rhs, _ := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec)
+	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
+		t.Fatal("with DefaultParams both sites must promote")
+	}
+
+	// Halving survival: tile-8 decisions under a 24-byte budget halve both
+	// sites (lhs K 8→2 = 8 bytes; rhs N,K 8→2,8→2 = 16 bytes) and keep
+	// them promoted.
+	fx2, lhs2, rhs2, _ := matmulUsed()
+	rec2 := matmulRecord(t, fx2, lhs2, rhs2)
+	for biv := range rec2.Iters {
+		d := rec2.Iters[biv]
+		d.TileSize = 8
+		rec2.Iters[biv] = d
+	}
+	cache := opt.NewCache()
+	cache.Put(rec2)
+	p := DefaultParams()
+	p.MaxCache = 24
+	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx2.g); err != nil {
+		t.Fatalf("budget-fallback run: %v", err)
+	}
+	if !lhs2.BasePtr().Erased() || !rhs2.BasePtr().Erased() {
+		t.Fatal("both sites must stay promoted after halving under a 24-byte budget")
+	}
+	findBuffer(t, fx2.g, ir.KindMemNewSMem, 8)  // lhs at T_k = 2
+	findBuffer(t, fx2.g, ir.KindMemNewSMem, 16) // rhs at (2,2)
+	assertVerifyAndRootReachable(t, fx2.g)
+
+	// Drop: a 20-byte budget drives rhs to (1,1) — it drops back to GMEM
+	// (the shared K iter drags lhs to tile 1 as well; both survive as
+	// GMEM loads, unwound).
+	fx4, lhs4, rhs4, _ := matmulUsed()
+	rec4 := matmulRecord(t, fx4, lhs4, rhs4)
+	for biv := range rec4.Iters {
+		d := rec4.Iters[biv]
+		d.TileSize = 8
+		rec4.Iters[biv] = d
+	}
+	cache4 := opt.NewCache()
+	cache4.Put(rec4)
+	p4 := DefaultParams()
+	p4.MaxCache = 20
+	if err := (LowerPass{Params: p4}).Run(&opt.Context{Pass: "tile-lower", Cache: cache4}, fx4.g); err != nil {
+		t.Fatalf("budget-drop run: %v", err)
+	}
+	if rhs4.BasePtr().Erased() {
+		t.Fatal("rhs must drop back to GMEM when halving reaches 1")
+	}
+	assertVerifyAndRootReachable(t, fx4.g)
+
+	// Budget of 1: every site drops; the pass still terminates clean.
+	fx3, lhs3, rhs3, _ := matmulUsed()
+	rec3 := matmulRecord(t, fx3, lhs3, rhs3)
+	cache3 := opt.NewCache()
+	cache3.Put(rec3)
+	p3 := DefaultParams()
+	p3.MaxCache = 1
+	if err := (LowerPass{Params: p3}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
+		t.Fatalf("maximal fallback run: %v", err)
+	}
+	if lhs3.BasePtr().Erased() || rhs3.BasePtr().Erased() {
+		t.Fatal("with MaxCache 1 no site may promote")
+	}
+}
+
+// TestSelfCheckInjections pins P7/§8: each exit condition is individually
+// provable — a crafted lowerRun carrying one violation must fail the
+// corresponding check with a named error.
+func TestSelfCheckInjections(t *testing.T) {
+	t.Run("stale iter", func(t *testing.T) {
+		fx := newChain32("inj1", 8)
+		u32 := ir.InternScalar(ir.TU32)
+		dv := fx.g.NewDimVar("ctor", fx.dims[0], fx.g.NewConst("ctor", u32, 0), fx.g.NewConst("ctor", u32, 1))
+		biv := fx.g.NewBoundedDimVar("ctor", dv, fx.g.NewConst("ctor", u32, 8))
+		fx.g.NewIter("ctor", biv, nil) // a LIVE iter survives
+		lr := &lowerRun{g: fx.g}
+		if err := lr.checkRetiredIters(); err == nil || !strings.Contains(err.Error(), "survived the rewrite") {
+			t.Fatalf("a live iter must trip the retired-iters check, got %v", err)
+		}
+	})
+
+	t.Run("fill layering", func(t *testing.T) {
+		g := ir.NewGraph("inj2")
+		u32 := ir.InternScalar(ir.TU32)
+		dim := g.NewInputParam("ctor", ir.RoleDim, "d", nil)
+		insideIV := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 256))
+		tensor := tensorParam(g, "t", 2)
+		src := g.NewMemLoad("ctor", tensor, []ir.Node{insideIV}) // a fill source referencing a covered dim's inside loop coordinate
+		d := &dimRewrite{soc: SoCTA, insideIV: insideIV, inside: g.NewForLoop("ctor", insideIV,
+			g.NewBoundedDimVar("ctor", insideIV, g.NewConst("ctor", u32, 8)), g.NewConst("ctor", u32, 0))}
+		lr := &lowerRun{g: g, fills: []*siteFill{{siteID: 7, src: src, covered: []*dimRewrite{d}, annotated: true}}}
+		if err := lr.checkFillLayering(); err == nil || !strings.Contains(err.Error(), "§4 layering") {
+			t.Fatalf("a fill inside a parallel inside loop must trip the layering check, got %v", err)
+		}
+	})
+
+	t.Run("annotation missing", func(t *testing.T) {
+		g := ir.NewGraph("inj3")
+		u32 := ir.InternScalar(ir.TU32)
+		dim := g.NewInputParam("ctor", ir.RoleDim, "d", nil)
+		ivn := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		loop := g.NewForLoop("ctor", ivn, g.NewBoundedDimVar("ctor", ivn, g.NewConst("ctor", u32, 8)), g.NewConst("ctor", u32, 0))
+		lr := &lowerRun{g: g, rewrites: []*lntRewrite{{dims: []*dimRewrite{{between: loop}}}}}
+		if err := lr.checkLoopAnnotations(); err == nil || !strings.Contains(err.Error(), "soc") {
+			t.Fatalf("an annotation-less generated loop must trip the annotation check, got %v", err)
+		}
+	})
+
+	t.Run("stale promoted load", func(t *testing.T) {
+		g := ir.NewGraph("inj4")
+		tensor := tensorParam(g, "t", 2) // node id 1: a live MemLoad
+		rec := &Record{Sites: map[uint64]SiteDecision{
+			1: {Promoted: true, Class: ClassSMEM},
+		}}
+		lr := &lowerRun{g: g}
+		if err := lr.checkNoStaleLoads(rec, nil); err == nil || !strings.Contains(err.Error(), "stale MemLoad") {
+			t.Fatalf("a surviving promoted load must trip the stale-load check, got %v", err)
+		}
+		_ = tensor
+	})
+
+	t.Run("frag fully-unroll", func(t *testing.T) {
+		fx := newChain32("inj5", 64)
+		u32 := ir.InternScalar(ir.TU32)
+		ctaIter := fx.iters[0]
+		lr := &lowerRun{
+			g: fx.g,
+			decisions: map[ir.Node]IterDecision{
+				ctaIter: {SoC: SoCTA, LoC: 100, TileSize: 32},
+			},
+			fills: []*siteFill{{siteID: 9, covered: []*dimRewrite{{iter: ctaIter}}}},
+		}
+		rec := &Record{Sites: map[uint64]SiteDecision{9: {Promoted: true, Class: ClassFRAG}}}
+		if err := lr.checkFragSites(rec, nil); err == nil || !strings.Contains(err.Error(), "fully-unroll") {
+			t.Fatalf("a FRAG site over a CTA dim must trip the fully-unroll check, got %v", err)
+		}
+		_ = u32
+	})
+}
+
+// assertReachable fails unless at least want live nodes of kind k are
+// reachable from the graph's end node.
+func assertReachable(t *testing.T, g *ir.Graph, k ir.Kind, want int) {
+	t.Helper()
+	var end ir.Node
+	for _, n := range g.AllocatedNodes() {
+		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindReturn {
+			end = n
+		}
+	}
+	seen := make(map[*ir.Base]bool)
+	var visit func(n ir.Node)
+	visit = func(n ir.Node) {
+		if n == nil || n.BasePtr() == nil || seen[n.BasePtr()] || n.BasePtr().Erased() {
+			return
+		}
+		seen[n.BasePtr()] = true
+		for _, dep := range ir.DataDeps(n) {
+			visit(dep)
+		}
+		for _, u := range ir.ImpactBy(n) {
+			visit(u.Def())
+		}
+	}
+	visit(end)
+	got := 0
+	for base := range seen {
+		if base.KindOf() == k {
+			got++
+		}
+	}
+	if got < want {
+		t.Fatalf("reachability from the end node: %d live %s nodes, want >= %d", got, k, want)
+	}
+}
+
+// TestDecideLowerComposition pins the plan's headline success criterion:
+// the decide→lower pair composes — tiling (114) → tiling-verify (115) →
+// tile-lower (116) runs clean over the matmul worked example with the REAL
+// record the search publishes, ending verifier-clean and typable.
+func TestDecideLowerComposition(t *testing.T) {
+	fx, _, _, _ := matmulUsed()
+	cache := opt.NewCache()
+	ctx := &opt.Context{Pass: "tiling", Cache: cache}
+	if err := (Pass{Params: DefaultParams()}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tiling decide: %v", err)
+	}
+	ctx.Pass = "tiling-verify"
+	if err := (VerifyPass{Params: DefaultParams()}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tiling-verify: %v", err)
+	}
+	ctx.Pass = "tile-lower"
+	if err := (LowerPass{Params: DefaultParams()}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tile-lower over the real record: %v", err)
+	}
+	if vs := ir.Verify(fx.g); len(vs) != 0 {
+		t.Fatalf("verifier after the pair: %v", vs)
+	}
+	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
+		t.Fatalf("typeinfer re-run after the pair: %v", err)
+	}
+}

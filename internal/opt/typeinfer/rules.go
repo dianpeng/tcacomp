@@ -253,7 +253,16 @@ func typeOfNode(n ir.Node, memo map[*ir.Base]ir.Type) (ir.Type, error) {
 		return derefType(n, ops, nt, memo)
 
 	case ir.KindMemNew, ir.KindMemNewSMem, ir.KindFragNew:
-		return nil, nil // untyped allocations (the closed untyped set)
+		// Untyped allocations by default. EXCEPTION (quick-261021-jay):
+		// cache lowering BINDS a buffer dtype (the MemLoadSMem rule's own
+		// message names it: "cache lowering must bind buffer types first")
+		// — a bound cell types the allocation and its consumers; the
+		// stamp phase's idempotent SetType keeps the cell stable across
+		// re-runs.
+		if t := ir.TypeOf(n); t != nil {
+			return t, nil
+		}
+		return nil, nil
 
 	// --- structural wrappers ---
 
