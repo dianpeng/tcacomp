@@ -293,8 +293,39 @@ func TestConstValueOf(t *testing.T) {
 	}
 }
 
+// TestDefaultParams pins the final-design defaults (loop_tiling.md "LoC
+// concurrency bounds, the FINAL MODEL"): 100 CTAs (Ampere's 108 rounded
+// DOWN to the PortionCTA multiple), 512 threads per CTA (= 16 warps),
+// WarpPortion auto, and the rest unchanged — the legacy LoC presets and
+// objective weights are gone from the surface entirely.
+func TestDefaultParams(t *testing.T) {
+	p := DefaultParams()
+	if p.MaxCTA != 100 {
+		t.Fatalf("MaxCTA default must be 100 (108 rounded down to the PortionCTA multiple), got %d", p.MaxCTA)
+	}
+	if p.MaxThreadsPerCTA != 512 {
+		t.Fatalf("MaxThreadsPerCTA default must be 512 (= 16 warps), got %d", p.MaxThreadsPerCTA)
+	}
+	if p.WarpPortion != 0 {
+		t.Fatalf("WarpPortion default must be 0 (auto), got %d", p.WarpPortion)
+	}
+	if p.MaxCache != 65536 || p.CacheDims != 2 || p.MaxCS != 16 || p.WindowK != 5 || p.NominalExtent != 4096 {
+		t.Fatalf("secondary defaults changed: %+v", p)
+	}
+	wantTiles := []int{32, 64, 128, 256}
+	if len(p.TileSizes) != len(wantTiles) {
+		t.Fatalf("TileSizes default must be %v, got %v", wantTiles, p.TileSizes)
+	}
+	for i, ts := range wantTiles {
+		if p.TileSizes[i] != ts {
+			t.Fatalf("TileSizes default must be %v, got %v", wantTiles, p.TileSizes)
+		}
+	}
+}
+
 // TestParamsValidate pins DefaultParams' cleanliness and every Validate
-// error class.
+// error class — the portion divisibility cases mirror the runtime
+// assert-and-trap pre-conditions.
 func TestParamsValidate(t *testing.T) {
 	if err := DefaultParams().Validate(); err != nil {
 		t.Fatalf("DefaultParams must validate clean, got %v", err)
@@ -305,15 +336,15 @@ func TestParamsValidate(t *testing.T) {
 	}{
 		{"threads not warp multiple", func(p *Params) { p.MaxThreadsPerCTA = 1023 }},
 		{"threads below one warp", func(p *Params) { p.MaxThreadsPerCTA = 16 }},
-		{"negative parallel weight", func(p *Params) { p.ParallelWeight = -1 }},
-		{"zero reuse weight", func(p *Params) { p.ReuseWeight = 0 }},
+		{"threads below portion minimum", func(p *Params) { p.MaxThreadsPerCTA = 64 }},
+		{"cta not portion multiple", func(p *Params) { p.MaxCTA = 99 }},
+		{"cta zero", func(p *Params) { p.MaxCTA = 0 }},
+		{"warp portion negative", func(p *Params) { p.WarpPortion = -1 }},
+		{"warp portion above cap", func(p *Params) { p.WarpPortion = PortionWarp + 1 }},
 		{"zero tile size", func(p *Params) { p.TileSizes = []int{32, 0} }},
-		{"negative cta preset", func(p *Params) { p.CTALoCs = []int{1, -2} }},
-		{"negative warp preset", func(p *Params) { p.WarpLoCs = []int{-1} }},
 		{"empty tile list", func(p *Params) { p.TileSizes = nil }},
 		{"windowk zero", func(p *Params) { p.WindowK = 0 }},
 		{"cachedims zero", func(p *Params) { p.CacheDims = 0 }},
-		{"maxcta zero", func(p *Params) { p.MaxCTA = 0 }},
 		{"maxcache negative", func(p *Params) { p.MaxCache = -1 }},
 		{"maxcs zero", func(p *Params) { p.MaxCS = 0 }},
 		{"nominalextent zero", func(p *Params) { p.NominalExtent = 0 }},

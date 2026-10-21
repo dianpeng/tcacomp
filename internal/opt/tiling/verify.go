@@ -71,8 +71,12 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //   - COVERAGE: every live Iter of every forest tree has a per-Iter entry
 //     under its BIV; every site key resolves to a live (non-erased)
 //     MemLoad; every re-derived candidate site has its record entry.
-//   - FEASIBILITY (per LNT): at least one CTA entry; the CTA LoC product
-//     <= MaxCTA; the warp LoC sum * 32 <= MaxThreadsPerCTA; sequential
+//   - FEASIBILITY (per LNT, the final model): the Params re-validation at
+//     the top re-checks the assert-and-trap divisibility (MaxCTA a
+//     PortionCTA multiple, warps a PortionWarp multiple); at least one
+//     CTA entry; the v0 policy (at most one CTA and one independent WARP
+//     entry); the CTA LoC == MaxCTA (portion -1/full); the warp LoC is a
+//     warp-portion multiple (LoC/quantum in [1, PortionWarp]); sequential
 //     entries carry LoC 1; every LoC and TileSize >= 1; every SoC known.
 //   - SITE well-formedness: a promoted site's Tie is a live iter of the
 //     site's LNT or nil; its class is SMEM or FRAG; and the recomputed
@@ -137,9 +141,14 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		}
 	}
 
-	// FEASIBILITY, per LNT.
+	// FEASIBILITY, per LNT — the final portion-grammar model. The legacy
+	// CTA-product / warp-sum bounds are subsumed: the single CTA dim must
+	// exhaust MaxCTA exactly (portion -1/full), and a warp LoC that is a
+	// portion multiple with portion in [1, PortionWarp] cannot exceed the
+	// warp space.
+	warpsPerPortion := (v.Params.MaxThreadsPerCTA / 32) / PortionWarp
 	for _, root := range f.Roots() {
-		ctaCount, ctaProduct, warpSum := 0, 1, 0
+		ctaCount, warpCount := 0, 0
 		for _, it := range treeItersOf(root) {
 			biv, err := bivOf(it)
 			if err != nil {
@@ -158,9 +167,16 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				}
 			case SoCTA:
 				ctaCount++
-				ctaProduct *= d.LoC
+				if d.LoC != v.Params.MaxCTA {
+					return fmt.Errorf("tiling-verify: iter node %d carries CTA LoC %d, want MaxCTA %d (portion -1/full exhausts the CTA space)",
+						it.BasePtr().ID(), d.LoC, v.Params.MaxCTA)
+				}
 			case SoCWARP:
-				warpSum += d.LoC
+				warpCount++
+				if portion := d.LoC / warpsPerPortion; d.LoC%warpsPerPortion != 0 || portion < 1 || portion > PortionWarp {
+					return fmt.Errorf("tiling-verify: iter node %d carries warp LoC %d, not a warp-portion multiple (quantum %d warps, portion in [1, %d])",
+						it.BasePtr().ID(), d.LoC, warpsPerPortion, PortionWarp)
+				}
 			default:
 				return fmt.Errorf("tiling-verify: iter node %d carries unknown SoC %d",
 					it.BasePtr().ID(), int(d.SoC))
@@ -170,13 +186,13 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d has no CTA assignment",
 				root.Iter.BasePtr().ID())
 		}
-		if ctaProduct > v.Params.MaxCTA {
-			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d has CTA LoC product %d > MaxCTA %d",
-				root.Iter.BasePtr().ID(), ctaProduct, v.Params.MaxCTA)
+		if ctaCount > 1 {
+			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries %d CTA dims, violating the v0 policy (at most one)",
+				root.Iter.BasePtr().ID(), ctaCount)
 		}
-		if warpSum*32 > v.Params.MaxThreadsPerCTA {
-			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d has warp LoC sum %d x 32 > MaxThreadsPerCTA %d",
-				root.Iter.BasePtr().ID(), warpSum, v.Params.MaxThreadsPerCTA)
+		if warpCount > 1 {
+			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries %d independent WARP dims, violating the v0 policy (at most one)",
+				root.Iter.BasePtr().ID(), warpCount)
 		}
 	}
 
