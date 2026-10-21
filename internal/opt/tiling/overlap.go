@@ -15,10 +15,17 @@
 //     past (RULE 2), and tiling demotion of the covered dims (RULE 3).
 //
 // Documented interpretations (each cited where it fires):
-//   - LNT ownership: a load belongs to the tree of the DEEPEST iter in its
-//     INS (ties: earlier root, then smaller iter id). A load whose INS
-//     intersects two trees is owned by exactly one LNT — the other skips it
-//     entirely. This avoids site-key collisions in the record.
+//   - LNT ownership (R4, ruled 2026-10-21 — fail-closed): a load whose INS
+//     spans >= 2 trees is NOT a v0 candidate: it gets an explicit
+//     non-candidate SiteDecision entry (Promoted = false, cross-LNT
+//     reason) in the overlap product, and NO tree owns it — the union
+//     judge (§7's UNION-of-assignments evaluation) is future work, and
+//     foreign iters must never be silently dropped from a candidate's INS
+//     to force single-tree ownership. A load owned by exactly one tree
+//     belongs to the tree of the DEEPEST iter in its INS (ties: earlier
+//     root, then smaller iter id). Loads with an EMPTY INS (or an INS
+//     holding no forest member) are likewise declared non-candidates —
+//     never silently skipped.
 //   - Tie canonicalization: a tie computed at the OUTERMOST level is
 //     recorded as nil. The placement is physically identical (directly
 //     above the outermost loop, RULE 1) and the reuse arithmetic is
@@ -55,6 +62,12 @@ type SiteFacts struct {
 	// INS is every LNT iter the load references (ValueEqual-deduped,
 	// tree-restricted).
 	INS []ir.Node
+	// ReuseDims is the site's reuse-dim set — {tie} plus the LNT iters
+	// strictly inner than the tie, minus covered — the loops whose INSIDE
+	// walks re-traverse the cached tile within one fill epoch. Derived
+	// once at admit time (schedule-independent); the per-thread reuse
+	// accounting multiplies each dim's own inside-walk trip count.
+	ReuseDims []ir.Node
 	// Levels is the owning LNT's full iter list, inner -> outer — the
 	// reuse-dim derivation walks it.
 	Levels []ir.Node
@@ -149,11 +162,28 @@ type ownedLoad struct {
 	ins  []ir.Node
 }
 
+// overlapProduct is the kernel-wide overlap analysis product: the per-tree
+// facts (Roots() order) plus the R4 non-candidate declarations — explicit
+// SiteDecision entries (keyed by MemLoad node id) for loads whose INS spans
+// >= 2 LNTs, loads with an empty INS, and loads whose INS holds no forest
+// member. The decide pass publishes them verbatim; tiling-verify fails if
+// such a load has NO record entry (fail-closed, never a silent drop).
+type overlapProduct struct {
+	// Trees holds each forest tree's lntFacts, in Roots() order.
+	Trees []lntFacts
+	// NonCandidates are the declared non-candidates keyed by MemLoad node
+	// id, each carrying Promoted=false and its reason.
+	NonCandidates map[uint64]SiteDecision
+}
+
 // analyzeOverlap computes every forest tree's overlap facts over g:
 //
-//   - OWNERSHIP: every live MemLoad with a non-empty INS is assigned to the
-//     tree of its deepest INS member (ties: earlier root, then smaller iter
-//     id) — loads never reference two trees ambiguously in the record.
+//   - NON-CANDIDATES (R4): loads with an empty INS, loads whose INS holds
+//     no forest member, and loads whose INS spans >= 2 trees get explicit
+//     non-candidate entries — they are never admitted to any CS.
+//   - OWNERSHIP: every other live MemLoad (INS within exactly one tree) is
+//     assigned to the tree of its deepest INS member (ties: earlier root,
+//     then smaller iter id).
 //   - LEVELS: each tree's iters ordered inner -> outer.
 //   - SET bucketing + admission: loads group at their innermost referenced
 //     level; the doc-ordered filters (raw set length >= 2; per-element rank
@@ -164,7 +194,7 @@ type ownedLoad struct {
 //
 // Trees are returned in Roots() order; a tree owning no load still gets an
 // entry (its iters still need schedule decisions).
-func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects, p Params) []lntFacts {
+func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects, p Params) overlapProduct {
 	roots := f.Roots()
 	rootOrder := make(map[*loopforest.Tree]int, len(roots))
 	member := make(map[ir.Node]*loopforest.Tree) // iter -> its ROOT tree
@@ -182,17 +212,23 @@ func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects,
 		treeFacts[facts[i].Tree] = &facts[i]
 	}
 
-	// Ownership pass: one allocation-order scan, loads appended to their
-	// tree's list so per-tree order stays allocation order.
+	// Ownership + non-candidate pass: one allocation-order scan, loads
+	// appended to their tree's list so per-tree order stays allocation
+	// order. R4 fail-closed: an INS spanning >= 2 trees is a declared
+	// non-candidate, never silently owned by the deepest tree.
+	nonCandidates := make(map[uint64]SiteDecision)
 	owned := make(map[*loopforest.Tree][]ownedLoad)
 	for _, n := range g.AllocatedNodes() {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemLoad {
 			continue
 		}
+		id := n.BasePtr().ID()
 		ins := findINS(n, se)
 		if len(ins) == 0 {
-			continue // no iter reference at all: no LNT owns it
+			nonCandidates[id] = SiteDecision{Promoted: false, Reason: ReasonEmptyINS}
+			continue // never bucketed: declared, not a candidate
 		}
+		spanned := make(map[*loopforest.Tree]bool, len(ins))
 		var owner *lntFacts
 		bestDepth, bestRoot, bestID := -1, 0, uint64(0)
 		for _, it := range ins {
@@ -200,6 +236,7 @@ func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects,
 			if !ok {
 				continue
 			}
+			spanned[root] = true
 			node, _ := f.NodeOf(it)
 			ro := rootOrder[root]
 			id := it.BasePtr().ID()
@@ -209,8 +246,13 @@ func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects,
 				bestDepth, bestRoot, bestID = node.Depth, ro, id
 			}
 		}
-		if owner == nil {
-			continue // INS holds no forest member (e.g. an erased iter): skip
+		switch {
+		case len(spanned) >= 2:
+			nonCandidates[id] = SiteDecision{Promoted: false, Reason: ReasonCrossLNT}
+			continue // cross-LNT INS: R4 non-candidate, no tree owns it
+		case owner == nil:
+			nonCandidates[id] = SiteDecision{Promoted: false, Reason: ReasonNoOwner}
+			continue // INS holds no forest member (e.g. an erased iter)
 		}
 		owned[owner.Tree] = append(owned[owner.Tree], ownedLoad{load: n, ins: ins})
 	}
@@ -218,7 +260,7 @@ func analyzeOverlap(g *ir.Graph, f loopforest.Forest, se sideeffect.SideEffects,
 	for i := range facts {
 		facts[i].admit(f, se, p, owned[facts[i].Tree], member)
 	}
-	return facts
+	return overlapProduct{Trees: facts, NonCandidates: nonCandidates}
 }
 
 // admit performs the SET bucketing, the admission filters, and the TIE
@@ -357,6 +399,26 @@ func newSiteFacts(f loopforest.Forest, se sideeffect.SideEffects, p Params, ol o
 		}
 		sf.Tie = next
 		sf.Covered = coveredAt(sf.Tie)
+	}
+
+	// REUSE DIMS: {tie} plus the iters strictly inner than the tie, minus
+	// covered — the inner non-covered loop dims whose inside walks
+	// re-traverse the cached tile within one fill epoch (the per-thread
+	// reuse accounting of the 2026-10-21 amendment).
+	coveredSet := make(map[ir.Node]bool, len(sf.Covered))
+	for _, c := range sf.Covered {
+		coveredSet[c] = true
+	}
+	if sf.Tie != nil && !coveredSet[sf.Tie] {
+		sf.ReuseDims = append(sf.ReuseDims, sf.Tie)
+	}
+	for _, it := range levels {
+		if coveredSet[it] || (sf.Tie != nil && it == sf.Tie) {
+			continue
+		}
+		if sf.Tie == nil || depthOf(it) > depthOf(sf.Tie) {
+			sf.ReuseDims = append(sf.ReuseDims, it)
+		}
 	}
 	return sf
 }

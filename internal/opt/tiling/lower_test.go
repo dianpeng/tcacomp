@@ -87,9 +87,20 @@ func recordOf(t *testing.T, fx fixture, decisions map[int]IterDecision, sites ma
 // runLower runs the pass over g with a crafted record and default params.
 func runLower(t *testing.T, g *ir.Graph, rec *Record) {
 	t.Helper()
+	runLowerP(t, g, rec, DefaultParams())
+}
+
+// runLowerP runs the pass over g with a crafted record and explicit
+// params. The budget-sensitive crafted fixtures (matmulRecord's
+// WARP-covered rhs) need a MaxCache that fits the R2 WINDOW pricing —
+// resolveBudget prices that site at 4 x (8 warps x 32) x 32 x 32 = 1 MB,
+// so the 64 KB default budget would (correctly, per the rulings) halve
+// and drop it.
+func runLowerP(t *testing.T, g *ir.Graph, rec *Record, p Params) {
+	t.Helper()
 	cache := opt.NewCache()
 	cache.Put(rec)
-	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, g); err != nil {
+	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, g); err != nil {
 		t.Fatalf("tile-lower Run: %v", err)
 	}
 }
@@ -104,7 +115,6 @@ func loopsOf(g *ir.Graph) []ir.Node {
 	}
 	return out
 }
-
 
 // nestOf returns the live for-loops in NEST order (outermost first),
 // following body operands. The pass builds nests inside-out, so allocation
@@ -710,7 +720,9 @@ func findBuffer(t *testing.T, g *ir.Graph, kind ir.Kind, wantBytes float64) ir.N
 func TestLowerMatmulEndToEnd(t *testing.T) {
 	fx, lhs, rhs, store := matmulUsed()
 	rec := matmulRecord(t, fx, lhs, rhs)
-	runLower(t, fx.g, rec)
+	p := DefaultParams()
+	p.MaxCache = 1 << 21 // fit the crafted rhs's R2 window (1 MB) — no halving
+	runLowerP(t, fx.g, rec, p)
 
 	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
 		t.Fatal("both promoted loads must be erased")
@@ -781,7 +793,9 @@ func TestLowerMatmulEndToEnd(t *testing.T) {
 func TestMatmulWorkedCheck(t *testing.T) {
 	fx, lhs, rhs, _ := matmulUsed()
 	rec := matmulRecord(t, fx, lhs, rhs)
-	runLower(t, fx.g, rec)
+	p := DefaultParams()
+	p.MaxCache = 1 << 21 // fit the crafted rhs's R2 window (1 MB) — no halving
+	runLowerP(t, fx.g, rec, p)
 
 	lbuf := findBuffer(t, fx.g, ir.KindMemNewSMem, 128)
 	var lhsFill ir.Node
@@ -818,19 +832,27 @@ func TestMatmulWorkedCheck(t *testing.T) {
 
 // TestBudgetFallback pins §6: with a forced-tiny MaxCache the halving loop
 // terminates — tile sizes halve while over budget, sites drop back to GMEM
-// when halving reaches 1; with DefaultParams the fallback is a no-op.
+// when halving reaches 1; with a budget that fits the R2 window pricing
+// the fallback is a no-op. AMENDED EXPECTATION (R2 window-bytes model):
+// the crafted WARP-covered rhs's footprint is 4 x (8 warps x 32) x T_n x
+// T_k — 4096 B at T=8 and 1024 B even at T=1 — so a 24-byte budget can
+// never fit it: rhs DROPS back to GMEM while the SEQ-covered lhs halves to
+// 8 B and stays promoted.
 func TestBudgetFallback(t *testing.T) {
-	// No-op case: both sites promote at their full tiles.
+	// No-op case: a budget fitting both sites' R2 windows leaves the
+	// record untouched.
 	fx, lhs, rhs, _ := matmulUsed()
 	rec := matmulRecord(t, fx, lhs, rhs)
-	runLower(t, fx.g, rec)
+	pNoop := DefaultParams()
+	pNoop.MaxCache = 1 << 21
+	runLowerP(t, fx.g, rec, pNoop)
 	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
-		t.Fatal("with DefaultParams both sites must promote")
+		t.Fatal("with a fitting budget both sites must promote")
 	}
 
-	// Halving survival: tile-8 decisions under a 24-byte budget halve both
-	// sites (lhs K 8→2 = 8 bytes; rhs N,K 8→2,8→2 = 16 bytes) and keep
-	// them promoted.
+	// Halving survival: tile-8 decisions under a 4104-byte budget halve
+	// both sites (rhs N,K 8→2 window = 4·256·2·2 = 4096 B; lhs K 8→2 = 8
+	// B; sum exactly 4104) and keep them promoted.
 	fx2, lhs2, rhs2, _ := matmulUsed()
 	rec2 := matmulRecord(t, fx2, lhs2, rhs2)
 	for biv := range rec2.Iters {
@@ -841,16 +863,38 @@ func TestBudgetFallback(t *testing.T) {
 	cache := opt.NewCache()
 	cache.Put(rec2)
 	p := DefaultParams()
-	p.MaxCache = 24
+	p.MaxCache = 4104
 	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx2.g); err != nil {
 		t.Fatalf("budget-fallback run: %v", err)
 	}
 	if !lhs2.BasePtr().Erased() || !rhs2.BasePtr().Erased() {
-		t.Fatal("both sites must stay promoted after halving under a 24-byte budget")
+		t.Fatal("both sites must stay promoted after halving under a 4104-byte budget")
 	}
 	findBuffer(t, fx2.g, ir.KindMemNewSMem, 8)  // lhs at T_k = 2
 	findBuffer(t, fx2.g, ir.KindMemNewSMem, 16) // rhs at (2,2)
 	assertVerifyAndRootReachable(t, fx2.g)
+
+	// Drop: a 24-byte budget can never fit the WARP window (>= 1024 B at
+	// any tile) — rhs drops back to GMEM, and the shared K iter drags lhs
+	// to tile 1 as well; both survive as GMEM loads.
+	fx2b, lhs2b, rhs2b, _ := matmulUsed()
+	rec2b := matmulRecord(t, fx2b, lhs2b, rhs2b)
+	for biv := range rec2b.Iters {
+		d := rec2b.Iters[biv]
+		d.TileSize = 8
+		rec2b.Iters[biv] = d
+	}
+	cache2b := opt.NewCache()
+	cache2b.Put(rec2b)
+	p2b := DefaultParams()
+	p2b.MaxCache = 24
+	if err := (LowerPass{Params: p2b}).Run(&opt.Context{Pass: "tile-lower", Cache: cache2b}, fx2b.g); err != nil {
+		t.Fatalf("budget-drop run: %v", err)
+	}
+	if lhs2b.BasePtr().Erased() || rhs2b.BasePtr().Erased() {
+		t.Fatal("both sites must drop back to GMEM under a 24-byte budget (R2 window pricing)")
+	}
+	assertVerifyAndRootReachable(t, fx2b.g)
 
 	// Drop: a 20-byte budget drives rhs to (1,1) — it drops back to GMEM
 	// (the shared K iter drags lhs to tile 1 as well; both survive as

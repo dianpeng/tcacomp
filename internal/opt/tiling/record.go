@@ -111,11 +111,62 @@ type IterDecision struct {
 // the promotion flag, the tie level, and the storage class. Tie == nil
 // means the cache sits directly above the OUTERMOST loop of the site's
 // LNT. DoSoC is deliberately absent — the lower pass derives it (§1c).
+//
+// The 2026-10-21 rulings (R2/R4/F4/F6) make the record self-describing:
+// Reuse is the per-thread re-traversal count within one fill epoch (0
+// when not computed), Bytes the site's footprint under the window-bytes
+// model (SMEM window bytes; per-thread bytes for FRAG), and Reason the
+// decline explanation on a non-promoted entry ("" when promoted).
+// Non-candidates (cross-LNT / never-bucketed loads, R4) are declared
+// with Promoted=false entries — never silently dropped.
 type SiteDecision struct {
 	Promoted bool
 	Tie      ir.Node
 	Class    CacheClass
+	// Reuse is the per-thread reuse count the judge computed (>= 2 on
+	// every promoted site; the computed value on a reuse decline; else 0).
+	Reuse int
+	// Bytes is the site's window-model footprint (window bytes for SMEM,
+	// per-thread bytes for FRAG); the computed value on a frag-byte or
+	// reuse decline; else 0.
+	Bytes int
+	// Reason names the decline cause on a non-promoted entry ("" when
+	// promoted) — one of the Reason constants below.
+	Reason string
 }
+
+// The decline reasons (R2 tier rule, F4 drop-rule gate, F6 frag budget,
+// the per-thread reuse gate, and the R4 non-candidate declarations).
+// Stable strings: the record, tiling-verify, and the tests pin them.
+const (
+	// ReasonCTACovered: a covered dim is CTA-assigned — no coherent fill
+	// variant exists under the v0 mechanics (R2 tier rule, refusal).
+	ReasonCTACovered = "covered dim CTA-assigned: no coherent fill variant (R2 tier rule)"
+	// ReasonTileOne: a covered dim sits at tile 1 — no reuse to cache
+	// (the judge's promotion gate = the lower's F4 drop rule).
+	ReasonTileOne = "covered dim at tile 1: no reuse to cache (F4)"
+	// ReasonFragBytes: the per-thread FRAG footprint exceeds
+	// MaxFragPerThread (F6).
+	ReasonFragBytes = "FRAG bytes exceed MaxFragPerThread (F6)"
+	// ReasonLowReuse: per-thread reuse < 2 — the cached bytes are not
+	// re-traversed by the owning thread, so no traffic is avoided.
+	ReasonLowReuse = "per-thread reuse < 2: no traffic avoided"
+	// ReasonCrossLNT: the load's INS spans >= 2 LNTs — not a v0
+	// candidate (R4 fail-closed; the union judge is future work).
+	ReasonCrossLNT = "cross-LNT INS: not a v0 candidate (R4)"
+	// ReasonEmptyINS: the load references no iter at all — never
+	// bucketed, declared non-candidate (R4).
+	ReasonEmptyINS = "empty INS: never bucketed (R4)"
+	// ReasonNoOwner: the load's INS holds no forest member (e.g. only
+	// erased iters) — declared non-candidate (R4).
+	ReasonNoOwner = "INS holds no LNT member (R4)"
+	// ReasonUnknownIter: a covered iter carries no schedule decision —
+	// the judge fails closed.
+	ReasonUnknownIter = "covered iter without a schedule decision"
+	// ReasonEmptyCovered: the site covers no dimension (M2: degenerate
+	// scalar cache, filtered at the decide pass).
+	ReasonEmptyCovered = "empty covered set (M2)"
+)
 
 // Record is the tiling decision side table (loop_tile_lower.md §1):
 // per-Iter entries keyed by BIV node identity — the Iter's operand 0,
@@ -206,9 +257,21 @@ type Params struct {
 	// else PortionWarp (full).
 	WarpPortion int
 	// MaxCache is the SMEM budget in bytes (the project's 64 KB SMEM
-	// budget; only promoted ClassSMEM sites count — FRAG sites are
-	// register-budgeted by the lower pass).
+	// budget; only promoted ClassSMEM sites count). The sum is
+	// KERNEL-WIDE (R3, ruled 2026-10-21): the decide feasibility, the
+	// tiling-verify gate, and the lower's budget resolution all gate the
+	// same sum accumulated over ALL LNTs' promoted sites — never a
+	// per-LNT one.
 	MaxCache int
+	// MaxFragPerThread is the per-thread FRAG byte budget (F6, ruled
+	// 2026-10-21; default 256 bytes/thread): the SUM of promoted FRAG
+	// sites' per-thread bytes, kernel-wide, must stay within it — an
+	// unbounded register footprint spills to local memory (doc/tca.md
+	// §5.8), strictly worse than the GMEM load it replaced. It gates the
+	// judge (a single site over the cap is declined) and the schedule
+	// feasibility (the accumulated sum), and participates in the lower's
+	// halve/drop fallback.
+	MaxFragPerThread int
 	// CacheDims is the dimension-level reuse count: only the last
 	// CacheDims tensor dimensions may be promoted (hardcoded 2 in the doc).
 	CacheDims int
@@ -220,27 +283,28 @@ type Params struct {
 	// TileSizes is the common tile-size search set; the uniform sweep also
 	// includes t=1 (tiling disabled).
 	TileSizes []int
-	// NominalExtent is the documented stand-in extent for a reuse dimension
-	// whose BIV max operand is NOT a constant: the doc demands static
-	// arithmetic, and real tensors bound by TensorDimOf have symbolic
-	// extents, so a symbolic dim contributes the nominal factor instead.
-	// The knob keeps ranking meaningful when extents are unknown; a
-	// constant max is always preferred when present.
+	// NominalExtent is the documented stand-in extent for a reuse
+	// dimension whose BIV max operand is NOT a constant. NOTE (2026-10-21
+	// amendment): reuse is PER-THREAD now — the product of the reuse dims'
+	// inside-walk trip counts, tile-derived — so extents no longer enter
+	// the objective and this knob is currently dormant; it stays on the
+	// surface for the future extent-aware ranking models.
 	NominalExtent int
 }
 
 // DefaultParams returns the final-design defaults (loop_tiling.md "LoC
 // concurrency bounds, the FINAL MODEL"): 100 CTAs (Ampere's 108 SMs
 // rounded DOWN to the PortionCTA multiple), 512 threads per CTA (= 16
-// warps), 64 KB SMEM, CacheDims 2, MaxCS 16, window K=5, tile sizes
-// {32,64,128,256}, nominal extent 4096, WarpPortion auto. The legacy LoC
-// presets and objective weights are gone — the portion grammar replaces
-// them.
+// warps), 64 KB SMEM, 256 bytes/thread FRAG (F6), CacheDims 2, MaxCS 16,
+// window K=5, tile sizes {32,64,128,256}, nominal extent 4096, WarpPortion
+// auto. The legacy LoC presets and objective weights are gone — the
+// portion grammar replaces them.
 func DefaultParams() Params {
 	return Params{
 		MaxCTA:           100,
 		MaxThreadsPerCTA: 512,
 		MaxCache:         65536,
+		MaxFragPerThread: 256,
 		CacheDims:        2,
 		MaxCS:            16,
 		WindowK:          5,
@@ -271,6 +335,9 @@ func (p Params) Validate() error {
 	}
 	if p.MaxCache < 1 {
 		return fmt.Errorf("tiling: MaxCache %d must be >= 1", p.MaxCache)
+	}
+	if p.MaxFragPerThread < 1 {
+		return fmt.Errorf("tiling: MaxFragPerThread %d must be >= 1 (F6: the per-thread FRAG byte budget)", p.MaxFragPerThread)
 	}
 	if p.CacheDims < 1 {
 		return fmt.Errorf("tiling: CacheDims %d must be >= 1", p.CacheDims)

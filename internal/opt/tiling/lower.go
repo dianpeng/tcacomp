@@ -128,7 +128,7 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 
 	f := loopforest.Analyze(g)
 	se := sideeffect.Analyze(g)
-	facts := analyzeOverlap(g, f, se, p.Params)
+	facts := analyzeOverlap(g, f, se, p.Params).Trees
 
 	// Resolve every iter's decision fail-closed before any mutation
 	// (adjacency guarantees completeness — a missing entry is corruption).
@@ -178,7 +178,7 @@ type lowerRun struct {
 	params    Params
 	mctx      *ir.MutContext
 	decisions map[ir.Node]IterDecision
-	overrides map[ir.Node]int   // budget tile overrides, keyed by iter
+	overrides map[ir.Node]int // budget tile overrides, keyed by iter
 	byIter    map[ir.Node]*dimRewrite
 	claimed   map[*ir.Base]bool // effectful body ops already owned by an LNT
 	rewrites  []*lntRewrite     // per-root products, Roots() order

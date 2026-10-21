@@ -71,7 +71,7 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 		for _, it := range sf.Covered {
 			m[it] = dec(it)
 		}
-		return siteBytesPerTile(sf, m)
+		return siteWindowBytes(sf, m)
 	}
 	smemSum := func() int {
 		sum := 0

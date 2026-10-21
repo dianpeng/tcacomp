@@ -161,18 +161,49 @@ func TestMatmulEndToEnd(t *testing.T) {
 	se := sideeffect.Analyze(fx.g)
 	forest := loopforest.Analyze(fx.g)
 	allFacts := analyzeOverlap(fx.g, forest, se, p)
-	facts := allFacts[0]
+	facts := allFacts.Trees[0]
 	socMap := iterSocMap(t, facts.Tree, rec)
+	ctx := judgeCtxOf(t, facts.Tree, socMap, p)
 	for _, sf := range facts.CS {
-		want, class := judgeSite(sf, socMap, p)
+		want := judgeSite(sf, socMap, ctx, p)
 		got, ok := rec.SiteDecisionOf(sf.Load)
 		if !ok {
 			t.Fatalf("CS load node %d missing its site entry", sf.Load.BasePtr().ID())
 		}
-		if got.Promoted != want || got.Class != class {
-			t.Fatalf("site node %d: record says (%v, %s), judge over the chosen schedule says (%v, %s)",
-				sf.Load.BasePtr().ID(), got.Promoted, got.Class, want, class)
+		if got.Promoted != want.promoted || got.Class != want.class ||
+			got.Reuse != want.reuse || got.Bytes != want.bytes {
+			t.Fatalf("site node %d: record says (%v, %s, reuse %d, bytes %d), judge over the chosen schedule says (%v, %s, reuse %d, bytes %d)",
+				sf.Load.BasePtr().ID(), got.Promoted, got.Class, got.Reuse, got.Bytes,
+				want.promoted, want.class, want.reuse, want.bytes)
 		}
+	}
+}
+
+// judgeCtxOf rebuilds the judge's portion context over an iter-keyed
+// decision map, mirroring evalSchedule's resolution: explicit
+// Params.WarpPortion, else auto (AutoWarpPortion when the LNT carries a
+// CTA dim, PortionWarp otherwise).
+func judgeCtxOf(t *testing.T, tree *loopforest.Tree, iters map[ir.Node]IterDecision, p Params) schedCtx {
+	t.Helper()
+	warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
+	warpPortion := p.WarpPortion
+	hasCTA := false
+	for _, d := range iters {
+		if d.SoC == SoCTA {
+			hasCTA = true
+		}
+	}
+	if warpPortion == 0 {
+		if hasCTA {
+			warpPortion = AutoWarpPortion
+		} else {
+			warpPortion = PortionWarp
+		}
+	}
+	return schedCtx{
+		warpsPerPortion: warpsPerPortion,
+		warpPortion:     warpPortion,
+		coupledThreads:  (PortionWarp - warpPortion) * warpsPerPortion * 32,
 	}
 }
 
@@ -224,15 +255,17 @@ func TestFeasibilityBounds(t *testing.T) {
 func TestPortionCompletion(t *testing.T) {
 	fx, _, _ := matmul()
 	p := DefaultParams()
-	f := loopforest.Analyze(fx.g)
 	lf := overlapOf(fx, p)
 	window := windowOf(lf, p) // outermost first: [iterM, iterN, iterK]
 	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
 
 	soc := []SoCType{SoCTA, SoCWARP, SoCSequential}
-	res, ok := evalSchedule(f, lf, window, soc, 32, p)
+	res, ok, err := evalSchedule(lf, window, soc, 32, p, 0, 0)
+	if err != nil {
+		t.Fatalf("[CTA, warp, seq] at t=32 must not error: %v", err)
+	}
 	if !ok {
-		t.Fatal("[CTA, warp, seq] at t=32 must be SMEM-feasible on the matmul fixture")
+		t.Fatal("[CTA, warp, seq] at t=32 must be budget-feasible on the matmul fixture (rhs declines by reuse, lhs is a 128 B FRAG)")
 	}
 	if d := res.iters[window[0]]; d.SoC != SoCTA || d.LoC != p.MaxCTA {
 		t.Fatalf("CTA dim must exhaust MaxCTA %d (portion -1/full), got %s/%d", p.MaxCTA, d.SoC, d.LoC)
@@ -246,7 +279,10 @@ func TestPortionCompletion(t *testing.T) {
 
 	// An explicit WarpPortion overrides the auto rule.
 	p.WarpPortion = 2
-	res, ok = evalSchedule(f, lf, window, soc, 32, p)
+	res, ok, err = evalSchedule(lf, window, soc, 32, p, 0, 0)
+	if err != nil {
+		t.Fatalf("explicit WarpPortion must not error: %v", err)
+	}
 	if !ok {
 		t.Fatal("explicit WarpPortion must not change feasibility here")
 	}
@@ -307,64 +343,220 @@ func TestSearchWindow(t *testing.T) {
 	}
 }
 
-// TestPromotionJudge pins the doc's judge verbatim: CTA at the last
-// subscript position blocks promotion; the last two positions fully
-// sequential yield FRAG; warp anywhere relevant yields SMEM; a covered
-// iter with tile 1 blocks promotion.
+// TestPromotionJudge pins the amended judge (R2 tier rule + F4 drop-rule
+// gate + F6 frag budget + the per-thread reuse gate): classification is by
+// the SoC of the site's COVERED dims — ANY CTA-covered dim refuses the
+// site; ANY WARP-covered dim yields the SMEM window class; all-SEQ covered
+// dims yield FRAG (subject to the per-thread byte and reuse gates); ANY
+// covered dim at tile 1 blocks promotion (the judge-side F4 gate, matching
+// the lower's drop rule).
 func TestPromotionJudge(t *testing.T) {
 	fx, lhs, rhs := matmul()
 	facts := overlapOf(fx, DefaultParams())
-	sl := siteOf(t, facts, lhs) // axes [M, K]
-	sr := siteOf(t, facts, rhs) // axes [N, K]
+	sl := siteOf(t, facts, lhs) // covered {K}
+	sr := siteOf(t, facts, rhs) // covered {N, K}
 	p := DefaultParams()
 
-	soc := func(dM, dN, dK IterDecision) map[ir.Node]IterDecision {
-		return map[ir.Node]IterDecision{fx.iters[0]: dM, fx.iters[1]: dN, fx.iters[2]: dK}
+	soc := func(dM, dN, dK IterDecision) (map[ir.Node]IterDecision, schedCtx) {
+		m := map[ir.Node]IterDecision{fx.iters[0]: dM, fx.iters[1]: dN, fx.iters[2]: dK}
+		quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
+		warpPortion := AutoWarpPortion // the auto rule for CTA-carrying vectors
+		return m, schedCtx{warpsPerPortion: quantum, warpPortion: warpPortion,
+			coupledThreads: (PortionWarp - warpPortion) * quantum * 32}
 	}
 
-	// CTA at the last position (K): not promoted.
-	prom, class := judgeSite(sl, soc(
-		IterDecision{SoCTA, 16, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCTA, 4, 32}), p)
-	if prom || class != ClassNone {
-		t.Fatalf("CTA at the last position must block promotion, got (%v, %s)", prom, class)
+	// A CTA-COVERED dim refuses the site (lhs covers K): R2 tier rule.
+	// (The old judge's "CTA at the last subscript position" gate is
+	// superseded — the covered set, not the axes, classifies.)
+	iters, ctx := soc(
+		IterDecision{SoCTA, 100, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCTA, 4, 32})
+	j := judgeSite(sl, iters, ctx, p)
+	if j.promoted || j.class != ClassNone || j.reason != ReasonCTACovered {
+		t.Fatalf("a CTA-covered dim must refuse the site, got (%v, %s, %q)", j.promoted, j.class, j.reason)
 	}
 
-	// Last two positions fully sequential: FRAG.
-	prom, class = judgeSite(sl, soc(
-		IterDecision{SoCSequential, 1, 32}, IterDecision{SoCTA, 16, 32}, IterDecision{SoCSequential, 1, 32}), p)
-	if !prom || class != ClassFRAG {
-		t.Fatalf("last two positions sequential must promote to FRAG, got (%v, %s)", prom, class)
+	// All covered dims sequential, per-thread reuse >= 2: FRAG.
+	iters, ctx = soc(
+		IterDecision{SoCTA, 100, 32}, IterDecision{SoCSequential, 1, 32}, IterDecision{SoCSequential, 1, 32})
+	j = judgeSite(sl, iters, ctx, p)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 4*32 || j.reuse != 32 {
+		t.Fatalf("all-SEQ covered dims must promote to FRAG (128 B, reuse 32), got (%v, %s, %d B, reuse %d)",
+			j.promoted, j.class, j.bytes, j.reuse)
 	}
 
-	// Warp at the last position: SMEM.
-	prom, class = judgeSite(sl, soc(
-		IterDecision{SoCTA, 16, 32}, IterDecision{SoCSequential, 1, 32}, IterDecision{SoCWARP, 8, 32}), p)
-	if !prom || class != ClassSMEM {
-		t.Fatalf("warp at the last position must promote to SMEM, got (%v, %s)", prom, class)
+	// A WARP-covered dim (lhs covers K): SMEM window class — bytes are the
+	// whole group's round window (#threads_d x T), not the bare tile.
+	iters, ctx = soc(
+		IterDecision{SoCTA, 100, 32}, IterDecision{SoCSequential, 1, 32}, IterDecision{SoCWARP, 8, 32})
+	j = judgeSite(sl, iters, ctx, p)
+	wantBytes := 4 * (8 * 32) * 32 // 8 warps = 256 threads, T 32
+	if !j.promoted || j.class != ClassSMEM || j.bytes != wantBytes {
+		t.Fatalf("a WARP-covered dim must promote to the SMEM window class with window bytes %d, got (%v, %s, %d B)",
+			wantBytes, j.promoted, j.class, j.bytes)
 	}
 
-	// Warp at the second-to-last position (rhs axis N): SMEM.
-	prom, class = judgeSite(sr, soc(
-		IterDecision{SoCTA, 16, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 32}), p)
-	if !prom || class != ClassSMEM {
-		t.Fatalf("warp at the second-to-last position must promote to SMEM, got (%v, %s)", prom, class)
+	// Any covered dim at tile 1 (lhs covers K): not promoted (F4 gate —
+	// ANY covered iter, not only all of them).
+	iters, ctx = soc(
+		IterDecision{SoCTA, 100, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 1})
+	j = judgeSite(sl, iters, ctx, p)
+	if j.promoted || j.reason != ReasonTileOne {
+		t.Fatalf("a covered iter at tile 1 must block promotion, got (%v, %q)", j.promoted, j.reason)
 	}
 
-	// Any covered iter with tile 1 (lhs covers K): not promoted.
-	prom, class = judgeSite(sl, soc(
-		IterDecision{SoCTA, 16, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 1}), p)
-	if prom || class != ClassNone {
-		t.Fatalf("a covered iter with tile 1 must block promotion, got (%v, %s)", prom, class)
+	// Per-thread reuse < 2 declines the site: rhs's only reuse dim is M;
+	// with M the CTA dim the owning thread walks ceil(32/256) = 1
+	// m-element per epoch — no re-traversal, no traffic avoided.
+	iters, ctx = soc(
+		IterDecision{SoCTA, 100, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 32})
+	j = judgeSite(sr, iters, ctx, p)
+	if j.promoted || j.reason != ReasonLowReuse || j.reuse != 1 {
+		t.Fatalf("rhs at default-like shapes must decline with per-thread reuse 1, got (%v, %q, reuse %d)",
+			j.promoted, j.reason, j.reuse)
 	}
 }
 
-// TestTrafficArithmeticAndOptimality pins the objective's arithmetic on the
-// matmul fixture (const extents) and cross-checks the chosen schedule's
-// score against a test-local enumeration of the whole schedule space — the
-// pass must pick a maximizer.
+// TestWorkedExampleJudge pins the doc's worked-example JUDGE output
+// verbatim (loop_tiling.md "Promotion OUTCOME at default shapes" +
+// loop_tile_lower.md §6bis "Worked example, ACCEPTED OUTCOME"): over the
+// pinned schedule M=CTA/100/T32, N=WARP/8 warps=256 threads/T32,
+// K=SEQ/T32 —
+//
+//   - lhs (tie iterN, covered {K} all-SEQ) is PROMOTED as a 128 B per-thread
+//     FRAG with per-thread reuse 32 (its 32-step n walk per (m-element,
+//     k-round) epoch);
+//   - rhs (tie nil, covered {N WARP, K SEQ}) is DECLINED — its reuse dim is
+//     M and the owning thread's per-epoch m-count is ceil(32/256) = 1 < 2 —
+//     consistent with its 1 MB SMEM window exceeding the 64 KB budget.
+func TestWorkedExampleJudge(t *testing.T) {
+	fx, lhs, rhs := matmul()
+	p := DefaultParams()
+	lf := overlapOf(fx, p)
+	window := windowOf(lf, p) // [iterM, iterN, iterK]
+
+	soc := []SoCType{SoCTA, SoCWARP, SoCSequential}
+	res, ok, err := evalSchedule(lf, window, soc, 32, p, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("the worked-example schedule must evaluate feasible: ok=%v err=%v", ok, err)
+	}
+
+	sl, ok := res.sites[lhs.BasePtr().ID()]
+	if !ok {
+		t.Fatal("lhs must carry a site entry")
+	}
+	if !sl.Promoted || sl.Class != ClassFRAG || sl.Reuse != 32 || sl.Bytes != 128 || sl.Reason != "" {
+		t.Fatalf("worked-example lhs = (promoted %v, %s, reuse %d, bytes %d, %q), want (true, frag, reuse 32, bytes 128, \"\")",
+			sl.Promoted, sl.Class, sl.Reuse, sl.Bytes, sl.Reason)
+	}
+	if sl.Tie != fx.iters[1] {
+		t.Fatalf("worked-example lhs tie must be iterN, got %s", tieLabel(sl.Tie))
+	}
+
+	sr, ok := res.sites[rhs.BasePtr().ID()]
+	if !ok {
+		t.Fatal("rhs must carry a site entry")
+	}
+	if sr.Promoted || sr.Reason != ReasonLowReuse || sr.Reuse != 1 {
+		t.Fatalf("worked-example rhs = (promoted %v, reuse %d, %q), want declined with per-thread reuse 1",
+			sr.Promoted, sr.Reuse, sr.Reason)
+	}
+	// The declined rhs's recorded bytes are its would-be window: 256
+	// threads x 32 x 32 x 4 B = 1 MB against the 64 KB kernel-wide budget.
+	if sr.Bytes != 4*(8*32)*32*32 {
+		t.Fatalf("worked-example rhs window bytes = %d, want %d", sr.Bytes, 4*(8*32)*32*32)
+	}
+
+	// The full pass at defaults must publish rhs declined with a recorded
+	// reason (whatever schedule wins, rhs never promotes at these shapes:
+	// its per-thread m-count is 1 under every CTA placement).
+	rec := runPass(t, fx.g, p)
+	got, ok := rec.SiteDecisionOf(rhs)
+	if !ok {
+		t.Fatal("rhs must carry a record entry")
+	}
+	if got.Promoted || got.Reason == "" {
+		t.Fatalf("the published record must decline rhs with a recorded reason, got (%v, %q)",
+			got.Promoted, got.Reason)
+	}
+}
+
+// TestCoupledPortionFloor pins F2 (HI-04): whenever the LNT carries a CTA
+// dim, the independent WarpPortion must leave >= 1 warp portion for the
+// coupled inside walk — evalSchedule ERRORS (a zero-portion coupled walk
+// is a zero-stride inside loop), the pass fails loud, and tiling-verify
+// rejects a published record whose warp portion starves the coupled walk.
+func TestCoupledPortionFloor(t *testing.T) {
+	fx, _, _ := matmul()
+	p := DefaultParams()
+	lf := overlapOf(fx, p)
+	window := windowOf(lf, p)
+
+	t.Run("eval schedule rejects warpportion 8 with cta", func(t *testing.T) {
+		q := p
+		q.WarpPortion = PortionWarp // legal as a PORTION, illegal with a CTA dim
+		_, _, err := evalSchedule(lf, window, []SoCType{SoCTA, SoCWARP, SoCSequential}, 32, q, 0, 0)
+		if err == nil {
+			t.Fatal("WarpPortion == PortionWarp with a CTA dim must error at schedule evaluation")
+		}
+		for _, want := range []string{"WarpPortion", "F2", "coupled"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("the floor error must name %q, got %q", want, err.Error())
+			}
+		}
+		// The no-warp-dim CTA vector errors the same way: the coupled walk
+		// starves regardless of whether an independent dim takes the
+		// portions.
+		_, _, err = evalSchedule(lf, window, []SoCType{SoCTA, SoCSequential, SoCSequential}, 32, q, 0, 0)
+		if err == nil {
+			t.Fatal("WarpPortion == PortionWarp must starve the coupled walk even without an independent warp dim")
+		}
+	})
+
+	t.Run("pass fails loud", func(t *testing.T) {
+		q := p
+		q.WarpPortion = PortionWarp
+		cache := opt.NewCache()
+		err := (Pass{Params: q}).Run(&opt.Context{Pass: "tiling", Cache: cache}, fx.g)
+		if err == nil {
+			t.Fatal("the decide pass must fail loud on a floor-violating WarpPortion")
+		}
+		if !strings.Contains(err.Error(), "F2") {
+			t.Fatalf("the pass error must name the F2 floor, got %q", err.Error())
+		}
+	})
+
+	t.Run("verify rejects starved record", func(t *testing.T) {
+		q := p
+		q.WarpPortion = 7 // floor-legal: 8-7 = 1 coupled portion
+		cache, rec := runDecide(t, fx.g, q)
+		// Corrupt the record's warp LoC to the full 8 portions: the
+		// coupled walk is starved, verify must flag it (the F2 record
+		// check runs on published records).
+		quantum := (q.MaxThreadsPerCTA / 32) / PortionWarp
+		for biv, d := range rec.Iters {
+			if d.SoC == SoCWARP {
+				d.LoC = PortionWarp * quantum
+				rec.Iters[biv] = d
+				break
+			}
+		}
+		err := verifyWith(fx.g, cache, q)
+		if err == nil {
+			t.Fatal("tiling-verify must reject a record whose warp portion starves the coupled walk")
+		}
+		if !strings.Contains(err.Error(), "F2") {
+			t.Fatalf("the record floor error must name F2, got %q", err.Error())
+		}
+	})
+}
+
+// TestTrafficArithmeticAndOptimality pins the objective's amended
+// arithmetic on the matmul fixture — window-bytes footprints, per-thread
+// reuse (tile-derived inside-walk trips), the F6/CTA gates — and
+// cross-checks the chosen schedule's score against a test-local
+// enumeration of the whole schedule space: the pass must pick a maximizer.
 func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	fx, lhs, rhs := matmul()
-	const M, N, K = 1024, 2048, 512
 	p := DefaultParams()
 	rec := runPass(t, fx.g, p)
 
@@ -372,32 +564,69 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	dN := decisionOf(t, rec, fx.iters[1])
 	dK := decisionOf(t, rec, fx.iters[2])
 
-	ceil := func(a, b int) int { return (a + b - 1) / b }
-	// lhs: covered {K} -> bytes 4*tile(K); reuse {N} -> ceil(N/tile(N)).
-	lhsBytes := 4 * dK.TileSize
-	lhsReuse := ceil(N, dN.TileSize)
-	// rhs: covered {N,K} -> bytes 4*tile(N)*tile(K); reuse {M} -> ceil(M/tile(M)).
-	rhsBytes := 4 * dN.TileSize * dK.TileSize
-	rhsReuse := ceil(M, dM.TileSize)
+	// Independent window-bytes + per-thread reuse arithmetic over the
+	// record's own schedule. alloc_d = the execution slots partitioning
+	// dim d's round window; the owning thread's inside-walk trips are T_d,
+	// except a CTA dim's coupled walk: ceil(T / coupledThreads).
+	alloc := func(d IterDecision) int {
+		switch d.SoC {
+		case SoCWARP:
+			return d.LoC * 32
+		case SoCTA:
+			return d.LoC
+		default:
+			return 1
+		}
+	}
+	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
+	coupled := (PortionWarp - AutoWarpPortion) * quantum * 32 // the chosen schedule carries a CTA dim
+	trips := func(d IterDecision) int {
+		if d.SoC == SoCTA {
+			return ceilDiv(d.TileSize, coupled)
+		}
+		return d.TileSize
+	}
+	// lhs: covered {K} -> bytes 4·alloc(K)·T_k; reuse dims {N} -> trips(N).
+	lhsBytes := 4 * alloc(dK) * dK.TileSize
+	lhsReuse := trips(dN)
+	// rhs: covered {N,K} -> bytes 4·alloc(N)·T_n·alloc(K)·T_k; reuse dims {M}.
+	rhsBytes := 4 * alloc(dN) * dN.TileSize * alloc(dK) * dK.TileSize
+	rhsReuse := trips(dM)
 
 	sl, _ := rec.SiteDecisionOf(lhs)
 	sr, _ := rec.SiteDecisionOf(rhs)
+	if sl.Bytes != lhsBytes || sl.Reuse != lhsReuse {
+		t.Fatalf("lhs record bytes/reuse = %d/%d, independent arithmetic says %d/%d",
+			sl.Bytes, sl.Reuse, lhsBytes, lhsReuse)
+	}
+	if sr.Bytes != rhsBytes || sr.Reuse != rhsReuse {
+		t.Fatalf("rhs record bytes/reuse = %d/%d, independent arithmetic says %d/%d",
+			sr.Bytes, sr.Reuse, rhsBytes, rhsReuse)
+	}
+
 	traffic := 0
-	smem := 0
+	smem, frag := 0, 0
 	if sl.Promoted {
 		traffic += lhsBytes * (lhsReuse - 1)
 		if sl.Class == ClassSMEM {
 			smem += lhsBytes
+		} else {
+			frag += lhsBytes
 		}
 	}
 	if sr.Promoted {
 		traffic += rhsBytes * (rhsReuse - 1)
 		if sr.Class == ClassSMEM {
 			smem += rhsBytes
+		} else {
+			frag += rhsBytes
 		}
 	}
 	if smem > p.MaxCache {
-		t.Fatalf("chosen schedule's SMEM footprint %d exceeds MaxCache %d", smem, p.MaxCache)
+		t.Fatalf("chosen schedule's kernel-wide SMEM footprint %d exceeds MaxCache %d", smem, p.MaxCache)
+	}
+	if frag > p.MaxFragPerThread {
+		t.Fatalf("chosen schedule's FRAG footprint %d exceeds MaxFragPerThread %d", frag, p.MaxFragPerThread)
 	}
 	// SINGLE-TERM objective: score is the traffic avoided alone.
 	score := float64(traffic)
@@ -409,18 +638,14 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 }
 
 // enumerateBest mirrors the pass's search over the matmul fixture and
-// returns the maximum score — the optimality cross-check.
+// returns the maximum score — the optimality cross-check. The judge's
+// gates and arithmetic are re-derived here INDEPENDENTLY (no judgeSite
+// call): window bytes, per-thread inside-walk trips, the tier rule, the
+// F4 tile-1 gate, the F6 per-site frag gate, the reuse gate, and the
+// kernel-wide budget feasibility.
 func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	t.Helper()
-	se := sideeffect.Analyze(fx.g)
-	forest := loopforest.Analyze(fx.g)
-	facts := analyzeOverlap(fx.g, forest, se, p)[0]
-	treeIters := treeItersOf(facts.Tree)
-	depths := make(map[ir.Node]int, len(treeIters))
-	for _, it := range treeIters {
-		node, _ := forest.NodeOf(it)
-		depths[it] = node.Depth
-	}
+	facts := overlapOf(fx, p)
 	window := windowOf(facts, p)
 
 	tiles := []int{1}
@@ -428,12 +653,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 		tiles = append(tiles, ts)
 	}
 	sort.Ints(tiles)
-
-	extents := make(map[ir.Node]int, len(treeIters))
-	for _, it := range treeIters {
-		extents[it] = extentOf(it, p)
-	}
-	ceil := func(a, b int) int { return (a + b - 1) / b }
+	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
 
 	soc := make([]SoCType, len(window))
 	best := -1.0
@@ -445,54 +665,93 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 			}
 		}
 		if hasCTA && v0PolicyClean(soc) { // the search's feasibility + v0 policy gates
-			warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
 			warpPortion := p.WarpPortion
 			if warpPortion == 0 {
-				if hasCTA {
-					warpPortion = AutoWarpPortion
-				} else {
-					warpPortion = PortionWarp
-				}
+				warpPortion = AutoWarpPortion // hasCTA holds here
 			}
+			if warpPortion > PortionWarp-1 {
+				t.Fatalf("test params violate the F2 floor (WarpPortion %d with a CTA dim)", warpPortion)
+			}
+			coupled := (PortionWarp - warpPortion) * quantum * 32
 			for _, tile := range tiles {
-				iters := make(map[ir.Node]IterDecision, len(treeIters))
-				for _, it := range treeIters {
+				iters := make(map[ir.Node]IterDecision, len(facts.Levels))
+				for _, it := range treeItersOf(facts.Tree) {
 					iters[it] = IterDecision{SoCSequential, 1, 1}
 				}
-				feasible := true
 				for i := range window { // portion completion
 					d := IterDecision{SoC: soc[i], LoC: 1, TileSize: tile}
 					switch soc[i] {
 					case SoCTA:
 						d.LoC = p.MaxCTA
 					case SoCWARP:
-						d.LoC = warpPortion * warpsPerPortion
+						d.LoC = warpPortion * quantum
 					}
 					iters[window[i]] = d
 				}
-				traffic, smem := 0, 0
+				traffic, smem, frag := 0, 0, 0
 				for _, sf := range facts.CS {
-					prom, class := judgeSite(sf, iters, p)
-					if !prom {
-						continue
-					}
-					bytes := 4
+					// The mirror judge: tier rule + gates, independent formulas.
+					promoted, ctaCovered, tileOne := true, false, false
+					class := ClassFRAG
 					for _, c := range sf.Covered {
-						bytes *= iters[c].TileSize
+						d := iters[c]
+						if d.SoC == SoCTA {
+							ctaCovered = true
+						}
+						if d.TileSize == 1 {
+							tileOne = true
+						}
+						if d.SoC == SoCWARP {
+							class = ClassSMEM
+						}
 					}
-					reuseDims := reuseDimsOf(sf, depths, treeIters)
-					reuse := 1
-					for _, rd := range reuseDims {
-						reuse *= ceil(extents[rd], iters[rd].TileSize)
+					if ctaCovered || tileOne || len(sf.Covered) == 0 {
+						promoted = false
 					}
-					traffic += bytes * (reuse - 1)
-					if class == ClassSMEM {
-						smem += bytes
+					bytes := 0
+					if promoted {
+						e, ok := elemTypeOf(sf.Load)
+						bytes = elemBytes(e)
+						for _, c := range sf.Covered {
+							d := iters[c]
+							perDim := d.TileSize
+							if d.SoC == SoCWARP {
+								perDim *= d.LoC * 32
+							}
+							bytes *= perDim
+						}
+						if !ok {
+							promoted = false
+						}
+						if class == ClassFRAG && bytes > p.MaxFragPerThread {
+							promoted = false
+						}
+					}
+					reuse := 0
+					if promoted {
+						reuse = 1
+						for _, rd := range sf.ReuseDims {
+							d := iters[rd]
+							tr := d.TileSize
+							if d.SoC == SoCTA {
+								tr = ceilDiv(d.TileSize, coupled)
+							}
+							reuse *= tr
+						}
+						if reuse < 2 {
+							promoted = false
+						}
+					}
+					if promoted {
+						traffic += bytes * (reuse - 1)
+						if class == ClassSMEM {
+							smem += bytes
+						} else {
+							frag += bytes
+						}
 					}
 				}
-				if smem > p.MaxCache {
-					feasible = false
-				}
+				feasible := smem <= p.MaxCache && frag <= p.MaxFragPerThread
 				score := float64(traffic) // single-term objective
 				if feasible && score > best {
 					best = score
@@ -515,28 +774,158 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	return best
 }
 
-// reuseDimsOf mirrors the objective's reuse-dim derivation: {tie} plus the
-// LNT iters strictly inner than the tie, minus covered.
-func reuseDimsOf(sf SiteFacts, depths map[ir.Node]int, treeIters []ir.Node) []ir.Node {
-	covered := make(map[ir.Node]bool, len(sf.Covered))
-	for _, c := range sf.Covered {
-		covered[c] = true
-	}
-	var out []ir.Node
-	if sf.Tie != nil {
-		if !covered[sf.Tie] {
-			out = append(out, sf.Tie)
+// addWarpWindowLNT appends one 3-deep chain (root->mid->leaf, extents 64)
+// with two co-traversed rank-2 loads referencing {root, leaf}: SET @ leaf,
+// tie mid, covered {leaf}. When the leaf is WARP-assigned the sites are
+// SMEM windows of 4 x (#threads x T) bytes each; with WarpPortion 1 the
+// group is 64 threads, so each site costs 256·T bytes.
+func addWarpWindowLNT(g *ir.Graph, tag string) (root, mid, leaf, lp, lq ir.Node) {
+	f32 := ir.InternScalar(ir.TF32)
+	dim := func(name string) ir.Node { return g.NewInputParam("ctor", ir.RoleDim, name, nil) }
+	var parent ir.Node
+	for i := 0; i < 3; i++ {
+		dv := g.NewDimVar("ctor", dim(fmt.Sprintf("%s_d%d", tag, i)), g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+		biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", f32, 64))
+		parent = g.NewIter("ctor", biv, parent)
+		switch i {
+		case 0:
+			root = parent
+		case 1:
+			mid = parent
+		case 2:
+			leaf = parent
 		}
 	}
-	for _, it := range treeIters {
-		if covered[it] || it == sf.Tie {
-			continue
-		}
-		if sf.Tie == nil || depths[it] > depths[sf.Tie] {
-			out = append(out, it)
+	lp = g.NewMemLoad("ctor", tensorParam(g, tag+"_p", 2), []ir.Node{iv(g, root), iv(g, leaf)})
+	lq = g.NewMemLoad("ctor", tensorParam(g, tag+"_q", 2), []ir.Node{iv(g, root), iv(g, leaf)})
+	return root, mid, leaf, lp, lq
+}
+
+// scaffoldConstStore wires a store+return observation over a const (the
+// decide-side fixtures need no data flow through their loads).
+func scaffoldConstStore(g *ir.Graph, name string) {
+	out := g.NewInputParam("ctor", ir.RoleTensor, name, ir.InternTensor(ir.TF32, []ir.DimRef{{Name: name + "_d0"}}))
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, nil, g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+}
+
+// TestKernelWideSmemBudget pins the R3 ruling (HI-06): the SMEM budget is
+// KERNEL-WIDE — the running total threads through the searcher, so two
+// LNTs whose promotions are EACH individually legal under MaxCache cannot
+// both promote when their SUM exceeds it: the first LNT (Roots() order)
+// consumes the budget and the second LNT's sites are declined in every
+// feasible schedule. tiling-verify stays green over the result — decide
+// and verify gate the SAME kernel-wide sum.
+func TestKernelWideSmemBudget(t *testing.T) {
+	p := DefaultParams()
+	p.WarpPortion = 1        // 1 portion x 2 warps = 64 threads per WARP dim
+	p.MaxFragPerThread = 128 // both FRAG sites (2 x 4·T >= 256 at T >= 32) never fit together
+
+	// Each LNT alone: both sites promote as 64-thread windows at the
+	// winning tile 128 — 4 x 64 x 128 = 32768 B per site, 65536 B per
+	// LNT, exactly the 64 KB budget.
+	single := func(t *testing.T) {
+		g := ir.NewGraph("kwb-single")
+		_, _, _, lp, lq := addWarpWindowLNT(g, "a")
+		scaffoldConstStore(g, "out")
+		rec := runPass(t, g, p)
+		for _, load := range []ir.Node{lp, lq} {
+			sd, ok := rec.SiteDecisionOf(load)
+			if !ok {
+				t.Fatal("each site must carry a record entry")
+			}
+			if !sd.Promoted || sd.Class != ClassSMEM || sd.Bytes != 4*64*128 {
+				t.Fatalf("individually-legal site = (%v, %s, %d B), want promoted SMEM windows of %d B",
+					sd.Promoted, sd.Class, sd.Bytes, 4*64*128)
+			}
 		}
 	}
-	return out
+	t.Run("each lnt alone is legal", single)
+
+	t.Run("sum over budget declines the second lnt", func(t *testing.T) {
+		g := ir.NewGraph("kwb-two")
+		_, _, _, lpA, lqA := addWarpWindowLNT(g, "a")
+		_, _, _, lpB, lqB := addWarpWindowLNT(g, "b")
+		scaffoldConstStore(g, "out")
+		rec := runPass(t, g, p)
+		for _, load := range []ir.Node{lpA, lqA} {
+			sd, _ := rec.SiteDecisionOf(load)
+			if !sd.Promoted || sd.Class != ClassSMEM {
+				t.Fatalf("the first LNT's site must still promote, got (%v, %s)", sd.Promoted, sd.Class)
+			}
+		}
+		for _, load := range []ir.Node{lpB, lqB} {
+			sd, ok := rec.SiteDecisionOf(load)
+			if !ok {
+				t.Fatal("the second LNT's sites must carry entries")
+			}
+			if sd.Promoted {
+				t.Fatalf("the second LNT's site must be declined: the kernel-wide sum is already at MaxCache (R3)")
+			}
+			if sd.Reason == "" {
+				t.Fatal("a declined site must record its reason")
+			}
+		}
+		// The record is CONSISTENT: verify gates the same kernel-wide sum
+		// and stays green.
+		cache := opt.NewCache()
+		if err := (Pass{Params: p}).Run(&opt.Context{Pass: "tiling", Cache: cache}, g); err != nil {
+			t.Fatalf("tiling.Run: %v", err)
+		}
+		if err := (VerifyPass{Params: p}).Run(&opt.Context{Pass: "tiling-verify", Cache: cache}, g); err != nil {
+			t.Fatalf("tiling-verify must be green over the kernel-wide-budgeted record: %v", err)
+		}
+	})
+}
+
+// TestFragBudgetGate pins F6 (MaxFragPerThread, default 256 B/thread):
+// the judge declines a single FRAG site whose per-thread bytes exceed the
+// cap, and the schedule-level gate accumulates the kernel-wide FRAG sum
+// against the floors the caller threads in.
+func TestFragBudgetGate(t *testing.T) {
+	fx, lhs, _ := matmul()
+	p := DefaultParams()
+	lf := overlapOf(fx, p)
+	window := windowOf(lf, p)
+
+	// Judge level: lhs (covered {K}) at K SEQ tile 64 is a 256 B FRAG —
+	// exactly the cap, promoted; tile 128 is 512 B, declined.
+	soc := []SoCType{SoCTA, SoCSequential, SoCSequential}
+	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
+	ctx := schedCtx{warpsPerPortion: quantum, warpPortion: AutoWarpPortion,
+		coupledThreads: (PortionWarp - AutoWarpPortion) * quantum * 32}
+	iters := map[ir.Node]IterDecision{
+		fx.iters[0]: {SoC: SoCTA, LoC: p.MaxCTA, TileSize: 64},
+		fx.iters[1]: {SoC: SoCSequential, LoC: 1, TileSize: 64},
+		fx.iters[2]: {SoC: SoCSequential, LoC: 1, TileSize: 64},
+	}
+	j := judgeSite(siteOf(t, lf, lhs), iters, ctx, p)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 {
+		t.Fatalf("a 256 B FRAG at the cap must promote, got (%v, %s, %d B)", j.promoted, j.class, j.bytes)
+	}
+	iters[fx.iters[2]] = IterDecision{SoC: SoCSequential, LoC: 1, TileSize: 128}
+	iters[fx.iters[1]] = IterDecision{SoC: SoCSequential, LoC: 1, TileSize: 128}
+	iters[fx.iters[0]] = IterDecision{SoC: SoCTA, LoC: p.MaxCTA, TileSize: 128}
+	j = judgeSite(siteOf(t, lf, lhs), iters, ctx, p)
+	if j.promoted || j.reason != ReasonFragBytes || j.bytes != 512 {
+		t.Fatalf("a 512 B FRAG must decline with the F6 reason, got (%v, %q, %d B)", j.promoted, j.reason, j.bytes)
+	}
+
+	// Schedule level: the same 256 B FRAG site is feasible at floor 0 but
+	// infeasible once earlier LNTs already consumed 128 FRAG bytes
+	// (fragFloor threads through evalSchedule — the kernel-wide F6 gate).
+	_, ok, err := evalSchedule(lf, window, soc, 64, p, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("tile-64 FRAG at floor 0 must be feasible: ok=%v err=%v", ok, err)
+	}
+	_, ok, err = evalSchedule(lf, window, soc, 64, p, 0, 128)
+	if err != nil {
+		t.Fatalf("floor-gated evaluation must not error: %v", err)
+	}
+	if ok {
+		t.Fatal("tile-64 FRAG with a 128-byte floor must be infeasible (128+256 > MaxFragPerThread)")
+	}
 }
 
 // TestDeterminismIdempotent pins INV determinism: a second Run over the

@@ -20,24 +20,49 @@
 //   - Portion completion replaces the legacy greedy LoC presets: under the
 //     v0 policy there is at most one CTA dim (portion -1/full, LoC =
 //     MaxCTA) and at most one independent warp dim (LoC = warp portion x
-//     warpsPerPortion); the CTA dim's coupled tile-inside walk implicitly
-//     consumes the remaining warp portions, its stride derived by the
-//     lower pass, not recorded.
+//     warpsPerPortion); the CTA dim's coupled tile-inside walk consumes
+//     the REMAINING warp portions — never fewer than one (the F2 floor
+//     below), its stride derived by the lower pass, not recorded.
 //   - v0 POLICY (loop_tiling.md "Composition Semantics, CTA x WARP", the
 //     "v0 default searcher POLICY" bullet): at most ONE CTA-assigned dim
 //     and at most ONE independent WARP dim per LNT. Same-category
 //     multi-dim composition (CTA+CTA, WARP+WARP) is FUTURE pending the
 //     combined-slicing arithmetic, so vectors violating the policy are
 //     skipped outright.
+//   - COUPLED-PORTION FLOOR (F2, ruled 2026-10-21): whenever the LNT
+//     carries a CTA dim, the effective independent WarpPortion must leave
+//     >= 1 warp portion for the CTA dim's coupled inside walk — a
+//     zero-portion coupled walk emits a zero-stride inside loop (an
+//     infinite loop), so evalSchedule ERRORS on the violation instead of
+//     ever selecting such a schedule ("the coupled walk implicitly
+//     consumes the remaining >= 1" is a CONSTRAINT, never an assumption).
+//   - WINDOW-BYTES feasibility (R2, ruled 2026-10-21 — rank-in-index =>
+//     window-in-shape): a promoted site's footprint is element size x the
+//     product over its covered dims of (alloc_d x tile_d) — WARP dims
+//     contribute the whole group's round window (#threads_d x T), SEQ
+//     dims contribute T, CTA dims the CTA group's window (nCTA x T;
+//     CTA-covered sites are REFUSED by the tier rule regardless).
+//   - PER-THREAD reuse (ruled 2026-10-21): reuse_count is re-traversal by
+//     the OWNING thread within one fill epoch — the product over the
+//     reuse dims (the tie level and the inner non-covered loop dims) of
+//     the thread's own trip count of that dim's INSIDE walk: T_d for a
+//     sequential or warp-owned chunk, ceil(T_d / coupledThreads) for a
+//     CTA dim's coupled element walk. Re-traversal by OTHER threads never
+//     counts; a site with reuse < 2 is NOT promoted.
+//   - KERNEL-WIDE budgets (R3 + F6, ruled 2026-10-21): the SMEM sum and
+//     the per-thread FRAG sum accumulate ACROSS LNTs — the caller threads
+//     the running totals (smemFloor/fragFloor) through searchSchedule, so
+//     an earlier LNT's promotions constrain later LNTs' feasibility; the
+//     gates here, tiling-verify, and the lower's budget resolution all
+//     gate the SAME kernel-wide sums.
 //   - Single-term objective (loop_tiling.md "Objective Function ...,
 //     SINGLE-TERM"): score = traffic avoided; the parallelism term is
 //     deleted — under mandatory per-LNT exhaustion total parallelism is
 //     CONSTANT, so it carries no ranking signal.
-//   - SMEM-only budget: the doc's Max.cache gate counts SMEM caches; FRAG
-//     sites are register-budgeted by the LOWER pass per its spec's ruling.
 package tiling
 
 import (
+	"fmt"
 	"sort"
 
 	"tcacomp/internal/analysis/loopforest"
@@ -46,19 +71,39 @@ import (
 
 // schedResult is one LNT's search product: per-iter decisions (keyed by the
 // ITER node — the pass converts to BIV keys at record assembly), per-site
-// decisions keyed by MemLoad node id, and the chosen schedule's score.
+// decisions keyed by MemLoad node id, the chosen schedule's score, and the
+// chosen schedule's kernel-wide budget consumption (what the caller adds to
+// the running floors for the next LNT).
 type schedResult struct {
 	iters map[ir.Node]IterDecision
 	sites map[uint64]SiteDecision
 	score float64
+	smem  int // the chosen schedule's promoted-SMEM window bytes
+	frag  int // the chosen schedule's promoted-FRAG per-thread bytes
+}
+
+// schedCtx is the per-schedule portion context the judge, the window-bytes
+// model, and the per-thread reuse accounting share.
+type schedCtx struct {
+	// warpsPerPortion is the warp quantum: total warps / PortionWarp.
+	warpsPerPortion int
+	// warpPortion is the EFFECTIVE independent warp portion (explicit
+	// Params.WarpPortion, or the auto rule: AutoWarpPortion when the
+	// vector carries a CTA dim, else PortionWarp).
+	warpPortion int
+	// coupledThreads is the CTA dim's coupled inside-walk thread count:
+	// the remaining warp portions x quantum x 32 (0 when no CTA dim).
+	coupledThreads int
 }
 
 // searchSchedule enumerates the PSched space of one LNT and returns the
-// best schedule under the objective. Enumeration order is fixed — SoC
-// odometer order (the outermost window level is the most significant
-// digit), tiles ascending within each vector — and selection keeps the
-// FIRST strict maximum, so the result is deterministic (INV).
-func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
+// best schedule under the objective, gated by the KERNEL-WIDE budget floors
+// already consumed by earlier LNTs (R3/F6: feasibility accumulates across
+// LNTs — the caller threads the running totals through). Enumeration order
+// is fixed — SoC odometer order (the outermost window level is the most
+// significant digit), tiles ascending within each vector — and selection
+// keeps the FIRST strict maximum, so the result is deterministic (INV).
+func searchSchedule(lf lntFacts, p Params, smemFloor, fragFloor int) (schedResult, error) {
 	window := windowOf(lf, p)
 	soc := make([]SoCType, len(window))
 	var best schedResult
@@ -73,9 +118,12 @@ func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
 		// the enumeration.
 		if hasCTALevel(soc) && v0PolicyClean(soc) {
 			for _, tile := range tileCandidates(p) {
-				res, ok := evalSchedule(f, lf, window, soc, tile, p)
+				res, ok, err := evalSchedule(lf, window, soc, tile, p, smemFloor, fragFloor)
+				if err != nil {
+					return schedResult{}, err // e.g. the F2 coupled-portion floor
+				}
 				if !ok {
-					continue // infeasible (SMEM budget): skipped
+					continue // infeasible (kernel-wide budget): skipped
 				}
 				if !found || res.score > best.score {
 					best, found = res, true
@@ -98,8 +146,8 @@ func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
 	}
 	if !found {
 		// Defensive: the t=1 point of any CTA-carrying vector is always
-		// feasible (nothing promotes at tile 1, so the SMEM sum is 0), so
-		// this is unreachable for validated Params — but a search that
+		// budget-feasible (nothing promotes at tile 1, so both sums are 0),
+		// so this is unreachable for validated Params — but a search that
 		// found nothing still owes every LNT a schedule. The legacy
 		// all-sequential fallback is INVALID under the >= 1-CTA ruling (an
 		// LNT without a CTA dim cannot execute under the CUDA thread
@@ -109,20 +157,24 @@ func searchSchedule(f loopforest.Forest, lf lntFacts, p Params) schedResult {
 		if len(fb) > 0 {
 			fb[0] = SoCTA
 		}
-		res, _ := evalSchedule(f, lf, window, fb, 1, p)
-		return res
+		res, _, err := evalSchedule(lf, window, fb, 1, p, smemFloor, fragFloor)
+		if err != nil {
+			return schedResult{}, err
+		}
+		return res, nil
 	}
-	return best
+	return best, nil
 }
 
 // evalSchedule scores one candidate (window SoC vector + uniform tile):
 // portion-grammar LoC completion, full per-iter decision map (window
 // assignments plus the sequential defaults for every non-window iter), the
-// promotion judge + traffic over the candidate sites, and the SMEM
-// feasibility gate. The portion grammar holds by construction: the (at
-// most one) CTA dim exhausts the CTA space (portion -1/full) and the (at
-// most one) independent warp dim takes its portion of the warp space.
-func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCType, tile int, p Params) (schedResult, bool) {
+// promotion judge + traffic over the candidate sites, and the KERNEL-WIDE
+// budget feasibility gates (the floors are what earlier LNTs already
+// consume; R3/F6). The portion grammar holds by construction: the (at most
+// one) CTA dim exhausts the CTA space (portion -1/full) and the (at most
+// one) independent warp dim takes its portion of the warp space.
+func evalSchedule(lf lntFacts, window []ir.Node, soc []SoCType, tile int, p Params, smemFloor, fragFloor int) (schedResult, bool, error) {
 	treeIters := treeItersOf(lf.Tree)
 	iters := make(map[ir.Node]IterDecision, len(treeIters))
 	for _, it := range treeIters {
@@ -138,8 +190,8 @@ func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCT
 	//     space, so LoC = MaxCTA.
 	//   - SoCWARP: LoC = warpPortion x warpsPerPortion warps, where
 	//     warpsPerPortion = (MaxThreadsPerCTA/32)/PortionWarp. The CTA
-	//     dim's coupled tile-inside walk implicitly consumes the REMAINING
-	//     warp portions; its stride is derived by the lower pass, not
+	//     dim's coupled tile-inside walk consumes the REMAINING warp
+	//     portions; its stride is derived by the lower pass, not
 	//     recorded. warpPortion is p.WarpPortion, or auto (0):
 	//     AutoWarpPortion when the vector carries a CTA dim (the coupled
 	//     inside needs the remaining portions, >= 1), else PortionWarp
@@ -154,6 +206,23 @@ func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCT
 			warpPortion = PortionWarp
 		}
 	}
+	// COUPLED-PORTION FLOOR (F2, ruled 2026-10-21): whenever the LNT
+	// carries a CTA dim, the independent WarpPortion must leave >= 1 warp
+	// portion for the coupled inside walk. A violation is a configuration
+	// error, not a skip: every feasible vector for a CTA-carrying LNT
+	// would emit a zero-stride inside loop, so the evaluation fails loud
+	// (defensive error at schedule evaluation — tiling-verify re-checks
+	// the same floor on published records).
+	if hasCTALevel(soc) && warpPortion > PortionWarp-1 {
+		return schedResult{}, false, fmt.Errorf(
+			"tiling: WarpPortion %d leaves %d warp portion(s) for the CTA dim's coupled inside walk — the coupled-portion floor (F2) demands >= 1, i.e. WarpPortion <= PortionWarp-1 = %d whenever the LNT carries a CTA dim (a zero-portion coupled walk is a zero-stride inside loop)",
+			warpPortion, PortionWarp-warpPortion, PortionWarp-1)
+	}
+	ctx := schedCtx{
+		warpsPerPortion: warpsPerPortion,
+		warpPortion:     warpPortion,
+		coupledThreads:  (PortionWarp - warpPortion) * warpsPerPortion * 32,
+	}
 	for i := range window {
 		d := IterDecision{SoC: soc[i], LoC: 1, TileSize: tile}
 		switch soc[i] {
@@ -166,20 +235,31 @@ func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCT
 	}
 
 	res := schedResult{iters: iters, sites: make(map[uint64]SiteDecision, len(lf.CS))}
-	traffic, smem := 0, 0
+	traffic := 0
 	for _, sf := range lf.CS { // slice order: deterministic float summation
-		prom, class := judgeSite(sf, iters, p)
-		bytes := siteBytesPerTile(sf, iters)
-		if prom {
-			traffic += bytes * (siteReuseCount(f, sf, iters, p) - 1)
-			if class == ClassSMEM {
-				smem += bytes
+		j := judgeSite(sf, iters, ctx, p)
+		if j.promoted {
+			traffic += j.bytes * (j.reuse - 1)
+			switch j.class {
+			case ClassSMEM:
+				res.smem += j.bytes
+			case ClassFRAG:
+				res.frag += j.bytes
 			}
 		}
-		res.sites[sf.Load.BasePtr().ID()] = SiteDecision{Promoted: prom, Tie: sf.Tie, Class: class}
+		res.sites[sf.Load.BasePtr().ID()] = SiteDecision{
+			Promoted: j.promoted, Tie: sf.Tie, Class: j.class,
+			Reuse: j.reuse, Bytes: j.bytes, Reason: j.reason,
+		}
 	}
-	if smem > p.MaxCache {
-		return schedResult{}, false // SMEM budget gate
+	// KERNEL-WIDE budget gates (R3 SMEM scope + F6 FRAG budget): the
+	// floors are what earlier LNTs' chosen schedules already consume; the
+	// same sums are what tiling-verify and the lower's resolveBudget gate.
+	if smemFloor+res.smem > p.MaxCache {
+		return schedResult{}, false, nil // kernel-wide SMEM budget gate
+	}
+	if fragFloor+res.frag > p.MaxFragPerThread {
+		return schedResult{}, false, nil // kernel-wide FRAG budget gate
 	}
 
 	// SINGLE-TERM OBJECTIVE (loop_tiling.md "Objective Function ...,
@@ -187,143 +267,134 @@ func evalSchedule(f loopforest.Forest, lf lntFacts, window []ir.Node, soc []SoCT
 	// is CONSTANT under mandatory per-LNT exhaustion, so the deleted
 	// weighted parallelism term carried no ranking signal.
 	res.score = float64(traffic)
-	return res, true
+	return res, true, nil
 }
 
-// judgeSite is the doc's promotion judge ("Judge Criterial"), over the
-// load's subscript positions (rank >= CacheDims is guaranteed by the
-// Task-1 admission filter):
+// siteJudgment is the promotion judge's product for one site.
+type siteJudgment struct {
+	promoted bool
+	class    CacheClass
+	reuse    int // per-thread re-traversal within one fill epoch
+	bytes    int // window-model footprint
+	reason   string
+}
+
+// judgeSite is the doc's promotion judge ("Judge Criterial"), as amended
+// 2026-10-21 (R2 tier rule + F4 drop-rule gate + F6 frag budget + the
+// per-thread reuse gate). The site is classified by the SoC of its COVERED
+// dims (the cached trailing dimensions; rank >= CacheDims is guaranteed by
+// the admission filter):
 //
-//   - GATE: any CTA-assigned iter referenced at the LAST subscript position
-//     blocks promotion (the last dim crosses CTA boundaries — no coherent
-//     cache line). An iter with NO decision fails closed the same way.
-//   - GATE: any covered iter with tile_size 1 blocks promotion (the doc's
-//     "if tile_size == 1 for a specific iteration, cache is NOT promoted").
-//   - CLASS: the last two positions (xn-1, xn) both fully sequential ->
-//     ClassFRAG (the access lives in a single thread); otherwise ->
-//     ClassSMEM (within a CTA but not within a single thread). A position
-//     referencing an iter with no decision counts as non-sequential.
-func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, p Params) (bool, CacheClass) {
-	if len(sf.AxesIters) == 0 {
-		return false, ClassNone
-	}
-	last := sf.AxesIters[len(sf.AxesIters)-1]
-	for _, it := range last {
-		d, ok := iters[it]
-		if !ok {
-			return false, ClassNone // unknown assignment: fail closed
-		}
-		if d.SoC == SoCTA {
-			return false, ClassNone // CTA at the last position
-		}
+//   - GATE: any covered dim CTA-assigned -> the site is REFUSED (a
+//     CTA-covered tile has no coherent fill variant under the v0
+//     mechanics). An iter with NO decision fails closed the same way.
+//   - GATE: any covered dim with tile_size 1 blocks promotion (F4: the
+//     judge's gate matches the lower's drop rule — ANY covered iter at
+//     tile 1, not only all of them).
+//   - TIER: any covered dim WARP-assigned -> ClassSMEM (the window class:
+//     cooperative LoadTileCta, window-sized buffer); all covered dims
+//     sequential -> ClassFRAG (per-thread LoadTileThread).
+//   - GATE: a FRAG site's per-thread bytes must fit MaxFragPerThread (F6).
+//   - GATE: per-thread reuse < 2 -> not promoted (bytes loaded once and
+//     read once avoid no traffic on the owning thread's behalf).
+func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx, p Params) siteJudgment {
+	if len(sf.Covered) == 0 {
+		return siteJudgment{reason: ReasonEmptyCovered}
 	}
 	for _, c := range sf.Covered {
 		d, ok := iters[c]
-		if !ok || d.TileSize < 1 {
-			return false, ClassNone // unknown/invalid tile: fail closed
+		if !ok {
+			return siteJudgment{reason: ReasonUnknownIter} // unknown assignment: fail closed
+		}
+		if d.SoC == SoCTA {
+			return siteJudgment{reason: ReasonCTACovered} // R2 tier refusal
+		}
+		if d.TileSize < 1 {
+			return siteJudgment{reason: ReasonUnknownIter} // invalid tile: fail closed
 		}
 		if d.TileSize == 1 {
-			return false, ClassNone // tiling disabled on a covered dim
+			return siteJudgment{reason: ReasonTileOne} // tiling disabled on a covered dim
 		}
 	}
-	if len(sf.AxesIters) >= 2 &&
-		positionSequential(sf.AxesIters[len(sf.AxesIters)-2], iters) &&
-		positionSequential(last, iters) {
-		return true, ClassFRAG
-	}
-	return true, ClassSMEM
-}
-
-// positionSequential reports whether every iter referenced at one
-// subscript position holds a sequential assignment (unknown iters count as
-// non-sequential — the caller's fail-closed stance).
-func positionSequential(axis []ir.Node, iters map[ir.Node]IterDecision) bool {
-	for _, it := range axis {
-		d, ok := iters[it]
-		if !ok || d.SoC != SoCSequential {
-			return false
+	class := ClassFRAG
+	for _, c := range sf.Covered {
+		if iters[c].SoC == SoCWARP {
+			class = ClassSMEM
+			break
 		}
 	}
-	return true
+	bytes := siteWindowBytes(sf, iters)
+	if class == ClassFRAG && bytes > p.MaxFragPerThread {
+		return siteJudgment{class: class, bytes: bytes, reason: ReasonFragBytes}
+	}
+	reuse := siteReuseCount(sf, iters, ctx)
+	if reuse < 2 {
+		return siteJudgment{class: class, reuse: reuse, bytes: bytes, reason: ReasonLowReuse}
+	}
+	return siteJudgment{promoted: true, class: class, reuse: reuse, bytes: bytes}
 }
 
-// siteBytesPerTile is the site's post-demotion footprint: element size
-// times the product of the covered iters' tile sizes (RULE 3).
-func siteBytesPerTile(sf SiteFacts, iters map[ir.Node]IterDecision) int {
+// siteWindowBytes is the site's post-demotion footprint under the
+// WINDOW-BYTES model (R2, ruled 2026-10-21 — rank-in-index =>
+// window-in-shape): element size x the product over the covered dims of
+// (alloc_d x tile_size_d), where alloc_d is the number of execution
+// slots partitioning that dim's round window in the schedule:
+//
+//   - SEQ dim: 1 (the tile alone — one thread's sequential chunk),
+//   - WARP dim: LoC_d x 32 threads (the whole group's round window, NOT
+//     the single-thread chunk),
+//   - CTA dim: LoC_d CTAs (the CTA group's round window; such sites are
+//     refused by the tier rule regardless — the value stays well-defined
+//     for diagnostics).
+func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision) int {
 	e, ok := elemTypeOf(sf.Load)
 	if !ok {
 		return 0 // unavailable element type: contributes no traffic (fail closed)
 	}
 	bytes := elemBytes(e)
 	for _, c := range sf.Covered {
-		if d, ok := iters[c]; ok && d.TileSize > 1 {
-			bytes *= d.TileSize
+		d, ok := iters[c]
+		if !ok || d.TileSize < 1 {
+			return 0
 		}
+		alloc := 1
+		switch d.SoC {
+		case SoCWARP:
+			alloc = d.LoC * 32
+		case SoCTA:
+			alloc = d.LoC
+		}
+		bytes *= alloc * d.TileSize
 	}
 	return bytes
 }
 
-// siteReuseCount is the site's reuse factor: the product over the reuse
-// dims — {tie} plus the LNT iters strictly inner than the tie, minus
-// covered — of ceil(extent_d / tile_d). Extents come from the BIV max
-// operand via ir.ConstValueOf; a non-const (symbolic) extent contributes
-// the NominalExtent factor.
-func siteReuseCount(f loopforest.Forest, sf SiteFacts, iters map[ir.Node]IterDecision, p Params) int {
-	covered := make(map[ir.Node]bool, len(sf.Covered))
-	for _, c := range sf.Covered {
-		covered[c] = true
-	}
+// siteReuseCount is the site's PER-THREAD reuse factor (ruled 2026-10-21):
+// re-traversal by the OWNING thread within one fill epoch — the product
+// over the site's precomputed reuse dims ({tie} plus the LNT iters strictly
+// inner than the tie, minus covered) of the thread's own trip count of
+// that dim's INSIDE walk, the only loops that run inside the fill position:
+//
+//   - SEQ dim: T_d (the sequential tile-interior walk),
+//   - WARP dim: T_d (the owned chunk's sequential walk),
+//   - CTA dim: ceil(T_d / coupledThreads) (the coupled element-stride
+//     walk — the thread owns every coupledThreads-th element).
+//
+// Re-traversal by OTHER threads never counts toward the site's reuse.
+func siteReuseCount(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx) int {
 	reuse := 1
-	consider := func(it ir.Node) {
-		if covered[it] {
-			return
+	for _, it := range sf.ReuseDims {
+		d, ok := iters[it]
+		if !ok || d.TileSize < 1 {
+			return 0 // unknown dim: fail closed (no reuse claim)
 		}
-		tile := 1
-		if d, ok := iters[it]; ok && d.TileSize > 0 {
-			tile = d.TileSize
+		trips := d.TileSize
+		if d.SoC == SoCTA {
+			trips = ceilDiv(d.TileSize, ctx.coupledThreads)
 		}
-		reuse *= ceilDiv(extentOf(it, p), tile)
-	}
-	if sf.Tie != nil {
-		consider(sf.Tie)
-	}
-	for _, it := range sf.Levels { // the LNT's iters, inner -> outer
-		if sf.Tie != nil && it == sf.Tie {
-			continue
-		}
-		if sf.Tie == nil || depthOfIter(f, it) > depthOfIter(f, sf.Tie) {
-			consider(it)
-		}
+		reuse *= trips
 	}
 	return reuse
-}
-
-// depthOfIter returns the iter's forest depth (-1 for non-members).
-func depthOfIter(f loopforest.Forest, it ir.Node) int {
-	node, ok := f.NodeOf(it)
-	if !ok {
-		return -1
-	}
-	return node.Depth
-}
-
-// extentOf reads an iter's static extent from its BIV's max operand; a
-// non-const or malformed bound yields the NominalExtent stand-in, and a
-// non-positive constant is clamped to 1 (a malformed extent must not
-// produce a zero reuse factor).
-func extentOf(iter ir.Node, p Params) int {
-	deps := ir.DataDeps(iter)
-	if len(deps) == 0 {
-		return p.NominalExtent
-	}
-	ops := ir.DataDeps(deps[0])
-	if len(ops) < 2 {
-		return p.NominalExtent
-	}
-	if v, ok := ir.ConstValueOf(ops[1]); ok && v >= 1 {
-		return int(v)
-	}
-	return p.NominalExtent
 }
 
 // ceilDiv is the ceiling of a/b over positive integers.

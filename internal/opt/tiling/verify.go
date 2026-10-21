@@ -70,18 +70,31 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //   - PRESENCE: the cache holds a *Record under "tiling-record".
 //   - COVERAGE: every live Iter of every forest tree has a per-Iter entry
 //     under its BIV; every site key resolves to a live (non-erased)
-//     MemLoad; every re-derived candidate site has its record entry.
+//     MemLoad; every re-derived candidate site has its record entry; and
+//     every re-derived NON-CANDIDATE (R4: cross-LNT INS, empty INS, no
+//     forest member) has its explicit record entry — fail-closed, a
+//     silently dropped load is corruption.
 //   - FEASIBILITY (per LNT, the final model): the Params re-validation at
 //     the top re-checks the assert-and-trap divisibility (MaxCTA a
 //     PortionCTA multiple, warps a PortionWarp multiple); at least one
 //     CTA entry; the v0 policy (at most one CTA and one independent WARP
 //     entry); the CTA LoC == MaxCTA (portion -1/full); the warp LoC is a
-//     warp-portion multiple (LoC/quantum in [1, PortionWarp]); sequential
+//     warp-portion multiple (LoC/quantum in [1, PortionWarp]); the
+//     COUPLED-PORTION FLOOR (F2): an LNT carrying a CTA dim and a WARP dim
+//     must leave >= 1 warp portion for the coupled inside walk; sequential
 //     entries carry LoC 1; every LoC and TileSize >= 1; every SoC known.
 //   - SITE well-formedness: a promoted site's Tie is a live iter of the
-//     site's LNT or nil; its class is SMEM or FRAG; and the recomputed
-//     SMEM footprint (element size x covered tile sizes) stays within
-//     MaxCache.
+//     site's LNT or nil; its class is SMEM or FRAG; and the site decision
+//     MATCHES the promotion judge re-run over the record's own schedule
+//     (promotion flag, class, Reuse, Bytes — a divergence is corruption).
+//   - KERNEL-WIDE BUDGETS (R3 + F6): the recomputed SMEM window-bytes sum
+//     and the per-thread FRAG sum, accumulated over ALL LNTs' promoted
+//     sites, stay within MaxCache / MaxFragPerThread — the SAME sums the
+//     decide feasibility and the lower's budget resolution gate.
+//   - FORLOOP STEP: every live ForLoop's dimvar step is a positive const
+//     (a zero/negative stride is an infinite/empty loop — the IR-verifier
+//     version of this invariant lands with T4; tiling-verify enforces it
+//     now).
 //
 // Gates mirror the decide pass: a nil graph and a materialized/CFG-carrying
 // graph are deterministic errors evaluated before anything is read.
@@ -110,7 +123,7 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	// Re-derive the forest and the overlap facts — never shared state.
 	f := loopforest.Analyze(g)
 	se := sideeffect.Analyze(g)
-	all := analyzeOverlap(g, f, se, v.Params)
+	op := analyzeOverlap(g, f, se, v.Params)
 
 	// COVERAGE (iters): every live Iter of every tree has an entry.
 	for _, root := range f.Roots() {
@@ -141,6 +154,20 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		}
 	}
 
+	// COVERAGE (non-candidates, R4): every re-derived non-candidate load
+	// has its explicit record entry, and the entry is NOT promoted.
+	for id, want := range op.NonCandidates {
+		sd, ok := rec.Sites[id]
+		if !ok {
+			return fmt.Errorf("tiling-verify: %s load node %d has no record entry (non-candidates are declared, never silently dropped)",
+				want.Reason, id)
+		}
+		if sd.Promoted {
+			return fmt.Errorf("tiling-verify: load node %d is declared non-candidate (%s) but its record entry is promoted",
+				id, want.Reason)
+		}
+	}
+
 	// FEASIBILITY, per LNT — the final portion-grammar model. The legacy
 	// CTA-product / warp-sum bounds are subsumed: the single CTA dim must
 	// exhaust MaxCTA exactly (portion -1/full), and a warp LoC that is a
@@ -148,7 +175,7 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	// warp space.
 	warpsPerPortion := (v.Params.MaxThreadsPerCTA / 32) / PortionWarp
 	for _, root := range f.Roots() {
-		ctaCount, warpCount := 0, 0
+		ctaCount, warpCount, warpPortion := 0, 0, 0
 		for _, it := range treeItersOf(root) {
 			biv, err := bivOf(it)
 			if err != nil {
@@ -173,10 +200,12 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				}
 			case SoCWARP:
 				warpCount++
-				if portion := d.LoC / warpsPerPortion; d.LoC%warpsPerPortion != 0 || portion < 1 || portion > PortionWarp {
+				portion := d.LoC / warpsPerPortion
+				if d.LoC%warpsPerPortion != 0 || portion < 1 || portion > PortionWarp {
 					return fmt.Errorf("tiling-verify: iter node %d carries warp LoC %d, not a warp-portion multiple (quantum %d warps, portion in [1, %d])",
 						it.BasePtr().ID(), d.LoC, warpsPerPortion, PortionWarp)
 				}
+				warpPortion = portion
 			default:
 				return fmt.Errorf("tiling-verify: iter node %d carries unknown SoC %d",
 					it.BasePtr().ID(), int(d.SoC))
@@ -194,51 +223,144 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries %d independent WARP dims, violating the v0 policy (at most one)",
 				root.Iter.BasePtr().ID(), warpCount)
 		}
+		// COUPLED-PORTION FLOOR (F2, ruled 2026-10-21): an LNT carrying a
+		// CTA dim must leave >= 1 warp portion for its coupled inside walk
+		// — WarpPortion <= PortionWarp-1 there. A violating record would
+		// lower into a zero-stride inside loop (an infinite loop).
+		if warpCount == 1 && warpPortion > PortionWarp-1 {
+			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries a CTA dim and warp portion %d — the coupled-portion floor (F2) demands WarpPortion <= PortionWarp-1 = %d so the coupled inside walk keeps >= 1 portion",
+				root.Iter.BasePtr().ID(), warpPortion, PortionWarp-1)
+		}
 	}
 
-	// SITE well-formedness + the recomputed SMEM budget, over the
-	// re-derived candidate sites.
-	smem := 0
-	for _, lf := range all {
+	// SITE checks over the re-derived candidate sites, in precedence
+	// order: (1) presence; (2) the KERNEL-WIDE budget recomputation (R3
+	// SMEM scope, F6 FRAG budget) over the judge's window bytes; (3) the
+	// structural well-formedness of promoted entries; (4) the judge
+	// cross-check — the record must agree with the promotion judge re-run
+	// over the record's own schedule (promotion flag, class, reuse, and
+	// bytes alike; a divergence is corruption).
+	type siteCheck struct {
+		lf *lntFacts
+		sf SiteFacts
+		sd SiteDecision
+		j  siteJudgment
+	}
+	var checks []siteCheck
+	smem, frag := 0, 0
+	for i := range op.Trees {
+		lf := &op.Trees[i]
 		dec := make(map[ir.Node]IterDecision, len(lf.Levels))
+		hasCTA := false
 		for _, it := range treeItersOf(lf.Tree) {
 			biv, err := bivOf(it)
 			if err != nil {
 				return fmt.Errorf("tiling-verify: %w", err)
 			}
 			dec[it] = rec.Iters[biv]
+			if dec[it].SoC == SoCTA {
+				hasCTA = true
+			}
+		}
+		// Rebuild the judge's portion context from the record + Params,
+		// mirroring evalSchedule's resolution (explicit WarpPortion, else
+		// auto: AutoWarpPortion when the LNT carries a CTA dim).
+		warpPortion := v.Params.WarpPortion
+		if warpPortion == 0 {
+			if hasCTA {
+				warpPortion = AutoWarpPortion
+			} else {
+				warpPortion = PortionWarp
+			}
+		}
+		ctxSchedule := schedCtx{
+			warpsPerPortion: warpsPerPortion,
+			warpPortion:     warpPortion,
+			coupledThreads:  (PortionWarp - warpPortion) * warpsPerPortion * 32,
 		}
 		for _, sf := range lf.CS {
-			sd, ok := rec.Sites[sf.Load.BasePtr().ID()]
+			id := sf.Load.BasePtr().ID()
+			sd, ok := rec.Sites[id]
 			if !ok {
-				return fmt.Errorf("tiling-verify: candidate site node %d has no record entry",
-					sf.Load.BasePtr().ID())
+				return fmt.Errorf("tiling-verify: candidate site node %d has no record entry", id)
 			}
-			if !sd.Promoted {
-				continue
-			}
-			if sd.Tie != nil {
-				if _, ok := f.NodeOf(sd.Tie); !ok || sd.Tie.BasePtr().Erased() {
-					return fmt.Errorf("tiling-verify: promoted site node %d tie node %d is not a live iter",
-						sf.Load.BasePtr().ID(), sd.Tie.BasePtr().ID())
+			j := judgeSite(sf, dec, ctxSchedule, v.Params)
+			checks = append(checks, siteCheck{lf: lf, sf: sf, sd: sd, j: j})
+			if sd.Promoted {
+				switch sd.Class {
+				case ClassSMEM:
+					smem += j.bytes
+				case ClassFRAG:
+					frag += j.bytes
 				}
-				if rootTreeOf(f, sd.Tie) != lf.Tree {
-					return fmt.Errorf("tiling-verify: promoted site node %d tie node %d belongs to another LNT",
-						sf.Load.BasePtr().ID(), sd.Tie.BasePtr().ID())
-				}
-			}
-			if sd.Class != ClassSMEM && sd.Class != ClassFRAG {
-				return fmt.Errorf("tiling-verify: promoted site node %d carries class %s",
-					sf.Load.BasePtr().ID(), sd.Class)
-			}
-			if sd.Class == ClassSMEM {
-				smem += siteBytesPerTile(sf, dec)
 			}
 		}
 	}
 	if smem > v.Params.MaxCache {
-		return fmt.Errorf("tiling-verify: recomputed SMEM footprint %d > MaxCache %d",
+		return fmt.Errorf("tiling-verify: recomputed kernel-wide SMEM footprint %d > MaxCache %d",
 			smem, v.Params.MaxCache)
+	}
+	if frag > v.Params.MaxFragPerThread {
+		return fmt.Errorf("tiling-verify: recomputed kernel-wide FRAG footprint %d > MaxFragPerThread %d",
+			frag, v.Params.MaxFragPerThread)
+	}
+	for _, c := range checks {
+		id := c.sf.Load.BasePtr().ID()
+		if !c.sd.Promoted {
+			continue
+		}
+		if c.sd.Tie != nil {
+			if _, ok := f.NodeOf(c.sd.Tie); !ok || c.sd.Tie.BasePtr().Erased() {
+				return fmt.Errorf("tiling-verify: promoted site node %d tie node %d is not a live iter",
+					id, c.sd.Tie.BasePtr().ID())
+			}
+			if rootTreeOf(f, c.sd.Tie) != c.lf.Tree {
+				return fmt.Errorf("tiling-verify: promoted site node %d tie node %d belongs to another LNT",
+					id, c.sd.Tie.BasePtr().ID())
+			}
+		}
+		if c.sd.Class != ClassSMEM && c.sd.Class != ClassFRAG {
+			return fmt.Errorf("tiling-verify: promoted site node %d carries class %s",
+				id, c.sd.Class)
+		}
+		if c.sd.Promoted != c.j.promoted || c.sd.Class != c.j.class ||
+			c.sd.Reuse != c.j.reuse || c.sd.Bytes != c.j.bytes {
+			return fmt.Errorf("tiling-verify: site node %d record (%v,%s,reuse %d,bytes %d) disagrees with the judge over its own schedule (%v,%s,reuse %d,bytes %d)",
+				id, c.sd.Promoted, c.sd.Class, c.sd.Reuse, c.sd.Bytes, c.j.promoted, c.j.class, c.j.reuse, c.j.bytes)
+		}
+	}
+
+	// FORLOOP dimvar steps: positive consts (the IR-verifier version of
+	// this invariant lands with T4; tiling-verify enforces it now).
+	if err := checkForLoopSteps(g); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkForLoopSteps asserts every live ForLoop's dimvar carries a POSITIVE
+// CONST step: ops = [dim, init, step] on the KindDimVar (node_dimvar.go).
+// A zero stride is an infinite loop (exactly the F2 failure mode), a
+// negative or symbolic stride is not a strided round enumeration at all.
+func checkForLoopSteps(g *ir.Graph) error {
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 || ops[0] == nil || ops[0].BasePtr() == nil || ops[0].BasePtr().Erased() {
+			return fmt.Errorf("tiling-verify: for-loop node %d carries no induction-variable operand",
+				n.BasePtr().ID())
+		}
+		dvOps := ir.DataDeps(ops[0])
+		if len(dvOps) < 3 || dvOps[2] == nil {
+			return fmt.Errorf("tiling-verify: for-loop node %d dimvar node %d carries no step operand",
+				n.BasePtr().ID(), ops[0].BasePtr().ID())
+		}
+		if step, ok := ir.ConstValueOf(dvOps[2]); !ok || step <= 0 {
+			return fmt.Errorf("tiling-verify: for-loop node %d dimvar step is not a positive const (a zero/negative stride is an infinite/empty loop)",
+				n.BasePtr().ID())
+		}
 	}
 	return nil
 }

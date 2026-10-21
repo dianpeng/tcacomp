@@ -90,10 +90,10 @@ func overlapOf(fx fixture, p Params) lntFacts {
 	se := sideeffect.Analyze(fx.g)
 	f := loopforest.Analyze(fx.g)
 	all := analyzeOverlap(fx.g, f, se, p)
-	if len(all) != 1 {
-		panic(fmt.Sprintf("chain fixture must yield exactly one LNT, got %d", len(all)))
+	if len(all.Trees) != 1 {
+		panic(fmt.Sprintf("chain fixture must yield exactly one LNT, got %d", len(all.Trees)))
 	}
-	return all[0]
+	return all.Trees[0]
 }
 
 // siteOf finds the CS entry of load.
@@ -275,6 +275,76 @@ func TestTieClampRank3(t *testing.T) {
 	assertIterSet(t, "covered(rhs3)", sr.Covered, fx.iters[1:])
 }
 
+// twoChains builds a graph with TWO independent root iter chains (A0->A1
+// and B0->B1) plus observation stores, so the forest holds two LNTs.
+func twoChains() (g *ir.Graph, a0, a1, b0, b1 ir.Node) {
+	g = ir.NewGraph("twochains")
+	f32 := ir.InternScalar(ir.TF32)
+	dim := func(name string) ir.Node { return g.NewInputParam("ctor", ir.RoleDim, name, nil) }
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}}))
+	chain := func(names ...string) (root, leaf ir.Node) {
+		var parent ir.Node
+		for _, n := range names {
+			dv := g.NewDimVar("ctor", dim(n), g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
+			biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", f32, 64))
+			parent = g.NewIter("ctor", biv, parent)
+			if root == nil {
+				root = parent
+			}
+			leaf = parent
+		}
+		return root, leaf
+	}
+	a0, a1 = chain("a0", "a1")
+	b0, b1 = chain("b0", "b1")
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, nil, g.NewConst("ctor", f32, 0))
+	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+	return g, a0, a1, b0, b1
+}
+
+// TestNonCandidateDeclarations pins the R4 fail-closed declarations: a
+// load whose INS spans >= 2 LNTs is NOT owned by any tree (the deepest-tree
+// ownership reading is retracted) and gets an explicit non-candidate entry
+// with the cross-LNT reason; a load with an empty INS (no iter references)
+// likewise gets an explicit never-bucketed entry — never a silent skip.
+func TestNonCandidateDeclarations(t *testing.T) {
+	g, _, a1, _, b1 := twoChains()
+	cross := g.NewMemLoad("ctor", tensorParam(g, "cross", 2),
+		[]ir.Node{iv(g, a1), iv(g, b1)}) // INS spans both trees
+	scalar := g.NewMemLoad("ctor", tensorParam(g, "bias", 2),
+		[]ir.Node{g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), g.NewConst("ctor", ir.InternScalar(ir.TF32), 1)})
+
+	se := sideeffect.Analyze(g)
+	f := loopforest.Analyze(g)
+	op := analyzeOverlap(g, f, se, DefaultParams())
+
+	if len(op.Trees) != 2 {
+		t.Fatalf("the fixture must yield two LNTs, got %d", len(op.Trees))
+	}
+	for _, lf := range op.Trees {
+		for _, sf := range lf.CS {
+			if sf.Load.BasePtr() == cross.BasePtr() {
+				t.Fatal("the cross-LNT load must never be admitted to any candidate set")
+			}
+		}
+	}
+	cd, ok := op.NonCandidates[cross.BasePtr().ID()]
+	if !ok {
+		t.Fatal("the cross-LNT load must carry an explicit non-candidate entry")
+	}
+	if cd.Promoted || cd.Reason != ReasonCrossLNT {
+		t.Fatalf("cross-LNT entry = (%v, %q), want (false, %q)", cd.Promoted, cd.Reason, ReasonCrossLNT)
+	}
+	sd, ok := op.NonCandidates[scalar.BasePtr().ID()]
+	if !ok {
+		t.Fatal("the empty-INS load must carry an explicit non-candidate entry")
+	}
+	if sd.Promoted || sd.Reason != ReasonEmptyINS {
+		t.Fatalf("empty-INS entry = (%v, %q), want (false, %q)", sd.Promoted, sd.Reason, ReasonEmptyINS)
+	}
+}
+
 // TestConstValueOf pins the new ir read face: consts report (value, true),
 // everything else reports (0, false).
 func TestConstValueOf(t *testing.T) {
@@ -309,7 +379,7 @@ func TestDefaultParams(t *testing.T) {
 	if p.WarpPortion != 0 {
 		t.Fatalf("WarpPortion default must be 0 (auto), got %d", p.WarpPortion)
 	}
-	if p.MaxCache != 65536 || p.CacheDims != 2 || p.MaxCS != 16 || p.WindowK != 5 || p.NominalExtent != 4096 {
+	if p.MaxCache != 65536 || p.MaxFragPerThread != 256 || p.CacheDims != 2 || p.MaxCS != 16 || p.WindowK != 5 || p.NominalExtent != 4096 {
 		t.Fatalf("secondary defaults changed: %+v", p)
 	}
 	wantTiles := []int{32, 64, 128, 256}
@@ -346,6 +416,8 @@ func TestParamsValidate(t *testing.T) {
 		{"windowk zero", func(p *Params) { p.WindowK = 0 }},
 		{"cachedims zero", func(p *Params) { p.CacheDims = 0 }},
 		{"maxcache negative", func(p *Params) { p.MaxCache = -1 }},
+		{"maxfrag zero", func(p *Params) { p.MaxFragPerThread = 0 }},
+		{"maxfrag negative", func(p *Params) { p.MaxFragPerThread = -8 }},
 		{"maxcs zero", func(p *Params) { p.MaxCS = 0 }},
 		{"nominalextent zero", func(p *Params) { p.NominalExtent = 0 }},
 	}

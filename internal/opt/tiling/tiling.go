@@ -74,6 +74,13 @@ func (Pass) Preserved() []string { return []string{RecordName} }
 //   - DERIVE: loopforest.Analyze and sideeffect.Analyze once per Run (the
 //     ValueEqual membership the overlap analysis threads), then per root —
 //     in allocation order — the overlap analysis and the PSched search.
+//   - KERNEL-WIDE BUDGETS (R3/F6, ruled 2026-10-21): the SMEM and FRAG
+//     sums accumulate across LNTs — each LNT's search is gated by the
+//     running totals the earlier LNTs' chosen schedules consume, and the
+//     chosen schedule's sums advance them. LNTs are decided in Roots()
+//     order, so the accumulation is deterministic.
+//   - NON-CANDIDATES (R4): the overlap product's explicit declarations
+//     (cross-LNT INS, empty INS) are published verbatim — never dropped.
 //   - PUBLISH: ctx.Cache.Put(record). A nil Context (or nil Cache) is
 //     tolerated — the pass is analysis-shaped and direct Run callers may
 //     have no manager; the decisions simply are not cached then.
@@ -90,12 +97,19 @@ func (p Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 
 	f := loopforest.Analyze(g)
 	se := sideeffect.Analyze(g)
+	op := analyzeOverlap(g, f, se, p.Params)
 	record := &Record{
 		Iters: make(map[ir.Node]IterDecision),
-		Sites: make(map[uint64]SiteDecision),
+		Sites: make(map[uint64]SiteDecision, len(op.NonCandidates)),
 	}
-	for _, lf := range analyzeOverlap(g, f, se, p.Params) {
-		res := searchSchedule(f, lf, p.Params)
+	smemFloor, fragFloor := 0, 0
+	for _, lf := range op.Trees {
+		res, err := searchSchedule(lf, p.Params, smemFloor, fragFloor)
+		if err != nil {
+			return err
+		}
+		smemFloor += res.smem
+		fragFloor += res.frag
 		for iter, d := range res.iters {
 			deps := ir.DataDeps(iter)
 			if len(deps) == 0 || deps[0] == nil {
@@ -106,6 +120,9 @@ func (p Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		for id, sd := range res.sites {
 			record.Sites[id] = sd
 		}
+	}
+	for id, sd := range op.NonCandidates {
+		record.Sites[id] = sd
 	}
 	if ctx != nil && ctx.Cache != nil {
 		ctx.Cache.Put(record)

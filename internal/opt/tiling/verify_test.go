@@ -18,10 +18,10 @@ import (
 // hand-built pipelines (the manager checks IDs only).
 type fakePass struct{ id string }
 
-func (f fakePass) ID() string                   { return f.id }
-func (fakePass) Requires() []string             { return nil }
-func (fakePass) Produces() opt.Stage            { return opt.StageConstructed }
-func (fakePass) Preserved() []string            { return nil }
+func (f fakePass) ID() string                      { return f.id }
+func (fakePass) Requires() []string                { return nil }
+func (fakePass) Produces() opt.Stage               { return opt.StageConstructed }
+func (fakePass) Preserved() []string               { return nil }
 func (fakePass) Run(*opt.Context, *ir.Graph) error { return nil }
 
 // runDecide runs the decide pass over g into a fresh cache and returns the
@@ -172,13 +172,19 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 
 	t.Run("promoted site tied outside its lnt", func(t *testing.T) {
 		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			// Target an already-promoted entry deterministically: forcing
+			// a DECLINED entry promoted would trip the budget gate first
+			// (a declined entry still carries its computed tier class and
+			// window bytes).
 			for id, d := range rec.Sites {
-				d.Promoted = true
+				if !d.Promoted {
+					continue
+				}
 				d.Tie = fx.g.NewConst("ctor", ir.InternScalar(ir.TF32), 1) // not an iter
 				rec.Sites[id] = d
 				return
 			}
-			t.Fatal("the matmul record must carry a site entry")
+			t.Fatal("the matmul record must carry a promoted site entry")
 		})
 		if !strings.Contains(err.Error(), "tie") {
 			t.Fatalf("foreign-tie error must name the tie, got %q", err.Error())
@@ -206,6 +212,104 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 			t.Fatalf("budget error must name MaxCache, got %q", err.Error())
 		}
 	})
+}
+
+// TestVerifyNonCandidateCoverage pins the R4 fail-closed coverage: over a
+// graph carrying a cross-LNT load, verify is GREEN when the record declares
+// the non-candidate entries, and FAILS when such an entry is missing (a
+// silently dropped load is corruption — never tolerated).
+func TestVerifyNonCandidateCoverage(t *testing.T) {
+	g, _, a1, _, b1 := twoChains()
+	cross := g.NewMemLoad("ctor", tensorParam(g, "cross", 2),
+		[]ir.Node{iv(g, a1), iv(g, b1)})
+
+	p := DefaultParams()
+	if err := verifyAfterTiling(t, g, p); err != nil {
+		t.Fatalf("verify must be green when the non-candidate entries are declared: %v", err)
+	}
+
+	cache, rec := runDecide(t, g, p)
+	sd, ok := rec.Sites[cross.BasePtr().ID()]
+	if !ok || sd.Promoted || sd.Reason != ReasonCrossLNT {
+		t.Fatalf("the decide record must declare the cross-LNT load, got (%v, %q)", ok, sd.Reason)
+	}
+	delete(rec.Sites, cross.BasePtr().ID())
+	err := verifyWith(g, cache, p)
+	if err == nil {
+		t.Fatal("verify must fail when a declared non-candidate load has no record entry")
+	}
+	if !strings.Contains(err.Error(), "no record entry") {
+		t.Fatalf("the missing non-candidate error must name the missing entry, got %q", err.Error())
+	}
+}
+
+// TestVerifyForLoopStep pins the ForLoop dimvar step-positive invariant
+// (enforced in tiling-verify now; the IR-verifier version lands with T4):
+// a ForLoop whose dimvar step is a zero const is rejected; a positive
+// const step passes.
+func TestVerifyForLoopStep(t *testing.T) {
+	mkFor := func(g *ir.Graph, step float64) ir.Node {
+		f32 := ir.InternScalar(ir.TU32)
+		d := g.NewInputParam("ctor", ir.RoleDim, "fd", nil)
+		dv := g.NewDimVar("ctor", d, g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, step))
+		return g.NewForLoop("ctor", dv, g.NewConst("ctor", f32, 64),
+			g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	}
+
+	t.Run("zero step rejected", func(t *testing.T) {
+		fx, _, _ := matmul()
+		mkFor(fx.g, 0)
+		cache, _ := runDecide(t, fx.g, DefaultParams())
+		err := verifyWith(fx.g, cache, DefaultParams())
+		if err == nil {
+			t.Fatal("a ForLoop with a zero dimvar step must be rejected (an infinite loop)")
+		}
+		if !strings.Contains(err.Error(), "step") {
+			t.Fatalf("the error must name the step, got %q", err.Error())
+		}
+	})
+
+	t.Run("positive const step green", func(t *testing.T) {
+		fx, _, _ := matmul()
+		mkFor(fx.g, 4)
+		if err := verifyAfterTiling(t, fx.g, DefaultParams()); err != nil {
+			t.Fatalf("a positive-const step must pass: %v", err)
+		}
+	})
+}
+
+// TestVerifyKernelWideFragGate pins the F6 kernel-wide gate at the verify
+// side: a genuine FRAG-promoting record (32 B at tile 8) verifies green
+// under the mirrored params, and the recomputed kernel-wide FRAG sum is
+// gated against THIS pass's MaxFragPerThread — a 31-byte budget flags it.
+func TestVerifyKernelWideFragGate(t *testing.T) {
+	fx, _, _ := matmul()
+	decideP := DefaultParams()
+	decideP.TileSizes = []int{8} // FRAG-friendly: lhs = 4·8 = 32 B, reuse 8
+	decideP.MaxCache = 100       // SMEM windows never fit: the FRAG tier wins
+
+	cache, rec := runDecide(t, fx.g, decideP)
+	var promotedFrag int
+	for _, sd := range rec.Sites {
+		if sd.Promoted && sd.Class == ClassFRAG {
+			promotedFrag += sd.Bytes
+		}
+	}
+	if promotedFrag != 32 {
+		t.Fatalf("the fixture must promote exactly one 32 B FRAG site, got %d B", promotedFrag)
+	}
+	if err := verifyWith(fx.g, cache, decideP); err != nil {
+		t.Fatalf("verify must be green under the mirrored params: %v", err)
+	}
+	tight := decideP
+	tight.MaxFragPerThread = 31
+	err := verifyWith(fx.g, cache, tight)
+	if err == nil {
+		t.Fatal("the kernel-wide FRAG gate must fire under a 31-byte budget")
+	}
+	if !strings.Contains(err.Error(), "MaxFragPerThread") {
+		t.Fatalf("the FRAG budget error must name MaxFragPerThread, got %q", err.Error())
+	}
 }
 
 // TestVerifyRequiresTiling pins the Requires enforcement: a pipeline of
