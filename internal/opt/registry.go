@@ -32,7 +32,8 @@ import (
 //	116   tile-lower (the decide→lower pair's lowering half: annotated tiled
 //	      loop nests + map-query intrinsics + SMEM/FRAG cache insertion)
 //	...   transformation passes slot between as they land
-//	900   late scheduling (schedule — the pre-codegen ordering fixup)
+//	900   scheduling (schedule — sea-of-nodes → AST-style CFG + LICM; the
+//	      final_lower transition point)
 //
 // Smaller priority = earlier. Equal priorities keep registration order
 // (stable sort), which is also the order init()s run in when only all.go

@@ -872,8 +872,9 @@ func TestGVNPipelineWiring(t *testing.T) {
 // pipeline — dce → dce-verify → gvn → gvn-verify, in registry order — over
 // a fixture with both dead code and duplicates, and confirms the end state
 // verifies. (The full BuildPipeline cannot run end-to-end today: the
-// cleanup passes refuse materialized graphs while schedule demands one —
-// Materialize slots between gvn-verify and schedule in the caller's flow.)
+// cleanup passes and schedule both refuse materialized graphs — schedule
+// consumes the Level-1 sea and emits the separate AST CFG — Materialize
+// slots between gvn-verify and schedule in the caller's flow.)
 func TestGVNL1PrefixPipelineInterop(t *testing.T) {
 	g := ir.NewGraph("full")
 	f32 := ir.InternScalar(ir.TF32)

@@ -1,26 +1,39 @@
+// Package schedule is the final optimization pass (quick-261021-ta3,
+// doc/optana/schedule.md): it brings the Level-1 sea-of-nodes back to an
+// AST-style CFG (Kernel → Group/Loop blocks) with scheduling-number LICM,
+// replacing the obsolete statement-level scheduler (deleted with this
+// rewrite — locked decision D-02). The emitted AST CFG lives in a SEPARATE
+// field on ir.Graph (locked decision D-01) and is consumed lastly by
+// final_lower and code generation (doc/optana/final_lower.md).
+//
+// scheduler.go is the pass proper: the fail-closed entry gates, then the
+// spec's Step 0/1/2 — nest forest (nest.go), SN initialization (loops and
+// their iv/bound header anchored at nest depth), max-propagation to
+// fixpoint over DataDeps+EffectDeps, containment clamping, per-LNT LBBN +
+// prologue/epilogue Groups, per-rank stable topological placement
+// (order.go), cluster concatenation, and the kernel metadata (Params/Gmem/
+// LNTs). The pass inserts NO runtime-object/glue nodes (locked decision
+// D-04): the empty prologue/epilogue Groups are the landing pads
+// final_lower later fills.
+//
+// Two documented readings of the spec's numbering, both required for the
+// algorithm to be correct on the real tile-lower output shape (see the
+// deviations in the plan's SUMMARY):
+//
+//   - "Iteration node" (spec 3.1) anchors the loop's HEADER — the ForLoop
+//     node plus its iv/bound operands — at the loop's nest depth, fixed
+//     during propagation. A body node only ever reaches the anchor through
+//     def chains (the loop→body edge is use→def, so the loop node itself
+//     is never in a body node's dependency closure), and the iv is exactly
+//     what loop-varying index math depends on.
+//   - A node's final SN is clamped to its deepest ENCLOSING loop depth
+//     (unenclosed nodes clamp to 0). Unclamped max-propagation would
+//     misplace the cross-nest effect-chained nodes tile-lower's
+//     repointChains creates (later-LNT chain heads and the end node point
+//     at earlier nests' roots) at ranks their structure cannot host; the
+//     clamp keeps SN and the enclosing structure consistent, which is also
+//     what makes the ownership assignment provably total.
 package schedule
-
-// scheduler.go is the optimization-pass scheduler (quick-261018-bl0 task 3,
-// R5): Materialize's default schedule is allocation order (D-7, the
-// deliberately minimal ir-tier default); THIS is the pass-level scheduler
-// the pipeline runs when it wants dependency order plus LICM. It is an
-// ordinary Pass (PASS-01/IR-07): ID "schedule", no requirements, produces
-// StageConstructed, preserves nothing.
-//
-// Run is three steps, all statement-level and built from the exported ir
-// read face only (StmtNodes/OperandsOf/PosetDeps/LambdaBodies/DataDeps/
-// EffectOf/Base.Statement) — the schedule package never reaches into ir
-// internals:
-//
-//  1. stable topological sort of the statement list (deps via the
-//     statement-ownership poset; ties keep the pre-existing list order);
-//  2. LICM over lowered for-loops, innermost-first, hoisting invariant
-//     pure computations before the outermost enclosing loop's statement;
-//  3. a second stable topo sort to fold the hoisted statements into
-//     dependency order.
-//
-// A dependency cycle (including a self-loop) fails closed with an error and
-// leaves the block untouched.
 
 import (
 	"errors"
@@ -32,508 +45,357 @@ import (
 )
 
 // init self-registers the scheduler in the global pass registry
-// (quick-261018-l36 requirement 9 point 4): importing this package — directly
-// or through internal/opt/all — is what makes "schedule" available to
-// BuildPipeline.
+// (quick-261018-l36 pattern): importing this package — directly or through
+// internal/opt/all — is what makes "schedule" available to BuildPipeline.
+// The ID and priority 900 are pinned by the locked decisions; Requires
+// pins tile-lower whose output shape — annotated KindForLoop nests — the
+// pass consumes (misconfiguration panics per the registry contract).
 func init() {
 	opt.Register(opt.PassSpec{
 		ID:       "schedule",
 		Priority: 900,
+		Requires: []string{"tile-lower"},
 		Factory:  func() opt.Pass { return Scheduler{} },
 	})
 }
 
-// Scheduler is the statement scheduler + LICM pass. It is stateless: every
-// Run re-derives the schedule from the graph, so re-runs are idempotent.
+// Scheduler is the sea-of-nodes → AST-style CFG + LICM pass. It is
+// stateless: every Run rebuilds the schedule from the graph and attaches a
+// fresh ASTKernel (the graph refuses a second attach).
 type Scheduler struct{}
 
 // ID returns the pipeline name "schedule".
 func (Scheduler) ID() string { return "schedule" }
 
-// Requires: the scheduler has no ordering preconditions.
-func (Scheduler) Requires() []string { return nil }
+// Requires pins tile-lower: the pass consumes its annotated KindForLoop
+// nest shape and refuses live raw-HIR iters that only tile-lower retires.
+func (Scheduler) Requires() []string { return []string{"tile-lower"} }
 
-// Produces: builder-output stage (it reorders statements; it introduces no
-// new node kinds), so the constructed legality window re-checks the graph.
+// Produces: builder-output stage — the pass adds no node kinds (D-04), so
+// the constructed legality window is the only populated row and re-checks
+// the untouched graph.
 func (Scheduler) Produces() opt.Stage { return opt.StageConstructed }
 
-// Preserved: nothing — every analysis is invalidated.
-func (Scheduler) Preserved() []string { return nil }
+// Preserved: the tiling-record analysis cache entry survives scheduling —
+// final_lower fetches it for per-LNT runtime mapping construction.
+func (Scheduler) Preserved() []string { return []string{"tiling-record"} }
 
-// Run executes topo sort → LICM → topo sort. A non-materialized graph is
-// refused with a deterministic message, never a partial schedule.
+// Run gates, then schedules the sea into the AST CFG per the spec's
+// Step 0/1/2. Every refusal is deterministic and leaves the graph's AST
+// unattached — never a partial schedule.
 func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
-	if g == nil || !g.Materialized() {
-		return errors.New("schedule: graph not materialized")
+	if g == nil {
+		return errors.New("schedule: nil graph")
 	}
-	if err := topoSchedule(g); err != nil {
-		return err
+	if g.Materialized() || g.CFG() != nil {
+		return errors.New("schedule: graph already materialized (schedule runs on the Level-1 sea)")
 	}
-	if err := licm(g); err != nil {
-		return err
+	if g.AST() != nil {
+		return errors.New("schedule: AST CFG already attached (one schedule per graph)")
 	}
-	return topoSchedule(g)
-}
-
-// topoSchedule re-establishes dependency order over the block's statements
-// with a stable Kahn sort: a statement's predecessors are the statements
-// owning the defs its tree depends on (data slots then ImpactBy payload,
-// ir.PosetDeps). Among ready statements the smallest list position wins, so
-// statements with no ordering constraint keep their pre-existing relative
-// order — on an already-ordered list the sort is the identity. A cycle
-// remainder fails closed and leaves the list untouched.
-func topoSchedule(g *ir.Graph) error {
-	bb := g.Block()
-	stmts := blockStatements(bb)
-	if len(stmts) == 0 {
-		return nil
-	}
-
-	owner := statementOwners(stmts)
-	preds, succs := statementEdges(stmts, owner)
-
-	pos := make(map[*ir.Statement]int, len(stmts))
-	for i, s := range stmts {
-		pos[s] = i
-	}
-	indeg := make(map[*ir.Statement]int, len(stmts))
-	ready := make([]*ir.Statement, 0, len(stmts))
-	for _, s := range stmts {
-		indeg[s] = len(preds[s])
-		if indeg[s] == 0 {
-			ready = append(ready, s)
-		}
-	}
-
-	var ordered []*ir.Statement
-	for len(ready) > 0 {
-		// Stable pick: the ready statement with the smallest list position.
-		best := 0
-		for i := 1; i < len(ready); i++ {
-			if pos[ready[i]] < pos[ready[best]] {
-				best = i
-			}
-		}
-		s := ready[best]
-		ready = append(ready[:best], ready[best+1:]...)
-		ordered = append(ordered, s)
-		for _, o := range succs[s] {
-			indeg[o]--
-			if indeg[o] == 0 {
-				ready = append(ready, o)
-			}
-		}
-	}
-
-	if len(ordered) != len(stmts) {
-		var stuck []uint64
-		emitted := make(map[*ir.Statement]bool, len(ordered))
-		for _, s := range ordered {
-			emitted[s] = true
-		}
-		for _, s := range stmts {
-			if !emitted[s] {
-				stuck = append(stuck, s.ID())
-			}
-		}
-		sort.Slice(stuck, func(i, j int) bool { return stuck[i] < stuck[j] })
-		return fmt.Errorf("schedule: dependency cycle among statements (scheduled %d of %d, stuck: %v)",
-			len(ordered), len(stmts), stuck)
-	}
-
-	// Apply: collect + relink. Statement IDs are stable (D-04) — only list
-	// order changes.
-	for _, s := range stmts {
-		bb.Remove(s)
-	}
-	for _, s := range ordered {
-		bb.Append(s)
-	}
-	return nil
-}
-
-// blockStatements collects the block's statements in list order.
-func blockStatements(bb *ir.BasicBlock) []*ir.Statement {
-	var out []*ir.Statement
-	if bb == nil {
-		return out
-	}
-	for s := bb.First(); s != nil; s = s.Next() {
-		out = append(out, s)
-	}
-	return out
-}
-
-// statementOwners maps every node appearing in any statement tree to its
-// owning statement. A node that roots a statement (Base.Statement != nil) is
-// owned by exactly that statement — this is what makes pass-inserted
-// statements (LICM hoists) win over the trees that still reference the
-// hoisted node. Any other node is owned by the first statement in block
-// order whose tree contains it.
-func statementOwners(stmts []*ir.Statement) map[*ir.Base]*ir.Statement {
-	owner := make(map[*ir.Base]*ir.Statement)
-	for _, s := range stmts {
-		for _, n := range ir.StmtNodes(s) {
-			b := n.BasePtr()
-			if root := b.Statement(); root != nil {
-				owner[b] = root
-				continue
-			}
-			if _, ok := owner[b]; !ok {
-				owner[b] = s
-			}
-		}
-	}
-	return owner
-}
-
-// statementEdges builds the predecessor/successor maps of the statement
-// dependency graph: for every owned node n of statement S, each live poset
-// def of n (data slots, then ImpactBy payload) owned by some statement O
-// contributes the edge O → S. A dep owned by S itself is an internal tree
-// edge and contributes nothing — EXCEPT a genuine self-dependency (d == n,
-// a node depending on itself), which is kept as a self-edge: it makes the
-// statement unschedulable, which the cycle remainder reports. InputParam
-// deps contribute nothing: kernel/lambda params are graph-owned leaves
-// produced by no statement (available from kernel entry), and since store
-// target accesses ride operand slots (Input/ImpactBy-only convention,
-// quick-261019-ktm revision) a shared tensor/dim param would otherwise
-// manufacture false cross-statement edges against the effect chains.
-func statementEdges(stmts []*ir.Statement, owner map[*ir.Base]*ir.Statement) (map[*ir.Statement][]*ir.Statement, map[*ir.Statement][]*ir.Statement) {
-	predSet := make(map[*ir.Statement]map[*ir.Statement]bool, len(stmts))
-	succs := make(map[*ir.Statement][]*ir.Statement, len(stmts))
-	for _, s := range stmts {
-		for _, n := range ir.StmtNodes(s) {
-			for _, d := range ir.PosetDeps(n) {
-				if d == nil {
-					continue
-				}
-				if d.BasePtr().KindOf() == ir.KindInputParam {
-					continue // graph-owned leaf: produced by no statement, order-free
-				}
-				o := owner[d.BasePtr()]
-				if o == nil {
-					continue // unowned (inline leaf): no statement edge
-				}
-				if o == s && d.BasePtr() != n.BasePtr() {
-					continue // internal tree edge: the dep lives inside this very statement
-				}
-				if predSet[s] == nil {
-					predSet[s] = make(map[*ir.Statement]bool)
-				}
-				if predSet[s][o] {
-					continue
-				}
-				predSet[s][o] = true
-				succs[o] = append(succs[o], s)
-			}
-		}
-	}
-	preds := make(map[*ir.Statement][]*ir.Statement, len(stmts))
-	for s, set := range predSet {
-		for o := range set {
-			preds[s] = append(preds[s], o)
-		}
-	}
-	return preds, succs
-}
-
-// licmHoistableKinds is the whitelist of kinds that may move out of a loop
-// body (pure scalar expressions and parameter leaves). Everything else —
-// memory family, loops, IV objects, stages — is pinned in place.
-var licmHoistableKinds = map[ir.Kind]bool{
-	ir.KindConst:      true,
-	ir.KindInputParam: true,
-	ir.KindParam:      true,
-	ir.KindBinOp:      true,
-	ir.KindUnaryOp:    true,
-	ir.KindSelect:     true,
-	ir.KindCast:       true,
-	ir.KindCall:       true,
-}
-
-// licm runs loop-invariant code motion over the lowered for-loops. For each
-// statement (block order), loops are processed innermost-first and
-// candidates are considered in StmtNodes order. A candidate hoists only
-// when it is invariant with respect to EVERY enclosing loop (else it stays
-// for a future pass). Hoisting splices a new statement — via the same
-// NewStatement factory Materialize uses — immediately before the EARLIEST
-// statement whose tree already contains the candidate: consumers are met
-// before their producers in StmtNodes order, so this insertion rule lands
-// every producer left of its consumers and keeps the ownership map acyclic
-// for the closing topo sort.
-func licm(g *ir.Graph) error {
-	bb := g.Block()
-	for _, s := range blockStatements(bb) {
-		nodes := ir.StmtNodes(s)
-		loops := make([]ir.Node, 0, 2)
-		for _, n := range nodes {
-			if n.KindOf() == ir.KindForLoop {
-				loops = append(loops, n)
-			}
-		}
-		if len(loops) == 0 {
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 			continue
 		}
-		an := newLoopAnalysis(nodes, loops)
+		if n.KindOf() == ir.KindIter {
+			return fmt.Errorf("schedule: live KindIter node %d — raw HIR iters must have been lowered by tile-lower",
+				n.BasePtr().ID())
+		}
+	}
+
+	// LIVE SET: mark everything reachable from the sea roots with ir.Walk
+	// (the same traversal checkLegality uses); erased and unreachable
+	// building debris is never scheduled.
+	g.ResetMarks()
+	defer g.ResetMarks()
+	ir.Walk(g, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
+		n.BasePtr().MarkAlive()
+		return ir.Descend
+	}))
+	nodes := g.AllocatedNodes()
+	live := make(map[ir.Node]bool, len(nodes))
+	allocIndex := make(map[ir.Node]int, len(nodes))
+	for i, n := range nodes {
+		allocIndex[n] = i
+		live[n] = n.BasePtr().Alive()
+	}
+
+	// STEP 0: the loop-nest forest. A non-erased ForLoop unreachable from
+	// the sea roots is dead debris: refuse it rather than schedule garbage.
+	roots := forLoopForest(g)
+	nests := allNests(roots)
+	for _, t := range nests {
+		if !live[t.loop] {
+			return fmt.Errorf("schedule: for-loop node %d is not reachable from the sea roots",
+				t.loop.BasePtr().ID())
+		}
+	}
+	sort.SliceStable(nests, func(i, j int) bool { return allocIndex[nests[i].loop] < allocIndex[nests[j].loop] })
+
+	// SN INITIALIZATION (spec 3.1): anchors — every ForLoop and its iv/bound
+	// header at the loop's nest depth, FIXED during propagation (letting a
+	// loop absorb its body's deeper rank would collapse the rank→block
+	// mapping; this is the design intent of "already scheduled" control
+	// nodes). A shared header node takes the MAX of its anchors'
+	// depths (order-independent). Every other live node starts at SN 0.
+	anchored := make(map[ir.Node]bool, len(nests)*3)
+	anchor := func(n ir.Node, depth int) {
+		if n == nil || !live[n] {
+			return
+		}
+		if !anchored[n] || n.BasePtr().SchedSN() < depth {
+			n.BasePtr().SetSched(depth, nil)
+		}
+		anchored[n] = true
+	}
+	for _, t := range nests {
+		anchor(t.loop, t.depth)
+		ops := ir.OperandsOf(t.loop)
+		if len(ops) >= 2 {
+			anchor(ops[0], t.depth) // iv
+			anchor(ops[1], t.depth) // bound
+		}
+	}
+
+	// Containment cap: the deepest loop whose body subtree contains n (0
+	// when unenclosed). A node can never land deeper than its structure
+	// allows, and an unenclosed node is a kernel-level statement (rank 0).
+	cap := make(map[ir.Node]int, len(nodes))
+	for _, t := range nests {
+		for n := range t.body {
+			if t.depth > cap[n] {
+				cap[n] = t.depth
+			}
+		}
+	}
+
+	// SN PROPAGATION (spec 3.2): fixpoint over AllocatedNodes in allocation
+	// order — SN(n) = max(SN(n), max SN over DataDeps then EffectDeps).
+	// Max-over-existing-values is monotone and bounded by the deepest nest
+	// depth, so it always terminates; anchored nodes never update.
+	for changed := true; changed; {
+		changed = false
 		for _, n := range nodes {
-			if !licmCandidate(n, an) {
+			if !live[n] || anchored[n] {
 				continue
 			}
-			hoisted := g.NewStatement(n) // appends at the tail; repositioned below
-			bb.Remove(hoisted)
-			bb.InsertBefore(hoisted, firstStatementContaining(bb, n))
-		}
-	}
-	return nil
-}
-
-// firstStatementContaining returns the earliest statement in block order
-// whose tree contains n. The statement being scheduled always qualifies
-// (its tree is where the candidate was found), so the result is never nil
-// for a candidate taken from a statement tree.
-func firstStatementContaining(bb *ir.BasicBlock, n ir.Node) *ir.Statement {
-	for s := bb.First(); s != nil; s = s.Next() {
-		for _, t := range ir.StmtNodes(s) {
-			if t.BasePtr() == n.BasePtr() {
-				return s
+			sn := n.BasePtr().SchedSN()
+			for _, d := range ir.DataDeps(n) {
+				if live[d] && d.BasePtr().SchedSN() > sn {
+					sn = d.BasePtr().SchedSN()
+				}
+			}
+			for _, d := range ir.EffectDeps(n) {
+				if live[d] && d.BasePtr().SchedSN() > sn {
+					sn = d.BasePtr().SchedSN()
+				}
+			}
+			if sn > n.BasePtr().SchedSN() {
+				n.BasePtr().SetSched(sn, nil)
+				changed = true
 			}
 		}
 	}
-	return nil
-}
-
-// loopAnalysis precomputes, for one statement, the per-loop body subtrees,
-// varying sets, and parent maps the candidate checks consume.
-type loopAnalysis struct {
-	loops []*loopInfo
-	pin   pinnedMemo
-}
-
-type loopInfo struct {
-	loop    ir.Node
-	body    map[*ir.Base]bool    // body subtree (operand + lambda closure)
-	parent  map[*ir.Base]ir.Node // child -> parent within the body subtree
-	varying map[*ir.Base]bool    // body nodes that transitively depend on iv/bound
-	ancVary map[*ir.Base]bool    // ancestors (within the body) of varying nodes
-}
-
-// newLoopAnalysis builds the per-loop analysis for the loops found in one
-// statement's node list. Loops are ordered innermost-first (a loop whose
-// body contains another loop is the outer one).
-func newLoopAnalysis(nodes []ir.Node, loops []ir.Node) *loopAnalysis {
-	an := &loopAnalysis{pin: newPinnedMemo()}
-	infos := make([]*loopInfo, 0, len(loops))
-	for _, l := range loops {
-		infos = append(infos, newLoopInfo(l))
-	}
-	// Innermost-first: sort by containment depth (outer loops contain more
-	// body nodes).
-	sort.SliceStable(infos, func(i, j int) bool { return len(infos[i].body) < len(infos[j].body) })
-	an.loops = infos
-	return an
-}
-
-// newLoopInfo computes the body subtree, parent map, and varying set of one
-// loop. The varying set is the set of body nodes whose data-dependency
-// closure reaches the loop's iv (operand 0) or bound (operand 1); ancestors
-// of varying nodes (within the body) are recorded separately.
-func newLoopInfo(loop ir.Node) *loopInfo {
-	info := &loopInfo{
-		loop:    loop,
-		body:    make(map[*ir.Base]bool),
-		parent:  make(map[*ir.Base]ir.Node),
-		varying: make(map[*ir.Base]bool),
-		ancVary: make(map[*ir.Base]bool),
-	}
-	ops := ir.OperandsOf(loop)
-	if len(ops) < 3 {
-		return info
-	}
-	iv, bound, body := ops[0], ops[1], ops[2]
-
-	// Body subtree with parent edges (operand slots + lambda bodies).
-	var visit func(n, par ir.Node)
-	visit = func(n, par ir.Node) {
-		if n == nil {
-			return
+	// Containment clamp: SN = min(SN, cap) for the non-anchored nodes (the
+	// anchors are the loops' own depths and stand). See the file comment.
+	for _, n := range nodes {
+		if !live[n] || anchored[n] {
+			continue
 		}
-		b := n.BasePtr()
-		if info.body[b] {
-			return
-		}
-		info.body[b] = true
-		if par != nil {
-			info.parent[b] = par
-		}
-		for _, d := range ir.OperandsOf(n) {
-			visit(d, n)
-		}
-		for _, lb := range ir.LambdaBodies(n) {
-			visit(lb, n)
-		}
-	}
-	visit(body, nil)
-
-	// Varying: body nodes whose DataDeps closure hits iv or bound.
-	memo := make(map[*ir.Base]bool)
-	var reaches func(n ir.Node) bool
-	reaches = func(n ir.Node) bool {
-		if n == nil {
-			return false
-		}
-		if sameNodePass(n, iv) || sameNodePass(n, bound) {
-			return true
-		}
-		b := n.BasePtr()
-		if v, ok := memo[b]; ok {
-			return v
-		}
-		memo[b] = false // DAG in well-formed graphs; the guard also bounds corruption
-		for _, d := range ir.DataDeps(n) {
-			if reaches(d) {
-				memo[b] = true
-				break
-			}
-		}
-		return memo[b]
-	}
-	for _, n := range bodyNodes(info) {
-		if reaches(n) {
-			info.varying[n.BasePtr()] = true
+		if c := cap[n]; n.BasePtr().SchedSN() > c {
+			n.BasePtr().SetSched(c, nil)
 		}
 	}
 
-	// Ancestors of varying nodes, within the body.
-	for vb := range info.varying {
-		for p := info.parent[vb]; p != nil; p = info.parent[p.BasePtr()] {
-			info.ancVary[p.BasePtr()] = true
-		}
-	}
-	return info
-}
-
-// bodyNodes lists the body subtree nodes in deterministic (visit) order.
-func bodyNodes(info *loopInfo) []ir.Node {
-	seen := make(map[*ir.Base]bool, len(info.body))
-	out := make([]ir.Node, 0, len(info.body))
-	var walk func(n ir.Node)
-	walk = func(n ir.Node) {
-		if n == nil || seen[n.BasePtr()] {
-			return
-		}
-		seen[n.BasePtr()] = true
-		out = append(out, n)
-		for _, d := range ir.OperandsOf(n) {
-			walk(d)
-		}
-		for _, lb := range ir.LambdaBodies(n) {
-			walk(lb)
-		}
-	}
-	ops := ir.OperandsOf(info.loop)
-	if len(ops) >= 3 {
-		walk(ops[2])
-	}
-	return out
-}
-
-// enclosingLoops lists the loops whose body contains n, innermost-first.
-func (an *loopAnalysis) enclosingLoops(n ir.Node) []*loopInfo {
-	var out []*loopInfo
-	for _, li := range an.loops {
-		if li.body[n.BasePtr()] {
-			out = append(out, li)
-		}
-	}
-	return out
-}
-
-// licmCandidate reports whether n may hoist out of its enclosing loops: it
-// is a whitelisted, non-leaf, effect-free node; nothing in its data-dependency
-// closure is pinned (memory/loops/IV objects/effectful nodes); it is not
-// already a statement root (idempotence); and it is invariant with respect
-// to every enclosing loop — not varying, and not an ancestor of a varying
-// node.
-func licmCandidate(n ir.Node, an *loopAnalysis) bool {
-	if n == nil {
-		return false
-	}
-	if n.BasePtr().Statement() != nil {
-		return false // already scheduled (root of some statement) — idempotence
-	}
-	if !licmHoistableKinds[n.KindOf()] {
-		return false
-	}
-	if len(ir.OperandsOf(n)) == 0 {
-		return false // leaf: nothing to compute, hoisting would only pollute the schedule
-	}
-	if ir.EffectOf(n).Has() {
-		return false // belt & braces: whitelisted kinds are all free
-	}
-	if an.pin.pinned(n) {
-		return false // operand closure touches memory/loops/IVs/effectful nodes
-	}
-	enclosing := an.enclosingLoops(n)
-	if len(enclosing) == 0 {
-		return false
-	}
-	for _, li := range enclosing {
-		if li.varying[n.BasePtr()] || li.ancVary[n.BasePtr()] {
-			return false
-		}
-	}
-	return true
-}
-
-// pinnedMemo memoizes the "pinned" (never-hoistable) predicate over the
-// data-dependency closure: a node is pinned when it is not whitelisted, is
-// effectful, or has a pinned dependency. Cycles (corrupted graphs) are
-// treated as pinned — the topological sort reports them first anyway.
-type pinnedMemo struct {
-	state map[*ir.Base]int // 0 unknown, 1 in progress, 2 pinned, 3 free
-}
-
-func newPinnedMemo() pinnedMemo {
-	return pinnedMemo{state: make(map[*ir.Base]int)}
-}
-
-func (m pinnedMemo) pinned(n ir.Node) bool {
-	return m.visit(n)
-}
-
-func (m pinnedMemo) visit(n ir.Node) bool {
-	if n == nil {
-		return false
-	}
-	b := n.BasePtr()
-	switch m.state[b] {
-	case 1:
-		return true // in progress: cycle — treat as pinned (fail safe)
-	case 2:
-		return true
-	case 3:
-		return false
-	}
-	m.state[b] = 1
-	p := !licmHoistableKinds[n.KindOf()] || ir.EffectOf(n).Has()
-	if !p {
-		for _, d := range ir.DataDeps(n) {
-			if m.visit(d) {
-				p = true
-				break
+	// OWNERSHIP: a rank-r (r > 0) node belongs to the LNT of the FIRST
+	// loop (allocation order) at depth r whose body subtree contains it —
+	// first-claim wins in allocation order, the spec's "nodes shared across
+	// nests: max SN wins" with single placement, no duplication. Within
+	// one nest the containing loops chain through every depth 1..cap, so
+	// every placed node has exactly one owner (totality by construction).
+	owner := make(map[ir.Node]*forNest, len(nodes))
+	for _, t := range nests { // allocation order of the loops
+		r := t.depth
+		for n := range t.body { // map order irrelevant: first claim per node wins
+			if live[n] && n.KindOf() != ir.KindForLoop && !anchored[n] &&
+				owner[n] == nil && n.BasePtr().SchedSN() == r {
+				owner[n] = nestRoot(t)
 			}
 		}
 	}
-	if p {
-		m.state[b] = 2
+
+	// STEP 1: per-LNT scheduling — LBBN construction, prologue/epilogue
+	// Groups (created EMPTY: landing pads final_lower later fills, D-04),
+	// per-rank stable topo placement with the persistent linkage stamped.
+	claimed := make(map[ir.Node]bool, len(nodes))
+	kernel := ir.NewASTGroup()
+	var lnts []ir.ASTLNT
+	if len(roots) == 0 {
+		// No ForLoop nests: the kernel body is a single Group holding every
+		// live node (all at rank 0), in dependency order.
+		var all []ir.Node
+		for _, n := range nodes {
+			if live[n] && n.KindOf() != ir.KindForLoop {
+				all = append(all, n)
+			}
+		}
+		ordered, err := topoRank(0, all, allocIndex)
+		if err != nil {
+			return err
+		}
+		for _, n := range ordered {
+			kernel.AppendItem(ir.ASTItem{Node: n})
+			n.BasePtr().SetSched(0, kernel)
+			claimed[n] = true
+		}
 	} else {
-		m.state[b] = 3
+		for _, r := range roots { // forest-root allocation order
+			rootBlock, metas, err := buildLBBN(r)
+			if err != nil {
+				return err
+			}
+			prologue, epilogue := ir.NewASTGroup(), ir.NewASTGroup() // landing pads, D-04
+			byDepth := make(map[int]*ir.ASTBlock, r.maxDepth())
+			var stampDepth func(t *forNest)
+			stampDepth = func(t *forNest) {
+				byDepth[t.depth] = t.block
+				for _, c := range t.children {
+					stampDepth(c)
+				}
+			}
+			stampDepth(r)
+			for rank := 0; rank <= r.maxDepth(); rank++ {
+				var collect []ir.Node
+				for _, n := range nodes { // allocation order: deterministic collection
+					if !live[n] || claimed[n] || n.KindOf() == ir.KindForLoop {
+						continue
+					}
+					if n.BasePtr().SchedSN() != rank {
+						continue
+					}
+					if rank == 0 || owner[n] == r {
+						collect = append(collect, n)
+					}
+				}
+				target := prologue
+				if rank > 0 {
+					target = byDepth[rank] // exists: the owner loop sits at this depth
+				}
+				ordered, err := topoRank(rank, collect, allocIndex)
+				if err != nil {
+					return err
+				}
+				for _, n := range ordered {
+					target.AppendItem(ir.ASTItem{Node: n})
+					n.BasePtr().SetSched(rank, target) // persistent SN + linkage (D-03)
+					claimed[n] = true
+				}
+			}
+			kernel.AppendItem(ir.ASTItem{Block: prologue})
+			kernel.AppendItem(ir.ASTItem{Block: rootBlock})
+			kernel.AppendItem(ir.ASTItem{Block: epilogue})
+			lnts = append(lnts, ir.ASTLNT{Root: r.loop, Loops: metas})
+		}
 	}
-	return p
+
+	// Fail-closed net: every live node landed in exactly one block (loops
+	// via the LBBN, statements via the rank placement). A leftover names
+	// the offending IDs — never a silently partial AST.
+	var leftover []uint64
+	for _, n := range nodes {
+		if live[n] && n.BasePtr().SchedBlock() == nil {
+			leftover = append(leftover, n.BasePtr().ID())
+		}
+	}
+	if len(leftover) > 0 {
+		sort.Slice(leftover, func(i, j int) bool { return leftover[i] < leftover[j] })
+		return fmt.Errorf("schedule: %d live nodes landed in no block (ids: %v)", len(leftover), leftover)
+	}
+
+	// STEP 2: kernel metadata — Params pass through; Gmem lists every live
+	// GMEM allocation in allocation order with its extent (op[0]); the LNT
+	// SoC metadata was assembled per nest above. Attach; do NOT set
+	// materialized, do NOT touch g.cfg (D-01).
+	var gmem []ir.ASTGmemAlloc
+	for _, n := range nodes {
+		if live[n] && n.KindOf() == ir.KindMemNew {
+			var extent ir.Node
+			if ops := ir.OperandsOf(n); len(ops) > 0 {
+				extent = ops[0]
+			}
+			gmem = append(gmem, ir.ASTGmemAlloc{New: n, Extent: extent})
+		}
+	}
+	return g.AttachAST(&ir.ASTKernel{
+		Body:   kernel,
+		Params: g.Params(),
+		Gmem:   gmem,
+		LNTs:   lnts,
+	})
 }
 
-// sameNodePass reports whether a and b are the same IR node (shared Base).
-func sameNodePass(a, b ir.Node) bool {
-	return a != nil && b != nil && a.BasePtr() == b.BasePtr()
+// nestRoot walks to the forest root of t's tree (the LNT identity the
+// claim pass compares against, in forest-root allocation order).
+func nestRoot(t *forNest) *forNest {
+	for t.parent != nil {
+		t = t.parent
+	}
+	return t
+}
+
+// buildLBBN is the spec's step 1.1 for one nest: recursively create the
+// Loop BB for every nested loop (mapping each LIR loop node to its Loop
+// BB — the LBBN), nest child blocks as Block items of their parent, and
+// stamp each loop node's persistent linkage at its own Loop block. The
+// prologue/epilogue Groups around the LBBN root are created by the caller.
+// Returns the root block plus the outer→inner loop metadata.
+func buildLBBN(t *forNest) (*ir.ASTBlock, []ir.ASTLoopMeta, error) {
+	blk, err := ir.NewASTLoop(t.loop)
+	if err != nil {
+		return nil, nil, err
+	}
+	t.block = blk
+	t.loop.BasePtr().SetSched(t.depth, blk) // the loop node lives in its own Loop block
+	// The anchored header (iv/bound, ops[0]/ops[1]) belongs to the Loop
+	// block too — the spec's header part of the loop structure. A header
+	// shared by nested loops anchors at the MAX depth (max-wins anchoring),
+	// so it lands at the deepest sharing loop: only the loop whose depth
+	// equals the header's anchored SN stamps it.
+	if ops := ir.OperandsOf(t.loop); len(ops) >= 2 {
+		for _, h := range ops[:2] {
+			if h != nil && h.BasePtr().SchedSN() == t.depth && h.BasePtr().SchedBlock() == nil {
+				h.BasePtr().SetSched(t.depth, blk)
+			}
+		}
+	}
+	metas := []ir.ASTLoopMeta{{
+		Loop:  t.loop,
+		Soc:   socOf(blk.Kind()),
+		Dosoc: blk.DoSoC(),
+		Loc:   blk.LoC(),
+	}}
+	for _, c := range t.children {
+		childBlk, childMetas, cerr := buildLBBN(c)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		blk.AppendItem(ir.ASTItem{Block: childBlk})
+		metas = append(metas, childMetas...)
+	}
+	return blk, metas, nil
+}
+
+// socOf maps a Loop block kind back to its soc encoding (0=seq, 1=cta,
+// 2=thr) for the per-LNT metadata (spec 4.3[2]). Groups do not occur here.
+func socOf(k ir.BlockKind) int {
+	switch k {
+	case ir.BlockSeqLoop:
+		return 0
+	case ir.BlockCTALoop:
+		return 1
+	case ir.BlockThrLoop:
+		return 2
+	default:
+		return -1
+	}
 }
