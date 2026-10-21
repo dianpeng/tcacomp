@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-15)
 Phase: 02 (naive-codegen-runtime-e2e) — NEXT
 Plan: 0 of 4
 Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-21 - Completed quick task 261021-j24: complete mechanical lowering procedure added to loop_tile_lower.md (§6bis Phases 0-5, §6 Site Rewrite Mechanics, §8 mechanical exits, M1-M4 implementer defaults) — the doc is now self-contained for implementing the loop-tile-lower pass
+Last activity: 2026-10-21 - Completed quick task 261021-jay: the loop-tile-lower pass lands — annotated tiled loop nests, map-query intrinsics, SMEM/FRAG cache insertion, §8 self-checks as pass exit conditions; decide→verify→lower composition green over the matmul worked example
 
 Progress: [██░░░░░░░░] 17%
 
