@@ -102,8 +102,10 @@ func corruptVerifyError(t *testing.T, mutate func(fx fixture, rec *Record)) erro
 }
 
 // TestVerifyFlagsCorruption pins each corruption class: a deleted BIV
-// entry, an inflated CTA LoC, a promoted site tied outside its LNT, and a
-// record whose recomputed SMEM footprint exceeds the budget.
+// entry, an inflated CTA LoC, a v0-policy violation (a second CTA dim), a
+// warp LoC that is not a portion multiple, a promoted site tied outside
+// its LNT, and a record whose recomputed SMEM footprint exceeds the
+// budget.
 func TestVerifyFlagsCorruption(t *testing.T) {
 	t.Run("deleted biv entry", func(t *testing.T) {
 		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
@@ -128,6 +130,43 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 		})
 		if !strings.Contains(err.Error(), "MaxCTA") {
 			t.Fatalf("inflated-LoC error must name MaxCTA, got %q", err.Error())
+		}
+	})
+
+	t.Run("v0 policy second cta dim", func(t *testing.T) {
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			// Flip one sequential entry into a well-formed second CTA dim
+			// (LoC == MaxCTA), so only the policy count fires.
+			for biv, d := range rec.Iters {
+				if d.SoC == SoCSequential {
+					d.SoC = SoCTA
+					d.LoC = DefaultParams().MaxCTA
+					rec.Iters[biv] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry a sequential entry")
+		})
+		if !strings.Contains(err.Error(), "v0 policy") {
+			t.Fatalf("second-CTA error must name the v0 policy, got %q", err.Error())
+		}
+	})
+
+	t.Run("warp loc not portion multiple", func(t *testing.T) {
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			quantum := (DefaultParams().MaxThreadsPerCTA / 32) / PortionWarp
+			for biv, d := range rec.Iters {
+				if d.SoC != SoCTA {
+					d.SoC = SoCWARP
+					d.LoC = quantum + 1 // not a quantum multiple
+					rec.Iters[biv] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry a non-CTA entry")
+		})
+		if !strings.Contains(err.Error(), "portion") {
+			t.Fatalf("non-portion warp LoC error must name the portion quantum, got %q", err.Error())
 		}
 	})
 
