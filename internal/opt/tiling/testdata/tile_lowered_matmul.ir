@@ -1,0 +1,8 @@
+statement #137:
+  memstore(%out[intrinsicgridmap(index, 0) * 64 + @d0(init=0, step=6400) + @d0(init=0, step=256) + intrinsicthreadmap(index, 0)][@d1(init=0, step=64) + @d1(init=0, step=1)][intrinsicthreadmap(index, 1) * 64 + @d2(init=0, step=16384) + @d2(init=0, step=1)], %2 * %14)
+
+statement #138:
+  return %out
+
+statement #139:
+  memstoresmem(%3[@d2(init=0, step=16384)][loadtile=1], %52)

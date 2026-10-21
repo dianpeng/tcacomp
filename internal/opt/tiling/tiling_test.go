@@ -120,11 +120,13 @@ func iterSocMap(t *testing.T, tree *loopforest.Tree, rec *Record) map[ir.Node]It
 	return out
 }
 
-// TestMatmulEndToEnd pins the doc's worked example through the whole pass:
-// all three BIV keys recorded, a feasible schedule (at least one CTA,
-// bounds holding), the Task-1 ties carried into the site entries, and the
-// promotion classes matching the judge recomputed over the chosen schedule.
-func TestMatmulEndToEnd(t *testing.T) {
+// TestMatmulWorkedRecord pins the doc's worked example through the whole
+// DECIDE pass (IR-level: the search + judge + record publication — no
+// execution; ME-05, 261021-o61 T5): all three BIV keys recorded, a feasible
+// schedule (at least one CTA, bounds holding), the Task-1 ties carried into
+// the site entries, and the promotion classes matching the judge recomputed
+// over the chosen schedule.
+func TestMatmulWorkedRecord(t *testing.T) {
 	fx, lhs, rhs := matmul()
 	p := DefaultParams()
 	rec := runPass(t, fx.g, p)

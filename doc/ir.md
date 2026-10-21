@@ -127,7 +127,7 @@ no enum surgery (append-only, IR-03).
 | `dce.go` | `BuildingDCE` and both level algorithms: `markReachable`/`buildingDCESea` (Level 1), `markDeadStatements`/`wipeDeadStatements` (Level 2), `isEffectKind`/`hasEffectNode`, `statementOwnership`. | Building debris is wiped before passes see the graph (P1R-08); see §7. |
 | `schedule.go` | `Graph.Materialize()` — the Level-1 → Level-2 transition. | Deliberately minimal default scheduling (D-7); optimization scheduling is the pass's job (§8.2). |
 | `cfg.go` | Level-2 control-flow shape: `CFG`, `BasicBlock`, `Statement`, the intrusive doubly-linked list (`Append`/`InsertBefore`/`InsertAfter`/`Remove`), `StmtKind` (`StmtAssign`/`StmtEffect`), `NewStatement`, `classifyStmt`. | O(1) removal by pointer (P1R-02); `NewStatement` is the factory passes use after scheduling. |
-| `verify.go` | `Verify`, the `use-def`/`def-use` chain invariants, per-kind shape checks (incl. the convention-driven dim/bound and dims-lead checks), the multiple-end-nodes check, `Violation` diagnostics. | The cheap verifier callable after every pass (design.md); fail-closed everywhere. |
+| `verify.go` | `Verify`, the `use-def`/`def-use` chain invariants, per-kind shape checks (incl. the convention-driven dim/bound and dims-lead checks), the loop scoping + positive-step invariants (§5.4), the multiple-end-nodes check, `Violation` diagnostics. | The cheap verifier callable after every pass (design.md); fail-closed everywhere. |
 | `convention.go` | The Input/ImpactBy-only convention, machine-checked: `hiddenRefFieldType` (type classifier — what counts as a hidden reference) and `checkConvention` (the reflect sweep over every allocated node's struct fields). | Wired into `Verify`; see §1.1's requirement box and §5.2. A forbidden field trips a `convention` violation even when zero-valued — the check is shape-level, fail-closed, and nil types classify hidden. |
 | `print.go` | The canonical deterministic printer: `Print`/`PrintOpts`, `Numbering`/`ComputeNumbering`, `StmtNodes`, `chainOf`, `stageText`/`value`, `Label`, `OperandsOf`/`LambdaBodies`/`LambdaParams`, `FormatConst`. | Byte-exact goldens (D-01..D-04, D-13); see §8.3. `LambdaBodies`/`LambdaParams` are DERIVED faces over the lambda node's operands — no stored records behind them. |
 | `mutate.go` | `MutContext` and the eight choke points: `SetDef`, `AddUse`, `RemoveUse`, `ReplaceAllUsesWith`, `SetLambdaBody`, `ClearLambdaParams`, `SetType`, `Erase`. | The ONLY sanctioned mutation path outside construction (IR-04, D-17); see §5.3. The two lambda choke points are the sanctioned way to edit a stage's lambda through its node (rewire the body operand; drop dead param operand slots); `SetType` is the computed-type cell's write path (idempotent by design). |
@@ -235,10 +235,10 @@ suite is the `effectIns` ImpactBy list of the three effect bearers.
 | 22 | `dimvar` | Abstract | -1 | ops = `[dim, init, step]` | Lowered induction variable — a value object; identity is the `(init, step)` tuple, never the name (doc/optana/induction_variable.md). Prints `@x(init=…, step=…)`. Shape check: operand 0 is a dim InputParam. |
 | 23 | `bdimvar` | Abstract | 2 | ops = `[iv(dimvar), max]` | Bounded IV `((iv tuple), Max)`; prints `@x/M`. Shape check: operand 0 must be a dimvar. |
 | 24 | `memloadsmem` | Memory | -1 | ops = `[src smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM load. Shape check: src must be a `memnewsmem`. |
-| 25 | `memstoresmem` | Memory | -1 | ops = `[value, dst smem buffer, bivs...]`; class = `StorageSMem` | Lowered SMEM store; returns the stored value (HIR contract, tca.md §2.5). |
+| 25 | `memstoresmem` | Memory | -1 | ops = `[value, dst smem buffer, bivs/round bases..., KeyedAttribute annotations...]`; class = `StorageSMem` | Lowered SMEM store; returns the stored value (HIR contract, tca.md §2.5). Trailing `keyedattribute` operands are ANNOTATIONS, not coordinates (LO-01): tile-lower's cache fill carries its `loadtile` loader-selection variant there, printing as the distinct suffix `[loadtile=1]` after the coordinate brackets. Shape check: trailing annotations are at most one per key, each with a const value. |
 | 26 | `memnewsmem` | Memory | 1 | ops = `[extent]`; class = `StorageSMem` | SMEM allocation. |
 | 27 | `fragload` | Memory | -1 | ops = `[src frag buffer, bivs...]`; class = `StorageFrag` | Lowered register-fragment load. Shape check: src must be a `fragnew`. |
-| 28 | `fragstore` | Memory | -1 | ops = `[value, dst frag buffer, bivs...]`; class = `StorageFrag` | Lowered fragment store; returns the stored value. |
+| 28 | `fragstore` | Memory | -1 | ops = `[value, dst frag buffer, bivs/round bases..., KeyedAttribute annotations...]`; class = `StorageFrag` | Lowered fragment store; returns the stored value. Same trailing-annotation convention and shape check as `memstoresmem`. |
 | 29 | `fragnew` | Memory | 1 | ops = `[extent]`; class = `StorageFrag` | Fragment allocation. |
 | 30 | `tensordimof` | Abstract | 2 | ops = `[tensor param, TU32 axis const]` | A tensor dimension's upper bound — the bound the lowering gives an `iter`. Shape checks: operand 0 a RoleTensor InputParam, operand 1 a const. |
 | 31 | `inductionvariable` | Abstract | 1 | ops = `[iter]` | The u32 current-iteration value of an iter — what a lowered `MemLoad`'s axes become. Shape check: operand 0 is an iter. |
@@ -257,7 +257,9 @@ Notes:
   InputParam at operand 0; `iterclusterproject` binds an itercluster;
   `inductionvariable` binds an iter; `tensordimof` binds a tensor param + a
   const axis; `as` binds dim InputParams, at most one, last value operand of
-  its stage; `reduce`'s operand 1 is its `KeyedAttribute`; a map's value-operand
+  its stage; `reduce`'s operand 1 is its `KeyedAttribute`; an LIR store's
+  trailing `KeyedAttribute` operands are at most one per key with const
+  values (§5.4); a map's value-operand
   count matches its lambda's declared parameter count while params remain.
 - **The Input/ImpactBy-only convention sweep** (convention.go) runs on every
   `Verify` — see §5.2.
@@ -392,6 +394,33 @@ deliberate exception: `SetType` stamps only when it actually writes):
 The var-level primitives (`replaceDefine`, `replaceAllReference`, `addRef`,
 `removeRef`) are unexported — reachable only from the choke points and from
 construction.
+
+### 5.4 Loop invariants: scoping and positive step (quick-261021-o61 T4)
+
+`Verify` enforces two GLOBAL invariants over every live `forloop` — the
+structural backstop that makes the tile-lower pass's output trustworthy even
+when a pass bug would otherwise produce verifier-clean but scope-broken
+graphs (the CR-02/HI-01/HI-02/ME-03 leakage class):
+
+- **Loop scoping (`loop-scope`)** — a live ForLoop's dimvar may be used ONLY
+  by nodes reachable from that loop's body operand subtree (operand and
+  ImpactBy payload edges) plus the loop's own structure (its dimvar, bound,
+  and annotations). A use anywhere else — above the loop, beside it, or
+  inside a *sibling* loop — is a violation naming the user and its slot.
+  Rationale: a loop induction variable is undefined outside its loop's
+  dynamic extent; before this invariant nothing rejected a graph that read
+  one (the entire class of "fill floats outside every loop but reads the
+  loop's IV" bugs printed green).
+- **Positive step (`loop-step`)** — a live ForLoop's dimvar step operand must
+  be a POSITIVE constant. A zero step is an infinite loop (the HI-04
+  zero-stride shape a starved coupled warp walk would emit), a negative step
+  a backwards loop no downstream materialization defines, and a non-constant
+  step has no materializable round stride.
+
+Both are reported as `Violation`s of invariant kinds `loop-scope`/`loop-step`
+and run over every allocated live loop on every `Verify` call — passes get
+them for free; hand-built fixtures that leak a dimvar out of its loop fail
+verification immediately.
 
 ## 6. The effect model (ImpactBy + the one end node)
 
@@ -535,7 +564,18 @@ pre-scheduler flow produced them, pinned byte-for-byte by the committed
 goldens). Refused on a nil graph, a second call, or an existing CFG. Shared
 pure values do **not** become statements: statement boundaries exist only at
 live effectful nodes, and everything reachable from a statement root renders
-inside that root's tree.
+inside that root's tree. `forloop` is **not** an effect kind — a lowered loop
+nest schedules no statement of its own and becomes reachable from the sea
+roots only through the pass-maintained ImpactBy edges onto its root (the
+tile-lower pass's chain re-pointing); in the print the nest therefore renders
+only through nodes that reference it. Today nothing references a loop node as
+an operand except an enclosing loop's body slot, so a tile-lowered graph
+prints its effect statements (GMEM store, fills, return) **top-level in
+allocation order**, with the loop nest owned-but-unrendered — nesting effect
+statements inside loop statements is a **deferred, codegen-facing
+Materialize contract**, pinned as current behavior by
+`internal/opt/tiling/testdata/tile_lowered_matmul.ir` (quick-261021-o61 T5;
+changing it is a conscious golden update, not a regression).
 
 **`pass.Scheduler` — the optimization pass** (quick-261018-bl0 task 3). An
 ordinary `Pass` (PASS-01/IR-07): ID `"schedule"`, no requirements, produces
@@ -834,15 +874,21 @@ through the chain.)
 
 What an HIR GMEM access lowered through an SMEM cache into a register
 fragment looks like at the node level, once cache lowering (a **future**
-phase) exists. No golden covers this: the node shapes and renderings below
-are what `catalog.go` + `node_lir_memory.go` + `print.go` support today;
-anything beyond is marked.
+phase) exists. The shapes below are what `catalog.go` +
+`node_lir_memory.go` + `print.go` support today; the tile-lower pass
+(`internal/opt/tiling`, pipeline 116) already emits this family over real
+kernels, and its print is now pinned by a committed golden —
+`internal/opt/tiling/testdata/tile_lowered_matmul.ir` (the decide→verify→
+lower triple over the matmul worked example; the golden's third statement is
+a real fill: `memstoresmem(%3[@d2(init=0, step=16384)][loadtile=1], %52)` —
+the round-base coordinate bracket plus the distinct annotation suffix).
+Anything in the sketch beyond that golden is marked.
 
 ```
 # illustrative — cache lowering is a FUTURE phase; nothing below is a golden.
 
 alloc = memnewsmem(extent)                                  # SMEM buffer, StorageClass=smem
-fill  = memstoresmem(%gmem_value, alloc, [@m_b, @k_b])     # ops = [value, dst buffer, biv axes]
+fill  = memstoresmem(%gmem_value, alloc, [@m_b, @k_b][loadtile=1])  # round-base coords + the loader-variant annotation suffix
 tile  = memloadsmem(alloc, [@m_b, @k_b])                   # ops = [src buffer, biv axes]
 faccr = fragnew(extent)                                     # register fragment, StorageClass=frag
 acc   = fragstore(%tile_value, faccr, [@m_b, @k_b])         # returns the stored value (tca.md §2.5)

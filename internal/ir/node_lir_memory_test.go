@@ -52,6 +52,66 @@ func TestLIRMemoryVerifyShapes(t *testing.T) {
 	})
 }
 
+// TestLIRStoreAnnotations pins the LIR fill-store annotation convention
+// (LO-01, quick-261021-o61 T5): a MemStoreSMem/FragStore's trailing
+// KeyedAttribute operands (tile-lower's loadtile loader-selection variant)
+// render as the DISTINCT attribute suffix `[key=value]` — never through the
+// keyedattribute value spelling that would read as a coordinate subscript —
+// and the verifier pins them well-formed: at most one per key, each with a
+// const value.
+func TestLIRStoreAnnotations(t *testing.T) {
+	u32 := InternScalar(TU32)
+
+	t.Run("annotation renders as attribute suffix", func(t *testing.T) {
+		g := NewGraph("fillattr")
+		dx := g.NewInputParam("ctor", RoleDim, "x", nil)
+		x := g.NewDimVar("ctor", dx, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
+		smem := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
+		attr := g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 1))
+		sts := g.NewMemStoreSMem("ctor", g.NewConst("ctor", u32, 0), smem, bx, attr)
+		g.NewReturn("ctor", sts)
+		if vs := Verify(g); len(vs) != 0 {
+			t.Fatalf("a store with one well-formed annotation must verify clean: %v", vs)
+		}
+		if err := g.Materialize(); err != nil {
+			t.Fatalf("Materialize: %v", err)
+		}
+		p := Print(g)
+		if !strings.Contains(p, "[@x/64][loadtile=1]") {
+			t.Errorf("the annotation must render as the distinct attribute suffix after the coordinates:\n%s", p)
+		}
+		if strings.Contains(p, "keyedattribute(") {
+			t.Errorf("an annotation must never render through the keyedattribute value spelling (a coordinate-subscript look):\n%s", p)
+		}
+	})
+
+	t.Run("duplicate key rejected", func(t *testing.T) {
+		g := NewGraph("dupattr")
+		dx := g.NewInputParam("ctor", RoleDim, "x", nil)
+		x := g.NewDimVar("ctor", dx, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
+		frag := g.NewFragNew("ctor", g.NewConst("ctor", u32, 64))
+		fst := g.NewFragStore("ctor", g.NewConst("ctor", u32, 0), frag, bx,
+			g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 2)),
+			g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 1)))
+		g.NewReturn("ctor", fst)
+		assertViolation(t, g, "repeats KeyedAttribute key")
+	})
+
+	t.Run("non-const annotation value rejected", func(t *testing.T) {
+		g := NewGraph("ncattr")
+		dx := g.NewInputParam("ctor", RoleDim, "x", nil)
+		x := g.NewDimVar("ctor", dx, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
+		smem := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
+		sts := g.NewMemStoreSMem("ctor", g.NewConst("ctor", u32, 0), smem, bx,
+			g.NewKeyedAttribute("ctor", "loadtile", x)) // a dimvar, not a const
+		g.NewReturn("ctor", sts)
+		assertViolation(t, g, `trailing KeyedAttribute "loadtile" must carry a const value`)
+	})
+}
+
 // TestLIRMemoryShapesVerifyClean: the LIR memory family built CORRECTLY
 // verifies clean, the storage-class metadata is bound by the constructors,
 // and the canonical print forms (D-6 lowercase kind names) are pinned. The

@@ -1,15 +1,17 @@
 package tiling
 
 // lower_test.go pins the loop-tile-lower pass (quick-261021-jay +
-// 261021-o61 T3, doc/optana/loop_tile_lower.md as amended): the fail-closed
+// 261021-o61 T3/T5, doc/optana/loop_tile_lower.md as amended): the fail-closed
 // record gates (incl. the F7 tiling-verify stamp), the §2 DoSoC numbering,
 // the PHASE 3 canonical loop forms (SEQ/CTA/WARP, T==1 and T>1, the F1
 // saturating tail guard), the F3 branched-LNT rejection, the LO-05 extent
 // typing guard, the M1 annotations, the P6 chain re-pointing liveness, the
 // pass determinism, and the PHASE 4 site surgery (variant-dependent fill
 // placement per R1, R2 window buffers + rank-in-index accesses, budget
-// fallback with the F4 drop rule) including the matmul worked example and
-// the decide→verify→lower composition.
+// fallback with the F4 drop rule) including the matmul worked example, the
+// decide→verify→lower composition over the REAL searched record, and the
+// Materialize+print round-trip golden of the lowered graph (IR-level pins
+// only — no numerical or GPU execution exists in-tree).
 
 import (
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"tcacomp/internal/golden"
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 	"tcacomp/internal/opt/typeinfer"
@@ -921,15 +924,19 @@ func loadtileVariantOf(t *testing.T, fill ir.Node) float64 {
 	return 0
 }
 
-// TestLowerMatmulEndToEnd pins the PHASE 4 surgery over the doc's worked
+// TestLowerMatmulSiteSurgery pins the PHASE 4 surgery over the doc's worked
 // example (the R2 accepted outcome, both sites promoted under a fitting
 // budget): lhs as a FRAG site (128 B per-thread FragNew buffer,
 // LoadTileThread fill INSIDE M.inside) and rhs as an SMEM WINDOW site
 // (1 MB MemNewSMem window — 4 B × 256 threads × 32 × 32 — cooperative
 // LoadTileCta fill at the K between-round body): loads erased with uses
 // RAUW'd to buffer accesses, verify-clean, typeinfer re-run clean, fill
-// placement structurally sound.
-func TestLowerMatmulEndToEnd(t *testing.T) {
+// placement structurally sound. IR-LEVEL ONLY (ME-05, 261021-o61 T5): this
+// pins node surgery over a crafted record under a fitting budget — no
+// numerical execution, GPU run, or Materialize/print round-trip happens
+// here (the real-record pipeline is TestDecideLowerComposition; the print
+// round-trip is TestLoweredMatmulPrintGolden).
+func TestLowerMatmulSiteSurgery(t *testing.T) {
 	fx, lhs, rhs, store := matmulUsed()
 	rec := matmulRecord(t, fx, lhs, rhs)
 	p := DefaultParams()
@@ -1564,8 +1571,124 @@ func assertReachable(t *testing.T, g *ir.Graph, k ir.Kind, want int) {
 // the decide→verify→lower triple composes — tiling (114) → tiling-verify
 // (115) → tile-lower (116) runs clean over the matmul worked example with
 // the REAL searched record (no crafted entries; the F7 stamp is the verify
-// pass's own product), ending verifier-clean and typable.
+// pass's own product), ending verifier-clean and typable. The searched
+// record's own outcome is pinned: the winning schedule promotes lhs through
+// the R2 WINDOW path and declines rhs with its reason.
 func TestDecideLowerComposition(t *testing.T) {
+	p := DefaultParams()
+	fx, lhs, rhs, store := matmulUsed()
+	cache := opt.NewCache()
+	ctx := &opt.Context{Pass: "tiling", Cache: cache}
+	if err := (Pass{Params: p}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tiling decide: %v", err)
+	}
+	rec, ok := cache.Get(RecordName).(*Record)
+	if !ok {
+		t.Fatalf("cache entry under %q is %T, want *Record", RecordName, cache.Get(RecordName))
+	}
+
+	// The REAL searched record over the worked example: the winning schedule
+	// assigns M=CTA/100, K=WARP/8 warps (256 threads), N=SEQ, all at T=64 —
+	// lhs (covered {K}, K WARP-assigned) promotes through the R2 tier rule
+	// as a 64 KB SMEM WINDOW (4 B × 256 threads × 64 — exactly MaxCache)
+	// with per-thread reuse 64 (its n-walk); rhs (covered {N,K}, only reuse
+	// dim M) declines — the owning thread's per-epoch m-count is
+	// ceil(64/256) = 1 < 2, no traffic avoided. The decide pass publishes
+	// the record UNSTAMPED (F7: tiling-verify owns the stamp).
+	sl, ok := rec.SiteDecisionOf(lhs)
+	if !ok {
+		t.Fatal("the searched record must carry lhs's site entry")
+	}
+	if !sl.Promoted || sl.Class != ClassSMEM || sl.Bytes != p.MaxCache || sl.Reuse != 64 {
+		t.Fatalf("searched lhs decision = %+v, want promoted %s window of %d B with per-thread reuse 64",
+			sl, ClassSMEM, p.MaxCache)
+	}
+	sr, ok := rec.SiteDecisionOf(rhs)
+	if !ok {
+		t.Fatal("the searched record must carry rhs's site entry")
+	}
+	if sr.Promoted || sr.Reason != ReasonLowReuse {
+		t.Fatalf("searched rhs decision = %+v, want declined with reason %q", sr, ReasonLowReuse)
+	}
+	if rec.Verified {
+		t.Fatal("the decide pass must publish the record unstamped (F7)")
+	}
+
+	ctx.Pass = "tiling-verify"
+	if err := (VerifyPass{Params: p}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tiling-verify: %v", err)
+	}
+	if !rec.Verified {
+		t.Fatal("tiling-verify must stamp the record (the F7 stamp tile-lower consumes)")
+	}
+	ctx.Pass = "tile-lower"
+	if err := (LowerPass{Params: p}).Run(ctx, fx.g); err != nil {
+		t.Fatalf("tile-lower over the real record: %v", err)
+	}
+
+	// Lowered products: the promoted lhs exercises the R2 WINDOW path end to
+	// end — a 64 KB MemNewSMem window buffer, a cooperative LoadTileCta
+	// fill (variant 1) riding the covered K dim's between-round dimvar (K is
+	// the WARP dim of the winning schedule: between stride (LoC×32)×T =
+	// 16384), and the rank-in-index access (thread_map.index(d)·T + i, R2);
+	// the declined rhs stays GMEM untouched.
+	if !lhs.BasePtr().Erased() {
+		t.Fatal("the promoted lhs load must be erased")
+	}
+	if rhs.BasePtr().Erased() {
+		t.Fatal("the declined rhs load must stay GMEM (untouched)")
+	}
+	buf := findBuffer(t, fx.g, ir.KindMemNewSMem, 65536)
+	fill := findFillOf(t, fx.g, buf)
+	if v := loadtileVariantOf(t, fill); v != 1 {
+		t.Fatalf("the real-record window fill variant = %v, want 1 (LoadTileCta)", v)
+	}
+	bases := ir.OperandsOf(fill)[2 : len(ir.OperandsOf(fill))-1]
+	if len(bases) != 1 {
+		t.Fatalf("the lhs fill must ride exactly its covered round base, got %d", len(bases))
+	}
+	if step, ok := ir.ConstValueOf(ir.OperandsOf(bases[0])[2]); !ok || step != 16384 {
+		t.Fatalf("the round base must be K's between dimvar (step (LoC×32)×T = 16384), got step %v", step)
+	}
+	var access ir.Node
+	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
+		if n.KindOf() == ir.KindMemLoadSMem {
+			access = n
+		}
+	}
+	if access == nil {
+		t.Fatal("the store's value must read the window buffer through a MemLoadSMem access")
+	}
+	if !subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindIntrinsicThreadMap) {
+		t.Fatal("the window access's K coordinate must carry the ThreadMap rank query (R2 rank-in-index)")
+	}
+
+	if vs := ir.Verify(fx.g); len(vs) != 0 {
+		t.Fatalf("verifier after the triple: %v", vs)
+	}
+	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
+		t.Fatalf("typeinfer re-run after the triple: %v", err)
+	}
+}
+
+// TestLoweredMatmulPrintGolden pins ME-05's missing round-trip: the
+// decide→verify→lower triple over the matmul worked example with the REAL
+// searched record, followed by Materialize + Print, renders byte-exactly —
+// the first golden covering a tile-lowered print (the fill store with its
+// loadtile annotation suffix, the window buffer, the lowered index
+// expressions on the surviving GMEM store, the declined rhs's GMEM load).
+//
+// ⚠ DEFERRED CONTRACT, deliberate (261021-o61 T3/T5): Materialize schedules
+// one top-level statement per live EFFECTFUL node in allocation order —
+// ForLoop is not an effect kind and no statement tree references a loop
+// node, so the loop NEST renders nowhere, and the fill prints as a
+// top-level statement in allocation order rather than nested inside its
+// host loop. Statement-level nesting of effect statements inside the loop
+// nest is a DEFERRED Materialize/codegen contract: when it lands, this
+// golden changes as a CONSCIOUS contract change (golden update in the same
+// commit), not as a regression. Until then the loop-owned omissions are
+// asserted complete below (nothing outside the loop nest is dropped).
+func TestLoweredMatmulPrintGolden(t *testing.T) {
 	fx, _, _, _ := matmulUsed()
 	cache := opt.NewCache()
 	ctx := &opt.Context{Pass: "tiling", Cache: cache}
@@ -1580,10 +1703,60 @@ func TestDecideLowerComposition(t *testing.T) {
 	if err := (LowerPass{Params: DefaultParams()}).Run(ctx, fx.g); err != nil {
 		t.Fatalf("tile-lower over the real record: %v", err)
 	}
-	if vs := ir.Verify(fx.g); len(vs) != 0 {
-		t.Fatalf("verifier after the triple: %v", vs)
+	if err := fx.g.Materialize(); err != nil {
+		t.Fatalf("Materialize over the lowered graph: %v", err)
 	}
-	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
-		t.Fatalf("typeinfer re-run after the triple: %v", err)
+	out := ir.Print(fx.g)
+	golden.Assert(t, "testdata/tile_lowered_matmul.ir", []byte(out))
+
+	// Round-trip honesty (ME-05): everything the CURRENT statement contract
+	// prints is well-formed — no placeholder fallback may survive where a
+	// coordinate or operand should have rendered (the store's lowered axes
+	// are computed index expressions now, not dim params; the pre-T5
+	// printer rendered them all as [@?] — silently losing every live
+	// coordinate).
+	for _, marker := range []string{"<nil>", "@?", "%?", "%<"} {
+		if strings.Contains(out, marker) {
+			t.Fatalf("the print carries placeholder marker %q — a live node's rendering was lost or corrupted:\n%s", marker, out)
+		}
+	}
+	// The deferred contract owns EVERYTHING the print omits: each node that
+	// is LIVE (reachable from the end node over data+payload edges —
+	// Materialize's own liveness test; retired-rewrite debris with zero live
+	// uses is out of scope) must be either printed or owned by a live
+	// for-loop (the nest's fixed slots: dimvar, bound, body, annotations) —
+	// nothing outside the loop nest is dropped silently.
+	num := ir.ComputeNumbering(fx.g)
+	lr := &lowerRun{g: fx.g}
+	live := lr.reachableFrom(fx.g.End())
+	loopOwned := make(map[*ir.Base]bool)
+	for _, n := range fx.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {
+			continue
+		}
+		for b := range lr.reachableFrom(n) {
+			loopOwned[b] = true
+		}
+	}
+	if len(loopOwned) == 0 {
+		t.Fatal("the lowered graph must carry live for-loops")
+	}
+	for _, n := range fx.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !live[n.BasePtr()] {
+			continue // dead debris (e.g. a retired dimvar's init const): DCE's prey
+		}
+		if _, printed := num.Num(n); printed {
+			continue
+		}
+		if !loopOwned[n.BasePtr()] {
+			t.Fatalf("live node %d (%s) is neither printed nor owned by the deferred loop-nest contract — silently dropped",
+				n.BasePtr().ID(), n.KindOf())
+		}
+	}
+	// Tripwire for the deferred contract itself: no loop renders today. When
+	// statement nesting lands, this fires — update the pin AND the golden
+	// consciously in the same commit.
+	if strings.Contains(out, "for(") {
+		t.Fatal("a for-loop rendered: the deferred statement-nesting contract landed — update this pin and the golden as a conscious contract change")
 	}
 }

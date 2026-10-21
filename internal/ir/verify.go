@@ -165,7 +165,10 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // LIR SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a
 // FragNew buffer; a for-loop binds a dimvar, with trailing operands beyond
 // (iv, bound, body) pinned to KeyedAttribute annotations (M1,
-// quick-261021-jay); an intrinsic map query holds exactly one const-u32
+// quick-261021-jay); an LIR store's trailing KeyedAttribute operands (the
+// fill annotation convention, LO-01/quick-261021-o61 T5) are pinned
+// well-formed — at most one per key, each with a const value; an intrinsic
+// map query holds exactly one const-u32
 // DoSoC operand and a field in {index, dimension} (§5 companion 3); an
 // IterClusterProject's operand 0 is an itercluster; an InductionVariable's operand 0 is an
 // iter; a TensorDimOf binds a RoleTensor tensor and a const axis; an As
@@ -241,10 +244,12 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		checkSMemBuffer(n, operandAt(t, 0), vs)
 	case *memStoreSMemNode:
 		checkSMemBuffer(n, operandAt(t, 1), vs)
+		checkStoreAnnotations(n, vs)
 	case *fragLoadNode:
 		checkFragBuffer(n, operandAt(t, 0), vs)
 	case *fragStoreNode:
 		checkFragBuffer(n, operandAt(t, 1), vs)
+		checkStoreAnnotations(n, vs)
 	case *forLoopNode:
 		if iv := operandAt(t, 0); iv != nil {
 			if _, ok := iv.(*dimVarNode); !ok {
@@ -355,6 +360,38 @@ func checkNodeShape(n Node, vs *[]Violation) {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
 				fmt.Sprintf("map input count must equal lambda parameter count (%d inputs, %d params)",
 					len(valueOps), lamParams)))
+		}
+	}
+}
+
+// checkStoreAnnotations pins the LIR store annotation convention (LO-01,
+// quick-261021-o61 T5): a MemStoreSMem/FragStore's trailing operands beyond
+// the fixed [value, dst] slots are its biv coordinates / fill round bases
+// plus at most one KeyedAttribute per key, and every such annotation must
+// carry a const value — the runtime reads the loadtile loader-selection
+// variant straight off the attribute, so a non-const or duplicated key is
+// a codegen-facing contract break, not a style issue.
+func checkStoreAnnotations(n Node, vs *[]Violation) {
+	seen := make(map[string]bool)
+	for i, op := range OperandsOf(n) {
+		if i < 2 || op == nil {
+			continue // [value, dst] slots; nil left to the generic slot check
+		}
+		attr, ok := op.(*keyedAttributeNode)
+		if !ok {
+			continue // a biv coordinate / round base: not an annotation
+		}
+		if seen[attr.key] {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("%s trailing operand %d repeats KeyedAttribute key %q", n.KindOf(), i, attr.key)))
+			continue
+		}
+		seen[attr.key] = true
+		if v := operandAt(attr, 0); v != nil {
+			if _, ok := v.(*constNode); !ok {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("%s trailing KeyedAttribute %q must carry a const value", n.KindOf(), attr.key)))
+			}
 		}
 	}
 }

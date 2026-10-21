@@ -606,7 +606,12 @@ func (r *renderer) memAccess(n Node, axesFrom int) string {
 // bufferAccess renders an LIR memory access's `buffer[biv][biv]...` form:
 // the buffer operand's value rendering followed by one `[biv]` per biv
 // operand (the bivs start at operand `bivsFrom` — 1 for loads, 2 for
-// stores, whose leading operands are the stored value and the buffer).
+// stores, whose leading operands are the stored value and the buffer). A
+// KeyedAttribute operand in the trailing region is an ANNOTATION, not a
+// coordinate (LO-01, 261021-o61 T5): the tile-lower fill stores carry their
+// loadtile loader-selection variant there, and it renders as the attribute
+// suffix `[key=value]` — never through the keyedattribute value spelling
+// that would read as a coordinate subscript.
 func (r *renderer) bufferAccess(n Node, bivsFrom int) string {
 	var b strings.Builder
 	if buf := operandAt(n, bivsFrom-1); buf != nil {
@@ -615,8 +620,14 @@ func (r *renderer) bufferAccess(n Node, bivsFrom int) string {
 		b.WriteString("<nil>")
 	}
 	for i := bivsFrom; i < len(OperandsOf(n)); i++ {
+		op := operandAt(n, i)
 		b.WriteString("[")
-		b.WriteString(r.value(operandAt(n, i)))
+		if op != nil && op.KindOf() == KindKeyedAttribute {
+			key, val := KeyedAttributeOf(op)
+			b.WriteString(key + "=" + r.value(val))
+		} else {
+			b.WriteString(r.value(op))
+		}
 		b.WriteString("]")
 	}
 	return b.String()
@@ -830,7 +841,11 @@ func (r *renderer) asClause(as Node) string {
 
 // accessText renders a structural store access: `%output[@m][@k]` — the
 // tensor operand (slot 1) and axis operands (slots 2...) of the store
-// (D14: the target access rides the Input list).
+// (D14: the target access rides the Input list). A dim-param axis renders
+// `@name`; any other axis (a lowered index expression — the tile-lower
+// pass's rank/offset arithmetic) renders through the value renderer, the
+// same rule memAccess applies (quick-261021-o61 T5: the old bare `[@?]`
+// fallback silently dropped every lowered coordinate from the print).
 func (r *renderer) accessText(n Node) string {
 	var b strings.Builder
 	if tp := opAt(n, 1); tp != nil {
@@ -839,11 +854,17 @@ func (r *renderer) accessText(n Node) string {
 		b.WriteString("%?")
 	}
 	for i := 2; i < len(OperandsOf(n)); i++ {
+		b.WriteString("[")
 		if ax := opAt(n, i); ax != nil {
-			b.WriteString("[@" + paramNameOfNode(ax) + "]")
+			if ip, ok := ax.(*inputParamNode); ok {
+				b.WriteString("@" + ip.name)
+			} else {
+				b.WriteString(r.value(ax))
+			}
 		} else {
-			b.WriteString("[@?]")
+			b.WriteString("@?")
 		}
+		b.WriteString("]")
 	}
 	return b.String()
 }
