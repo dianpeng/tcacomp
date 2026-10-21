@@ -302,7 +302,8 @@ for (auto m = 0; m < M; m++) {         // <- iterM
 // The runtime will ALWAYS generate strided loop, also loop tiling
 
 // (1) for a CTA parallised loop, the signature will be like
-for (auto i = 0; i < i_max_tile; i += i_tile_size * <# of CTA, ie nCTA>) {
+//     0-based round enumeration over the FULL extent, rank enters in-body only
+for (auto i = 0; i < I; i += i_tile_size * <# of CTA, ie nCTA>) {
 
   // (1.1) the tile loop, ie for that CTA span, will be assigned with the **counterpart WARP**
   //       for that CTA assignment
@@ -316,10 +317,10 @@ for (auto i = 0; i < i_max_tile; i += i_tile_size * <# of CTA, ie nCTA>) {
 // (2) for a **SINGLE** WARP/thread parallised loop, ie not coupled with CTA assignment
 //     the signature will be like
 
-for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assignment, nThreads>) {
+for (auto j = 0; j < J; j += j_tile_size * <# of threads in WARP assignment, nThreads>) {
 
   // (2.1)
-  // inside of the tile loop
+  // inside of the tile loop, sequential over the owned chunk
   for (auto jj = 0; jj < j_tile_size; jj += <# of threads of WARP assignment, nThreads>) {
   }
 }
@@ -344,28 +345,42 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
          - (2) tile_size
       - 3) For each such assignment, we call it a ParallelSchedule ie PSched
       - 4) For PSched, it must satisfy following constraints
-        - (1) At least a single CTA assignment must show up
-        - (2) LoC concurrency bounds, the thresholds are EXTERNALLY PROVIDED to the pass
-          - Max.cta: total CTA allocation bound, ie gridDim.x
-          - Max.threads_per_cta: total threads per CTA bound, ie blockDim.x
-            - MUST be a multiple of WARP, ie 32
-          - CTA accounting: for one LNT, the total CTA allocation is the PRODUCT of
-            the LoC over all CTA-assigned dimensions
-            - Each CTA owns a tuple of tile ids across those dimensions
-            - Product over all CTA-assigned dims of nCTA_d <= Max.cta
-          - WARP/THREAD accounting: warp groups are DISJOINT whole-warp shards of
-            one CTA's thread budget
-            - Per CTA, SUM over warp-assigned dims of (warp LoC * 32) <= Max.threads_per_cta
+        - (1) At least ONE CTA-assigned dim per LNT
+          - Else the CUDA thread model cannot execute that LNT
+        - (2) LoC concurrency bounds, the FINAL MODEL
+          - Launch config: EXTERNAL, static at compile time
+            - From the target GPU and green-context SM slicing
+            - Defaults: Ampere, NO green context, 512 threads per CTA = 16 warps,
+              CTA count rounded DOWN to the portion multiple (108 -> 100 CTAs)
+            - Target-specific configs override the defaults, e.g. A6000 84 -> 80
+          - Named portion constants, future adaptation points
+            - PORTION_CTA = 10
+            - PORTION_WARP = 8
+          - Runtime hard pre-condition, ASSERT-AND-TRAP
+            - Provided # of CTAs is a multiple of PORTION_CTA, ie 10
+            - Threads per CTA is a multiple of PORTION_WARP warps, ie 8 warps,
+              256 threads minimum
+              - PORTION_WARP = 8 BECAUSE at the minimum config each portion is
+                exactly one warp
+          - Search window: at most K = 5 innermost dims SoC-assigned per LNT
+            - Default scheduler config
+          - Portion grammar
+            - CTA-assigned dims' portions SUM to PORTION_CTA, ie 10
+            - Warp-assigned dims' portions, CTA-coupled warp halves INCLUDED,
+              SUM to PORTION_WARP, ie 8
+            - The LAST assignment in each category may be -1 = derived remainder
+              - The searcher decides the leading n-1, the last is the remainder
+            - LoC of a dim = portion x quantum
+              - quantum = total CTAs / 10 for CTA dims, total warps / 8 for warp dims
           - Sequential loops keep LoC = 1
           - EVERY LNT in the kernel is optimized under the SAME bounds
-            - The combined scheduling of ALL LNTs must stay within the total upper
-              bounds, ie gridDim.x / blockDim.x
-            - In v0 LNTs execute sequentially, each remapping the same launch, so
-              this reduces to every LNT individually satisfying the bounds
-          - The one dimensional CUDA mapping, gridDim.x = total # of CTAs and
-            blockDim.x = # of threads per CTA, is a RUNTIME CONTRACT
-            - It is how the per-LNT runtime map objects learn the totals they remap
-            - It is NOT a compiler-side launch decision
+            - In v0 LNTs execute sequentially, each remaps the FULL launch,
+              ie per-LNT exhaustion
+            - Portion-sharding across LNTs is the FUTURE concurrent-LNT mechanism
+            - The one dimensional CUDA mapping, gridDim.x = total # of CTAs and
+              blockDim.x = # of threads per CTA, is a RUNTIME CONTRACT
+              - It is how the per-LNT runtime map objects learn the totals they remap
+              - It is NOT a compiler-side launch decision
         - (3) SMEM constraints
           - The Candidate Set generated by previous analysis pass forms **potential cache site**
           - For each cache, we ONLY allow the **LAST Cache.dims dimensions** of each MemLoad's tensor to be promoted as SMEM cache
@@ -388,24 +403,23 @@ for (auto j = 0; j < j_max_tile; j += j_tile_size * <# of threads in WARP assign
               - It setups a constraints that SUMMATION of all cache size CANNOT be larger than SMEM size of SM on CUDA
                 - Assuming as a known const as Max.cache
 
-      - Objective Functions: for a specific PSched
-        - 1) Maximize parallism
-        - 2) Maximize SMEM reuse
-        - We can use a simple weighted sum
-          - (1) parallism can be given by summation of all LoC across the assignment
-          - (2) SMEM reuse can be given by GMEM TRAFFIC AVOIDED by the cache decisions
-            - traffic_avoided = SUM over cache sites of
-              bytes_per_tile(site) * (reuse_count(site) - 1)
-              - bytes_per_tile(site) = element size * product of the site's covered
-                tile sizes, AFTER demotion per the Cache Tie Semantics
-              - reuse_count(site) = # of times the cached tile is re-read before
-                reload = PRODUCT over the reuse dimensions, ie the tie level and the
-                inner non-covered loop dims, of ceil(extent_d / tile_d)
-            - Both terms are computed statically from the LNT plus the tie/tile decisions
-            - NOTES: maximize traffic AVOIDED, NOT cache bytes
-              - Footprint is bounded by the budget constraint, it is not an objective
-          - score = parallel_weight * parallelism + reuse_weight * traffic_avoided
-            - Larger is better
+      - Objective Function: for a specific PSched, SINGLE-TERM
+        - Maximize memory reuse = GMEM traffic avoided
+          - traffic_avoided = SUM over cache sites of
+            bytes_per_tile(site) * (reuse_count(site) - 1)
+            - bytes_per_tile(site) = element size * product of the site's covered
+              tile sizes, AFTER demotion per the Cache Tie Semantics
+            - reuse_count(site) = # of times the cached tile is re-read before
+              reload = PRODUCT over the reuse dimensions, ie the tie level and the
+              inner non-covered loop dims, of ceil(extent_d / tile_d)
+          - Computed statically from the LNT plus the tie/tile decisions
+          - NOTES: maximize traffic AVOIDED, NOT cache bytes
+            - Footprint is bounded by the budget constraint, it is not an objective
+        - The parallelism term is DELETED
+          - Under mandatory full exhaustion total parallelism is CONSTANT by
+            construction, so it carries no ranking signal
+        - score = traffic_avoided
+          - Larger is better
 
     - Algorithm to solve the above formentioned optimization problem
       - 1) Using a simple hardcoded search loop
@@ -435,20 +449,15 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
 
   if (!is_feasiable(each_sched)) continue; // checking feasibility
 
-  // (1) calculating parallism
-  auto p = 0;
-  for (auto soc in each_sched) {
-    p += loc_of(soc); // obtain a iteration corresponding SoC's LoC value
-  }
-
-  // (2) calculating GMEM traffic avoided, ie SMEM reuse
+  // calculating GMEM traffic avoided, ie memory reuse — the SINGLE objective term
   auto traffic_avoided = 0;
   for (auto cache_cand in candidate_set) {
     traffic_avoided += get_traffic_avoided(each_sched, cache_cand); // bytes_per_tile(site) * (reuse_count(site) - 1), computed statically from LNT + tie/tile decisions
   }
 
-  // (3) weighted sum
-  auto score = parallel_weight * p + reuse_weight * traffic_avoided;
+  // single-term score: the weighted multi-objective sum is deleted, parallelism
+  // is constant under mandatory full exhaustion
+  auto score = traffic_avoided;
   if (score > current_max_score) {
     current_max_score = score;
     current_sched = each_sched;
@@ -466,6 +475,32 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
 
 - Sequential Execution
   - For iteration/Iter node that does not assign with a parallisation indication, it will be sequential loop
+
+- Composition Semantics, CTA x WARP
+  - Warp allocations are PER-CTA
+    - Every CTA holds the FULL thread space and re-partitions it
+    - Warp ranks are CTA-RELATIVE, never global
+  - The m x n cross product arises STRUCTURALLY
+    - CTA ranks slice the CTA space, the m ranks m1/m2/m3/...
+    - Within EACH CTA its warps slice the n space
+    - Every CTA-sliced m rank gets a FULL n dimension space, partitioned by
+      that CTA's warp group
+    - Iteration unit is the THREAD
+  - Two DISTINCT warp-level codegen forms
+    - (a) independent WARP dim's between loop
+      - Stride = #threads x tile_size, ie tile-chunk granularity
+      - Each thread owns a WHOLE tile_size CHUNK of that dimension
+      - Its inside loop is SEQUENTIAL over the chunk's elements
+    - (b) CTA dim's coupled inside loop
+      - Stride = #threads at ELEMENT granularity
+      - Each thread owns rows/elements of the tile interior
+  - v0 default searcher POLICY, within the constraints, NOT a model rule
+    - At most ONE CTA-assigned dim and at most ONE independent WARP dim per LNT
+    - Same-category multi-dim composition, CTA+CTA or independent WARP+WARP,
+      is FUTURE
+      - Its combined-slicing arithmetic, product factors of the level's space
+        and portions as the selection grammar, must be pinned BEFORE the
+        searcher may emit such schedules
 
 ## Cache Mark and Loop Tile Rewrite
 
@@ -526,6 +561,17 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
       - Notes:
         - Using Runtime object to obtain the gridIndex/threadIndex like cuda mapping
           - NOTES, our runtime perform remapping of those index, not relying on cuda
+        - ALL between loops are 0-BASED round enumerations
+          - for (d = 0; d < D_extent; d += LoC * T), induction starts at 0
+          - Trip count is UNIFORM for every CTA/thread of the allocation, the
+            CTA-uniform invariant holds by construction
+          - NO map index in ANY induction variable, ranks appear only as
+            in-body offset locals
+        - In-body offset locals carry the rank
+          - const auto d_offset = d_rank * T + d
+          - d_rank is the CTA's/thread's rank in dimension d's allocation
+          - CTA dims: rank from GridMapping, UNIFORM across the CTA's threads
+          - WARP dims: rank from ThreadMap, PER-THREAD
         - ALL logic that depend on original loop before rewritting
           - ALL patched into **tile inside loop**
           - Patch all InductionVariable node to use **Tile Insde Loop**
@@ -534,6 +580,9 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
           - Default use **strided style loop**, always safe to write and execute in cuda runtime
         - Ensure bounds check
           - Calculate actual tile inside loop's bound before entering into the loop
+        - Tail guard
+          - Out-of-range ranks/threads become WHOLE-BODY no-ops via the loop
+            materialization, loop_tile_lower.md §4
 
     - Code Organization
       - The code requires large **IRGraph** patch
@@ -591,12 +640,13 @@ for (auto a = 0; a < ceil(A/tile_size_a); a++) {
 
 // notes the only difference here
 //
-// [1] the tile between part is a tile-id enumeration driven by the grid map: each
-//     CTA's grid_map index IS its tile id, the stride is the map dimension, ie
-//     the CTA LoC of this dimension
+// [1] the tile between part is a 0-BASED round enumeration: the induction starts
+//     at 0 and strides nCTA * tile_size_a, so EVERY CTA runs the SAME trip count
+//     (the CTA-uniform invariant); the CTA's rank enters ONLY inside the body as
+//     the in-body offset local a_offset = cta_rank * tile_size_a + a
 // [2] the tile inside part, since CTA will implicitly assigned with a WARP schedule
 //     which means that part needs to count in the WARP schedule, ie the stride in the
-//     tile will factor in WARP's level of concurrency
+//     tile will factor in WARP's level of concurrency, ELEMENT granularity
 
 // For simplicity, we ONLY lower one outer loop here
 
@@ -625,36 +675,43 @@ for (auto a = 0; a < ceil(A/tile_size_a); a++) {
 //
 // For simplicity, we use grid_map<DoSoC> to represent corresponding grid_map runtime object
 
-// tile between part: tile-id enumeration driven by the grid map
+// tile between part: 0-based round enumeration, NO map index in the induction
+// nCTA = this dimension's CTA LoC, ie grid_map<IterA.CTA.DoSoC>.dimension
 for (
-  auto a = grid_map<IterA.CTA.DoSoC>.index;
-  a < ceil(A/tile_size_a);
-  a += grid_map<IterA.CTA.DoSoC>.dimension
+  auto a = 0;
+  a < A;
+  a += nCTA * tile_size_a
 ) {
 
+  // the CTA's rank in this dimension's allocation, UNIFORM across the CTA's threads
+  const auto cta_rank = grid_map<IterA.CTA.DoSoC>.index;
+
+  // in-body offset local: rank scaled by tile size + round base
+  const auto a_offset = cta_rank * tile_size_a + a;
+
   // (1.2) tile inside part
-  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - a_tile_offset,
+    A - a_offset,
   );
+
+  // notes, on a tail round an out-of-range CTA rank gives a_tile_max <= 0: the
+  // WHOLE body becomes a no-op via the loop materialization, loop_tile_lower.md
+  // §4 (RULED 2026-10-20), the compiler emits no guard and no branch
 
   // thread-parallel strided walk over the tile, the WARP half of the CTA assignment
   // nThreads = total # of threads mapped to this dimension, ie warp LoC * 32
+  // ELEMENT granularity: each thread owns rows/elements of the tile interior
   for (
       auto a_tile = 0;
       a_tile < a_tile_max;
       a_tile += nThreads
   ) {
-    const auto a_index = a_tile_offset + a_tile + thread_map<IterA.WARP.DoSoC>.index;
-
-    // notes, on a tail tile some threads' a_index can exceed A: per-element bounds
-    // guarding is handled by the predication discipline (one basic block), open
-    // item from the review (F11), not specced here
+    const auto a_index = a_offset + a_tile + thread_map<IterA.WARP.DoSoC>.index;
 
     ...
     // notes, the memory access within the tile is of same shape, ie using the
-    // a_tile_offset
+    // a_offset
   }
 }
 
@@ -664,8 +721,12 @@ for (
 //
 // Very similar to CTA style rewrite, except
 //
-// [1] The tile between loop is parallized by the thread in warp group
-// [2] The tile inside loop is **sequential** **DIFFERENT FROM CTA REWRITE**
+// [1] The tile between loop is a 0-BASED round enumeration parallized by the
+//     threads of the warp group: stride nThreads * tile_size_a, TILE-CHUNK
+//     granularity, each thread owns a WHOLE tile_size chunk of the dimension;
+//     the thread's rank enters ONLY inside the body
+// [2] The tile inside loop is **sequential** **DIFFERENT FROM CTA REWRITE**:
+//     the owned chunk is walked element by element by its single owning thread
 //
 // For simplicity, we ONLY lower one outer loop here
 //
@@ -674,20 +735,30 @@ for (
 // The IntrinsicGridMap/IntrinsicThreadMap IR node list is the SAME as listed in the
 // CTA section above, not repeated here
 
-// tile between part: tile-id enumeration driven by the thread map, same form as
-// the CTA case but via thread_map, each thread group's map index IS its tile id
+// tile between part: 0-based round enumeration, NO map index in the induction
+// nThreads = total # of threads in the WARP assignment, ie warp LoC * 32
 for (
-  auto a = thread_map<IterA.DoSoC>.index;
-  a < ceil(A/tile_size_a);
-  a += thread_map<IterA.DoSoC>.dimension
+  auto a = 0;
+  a < A;
+  a += nThreads * tile_size_a
 ) {
 
+  // the thread's rank in this dimension's allocation, PER-THREAD
+  const auto thread_rank = thread_map<IterA.DoSoC>.index;
+
+  // in-body offset local: rank scaled by tile size + round base, the base of
+  // the thread's OWNED tile chunk
+  const auto a_offset = thread_rank * tile_size_a + a;
+
   // (1.2) tile inside part
-  const auto a_tile_offset = a * tile_size_a;
   const auto a_tile_max = min(
     tile_size_a,
-    A - a_tile_offset,
+    A - a_offset,
   );
+
+  // notes, on a tail round an out-of-range thread gives a_tile_max <= 0: the
+  // WHOLE body becomes a no-op via the loop materialization, loop_tile_lower.md
+  // §4 (RULED 2026-10-20)
 
   // loop must be sequential here. The allocation is really per tile/stride is assigned
   // to a thread, within that tile/stride, it is sequential again
@@ -696,11 +767,11 @@ for (
       a_tile < a_tile_max;
       a_tile++
   ) {
-    const auto a_index = a_tile_offset + a_tile;
+    const auto a_index = a_offset + a_tile;
 
     ...
     // notes, the memory access within the tile is of same shape, ie using the
-    // a_tile_offset
+    // a_offset
   }
 }
 

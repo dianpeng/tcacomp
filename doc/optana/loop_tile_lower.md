@@ -63,14 +63,17 @@
 ## §3 Canonical Lowered Loop Forms
 
 - The normative loop FORMS are the revised templates of doc/optana/loop_tiling.md
-  ("Mechanical rewrite for tiling"): tile-id enumeration in the between loops,
-  offset = tile_id × tile_size, materialized per-tile uniform bounds
-  (a_tile_max = min(tile_size, A − a_tile_offset))
+  ("Mechanical rewrite for tiling"): 0-BASED round enumeration in the between
+  loops (induction starts at 0, stride LoC × T, NO map index in any induction
+  variable, CTA-uniform trip counts), ranks appearing only as in-body offset
+  locals (offset = rank × tile_size + round base), materialized per-tile
+  uniform bounds (a_tile_max = min(tile_size, A − a_offset))
   - This spec does NOT duplicate those templates wholesale; it states the
     pass's obligations on top of them
 - Obligations
   - (a) sequential-inside loops: bounded by the materialized uniform bound
-  - (b) parallel-inside loops (CTA-companion warp inside loops, warp loops)
+  - (b) parallel loops (CTA-companion warp inside loops, the thread-parallel
+      between loops of WARP dims)
     - the strided tile coverage of [0, a_tile_max) is normative
     - the materialized uniform bound is normative
     - the TAIL-GUARD is the loop primitive's OWN bailout — RESOLVED (§4,
@@ -104,15 +107,21 @@
 
 - RULING: the bounds bailout is an operation of the RUNTIME LOOP
   MATERIALIZATION, NOT of the IR
+  - ALL parallel loops are GUARDED, cta_loop INCLUDED (amended 2026-10-21):
+    allocated concurrency may EXCEED what the iteration space needs, so
+    out-of-range ranks/threads whole-body no-op via the runtime loop
+    materialization
   - The pass lowers loops to three primitive forms
     - thr_loop — thread-parallel element loop; its materialization checks
       whether the offset global index lies within the allowed iteration
       space; out-of-range iterations become a NO-OP for the ENTIRE iteration
       body (whole-body skip, compiler-inlined pure computation included)
-    - cta_loop — CTA-parallel tile loop; EXACT by launch construction
-      (grid = ceil(ext/T), every launched CTA owns a tile) — no bailout
-      needed; a multi-tile grid-stride variant adds only a CTA-uniform
-      tile-id comparison
+    - cta_loop — CTA-parallel round loop; ALSO GUARDED, same whole-body no-op
+      materialization as thr_loop
+      - AMENDED (2026-10-21): the portion model allocates a full round stride
+        (nCTA × T) whether or not the extent fills it, so an out-of-range CTA
+        rank must whole-body no-op — the earlier "exact by launch
+        construction, no bailout needed" wording is superseded
     - seq_loop — single-thread sequential; native bounds, no cross-thread
       concerns
   - Branches NEVER enter the IR: divergence exists only inside the
@@ -256,6 +265,13 @@
 - Determinism
   - DoSoC numbering order (outer → inner per LNT, §2) and the decide pass's
     preset ordering are inherited; this pass ADDS NO SEARCH of its own
+- Inherited v0 default searcher policy (from the decide pass,
+  doc/optana/loop_tiling.md composition semantics)
+  - At most ONE CTA-assigned dim and at most ONE independent WARP dim per LNT
+    - A POLICY within the constraint set, NOT a model rule
+  - Same-category multi-dim composition (CTA+CTA, independent WARP+WARP) is
+    FUTURE pending the combined-slicing arithmetic; the searcher may NOT emit
+    such schedules until it is pinned
 - Re-typing: see §6 epilogue
 
 ## §7bis Runtime Contract (what this pass assumes exists)
@@ -271,13 +287,34 @@
 - Linearization
   - The multi-dim remap of the 1-D launch is runtime-OWNED
   - The compiler never inlines its own copy of the linearization arithmetic
-- OPEN — allocator vocabulary (D3, UNDECIDED)
-  - Question: how do the maps' dimension-vector remaps relate to a kernel-wide
-    budget allocator — doc/tca.md §5.7.1's percentage sharding, or a successor?
-  - Who computes the per-LNT split of gridDim.x and blockDim.x, and by what
-    scheme, is NOT decided here; no option is picked
-  - The per-LNT scoped maps themselves and the 1-D launch contract above are
-    RULED and independent of this question
+- Allocator vocabulary (D3 — RULED 2026-10-21)
+  - Per LNT exactly TWO mapping objects
+    - ONE GridMapping over the CTA space
+    - ONE ThreadMap over the per-CTA thread space
+    - Each is MULTI-DIMENSIONAL and holds the COMPLETE partition knowledge of
+      its space, ie all CTA dims for the GridMapping, all warp-category
+      consumers for the ThreadMap
+    - The earlier per-dim chained map description was a DESIGN TYPO — superseded
+  - Tuple coordinates
+    - cuda_linear_id computed FIRST, linear over the 1-D launch
+    - Then reverse stride-shape decomposition per the mapping's shape
+    - warp_index / lane_index / is_first_thread queries provided for
+      warp-specialized reduce
+  - Counting invariant (author-ruled)
+    - p = m: CTA assignments = CTA dims
+    - q = n: independent warp assignments
+    - A CTA dim's coupled inside-warp is part of its CTA assignment, NOT
+      double-counted
+    - ThreadMap dimensionality = m coupled + n independent dims
+  - Portion/exhaustion grammar, from doc/optana/loop_tiling.md
+    - Portion sums 10 (CTA) / 8 (warp), -1 = derived remainder
+    - PORTION_CTA / PORTION_WARP constants, assert-and-trap pre-conditions
+    - Defaults: Ampere, no green context, 512 threads per CTA = 16 warps, CTA
+      count rounded DOWN to the portion multiple (108 -> 100; A6000 84 -> 80)
+  - Warp allocations are PER-CTA, cross-product composition per
+    doc/optana/loop_tiling.md's composition-semantics section
+  - FUTURE concurrent-LNT portion sharding is the ONE place chained/shard maps
+    may return
 - Tile-op obligations (runtime API must provide)
   - Visibility: SMEM writes visible to the whole CTA after the op returns
   - Reuse safety: a refill waits for prior reads (write-after-read)
@@ -293,7 +330,10 @@
 - Sync ownership (RULED)
   - The runtime owns ALL synchronization/barriers; this pass never emits them
 - Launch/budget validation at runtime
-  - grid = ceil(ext/T) computed at launch
+  - Launch config is EXTERNAL and static at compile time, per the portion
+    grammar of doc/optana/loop_tiling.md; the runtime ASSERT-AND-TRAPs the
+    pre-conditions (#CTAs multiple of 10, threads per CTA multiple of 8 warps)
+    and guards every parallel loop rank (§4, ALL parallel loops)
   - SMEM budget via device-attribute queries — NEVER hardcode sm_86 ceilings
     (101,376 B); assert ≥ the design budget
   - The compiler emits code + runtime files; it does NOT drive nvcc
