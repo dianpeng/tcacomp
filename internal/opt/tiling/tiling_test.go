@@ -60,13 +60,11 @@ type feas struct {
 	ctaProduct int
 	warpCount  int
 	warpSum    int
-	locSum     int
 }
 
 func feasibilityOf(rec *Record) feas {
 	f := feas{ctaProduct: 1}
 	for _, d := range rec.Iters {
-		f.locSum += d.LoC
 		switch d.SoC {
 		case SoCTA:
 			f.ctaCount++
@@ -214,6 +212,79 @@ func TestFeasibilityBounds(t *testing.T) {
 			t.Fatal("a schedule with zero CTA levels must never be selected")
 		}
 	})
+}
+
+// TestPortionCompletion pins the portion-grammar LoC derivation directly on
+// evalSchedule: the single CTA dim exhausts MaxCTA (portion -1/full), the
+// independent warp dim takes warpPortion x quantum warps (auto =
+// AutoWarpPortion when a CTA dim is present; explicit WarpPortion
+// overrides), and sequential dims stay at LoC 1. The coupled tile-inside
+// warp half of the CTA dim is deliberately NOT recorded (the lower pass
+// derives its stride).
+func TestPortionCompletion(t *testing.T) {
+	fx, _, _ := matmul()
+	p := DefaultParams()
+	f := loopforest.Analyze(fx.g)
+	lf := overlapOf(fx, p)
+	window := windowOf(lf, p) // outermost first: [iterM, iterN, iterK]
+	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
+
+	soc := []SoCType{SoCTA, SoCWARP, SoCSequential}
+	res, ok := evalSchedule(f, lf, window, soc, 32, p)
+	if !ok {
+		t.Fatal("[CTA, warp, seq] at t=32 must be SMEM-feasible on the matmul fixture")
+	}
+	if d := res.iters[window[0]]; d.SoC != SoCTA || d.LoC != p.MaxCTA {
+		t.Fatalf("CTA dim must exhaust MaxCTA %d (portion -1/full), got %s/%d", p.MaxCTA, d.SoC, d.LoC)
+	}
+	if d := res.iters[window[1]]; d.SoC != SoCWARP || d.LoC != AutoWarpPortion*quantum {
+		t.Fatalf("auto warp dim must carry %d x %d warps, got %s/%d", AutoWarpPortion, quantum, d.SoC, d.LoC)
+	}
+	if d := res.iters[window[2]]; d.SoC != SoCSequential || d.LoC != 1 {
+		t.Fatalf("sequential dim must stay at LoC 1, got %s/%d", d.SoC, d.LoC)
+	}
+
+	// An explicit WarpPortion overrides the auto rule.
+	p.WarpPortion = 2
+	res, ok = evalSchedule(f, lf, window, soc, 32, p)
+	if !ok {
+		t.Fatal("explicit WarpPortion must not change feasibility here")
+	}
+	if d := res.iters[window[1]]; d.LoC != 2*quantum {
+		t.Fatalf("explicit warp portion 2 must give LoC %d, got %d", 2*quantum, d.LoC)
+	}
+}
+
+// TestV0PolicyFilter pins the v0 searcher policy (loop_tiling.md
+// "Composition Semantics, CTA x WARP"): the emitted record never carries
+// more than one CTA dim or more than one independent WARP dim per LNT —
+// 2-CTA and 2-warp SoC vectors exist in the raw 3^K enumeration but are
+// skipped, on both a deep window (many raw violators) and the matmul.
+func TestV0PolicyFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		g    func() (fixture, ir.Node, ir.Node)
+	}{
+		{"window7", func() (fixture, ir.Node, ir.Node) {
+			maxes := []float64{64, 64, 64, 64, 64, 64, 64}
+			fx := newChain("window7", maxes...)
+			scaffoldStore(fx, fx.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+			return fx, nil, nil
+		}},
+		{"matmul", func() (fixture, ir.Node, ir.Node) { return matmul() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx, _, _ := tc.g()
+			rec := runPass(t, fx.g, DefaultParams())
+			f := feasibilityOf(rec)
+			if f.ctaCount != 1 {
+				t.Fatalf("v0 policy: exactly one CTA dim expected, got %d", f.ctaCount)
+			}
+			if f.warpCount > 1 {
+				t.Fatalf("v0 policy: at most one independent WARP dim expected, got %d", f.warpCount)
+			}
+		})
+	}
 }
 
 // TestSearchWindow pins the innermost-K window: a 7-deep chain under
