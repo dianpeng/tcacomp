@@ -24,18 +24,30 @@ func (v Violation) String() string {
 		v.NodeID, v.LastTouchedBy, v.Invariant, v.Msg)
 }
 
-// Invariant names for the two chain directions checked on every graph.
+// Invariant names for the two chain directions checked on every graph, plus
+// the LIR loop-structure invariants (quick-261021-o61 T4).
 const (
 	invUseDef = "use-def" // every operand handle resolves to a live def of a known kind
 	invDefUse = "def-use" // every def's ref list matches the operand slots that own its records
+
+	// invLoopScope is the loop-IV scoping invariant: a live ForLoop's dimvar
+	// may be used only by the loop's own operand structure (its iv/bound/body
+	// edges) or by nodes reachable from its body operand subtree — the
+	// CR-02/HI-01/HI-02/ME-03 leakage class of the 261021-mlx review.
+	invLoopScope = "loop-scope"
+	// invLoopStep is the positive-step invariant: a live ForLoop's dimvar
+	// step must be a positive constant (HI-04's IR-level backstop —
+	// tiling-verify checks the tiling records; this is the graph itself).
+	invLoopStep = "loop-step"
 )
 
-// Verify runs both chain-consistency checkers over g and returns every
-// violation found, in deterministic walk order: the level-aware roots (params
-// plus the end node at Level 1, params plus statement order at Level 2),
-// then per-node operand order — never map iteration (RESEARCH Pitfall 1).
-// A nil or empty result means the chains are consistent. Verify needs no
-// Materialize: the Level-1 roots cover the whole constructed graph.
+// Verify runs both chain-consistency checkers plus the loop-structure
+// invariants over g and returns every violation found, in deterministic walk
+// order: the level-aware roots (params plus the end node at Level 1, params
+// plus statement order at Level 2), then per-node operand order — never map
+// iteration (RESEARCH Pitfall 1). A nil or empty result means the chains are
+// consistent. Verify needs no Materialize: the Level-1 roots cover the whole
+// constructed graph.
 func Verify(g *Graph) []Violation {
 	if g == nil {
 		return nil
@@ -43,6 +55,7 @@ func Verify(g *Graph) []Violation {
 	var vs []Violation
 	nodes := walkCheckUseDef(g, &vs)
 	checkDefUse(nodes, &vs)
+	checkLoopInvariants(nodes, &vs)
 	checkConvention(g, &vs)
 	return vs
 }
@@ -513,4 +526,178 @@ func varNode(v *SSAVar) Node {
 		return nil
 	}
 	return v.node
+}
+
+// checkLoopInvariants enforces the two LIR loop invariants over every live
+// ForLoop the walk visited, in walk order (deterministic):
+//
+//   - loop-scope (the CR-02/HI-01/HI-02/ME-03 leakage class, quick-261021-o61
+//     T4): every use of a live ForLoop's IV dimvar must belong to the loop's
+//     own operand structure — the loop node itself plus everything reachable
+//     from its operand and payload edges (the iv/bound/body slots: the
+//     bound's BoundedDimVar wrapper, the body operand subtree with nested
+//     loops AND their bounds, and the construction-time effect chains hanging
+//     off body nodes — the same operand+payload reachability tile-lower's §8
+//     fill-placement check computes). A use from a sibling subtree, from
+//     outside every loop, or from a branch that does not sit under the
+//     defining loop reads an induction value that is not defined at the
+//     use's position. Containment is the Level-1 sea's STRUCTURAL notion
+//     (the child-edge walk), never materialized statement order.
+//   - loop-step (HI-04's IR-level half): the dimvar's step operand must be a
+//     constant > 0 — a zero or negative stride is an infinite or backwards
+//     loop, and a non-constant step has no materializable round stride.
+//
+// Users the walk never reached are skipped (dead-subgraph bookkeeping, the
+// checkDefUse precedent), as are erased/detached users.
+func checkLoopInvariants(nodes []Node, vs *[]Violation) {
+	walked := make(map[Node]bool, len(nodes))
+	for _, n := range nodes {
+		walked[n] = true
+	}
+	for _, n := range nodes {
+		if n.KindOf() != KindForLoop {
+			continue
+		}
+		checkLoopScope(n, walked, vs)
+		checkLoopStep(n, vs)
+	}
+}
+
+// forLoopIV resolves loop's IV dimvar node, or nil when the operand is
+// missing or not a dimvar (the generic slot and shape checks own those).
+func forLoopIV(loop Node) *dimVarNode {
+	iv := operandAt(loop, 0)
+	if iv == nil {
+		return nil
+	}
+	dv, _ := iv.(*dimVarNode)
+	return dv
+}
+
+// checkLoopScope enforces loop-scope for one live ForLoop: every live use of
+// its IV dimvar must be held by the loop itself or by a node inside its
+// operand/payload closure. The diagnostic names the loop, the dimvar, the
+// offending user node, and the offending use's slot.
+func checkLoopScope(loop Node, walked map[Node]bool, vs *[]Violation) {
+	dv := forLoopIV(loop)
+	if dv == nil {
+		return
+	}
+	allowed := childClosure(loop)
+	for _, u := range UsesOf(dv) {
+		user := u.User()
+		if user == nil || user.BasePtr() == nil || user.BasePtr().Erased() || !walked[user] {
+			continue // erased/detached, or dead-subgraph bookkeeping
+		}
+		if allowed[user] {
+			continue
+		}
+		*vs = append(*vs, nodeViolation(user, invLoopScope,
+			fmt.Sprintf("for-loop node %d's dimvar node %d is used by node %d (%s) at its %s, outside the loop's body operand subtree — a loop's induction variable may only be used by the loop's own structure or by nodes inside its body",
+				loop.BasePtr().id, dv.BasePtr().id, user.BasePtr().id, user.KindOf(), useSlotOf(user, dv))))
+	}
+}
+
+// checkLoopStep enforces loop-step for one live ForLoop: its dimvar's step
+// operand must be a positive constant.
+func checkLoopStep(loop Node, vs *[]Violation) {
+	dv := forLoopIV(loop)
+	if dv == nil {
+		return
+	}
+	step := operandAt(dv, 2)
+	if step == nil {
+		return // unwired step: the generic use-def slot check owns it
+	}
+	v, ok := constValueOf(step)
+	if !ok {
+		*vs = append(*vs, nodeViolation(loop, invLoopStep,
+			fmt.Sprintf("for-loop node %d's dimvar node %d carries a non-constant step (node %s) — a lowered loop's induction step must be a positive constant",
+				loop.BasePtr().id, dv.BasePtr().id, nodeIDStr(step))))
+		return
+	}
+	if v <= 0 {
+		*vs = append(*vs, nodeViolation(loop, invLoopStep,
+			fmt.Sprintf("for-loop node %d's dimvar node %d carries step %v — a lowered loop's induction step must be a positive constant (zero or negative strides are infinite or backwards loops)",
+				loop.BasePtr().id, dv.BasePtr().id, v)))
+	}
+}
+
+// childClosure returns the set of nodes reachable from start over the walk's
+// child relation — live operand defs in slot order, then live payload-use
+// defs (the ImpactBy effect chains included) — plus start itself, skipping
+// erased nodes. It is the Level-1 sea's structural-containment carrier:
+// "inside a loop" means reachable from the loop's operand/payload edges,
+// never materialized statement order. Iterative with a visited set, so
+// malformed (even cyclic) graphs cannot overflow the stack (T-1.1-02).
+func childClosure(start Node) map[Node]bool {
+	seen := make(map[Node]bool)
+	if start == nil {
+		return seen
+	}
+	stack := []Node{start}
+	push := func(n Node) {
+		if n != nil && !seen[n] {
+			stack = append(stack, n)
+		}
+	}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[n] || n.BasePtr() == nil || n.BasePtr().Erased() {
+			continue
+		}
+		seen[n] = true
+		if impl := asImpl(n); impl != nil {
+			impl.forEachOperand(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					push(u.rec.def.node)
+				}
+			})
+		}
+		if pb, ok := n.(payloadBearer); ok {
+			pb.forEachPayloadUse(func(u SSAUse) {
+				if u.rec != nil && !u.rec.killed && u.rec.def != nil {
+					push(u.rec.def.node)
+				}
+			})
+		}
+	}
+	return seen
+}
+
+// useSlotOf names where user holds a use of def: the first operand slot that
+// resolves at def, else the first payload use, else "an unknown slot" (a
+// corrupted record can dangle from both directions). It fills the offending
+// use's slot into the loop-scope diagnostic.
+func useSlotOf(user, def Node) string {
+	where := ""
+	if impl := asImpl(user); impl != nil {
+		slot := 0
+		impl.forEachOperand(func(u SSAUse) {
+			if where != "" {
+				return
+			}
+			if d := u.Def(); d != nil && d.BasePtr() == def.BasePtr() {
+				where = fmt.Sprintf("operand slot %d", slot)
+			}
+			slot++
+		})
+	}
+	if pb, ok := user.(payloadBearer); ok && where == "" {
+		idx := 0
+		pb.forEachPayloadUse(func(u SSAUse) {
+			if where != "" {
+				return
+			}
+			if d := u.Def(); d != nil && d.BasePtr() == def.BasePtr() {
+				where = fmt.Sprintf("payload use %d", idx)
+			}
+			idx++
+		})
+	}
+	if where == "" {
+		where = "an unknown slot"
+	}
+	return where
 }
