@@ -167,9 +167,12 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // (iv, bound, body) pinned to KeyedAttribute annotations (M1,
 // quick-261021-jay); an LIR store's trailing KeyedAttribute operands (the
 // fill annotation convention, LO-01/quick-261021-o61 T5) are pinned
-// well-formed — at most one per key, each with a const value; an intrinsic
-// map query holds exactly one const-u32
-// DoSoC operand and a field in {index, dimension} (§5 companion 3); an
+// well-formed — at most one per key, each with a const value; a runtime map
+// query holds exactly one const-u32
+// DoSoC operand and a field in {index, dimension} (§5 companion 3); the
+// runtime-object family's P-3 shape cross-checks (KernelInfo operand-free,
+// mapping portion grammar, reducer (init, lambda) pair, closed method/
+// attribute vocabularies with their object domains); an
 // IterClusterProject's operand 0 is an itercluster; an InductionVariable's operand 0 is an
 // iter; a TensorDimOf binds a RoleTensor tensor and a const axis; an As
 // binds dim InputParams; a Reduce's operand 1 is its KeyedAttribute init;
@@ -270,29 +273,120 @@ func checkNodeShape(n Node, vs *[]Violation) {
 				break
 			}
 		}
-	case *intrinsicNode:
-		// §5 companion 3 (quick-261021-jay): exactly one operand — the DoSoC
-		// const u32; the field payload must be a known query selector.
+	case *runtimeQueryNode:
+		// §5 companion 3 (quick-261021-jay, renamed LR-6): exactly one
+		// operand — the DoSoC const u32; the field payload must be a known
+		// query selector.
 		if len(OperandsOf(t)) != 1 {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				"intrinsic map query must hold exactly one operand (the DoSoC const)"))
+				"runtime map query must hold exactly one operand (the DoSoC const)"))
 			break
 		}
 		if d := operandAt(t, 0); d != nil {
 			c, ok := d.(*constNode)
 			if !ok {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
-					"intrinsic map query operand 0 must be a const-u32 DoSoC"))
+					"runtime map query operand 0 must be a const-u32 DoSoC"))
 			} else if typ := c.typ; typ == nil || !typ.Equal(InternScalar(TU32)) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
-					"intrinsic map query operand 0 must be a const-u32 DoSoC"))
+					"runtime map query operand 0 must be a const-u32 DoSoC"))
 			}
 		}
 		switch t.field {
 		case "index", "dimension":
 		default:
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("intrinsic map query field %q must be \"index\" or \"dimension\"", t.field)))
+				fmt.Sprintf("runtime map query field %q must be \"index\" or \"dimension\"", t.field)))
+		}
+	case *runtimeKernelInfoNode:
+		// LR-4 (quick-261022-l1o): the kernel information object carries NO
+		// operands — any operand is a shape violation (the fixed-arity-0
+		// surplus check also fires on the raw NewNode path).
+		if len(OperandsOf(t)) != 0 {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"runtimekernelinfo must carry no operands"))
+		}
+	case *runtimeMappingNode:
+		// P-3 (quick-261022-l1o): ops = [kernel_info, ndim const TI32,
+		// portion consts TI32 ...] with len(portions) == ndim >= 1, each
+		// portion >= 1, and -1 allowed ONLY as the last portion (the D3
+		// remainder rule).
+		checkRuntimeMappingShape(n, t, vs)
+	case *runtimeReducerNode:
+		// LR-3/P-3: exactly (typed init value, KindLambda) — swapped,
+		// missing, or mis-typed operands are shape violations. A missing
+		// operand leaves an unwired slot (the generic nil-def check also
+		// fires); the count check reads OperandsOf, whose slot count covers
+		// unwired slots, so probe nil explicitly for the named message.
+		ops := OperandsOf(t)
+		if len(ops) != 2 || ops[0] == nil || ops[1] == nil {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("%s must carry exactly (init, lambda), got %d operands", n.KindOf(), len(ops))))
+			break
+		}
+		if init := operandAt(t, 0); init != nil && TypeOf(init) == nil && ConstTypeOf(init) == nil {
+			// "Typed" reads either the computed cell (the real flow:
+			// typeinfer ran long before final-lower) or a const's interned
+			// payload type (the fixture vocabulary). Constructions only
+			// exist after final-lower, so real graphs always satisfy the
+			// first; the second keeps hand-built test fixtures verifiable.
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"reducer construction operand 0 must be a typed init value"))
+		}
+		if lam := operandAt(t, 1); lam != nil && lam.KindOf() != KindLambda {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"reducer construction operand 1 must be the combiner KindLambda node"))
+		}
+	case *runtimeCallNode:
+		// P-3: the method vocabulary is closed {Init, Reduce, Combine} and
+		// applies to a REDUCER CONSTRUCTION object only (the sole method
+		// domain of v0's runtime surface).
+		switch t.method {
+		case "Init", "Reduce", "Combine":
+		default:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("runtimecallmethod payload %q must be one of \"Init\", \"Reduce\", \"Combine\"", t.method)))
+		}
+		if obj := operandAt(t, 0); obj != nil && !isRuntimeReducerKind(obj.KindOf()) {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("runtimecallmethod operand 0 must be a reducer construction object, got %s", obj.KindOf())))
+		}
+	case *runtimeGetAttributeNode:
+		// P-3: the attribute vocabulary is closed; "total_*" applies to a
+		// KernelInfo object with NO extra args; "index"/"dimension" to a
+		// mapping object with EXACTLY ONE const-u32 arg.
+		switch t.attribute {
+		case "total_cta", "total_thread_per_cta":
+			if obj := operandAt(t, 0); obj != nil && obj.KindOf() != KindRuntimeKernelInfo {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q requires a KernelInfo object, got %s", t.attribute, obj.KindOf())))
+			}
+			if extra := len(OperandsOf(t)) - 1; extra != 0 {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q carries %d extra args, want 0", t.attribute, extra)))
+			}
+		case "index", "dimension":
+			if obj := operandAt(t, 0); obj != nil && !isRuntimeMappingKind(obj.KindOf()) {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q requires a mapping object, got %s", t.attribute, obj.KindOf())))
+			}
+			if extra := len(OperandsOf(t)) - 1; extra != 1 {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q carries %d extra args, want exactly 1 (the DoSoC const)", t.attribute, extra)))
+				break
+			}
+			if d := operandAt(t, 1); d != nil {
+				if _, ok := constValueOf(d); !ok {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("runtimegetattribute %q arg must be a const DoSoC", t.attribute)))
+				} else if ct := ConstTypeOf(d); ct == nil || !ct.Equal(InternScalar(TU32)) {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("runtimegetattribute %q arg must be a const-u32 DoSoC", t.attribute)))
+				}
+			}
+		default:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("runtimegetattribute payload %q must be one of \"total_cta\", \"total_thread_per_cta\", \"index\", \"dimension\"", t.attribute)))
 		}
 	case *iterClusterProjectNode:
 		if cl := operandAt(t, 0); cl != nil {
@@ -392,6 +486,71 @@ func checkStoreAnnotations(n Node, vs *[]Violation) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					fmt.Sprintf("%s trailing KeyedAttribute %q must carry a const value", n.KindOf(), attr.key)))
 			}
+		}
+	}
+}
+
+// checkRuntimeMappingShape pins the P-3 mapping constructor encoding
+// (quick-261022-l1o): ops = [kernel_info, ndim const TI32, portion consts
+// TI32 ...] with len(portions) == ndim >= 1, each portion >= 1, and -1 (the
+// remainder) allowed ONLY as the last portion (the D3 remainder rule). The
+// dedicated kind is what makes this verifier-pinnable (LR-4).
+func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
+	ops := OperandsOf(t)
+	if len(ops) < 2 {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s must carry (kernel_info, ndim, portions...), got %d operands", n.KindOf(), len(ops))))
+		return
+	}
+	if ki := ops[0]; ki != nil && ki.KindOf() != KindRuntimeKernelInfo {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s operand 0 must be a RuntimeKernelInfo node, got %s", n.KindOf(), ki.KindOf())))
+	}
+	// The ndim const: const, TI32, >= 1.
+	nd, ok := ConstValueOf(ops[1])
+	if !ok {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s operand 1 (ndim) must be a const", n.KindOf())))
+		return
+	}
+	if ct := ConstTypeOf(ops[1]); ct == nil || !ct.Equal(InternScalar(TI32)) {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s operand 1 (ndim) must be a const-i32", n.KindOf())))
+		return
+	}
+	if nd < 1 {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s ndim must be >= 1, got %v", n.KindOf(), nd)))
+		return
+	}
+	portions := ops[2:]
+	if float64(len(portions)) != nd {
+		*vs = append(*vs, nodeViolation(n, invUseDef,
+			fmt.Sprintf("%s lists %d portions but declares ndim %v", n.KindOf(), len(portions), nd)))
+		return
+	}
+	for i, p := range portions {
+		v, ok := ConstValueOf(p)
+		if !ok {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("%s portion %d must be a const", n.KindOf(), i)))
+			continue
+		}
+		if ct := ConstTypeOf(p); ct == nil || !ct.Equal(InternScalar(TI32)) {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("%s portion %d must be a const-i32", n.KindOf(), i)))
+			continue
+		}
+		if v == -1 {
+			if i != len(portions)-1 {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("%s portion %d is -1 (the remainder): only the LAST portion may be -1 (the D3 remainder rule)", n.KindOf(), i)))
+			}
+			continue // the legal last-position remainder
+		}
+		if v < 1 {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				fmt.Sprintf("%s portion %d must be >= 1 (or -1 as the last portion), got %v", n.KindOf(), i, v)))
 		}
 	}
 }

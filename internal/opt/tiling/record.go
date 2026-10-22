@@ -226,6 +226,60 @@ func (r Record) SiteDecisionOf(load ir.Node) (SiteDecision, bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Tiling provenance record (quick-261022-l1o, doc/optana/final_lower.md
+// "Tiling Provenance Record" as amended): the per-dim between/inside loop
+// relationship + the per-LNT mapping-portion plans, published as DATA by
+// tile-lower and consumed by final-lower. ir deliberately knows nothing
+// about opt/tiling (the astcfg.go layering rule), so the relationship rides
+// the analysis cache exactly like the decision record — but keyed by nodes
+// that SURVIVE tile-lower (dim InputParams and the generated ForLoop roots),
+// which is why it gets its own name and lifetime.
+// ---------------------------------------------------------------------------
+
+// ProvenanceName is the analysis-cache name of the provenance record — the
+// key final-lower fetches it under. It must survive tile-lower's own
+// invalidation (tile-lower's Preserved) and the schedule pass (schedule's
+// Preserved).
+const ProvenanceName = "tiling-provenance"
+
+// DimProvenance is one rewritten dim's loop relationship (final_lower.md
+// "per-dim provenance entry"): the tile-BETWEEN forloop (== the single loop
+// when T==1), the tile-INSIDE forloop (nil when T==1), the effective SoC
+// (mirrors ASTLoopMeta — LR-7's specialization input), and the effective
+// tile size (1 = untiled).
+type DimProvenance struct {
+	Between ir.Node
+	Inside  ir.Node // nil at T==1
+	Soc     SoCType
+	Tile    int
+}
+
+// MappingPlan is one LNT's runtime mapping construction data (LR-11/P-3):
+// the GridMapping and ThreadMapping portion vectors. v0 policy: grid is
+// always [-1] (every rewritten LNT carries >= 1 CTA dim by the searcher's
+// CTA-carrying fallback, and the whole PortionCTA=10 space goes to it);
+// thread is [warpPortion, -1] (the independent warp dim's portion, the
+// remainder left to the CTA dim's coupled tile-inside walk).
+type MappingPlan struct {
+	GridPortions   []int
+	ThreadPortions []int
+}
+
+// Provenance is the tile-lower product final-lower consumes: per-dim entries
+// keyed by the DIM node (a RoleDim InputParam — stable across every later
+// pass, and exactly what final-lower's @r derivation naturally yields) and
+// per-LNT plans keyed by the generated LNT root ForLoop node.
+type Provenance struct {
+	Dims map[ir.Node]DimProvenance
+	LNTs map[ir.Node]MappingPlan
+}
+
+// Name satisfies analysis.Analysis structurally (the single-method Name()
+// interface — the Record precedent): the provenance publishes itself through
+// the opt analysis cache under ProvenanceName.
+func (Provenance) Name() string { return ProvenanceName }
+
+// ---------------------------------------------------------------------------
 // Params: the externally provided thresholds (doc: "the thresholds are
 // EXTERNALLY PROVIDED to the pass").
 // ---------------------------------------------------------------------------

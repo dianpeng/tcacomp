@@ -114,6 +114,49 @@ func TestEffectVerdictsMemoryFamily(t *testing.T) {
 	}
 }
 
+// TestEffectVerdictsRuntimeFamily pins P-2 (quick-261022-l1o): the ONE
+// final-lower effect arm — KindRuntimeCallMethod is FULL (an ordered method
+// call on a stateful reducer object, never GVN-CSE'd) — while every other
+// Runtime/Collective kind (the KernelInfo/mapping constructions, the three
+// reducer constructions, RuntimeGetAttribute, and the renamed launch-map
+// queries) stays free (immutable objects / pure reads).
+func TestEffectVerdictsRuntimeFamily(t *testing.T) {
+	g := NewGraph("runtime-effect")
+	f32 := InternScalar(TF32)
+	ki := g.NewRuntimeKernelInfo("ctor")
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	acc := g.NewLambdaInputParam("ctor", "acc", f32)
+	now := g.NewLambdaInputParam("ctor", "now", f32)
+	comb := g.NewBinOp("ctor", BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))
+	lam := g.NewLambdaNode("ctor", []Node{acc, now}, comb)
+	seq := g.NewRuntimeSequentialReducer("ctor", g.NewConst("ctor", f32, 0), lam)
+	warp := g.NewRuntimeWarpReducer("ctor", g.NewConst("ctor", f32, 0), lam)
+	glob := g.NewRuntimeGlobalReducer("ctor", g.NewConst("ctor", f32, 0), lam)
+	getattr := g.NewRuntimeGetAttribute("ctor", "index", gm, u32const(g, 0))
+	gq := g.NewRuntimeGridQuery("ctor", "index", u32const(g, 0))
+	tq := g.NewRuntimeThreadQuery("ctor", "dimension", u32const(g, 1))
+	for name, n := range map[string]Node{
+		"kernelinfo": ki, "gridmapping": gm, "threadmapping": tm,
+		"seqreducer": seq, "warpreducer": warp, "globalreducer": glob,
+		"getattr": getattr, "gridquery": gq, "threadquery": tq,
+	} {
+		if e := EffectOf(n); e.Has() {
+			t.Fatalf("%s must be effect-free (P-2: immutable objects and pure reads), got %s", name, e)
+		}
+	}
+	for name, method := range map[string]string{
+		"init":    "Init",
+		"reduce":  "Reduce",
+		"combine": "Combine",
+	} {
+		call := g.NewRuntimeCallMethod("ctor", method, warp, g.NewConst("ctor", f32, 1))
+		if e := EffectOf(call); !e.Has() {
+			t.Fatalf("runtimecallmethod %s must be fully effectful (P-2: ordered side effect)", name)
+		}
+	}
+}
+
 // TestUnchainedStoreHasNoImpactBy pins the chain-head invariant: a store
 // built without an env (or as the first store of its chain) carries NO
 // ordering edges — an ImpactBy-nil node can still be effectful (it IS the

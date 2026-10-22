@@ -79,7 +79,20 @@ func (InlinePass) Run(_ *opt.Context, g *ir.Graph) error {
 			continue
 		}
 		switch stage.KindOf() {
-		case ir.KindMap, ir.KindReduce:
+		case ir.KindMap:
+			// Map bodies stay fully inlined (doc/optana/final_lower.md
+			// "Fix of existed pipeline" [2]: Map's body inline is still kept
+			// and useful — the map is a pure identity projector its
+			// consumers see through).
+		case ir.KindReduce:
+			// The REDUCE-INLINE EXEMPTION (final_lower.md [1], LR-3
+			// prerequisite, quick-261022-l1o): the combiner must survive as
+			// a function of its two formals — the runtime reducer owns the
+			// (prev, cur) application, so inlining the lambda parameters
+			// here would destroy the callable the reducer construction
+			// carries as its second operand. Skip the whole stage: params
+			// stay declared, the body keeps its paramRefs.
+			continue
 		default:
 			continue
 		}

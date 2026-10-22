@@ -458,7 +458,7 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	coords := make([]ir.Node, 0, len(covered))
 	for _, d := range covered {
 		if d.soc == SoCWARP {
-			rank := lr.g.NewIntrinsicThreadMap(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
+			rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			shifted := lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(float64(d.tile)))
 			coords = append(coords, lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, shifted, d.insideIV))
 		} else {

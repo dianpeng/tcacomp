@@ -744,14 +744,15 @@ func (r *renderer) value(n Node) string {
 		return b.String()
 	case *inductionVariableNode:
 		return "inductionvariable(" + r.value(opAt(t, 0)) + ")"
-	case *intrinsicNode:
+	case *runtimeQueryNode:
 		// The launch-map queries render like calls with the field as the
-		// leading selector: intrinsicgridmap(index, %N) (quick-261021-jay).
+		// leading selector: runtimegridquery(index, %N)
+		// (quick-261021-jay; renamed LR-6, quick-261022-l1o).
 		var b strings.Builder
-		if t.KindOf() == KindIntrinsicGridMap {
-			b.WriteString("intrinsicgridmap(")
+		if t.KindOf() == KindRuntimeGridQuery {
+			b.WriteString("runtimegridquery(")
 		} else {
-			b.WriteString("intrinsicthreadmap(")
+			b.WriteString("runtimethreadquery(")
 		}
 		b.WriteString(t.field)
 		if d := opAt(t, 0); d != nil {
@@ -759,6 +760,62 @@ func (r *renderer) value(n Node) string {
 			b.WriteString(r.value(d))
 		}
 		b.WriteString(")")
+		return b.String()
+	case *runtimeKernelInfoNode:
+		return "runtimekernelinfo()"
+	case *runtimeMappingNode:
+		// runtimegridmapping(%ki, 1, -1): the object operand followed by the
+		// ndim and portion constants at their typed spellings.
+		var b strings.Builder
+		b.WriteString(t.KindOf().String() + "(")
+		first := true
+		for _, op := range OperandsOf(t) {
+			if !first {
+				b.WriteString(", ")
+			}
+			first = false
+			b.WriteString(r.value(op))
+		}
+		b.WriteString(")")
+		return b.String()
+	case *runtimeReducerNode:
+		// runtimewarpreducer(%init, %lambda): the construction carries ALL
+		// state (LR-3).
+		var b strings.Builder
+		b.WriteString(t.KindOf().String() + "(")
+		for i, op := range OperandsOf(t) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.value(op))
+		}
+		b.WriteString(")")
+		return b.String()
+	case *runtimeCallNode:
+		// runtimecallmethod(%reducer, "Init", ...): the method payload as a
+		// quoted selector after the object, then the args as values (LR-4).
+		var b strings.Builder
+		b.WriteString("runtimecallmethod(")
+		for i, op := range OperandsOf(t) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.value(op))
+		}
+		b.WriteString(", " + strconv.Quote(t.method) + ")")
+		return b.String()
+	case *runtimeGetAttributeNode:
+		// runtimegetattribute(%mapping, "index", 1): the attribute payload
+		// as a quoted selector after the object, then the args (LR-4).
+		var b strings.Builder
+		b.WriteString("runtimegetattribute(")
+		for i, op := range OperandsOf(t) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.value(op))
+		}
+		b.WriteString(", " + strconv.Quote(t.attribute) + ")")
 		return b.String()
 	case *keyedAttributeNode:
 		return "keyedattribute(" + t.key + "=" + r.value(opAt(t, 0)) + ")"

@@ -157,6 +157,74 @@ func TestASTLoopNonConstAttrsFailsClosed(t *testing.T) {
 	}
 }
 
+// TestASTBlockItemMutators pins P-6 (quick-261022-l1o): InsertItemAt's
+// fail-closed bounds (negative / beyond-append indices error, leaving the
+// block untouched), insert-at-0 / -middle / -end placement order, and
+// RemoveItemsIf's order-preserving filtered removal with its count.
+func TestASTBlockItemMutators(t *testing.T) {
+	g := NewGraph("mut")
+	blk := NewASTGroup()
+	a := g.NewConst("ctor", InternScalar(TU32), 1)
+	b := g.NewConst("ctor", InternScalar(TU32), 2)
+	c := g.NewConst("ctor", InternScalar(TU32), 3)
+	blk.AppendItem(ASTItem{Node: a})
+	blk.AppendItem(ASTItem{Node: b})
+
+	// Bounds: negative and > len are errors; index == len appends.
+	if err := blk.InsertItemAt(-1, ASTItem{Node: c}); err == nil {
+		t.Fatal("negative index must fail closed")
+	}
+	if err := blk.InsertItemAt(3, ASTItem{Node: c}); err == nil {
+		t.Fatal("index beyond the append position must fail closed")
+	}
+	if got := len(blk.Items()); got != 2 {
+		t.Fatalf("a refused insert must leave the block untouched, got %d items", got)
+	}
+
+	// Insert at 0: prepends.
+	if err := blk.InsertItemAt(0, ASTItem{Node: c}); err != nil {
+		t.Fatalf("insert at 0: %v", err)
+	}
+	items := blk.Items()
+	if len(items) != 3 || items[0].Node.BasePtr() != c.BasePtr() || items[1].Node.BasePtr() != a.BasePtr() {
+		t.Fatalf("insert at 0 must prepend, got order %v", items)
+	}
+
+	// Insert in the middle and at the end.
+	if err := blk.InsertItemAt(2, ASTItem{Node: c}); err != nil {
+		t.Fatalf("insert at 2: %v", err)
+	}
+	if err := blk.InsertItemAt(len(blk.Items())+1, ASTItem{Node: a}); err == nil {
+		t.Fatal("the bounds moved with the growing block: index len+1 must still fail")
+	}
+	if err := blk.InsertItemAt(4, ASTItem{Node: a}); err != nil {
+		t.Fatalf("insert at end: %v", err)
+	}
+	items = blk.Items()
+	if len(items) != 5 || items[2].Node.BasePtr() != c.BasePtr() || items[4].Node.BasePtr() != a.BasePtr() {
+		t.Fatalf("middle/end inserts misplaced, got order %v", items)
+	}
+
+	// RemoveItemsIf: drops every matching item in order, returns the count.
+	removed := blk.RemoveItemsIf(func(it ASTItem) bool {
+		return it.Node != nil && it.Node.BasePtr() == c.BasePtr()
+	})
+	if removed != 2 || len(blk.Items()) != 3 {
+		t.Fatalf("RemoveItemsIf removed %d, len %d, want 2 removed len 3", removed, len(blk.Items()))
+	}
+	for _, it := range blk.Items() {
+		if it.Node != nil && it.Node.BasePtr() == c.BasePtr() {
+			t.Fatal("every matching item must be gone")
+		}
+	}
+	if removed := blk.RemoveItemsIf(nil); removed != 0 {
+		t.Fatal("a nil predicate removes nothing")
+	}
+	if removed := blk.RemoveItemsIf(func(ASTItem) bool { return false }); removed != 0 {
+		t.Fatal("an all-false predicate removes nothing")
+	}
+}
+
 // TestASTGroupNestAccessor pins ruling 7 (quick-261022-b2m): a plain
 // NewASTGroup carries NO owning nest, while NewASTGroupInNest carries the
 // given LNT record — same pointer, O(1) identity for final_lower's

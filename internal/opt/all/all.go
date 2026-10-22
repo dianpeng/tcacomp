@@ -10,6 +10,7 @@ package all
 
 import (
 	_ "tcacomp/internal/opt/dce"
+	_ "tcacomp/internal/opt/finallower" // "final-lower" @950 — the last pass before codegen (quick-261022-l1o)
 	_ "tcacomp/internal/opt/gvn"
 	_ "tcacomp/internal/opt/memopt"
 	_ "tcacomp/internal/opt/schedule"

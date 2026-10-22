@@ -192,8 +192,46 @@ func (b *ASTBlock) Nest() *ASTLNT { return b.nest }
 func (b *ASTBlock) Items() []ASTItem { return append([]ASTItem(nil), b.items...) }
 
 // AppendItem appends one statement item (a scheduled node or a nested loop
-// block) — the only mutator besides the constructors.
+// block) — the primary construction mutator besides the constructors.
 func (b *ASTBlock) AppendItem(it ASTItem) { b.items = append(b.items, it) }
+
+// InsertItemAt inserts one statement item at index, shifting the existing
+// items at and after index back (P-6, quick-261022-l1o). Fail-closed bounds:
+// a negative index or one beyond the current length (append position
+// excluded — index == len appends, mirroring slice-insert semantics) is an
+// error leaving the block untouched. final-lower is the first consumer (the
+// KernelInfo prepend, the reducer bracket insertions); the utility stays
+// generic — no final-lower semantics live here.
+func (b *ASTBlock) InsertItemAt(index int, it ASTItem) error {
+	if index < 0 || index > len(b.items) {
+		return fmt.Errorf("ir: ASTBlock.InsertItemAt index %d out of bounds [0, %d]", index, len(b.items))
+	}
+	b.items = append(b.items, ASTItem{})
+	copy(b.items[index+1:], b.items[index:])
+	b.items[index] = it
+	return nil
+}
+
+// RemoveItemsIf drops every item for which pred reports true, preserving
+// the relative order of the survivors, and returns the number removed (P-6,
+// quick-261022-l1o). final-lower is the first consumer (the erased-node
+// sweep); the utility stays generic.
+func (b *ASTBlock) RemoveItemsIf(pred func(ASTItem) bool) int {
+	if pred == nil {
+		return 0
+	}
+	kept := b.items[:0]
+	removed := 0
+	for _, it := range b.items {
+		if pred(it) {
+			removed++
+			continue
+		}
+		kept = append(kept, it)
+	}
+	b.items = kept
+	return removed
+}
 
 // NewASTGroup creates an empty BlockGroup — a kernel body or one of the
 // prologue/epilogue pads around a loop-nest cluster (spec step 1.2) — with

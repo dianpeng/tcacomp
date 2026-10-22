@@ -655,11 +655,13 @@ func TestInlineMap(t *testing.T) {
 	assertCleanVerify(t, g, "the inlined doc example")
 }
 
-// TestInlineReduce pins D9's positional rule on a reduce: [piped,
-// attr(init)] binds [acc, now] as acc↔piped, now↔init-VALUE; a param still
-// referenced through a non-paramRef use stays declared (ClearLambdaParams
-// keeps live ones), and a body-root paramRef (identity map) rewires through
-// the body choke point.
+// TestInlineReduce pins the REDUCE-INLINE EXEMPTION (final_lower.md [1],
+// LR-3 prerequisite, quick-261022-l1o): after simplify-inline a Reduce's
+// lambda params REMAIN declared and its body still references them through
+// paramRefs — the combiner must survive as a function of its two formals
+// (the runtime reducer owns the (prev, cur) application). The piped MAP
+// still inlines fully (its identity body rewires to the load), and
+// simplify-verify accepts BOTH shapes.
 func TestInlineReduce(t *testing.T) {
 	g := ir.NewGraph("redinline")
 	f := f32(t)
@@ -675,39 +677,44 @@ func TestInlineReduce(t *testing.T) {
 	init := g.NewConst("ctor", f, 0)
 	acc := g.NewLambdaInputParam("ctor", "acc", f)
 	now := g.NewLambdaInputParam("ctor", "now", f)
-	comb := g.NewBinOp("ctor", ir.BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))
+	accRef, nowRef := g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now)
+	comb := g.NewBinOp("ctor", ir.BinOpAdd, accRef, nowRef)
 	red := g.NewReduce("ctor", init, mp, ir.NewLambda([]ir.Node{acc, now}, comb))
-
-	// A non-paramRef use of acc keeps the param alive: ClearLambdaParams
-	// must keep it declared while erasing now.
-	keeper := g.NewBinOp("ctor", ir.BinOpMul, acc, init)
-	g.NewReturn("ctor", red, keeper)
+	g.NewReturn("ctor", red)
 
 	runInline(t, g)
 
-	// acc↔piped (the map), now↔init VALUE (attribute unwrapped).
-	if ops := ir.OperandsOf(comb); len(ops) != 2 || ops[0] != mp || ops[1] != init {
-		t.Fatalf("combiner body must resolve to [piped, init-value], got %v", ops)
+	// The exemption: BOTH reduce formals stay declared, the combiner body
+	// still resolves to the two paramRefs (never rewired onto the piped
+	// map / init value), and the paramRef nodes stay live.
+	alive := nodeSet(g)
+	for name, p := range map[string]ir.Node{"acc": acc, "now": now} {
+		if !alive[p.BasePtr()] {
+			t.Fatalf("the reduce formal %s must stay live under the inline exemption", name)
+		}
 	}
-	// The piped map's identity body rewired to the load.
+	if ops := ir.OperandsOf(comb); len(ops) != 2 || ops[0] != accRef || ops[1] != nowRef {
+		t.Fatalf("the combiner body must keep its paramRefs under the exemption, got %v", ops)
+	}
+	params := ir.LambdaParams(red)
+	if len(params) != 1 || len(params[0]) != 2 || params[0][0] != acc || params[0][1] != now {
+		t.Fatalf("the reduce's lambda must keep both formals declared, got %v", params)
+	}
+	// The piped map's identity body STILL inlines (Map is not exempt): the
+	// body root rewires to the load, the map's formal is gone.
 	if bodies := ir.LambdaBodies(mp); len(bodies) != 1 || bodies[0] != load {
 		t.Fatalf("identity body must rewire to the load, got %v", bodies)
 	}
-	// now is erased; acc stays declared (still used by keeper).
-	alive := nodeSet(g)
-	if alive[now.BasePtr()] {
-		t.Fatal("the fully-inlined param `now` must be erased")
+	if mparams := ir.LambdaParams(mp); len(mparams) != 1 || len(mparams[0]) != 0 {
+		t.Fatalf("the inlined map's lambda must declare no params, got %v", mparams)
 	}
-	if !alive[acc.BasePtr()] {
-		t.Fatal("acc must stay live (a non-paramRef use remains)")
+	assertCleanVerify(t, g, "the exemption-shaped reduce")
+
+	// simplify-verify accepts BOTH shapes: the exempt Reduce and the fully
+	// inlined Map side by side.
+	if err := (simplify.VerifyPass{}).Run(nil, g); err != nil {
+		t.Fatalf("simplify-verify must accept the reduce-exempt shape: %v", err)
 	}
-	if !useWithUser(acc, keeper) {
-		t.Fatal("acc's surviving use must be the keeper binop")
-	}
-	if params := ir.LambdaParams(red); len(params) != 1 || len(params[0]) != 1 || params[0][0] != acc {
-		t.Fatalf("the reduce's lambda must declare exactly [acc], got %v", params)
-	}
-	assertCleanVerify(t, g, "the inlined reduce")
 }
 
 // TestInlineIdempotence pins that a second lower+inline changes nothing.

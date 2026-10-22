@@ -81,6 +81,7 @@ import (
 
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
+	"tcacomp/internal/opt/tiling" // Preserved: the tiling-provenance cache entry (sibling opt package — data only, no cycle)
 )
 
 // init self-registers the scheduler in the global pass registry
@@ -115,9 +116,14 @@ func (Scheduler) Requires() []string { return []string{"tile-lower"} }
 // the untouched graph.
 func (Scheduler) Produces() opt.Stage { return opt.StageConstructed }
 
-// Preserved: the tiling-record analysis cache entry survives scheduling —
-// final_lower fetches it for per-LNT runtime mapping construction.
-func (Scheduler) Preserved() []string { return []string{"tiling-record"} }
+// Preserved: the tiling PROVENANCE record survives scheduling — final-lower
+// fetches it for the reducer bracket loops (per-dim Between/Inside) and the
+// per-LNT runtime mapping construction (P-5, quick-261022-l1o). The old
+// "tiling-record" entry is deliberately dropped here: that record provably
+// dies at tile-lower (tile-lower's own Preserved was empty before the
+// provenance landed, so nothing ever preserved the decision record past it
+// — it is keyed by BIV nodes tile-lower erases).
+func (Scheduler) Preserved() []string { return []string{tiling.ProvenanceName} }
 
 // Run schedules the sea of nodes into the AST-style CFG: the entry gates,
 // then the design doc's phases composed one call per step (the

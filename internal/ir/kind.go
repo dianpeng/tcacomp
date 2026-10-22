@@ -77,13 +77,31 @@ const (
 	KindTensorDimOf       // lowered shape upper bound: TensorDimOf(tensor, axis const)
 	KindInductionVariable // lowered u32 iteration value: InductionVariable(iter)
 
-	// --- LIR tier, loop-tile-lower additions (quick-261021-jay) ---
-	// Append-only within the tier (no KindVersion bump): the map-query
-	// intrinsics the loop-tile-lower pass materializes exist only between
-	// that pass and codegen.
+	// --- LIR tier, loop-tile-lower additions (quick-261021-jay; renamed to
+	// the Runtime vocabulary by quick-261022-l1o, LR-6 — a PURE rename, enum
+	// values unchanged) ---
+	// Append-only within the tier (no KindVersion bump): the launch-map
+	// queries the loop-tile-lower pass materializes exist only between that
+	// pass and final-lower; after final-lower's query rewrite they vanish
+	// from every graph.
 
-	KindIntrinsicGridMap   // lowered launch-map query: IntrinsicGridMap(field, DoSoC const)
-	KindIntrinsicThreadMap // lowered launch-map query: IntrinsicThreadMap(field, DoSoC const)
+	KindRuntimeGridQuery   // pre-final-lower launch-map query: RuntimeGridQuery(field, DoSoC const)
+	KindRuntimeThreadQuery // pre-final-lower launch-map query: RuntimeThreadQuery(field, DoSoC const)
+
+	// --- LIR tier, final-lower additions (quick-261022-l1o,
+	// doc/optana/final_lower.md LR-4/LR-5) ---
+	// Append-only within the tier (no KindVersion bump): the runtime-object
+	// node family exists only between final-lower and codegen — codegen
+	// consumes exactly this output.
+
+	KindRuntimeKernelInfo        // runtime object: the kernel information construction (no operands)
+	KindRuntimeGridMapping       // runtime object: per-LNT GridMapping(kernel_info, ndim, portions...)
+	KindRuntimeThreadMapping     // runtime object: per-LNT ThreadMapping(kernel_info, ndim, portions...)
+	KindRuntimeSequentialReducer // runtime object: sequential reducer construction (init, lambda)
+	KindRuntimeWarpReducer       // runtime object: warp reducer construction (init, lambda)
+	KindRuntimeGlobalReducer     // runtime object: global reducer construction (init, lambda) — v0-unreachable scaffolding
+	KindRuntimeCallMethod        // runtime generic: method call on a reducer object; method payload Init|Reduce|Combine; ordered side effect
+	KindRuntimeGetAttribute      // runtime generic: attribute read on a runtime object; attribute payload total_cta|total_thread_per_cta|index|dimension; pure
 
 	KindEnd // sentinel: all kinds < KindEnd
 )
@@ -156,10 +174,26 @@ func (k Kind) String() string {
 		return "tensordimof"
 	case KindInductionVariable:
 		return "inductionvariable"
-	case KindIntrinsicGridMap:
-		return "intrinsicgridmap"
-	case KindIntrinsicThreadMap:
-		return "intrinsicthreadmap"
+	case KindRuntimeGridQuery:
+		return "runtimegridquery"
+	case KindRuntimeThreadQuery:
+		return "runtimethreadquery"
+	case KindRuntimeKernelInfo:
+		return "runtimekernelinfo"
+	case KindRuntimeGridMapping:
+		return "runtimegridmapping"
+	case KindRuntimeThreadMapping:
+		return "runtimethreadmapping"
+	case KindRuntimeSequentialReducer:
+		return "runtimesequentialreducer"
+	case KindRuntimeWarpReducer:
+		return "runtimewarpreducer"
+	case KindRuntimeGlobalReducer:
+		return "runtimeglobalreducer"
+	case KindRuntimeCallMethod:
+		return "runtimecallmethod"
+	case KindRuntimeGetAttribute:
+		return "runtimegetattribute"
 	case KindEnd:
 		return "end"
 	default:
@@ -170,17 +204,21 @@ func (k Kind) String() string {
 // Family classifies a Kind into its node family (D-15). FamilyMemory gained
 // the whole HIR GMEM family (MemLoad/MemStore/MemNew) and the lowered SMEM/
 // FRAG families with the v3 re-organization, replacing FamilyTileOp (the
-// LoadTile/StoreTile kinds are gone — R4d). FamilyCollective remains reserved
-// with no member kinds until reduce lowering lands. New lowering kinds join
-// via new constants without enum surgery (single-tier IR rule).
+// LoadTile/StoreTile kinds are gone — R4d). FamilyCollective gained its
+// first members with final lowering (quick-261022-l1o, LR-5): the three
+// RuntimeXXXReducer constructions. FamilyRuntime is NEW in the same change
+// (KernelInfo/GridMapping/ThreadMapping + RuntimeCallMethod +
+// RuntimeGetAttribute). New lowering kinds join via new constants without
+// enum surgery (single-tier IR rule).
 type Family int
 
 const (
 	FamilyAbstract   Family = iota
 	FamilyLoop              // iter/itercluster headers and the lowered for-loop
 	FamilyMemory            // GMEM MemLoad/MemStore/MemNew + lowered SMEM/FRAG families
-	FamilyCollective        // reserved: reducers/collectives (no members yet)
+	FamilyCollective        // reducers/collectives: the three RuntimeXXXReducer constructions
 	FamilyScalarExpr        // const/param/binop/unaryop/select/cast/call
+	FamilyRuntime           // runtime objects: KernelInfo/mappings + CallMethod/GetAttribute (quick-261022-l1o)
 )
 
 // Family returns the family of the kind.
@@ -194,17 +232,22 @@ func (k Kind) Family() Family {
 		return FamilyMemory
 	case KindIter, KindIterCluster, KindForLoop:
 		return FamilyLoop
+	case KindRuntimeSequentialReducer, KindRuntimeWarpReducer, KindRuntimeGlobalReducer:
+		return FamilyCollective
+	case KindRuntimeKernelInfo, KindRuntimeGridMapping, KindRuntimeThreadMapping,
+		KindRuntimeCallMethod, KindRuntimeGetAttribute:
+		return FamilyRuntime
 	default:
 		// KindMap, KindReduce, KindInputParam, KindReturn, KindDimVar,
 		// KindBoundedDimVar, the Input-list restructure additions
 		// (IterClusterProject, KeyedAttribute, As, Lambda — reference-carrier
 		// and expression-carrier nodes, quick-261019-ktm), the lowered
 		// shape/iteration VALUE nodes (TensorDimOf, InductionVariable — pure
-		// value nodes per the DimVar precedent), the loop-tile-lower map
-		// queries (IntrinsicGridMap/IntrinsicThreadMap — the same pure-value
-		// precedent, quick-261021-jay: per-launch deterministic queries, so
-		// EffectOf is free and GVN-CSE sound), and the sentinel values
-		// belong to the abstract suite
+		// value nodes per the DimVar precedent), the pre-final-lower
+		// launch-map queries (RuntimeGridQuery/RuntimeThreadQuery — the same
+		// pure-value precedent, quick-261021-jay: per-launch deterministic
+		// queries, so EffectOf is free and GVN-CSE sound), and the sentinel
+		// values belong to the abstract suite
 		// (the lowered dimvars are value-level IV objects, doc/optana/
 		// induction_variable.md, not loop-nest structure).
 		return FamilyAbstract

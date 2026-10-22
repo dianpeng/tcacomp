@@ -200,16 +200,17 @@ func TestLoopValueKindsU32(t *testing.T) {
 	}
 }
 
-// TestIntrinsicAndUminRules pins quick-261021-jay's §5 companion 4 and §3's
-// integer-bounds recipe: the launch-map query intrinsics type u32, and a
+// TestRuntimeQueryAndUminRules pins quick-261021-jay's §5 companion 4 and §3's
+// integer-bounds recipe: the launch-map queries (renamed RuntimeGridQuery/
+// RuntimeThreadQuery, LR-6) type u32, and a
 // u32-arg "umin" call types u32 through the existing registry-driven KindCall
 // rule (the tile-lower pass's materialized tile_max form).
-func TestIntrinsicAndUminRules(t *testing.T) {
+func TestRuntimeQueryAndUminRules(t *testing.T) {
 	g := ir.NewGraph("tilelower-types")
 	d0 := g.NewConst("t", u32T(), 0)
 	d1 := g.NewConst("t", u32T(), 1)
-	gm := g.NewIntrinsicGridMap("t", "index", d0)
-	tm := g.NewIntrinsicThreadMap("t", "dimension", d1)
+	gm := g.NewRuntimeGridQuery("t", "index", d0)
+	tm := g.NewRuntimeThreadQuery("t", "dimension", d1)
 	extent := g.NewTensorDimOf("t",
 		g.NewInputParam("t", ir.RoleTensor, "lhs", tensorT(ir.TF32, "m", "k")), 1)
 	tileMax := g.NewCall("t", "umin", d1, extent)
@@ -230,6 +231,50 @@ func TestIntrinsicAndUminRules(t *testing.T) {
 	badArg.NewCall("t", "umin", badArg.NewConst("t", u32T(), 1), badArg.NewConst("t", f32T(), 1))
 	if err := runTI(badArg); err == nil || !strings.Contains(err.Error(), "umin") {
 		t.Fatalf("f32-arg umin must fail closed naming the builtin, got %v", err)
+	}
+}
+
+// TestRuntimeObjectRules pins P-4 (quick-261022-l1o): RuntimeGetAttribute
+// types u32 (every attribute of the closed vocabulary is a launch
+// coordinate/dim); RuntimeCallMethod("Combine") types as the reducer
+// construction's init operand type (T = the element type, LR-8); the
+// Init/Reduce call statements and the five object-construction kinds stay
+// untyped WITHOUT failing the postcondition sweep.
+func TestRuntimeObjectRules(t *testing.T) {
+	g := ir.NewGraph("runtime-types")
+	ki := g.NewRuntimeKernelInfo("t")
+	gm := g.NewRuntimeGridMapping("t", ki, []int{-1})
+	tm := g.NewRuntimeThreadMapping("t", ki, []int{4, -1})
+	idx := g.NewRuntimeGetAttribute("t", "index", gm, g.NewConst("t", u32T(), 0))
+	total := g.NewRuntimeGetAttribute("t", "total_cta", ki)
+
+	// A typed init value + a live combiner lambda (the reduce-exemption
+	// shape: params declared, body referencing them through paramRefs).
+	init := g.NewConst("t", f32T(), 0)
+	acc := g.NewLambdaInputParam("t", "acc", f32T())
+	now := g.NewLambdaInputParam("t", "now", f32T())
+	comb := g.NewBinOp("t", ir.BinOpAdd, g.NewParamRef("t", acc), g.NewParamRef("t", now))
+	red := g.NewRuntimeWarpReducer("t", init, g.NewLambdaNode("t", []ir.Node{acc, now}, comb))
+	callInit := g.NewRuntimeCallMethod("t", "Init", red)
+	callReduce := g.NewRuntimeCallMethod("t", "Reduce", red, init)
+	callCombine := g.NewRuntimeCallMethod("t", "Combine", red)
+	g.NewReturn("t", idx, total, callCombine) // anchor: Level-1 Verify walks from the end node
+
+	mustRun(t, g)
+	wantType(t, idx, "getattr index", u32T())
+	wantType(t, total, "getattr total_cta", u32T())
+	wantType(t, callCombine, "Combine call", f32T())
+	for name, n := range map[string]ir.Node{
+		"kernelinfo":    ki,
+		"gridmapping":   gm,
+		"threadmapping": tm,
+		"reducer":       red,
+		"init-call":     callInit,
+		"reduce-call":   callReduce,
+	} {
+		if ir.TypeOf(n) != nil {
+			t.Fatalf("%s must stay untyped (P-4: object handles and Init/Reduce statements carry no Type), got %v", name, ir.TypeOf(n))
+		}
 	}
 }
 

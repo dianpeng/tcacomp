@@ -193,11 +193,50 @@ func typeOfNode(n ir.Node, memo map[*ir.Base]ir.Type) (ir.Type, error) {
 
 	case ir.KindIter, ir.KindForLoop, ir.KindDimVar, ir.KindBoundedDimVar,
 		ir.KindInductionVariable, ir.KindTensorDimOf,
-		ir.KindIntrinsicGridMap, ir.KindIntrinsicThreadMap:
+		ir.KindRuntimeGridQuery, ir.KindRuntimeThreadQuery,
+		ir.KindRuntimeGetAttribute:
 		// §5 companion 4 (quick-261021-jay): the launch-map queries type
 		// u32 — without this arm the post-tile-lower typeinfer re-run
-		// fails closed on the closed catalog.
+		// fails closed on the closed catalog. P-4 (quick-261022-l1o):
+		// RuntimeGetAttribute joins the same u32 class (every attribute of
+		// the closed vocabulary — total_cta, total_thread_per_cta, index,
+		// dimension — is a launch coordinate/dim), and the query kinds
+		// carry their renamed names (LR-6).
 		return u32(), nil
+
+	// --- runtime objects (final lowering, quick-261022-l1o) ---
+
+	case ir.KindRuntimeKernelInfo, ir.KindRuntimeGridMapping,
+		ir.KindRuntimeThreadMapping,
+		ir.KindRuntimeSequentialReducer, ir.KindRuntimeWarpReducer,
+		ir.KindRuntimeGlobalReducer:
+		// P-4/LR-8: object handles carry no scalar Type anywhere — the
+		// kinds also sit on the pass's untypedKinds whitelist so the
+		// postcondition sweep accepts their nil cells.
+		return nil, nil
+
+	case ir.KindRuntimeCallMethod:
+		// P-4: payload "Combine" produces the reduced value — T = the type
+		// of the reducer construction's operand 0 (%init — the construction
+		// itself is an untyped handle, so the rule reads THROUGH operand 0);
+		// payloads "Init"/"Reduce" are statements, not values
+		// (untypedAllowed).
+		if ir.RuntimeMethodOf(n) != "Combine" {
+			return nil, nil
+		}
+		if len(ops) == 0 || ops[0] == nil {
+			return nil, nodeErr(n, "operand slot 0 is unwired")
+		}
+		redOps := ir.OperandsOf(ops[0])
+		if len(redOps) == 0 || redOps[0] == nil {
+			return nil, nodeErr(n, "reducer construction node %d carries no init operand", ops[0].BasePtr().ID())
+		}
+		ty, ok := memo[redOps[0].BasePtr()]
+		if !ok || ty == nil {
+			return nil, nodeErr(n, "reducer init node %d (%s) carries no computed type",
+				redOps[0].BasePtr().ID(), redOps[0].KindOf())
+		}
+		return ty, nil
 
 	// --- iteration clusters (spec (2): lowered before TI) ---
 

@@ -64,14 +64,25 @@ func (Pass) Preserved() []string { return nil }
 
 // untypedKinds is the closed untyped whitelist: allocations carry no dtype
 // anywhere in their operands (memnew/memnewsmem/fragnew), As is an
-// output-order clause rather than a value, and Lambda is a function
-// expression for which no function Type exists yet.
+// output-order clause rather than a value, Lambda is a function
+// expression for which no function Type exists yet, and the runtime OBJECT
+// CONSTRUCTION kinds carry no scalar Type anywhere (P-4/LR-8,
+// quick-261022-l1o: KernelInfo / the two mappings / the three reducers are
+// opaque handles — the reducer's element type T is checked against the
+// lambda's parameter-definition types at Reduce lowering, never derived
+// from the construction node).
 var untypedKinds = map[ir.Kind]bool{
-	ir.KindMemNew:     true,
-	ir.KindMemNewSMem: true,
-	ir.KindFragNew:    true,
-	ir.KindAs:         true,
-	ir.KindLambda:     true,
+	ir.KindMemNew:                   true,
+	ir.KindMemNewSMem:               true,
+	ir.KindFragNew:                  true,
+	ir.KindAs:                       true,
+	ir.KindLambda:                   true,
+	ir.KindRuntimeKernelInfo:        true,
+	ir.KindRuntimeGridMapping:       true,
+	ir.KindRuntimeThreadMapping:     true,
+	ir.KindRuntimeSequentialReducer: true,
+	ir.KindRuntimeWarpReducer:       true,
+	ir.KindRuntimeGlobalReducer:     true,
 }
 
 // Run performs the typing over the Level-1 sea. Gates first (nil and
@@ -126,10 +137,15 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 }
 
 // untypedAllowed reports whether n may legitimately stay untyped: a
-// whitelist kind, or a Return with 0 or >1 value operands (none/multi-
-// valued; a tuple Type is the documented future extension point).
+// whitelist kind, a Return with 0 or >1 value operands (none/multi-
+// valued; a tuple Type is the documented future extension point), or an
+// Init/Reduce RuntimeCallMethod (statements, not values — P-4,
+// quick-261022-l1o; only the Combine call produces the reduced value).
 func untypedAllowed(n ir.Node) bool {
 	if untypedKinds[n.KindOf()] {
+		return true
+	}
+	if n.KindOf() == ir.KindRuntimeCallMethod && ir.RuntimeMethodOf(n) != "Combine" {
 		return true
 	}
 	return n.KindOf() == ir.KindReturn && len(ir.OperandsOf(n)) != 1

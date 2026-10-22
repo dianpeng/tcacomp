@@ -83,9 +83,14 @@ func (LowerPass) Requires() []string { return []string{"tiling", "tiling-verify"
 // revision-point note).
 func (LowerPass) Produces() opt.Stage { return opt.StageConstructed }
 
-// Preserved: NOTHING — the record is keyed by pre-rewrite BIV nodes this
-// pass erases; letting it survive would hand the next pass stale keys.
-func (LowerPass) Preserved() []string { return nil }
+// Preserved: the tiling PROVENANCE record this pass publishes (P-5,
+// quick-261022-l1o) — per-dim between/inside entries keyed by DIM
+// InputParams and per-LNT mapping plans keyed by the GENERATED ForLoop
+// roots, both stable across this pass and scheduling. The decision record
+// itself ("tiling-record") deliberately DIES here: it is keyed by
+// pre-rewrite BIV nodes this pass erases, so letting it survive would hand
+// the next pass stale keys.
+func (LowerPass) Preserved() []string { return []string{ProvenanceName} }
 
 // Run lowers every decided LNT and every promoted site:
 //
@@ -172,6 +177,10 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		overrides: overrides,
 		byIter:    make(map[ir.Node]*dimRewrite),
 		claimed:   make(map[*ir.Base]bool),
+		prov: &Provenance{
+			Dims: make(map[ir.Node]DimProvenance),
+			LNTs: make(map[ir.Node]MappingPlan),
+		},
 	}
 	for _, root := range f.Roots() {
 		if err := lr.rewriteLNT(root); err != nil {
@@ -181,13 +190,25 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	if err := lr.lowerSites(rec, facts, dropped); err != nil {
 		return err
 	}
-	return lr.epilogue(rec, dropped)
+	if err := lr.epilogue(rec, dropped); err != nil {
+		return err
+	}
+	// P-5 (quick-261022-l1o): publish the tiling provenance AFTER the
+	// epilogue succeeds — the per-dim between/inside entries and the
+	// per-LNT mapping plans final-lower consumes. Preserved keeps it alive
+	// across this pass's own invalidation and scheduling.
+	if ctx.Cache == nil {
+		return errors.New("tile-lower: no analysis cache to publish the tiling provenance under")
+	}
+	ctx.Cache.Put(lr.prov)
+	return nil
 }
 
 // lowerRun carries one Run's rewrite state: the pass thresholds, the
 // choke-point context, the effective per-iter decisions (record decision
 // plus any budget override), and the per-dim rewrite products PHASE 4
-// consumes (filled by rewriteLNT).
+// consumes (filled by rewriteLNT), and the provenance record under
+// construction (P-5).
 type lowerRun struct {
 	g         *ir.Graph
 	params    Params
@@ -198,6 +219,7 @@ type lowerRun struct {
 	claimed   map[*ir.Base]bool // effectful body ops already owned by an LNT
 	rewrites  []*lntRewrite     // per-root products, Roots() order
 	fills     []*siteFill       // PHASE 4 products, for the §8 placement/scope checks
+	prov      *Provenance       // the P-5 provenance under construction
 }
 
 // effectiveTile returns the iter's tile size after budget overrides.
@@ -395,7 +417,7 @@ func (lr *lowerRun) checkFillPlacement() error {
 					return fmt.Errorf("tile-lower: fill for site %d references dimvar node %d of loop %d, which does not enclose its fill position (host loop %d) — a fill may only reference dimvars of enclosing loops",
 						fill.siteID, n.BasePtr().ID(), def.BasePtr().ID(), fill.host.BasePtr().ID())
 				}
-				if fill.variant == loadTileCta && n.KindOf() == ir.KindIntrinsicThreadMap {
+				if fill.variant == loadTileCta && n.KindOf() == ir.KindRuntimeThreadQuery {
 					return fmt.Errorf("tile-lower: cooperative fill for site %d carries a ThreadMap (per-thread) term in its coordinates — LoadTileCta source bases must be CTA-uniform (R1/HI-03)",
 						fill.siteID)
 				}
