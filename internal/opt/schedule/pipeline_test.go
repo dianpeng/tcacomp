@@ -109,7 +109,10 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 	}
 
 	// Linkage + single placement: every walked node's SchedBlock is exactly
-	// its containing block, and no node appears twice anywhere.
+	// its containing block, and no node appears twice anywhere. The walk
+	// covers the WHOLE kernel — Prototype (quick-261022-e2u) and Body — and
+	// pins the placeholder anchoring: every live InputParam at SN -1 in the
+	// Prototype block, whose items are exactly the live params.
 	walkItems(k1.Body, func(n ir.Node, containing *ir.ASTBlock) {
 		if n.BasePtr().SchedBlock() != containing {
 			t.Fatalf("node %d (%s): SchedBlock is not its containing block (linkage broken)",
@@ -119,6 +122,24 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 			t.Fatalf("node %d (%s) placed %d times, want exactly 1", n.BasePtr().ID(), n.KindOf(), got)
 		}
 	})
+	if k1.Prototype.Kind() != ir.BlockPrototype {
+		t.Fatalf("prototype kind = %s, want Prototype", k1.Prototype.Kind())
+	}
+	walkItems(k1.Prototype, func(n ir.Node, containing *ir.ASTBlock) {
+		if n.KindOf() != ir.KindInputParam {
+			t.Fatalf("prototype item %d is %s, want an InputParam placeholder", n.BasePtr().ID(), n.KindOf())
+		}
+		if n.BasePtr().SchedSN() != ir.PrototypeSN || n.BasePtr().SchedBlock() != k1.Prototype {
+			t.Fatalf("param %d must anchor at SN -1 in the Prototype block, got %d/%p",
+				n.BasePtr().ID(), n.BasePtr().SchedSN(), n.BasePtr().SchedBlock())
+		}
+		if got := countOccurrences(k1.Body, n); got != 0 {
+			t.Fatalf("param %d appears %d times in the body — placeholders live only in the Prototype", n.BasePtr().ID(), got)
+		}
+	})
+	if got := len(itemNodes(k1.Prototype)); got != len(k1.Params) {
+		t.Fatalf("prototype items = %d, want exactly the %d live params", got, len(k1.Params))
+	}
 
 	// Structure: one LNT; the body's top-level items are exactly
 	// [prologue Group, root LBBN block, epilogue Group].

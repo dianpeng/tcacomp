@@ -67,7 +67,7 @@ func TestVerifyBlockOrderInversion(t *testing.T) {
 
 	nodes := []ir.Node{n, d}
 	live := map[ir.Node]bool{n: true, d: true}
-	err := verifyBlockOrder(&ir.ASTKernel{Body: body}, nodes, live)
+	err := verifyBlockOrder(&ir.ASTKernel{Prototype: ir.NewASTPrototype(), Body: body}, nodes, live)
 	if err == nil {
 		t.Fatal("an inversion (user block before dep block) must fail closed")
 	}
@@ -100,7 +100,7 @@ func TestVerifyBlockOrderLeftover(t *testing.T) {
 
 	nodes := []ir.Node{placed, loose}
 	live := map[ir.Node]bool{placed: true, loose: true}
-	err := verifyBlockOrder(&ir.ASTKernel{Body: body}, nodes, live)
+	err := verifyBlockOrder(&ir.ASTKernel{Prototype: ir.NewASTPrototype(), Body: body}, nodes, live)
 	if err == nil || !strings.Contains(err.Error(), "landed in no block") {
 		t.Fatalf("leftover verification = %v, want the landed-in-no-block refusal", err)
 	}

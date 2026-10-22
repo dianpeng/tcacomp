@@ -128,9 +128,11 @@ func bodyBlocks(t *testing.T, k *ir.ASTKernel) []*ir.ASTBlock {
 }
 
 // TestNoLoops pins spec step 2's degenerate shape: a store-only graph with
-// no ForLoop yields a kernel body that is a SINGLE Group holding every
-// live node in dependency order, all at SN 0, every node's SchedBlock
-// pointing at that group.
+// no ForLoop yields a kernel body that is a SINGLE Group holding every live
+// non-placeholder node in dependency order, all at SN 0, every such node's
+// SchedBlock pointing at that group. The two placeholders (the dim param m
+// and the tensor param out) anchor at SN -1 into the Prototype block
+// (quick-261022-e2u, D-1) — rendered first, not inside the body.
 func TestNoLoops(t *testing.T) {
 	f := newFx("noloop")
 	a := f.g.NewConst("ctor", f.f32, 3)
@@ -143,9 +145,12 @@ func TestNoLoops(t *testing.T) {
 	if k.Body.Kind() != ir.BlockGroup {
 		t.Fatalf("no-loop body kind = %s, want Group", k.Body.Kind())
 	}
+	if k.Prototype.Kind() != ir.BlockPrototype {
+		t.Fatalf("no-loop prototype kind = %s, want Prototype", k.Prototype.Kind())
+	}
 	items := itemNodes(k.Body)
-	if len(items) != 7 { // m, out, a, b, prod, st, end
-		t.Fatalf("body holds %d nodes, want every live node (7)", len(items))
+	if len(items) != 5 { // a, b, prod, st, end — m/out are prototype placeholders (D-1)
+		t.Fatalf("body holds %d nodes, want the 5 non-placeholder live nodes", len(items))
 	}
 	if indexOf(items, a) > indexOf(items, prod) || indexOf(items, b) > indexOf(items, prod) {
 		t.Fatal("producers must precede their consumer (dependency order)")
@@ -153,13 +158,23 @@ func TestNoLoops(t *testing.T) {
 	if indexOf(items, prod) > indexOf(items, st) {
 		t.Fatal("the store must follow its value")
 	}
-	for _, n := range []ir.Node{f.m, f.out, a, b, prod, st, end} {
+	for _, n := range []ir.Node{a, b, prod, st, end} {
 		if n.BasePtr().SchedSN() != 0 {
 			t.Fatalf("node %d SN = %d, want 0", n.BasePtr().ID(), n.BasePtr().SchedSN())
 		}
 		if n.BasePtr().SchedBlock() != k.Body {
 			t.Fatalf("node %d must land in the kernel body group", n.BasePtr().ID())
 		}
+	}
+	for _, n := range []ir.Node{f.m, f.out} {
+		if n.BasePtr().SchedSN() != ir.PrototypeSN || n.BasePtr().SchedBlock() != k.Prototype {
+			t.Fatalf("placeholder %d must anchor at SN -1 in the Prototype block, got %d/%p",
+				n.BasePtr().ID(), n.BasePtr().SchedSN(), n.BasePtr().SchedBlock())
+		}
+	}
+	protoItems := itemNodes(k.Prototype)
+	if indexOf(protoItems, f.m) < 0 || indexOf(protoItems, f.out) < 0 {
+		t.Fatal("the Prototype block's items must be exactly the live params")
 	}
 }
 
@@ -413,6 +428,27 @@ func TestKernelMetadata(t *testing.T) {
 	if k.Gmem[0].New.BasePtr() != tmp.BasePtr() || k.Gmem[0].Extent.BasePtr() != extent.BasePtr() {
 		t.Fatal("Gmem must list the MemNew with its extent (op[0])")
 	}
+	// quick-261022-e2u (D-1/D-2): the canonical schedule view — the GMEM
+	// MemNew and both params anchor at SN -1 as items of the Prototype
+	// block (rendered first); the extent const stays scheduled at SN 0.
+	if k.Prototype.Kind() != ir.BlockPrototype {
+		t.Fatalf("prototype kind = %s, want Prototype", k.Prototype.Kind())
+	}
+	if tmp.BasePtr().SchedSN() != ir.PrototypeSN || tmp.BasePtr().SchedBlock() != k.Prototype {
+		t.Fatal("the GMEM MemNew must anchor at SN -1 in the Prototype block")
+	}
+	if extent.BasePtr().SchedSN() != 0 || extent.BasePtr().SchedBlock() == k.Prototype {
+		t.Fatal("the extent const is a value: scheduled at SN 0, NOT in the Prototype")
+	}
+	for _, p := range []ir.Node{f.m, f.out} {
+		if p.BasePtr().SchedSN() != ir.PrototypeSN || p.BasePtr().SchedBlock() != k.Prototype {
+			t.Fatalf("param %d must anchor at SN -1 in the Prototype block", p.BasePtr().ID())
+		}
+	}
+	protoItems := itemNodes(k.Prototype)
+	if len(protoItems) != 3 { // m, out, tmp — exactly the live placeholders
+		t.Fatalf("prototype items = %d, want exactly the 3 live placeholders (m, out, tmp)", len(protoItems))
+	}
 	if len(k.LNTs) != 1 {
 		t.Fatalf("LNTs = %d entries, want 1", len(k.LNTs))
 	}
@@ -545,8 +581,12 @@ func TestEffectfulNoHoist(t *testing.T) {
 		if inv.BasePtr().SchedSN() != 0 || inv.BasePtr().SchedBlock() != prologue {
 			t.Fatal("the pure invariant must still hoist to the prologue (LICM intact)")
 		}
-		if buf.BasePtr().SchedSN() != 0 || buf.BasePtr().SchedBlock() != prologue {
-			t.Fatalf("allocation SN/block = %d/%p, want 0/prologue (the HI-02 exemption pin)", buf.BasePtr().SchedSN(), buf.BasePtr().SchedBlock())
+		// quick-261022-e2u (D-1/D-4): a KindMemNew (GMEM) is a PLACEHOLDER —
+		// anchored at SN -1 into the Prototype block, not scheduled. (The
+		// HI-02 exemption still governs KindMemNewSMem/KindFragNew, pinned by
+		// the pipeline fill test's buffer-at-SN-0 leg.)
+		if buf.BasePtr().SchedSN() != ir.PrototypeSN || buf.BasePtr().SchedBlock() != k.Prototype {
+			t.Fatalf("GMEM allocation SN/block = %d/%p, want -1/Prototype (placeholder anchoring)", buf.BasePtr().SchedSN(), buf.BasePtr().SchedBlock())
 		}
 		if load.BasePtr().SchedSN() != 1 || load.BasePtr().SchedBlock() != thr {
 			t.Fatalf("the iv-varying load SN/block = %d/%p, want 1/ThrLoop", load.BasePtr().SchedSN(), load.BasePtr().SchedBlock())

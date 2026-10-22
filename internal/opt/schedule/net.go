@@ -35,8 +35,8 @@ import (
 // order and the per-root concatenation give exactly the kernel's execution
 // order.
 func verifyBlockOrder(k *ir.ASTKernel, nodes []ir.Node, live map[ir.Node]bool) error {
-	if k == nil || k.Body == nil {
-		return fmt.Errorf("schedule: no kernel body to verify (nil AST)")
+	if k == nil || k.Prototype == nil || k.Body == nil {
+		return fmt.Errorf("schedule: kernel missing its Prototype or Body (nil AST)")
 	}
 	blockIndex := make(map[*ir.ASTBlock]int)
 	parent := make(map[*ir.ASTBlock]*ir.ASTBlock)
@@ -50,6 +50,9 @@ func verifyBlockOrder(k *ir.ASTKernel, nodes []ir.Node, live map[ir.Node]bool) e
 			}
 		}
 	}
+	// PROTOTYPE FIRST (quick-261022-e2u, D-2): the signature block renders
+	// before the body, so every -1 dep is trivially legal (index 0 < all).
+	flatten(k.Prototype, nil)
 	flatten(k.Body, nil)
 
 	// blockContains reports whether desc is b itself or lives in b's item
@@ -109,6 +112,18 @@ func verifyBlockOrder(k *ir.ASTKernel, nodes []ir.Node, live map[ir.Node]bool) e
 			// deeper block of its own subtree cannot exist (SN propagation
 			// would have raised its SN), so statements stay fully guarded.
 			if n.KindOf() == ir.KindForLoop && blockContains(n.BasePtr().SchedBlock(), d.BasePtr().SchedBlock()) {
+				continue
+			}
+			// SIGNATURE-EDGE CARVE-OUT (quick-261022-e2u, D-4): a prototype
+			// placeholder (InputParam/MemNew, SN -1) may reference scheduled
+			// values — a MemNew's extent const stays at SN 0 in a prologue
+			// (index > 0) — but a placeholder is DECLARATION, not execution:
+			// nothing executes inside the signature scope, so the linear
+			// "prototype before extent" index order asserts nothing about
+			// runtime order. Mirrors the ForLoop containment carve-out;
+			// prototype-landed DEPENDENTS (scheduled users of a placeholder)
+			// stay fully guarded (index > 0).
+			if n.BasePtr().SchedSN() == ir.PrototypeSN && blockContains(k.Prototype, n.BasePtr().SchedBlock()) {
 				continue
 			}
 			if di > ni {

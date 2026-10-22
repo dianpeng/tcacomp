@@ -200,6 +200,18 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 	// mapping; this is the design intent of "already scheduled" control
 	// nodes). A shared header node takes the MAX of its anchors'
 	// depths (order-independent). Every other live node starts at SN 0.
+	//
+	// PLACEHOLDER ANCHORS (quick-261022-e2u, D-1): live KindInputParam and
+	// KindMemNew (GMEM — the launcher-provided buffer) nodes are
+	// placeholders to known states, NOT statements: they anchor at SN -1
+	// (ir.PrototypeSN), the signature scope. Like the loop-header anchors
+	// they are FIXED during propagation — a MemNew's extent dep at SN 0
+	// must not lift it out of the signature scope — and excluded from rank
+	// collection/ownership by the anchored set, exactly the loop-header
+	// discipline. Zero special conditions downstream: propagation's meet
+	// is a MAX, so a -1 dep contributes nothing. KindMemNewSMem/KindFragNew
+	// are NOT anchored (in-kernel declarations, D-4); extent consts are
+	// values and stay scheduled.
 	anchored := make(map[ir.Node]bool, len(nests)*3)
 	anchor := func(n ir.Node, depth int) {
 		if n == nil || !live[n] {
@@ -216,6 +228,18 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 		if len(ops) >= 2 {
 			anchor(ops[0], t.depth) // iv
 			anchor(ops[1], t.depth) // bound
+		}
+	}
+	prototype := ir.NewASTPrototype()
+	for _, n := range nodes { // allocation order: deterministic item order
+		if !live[n] {
+			continue
+		}
+		switch n.KindOf() {
+		case ir.KindInputParam, ir.KindMemNew:
+			anchor(n, ir.PrototypeSN)
+			prototype.AppendItem(ir.ASTItem{Node: n})
+			n.BasePtr().SetSched(ir.PrototypeSN, prototype) // SN -1 + signature linkage (D-1)
 		}
 	}
 
@@ -405,10 +429,12 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 	var lnts []*ir.ASTLNT
 	if len(roots) == 0 {
 		// No ForLoop nests: the kernel body is a single Group holding every
-		// live node (all at rank 0), in dependency order.
+		// live non-placeholder node (all at rank 0), in dependency order.
+		// The prototype-anchored InputParam/MemNew placeholders are excluded
+		// (anchored set) — they live in the Prototype block (D-1).
 		var all []ir.Node
 		for _, n := range nodes {
-			if live[n] && n.KindOf() != ir.KindForLoop {
+			if live[n] && n.KindOf() != ir.KindForLoop && !anchored[n] {
 				all = append(all, n)
 			}
 		}
@@ -510,10 +536,11 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 		}
 	}
 	ast := &ir.ASTKernel{
-		Body:   kernel,
-		Params: g.Params(),
-		Gmem:   gmem,
-		LNTs:   lnts,
+		Prototype: prototype,
+		Body:      kernel,
+		Params:    g.Params(),
+		Gmem:      gmem,
+		LNTs:      lnts,
 	}
 
 	// Cross-block ordering net (locked decision 2, quick-261022-b2m): the
