@@ -199,11 +199,11 @@ func (b *Builder) And(x, y Expr) Expr { return b.typedBinOp(ir.BinOpLAnd, x, y, 
 func (b *Builder) Or(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpLOr, x, y, classBool) }
 
 // Integer bitwise operators and shifts, same integer type (§6.2).
-func (b *Builder) BitAnd(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpAnd, x, y, classInt) }
-func (b *Builder) BitOr(x, y Expr) Expr   { return b.typedBinOp(ir.BinOpOr, x, y, classInt) }
-func (b *Builder) BitXor(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpXor, x, y, classInt) }
-func (b *Builder) Shl(x, y Expr) Expr     { return b.typedBinOp(ir.BinOpShL, x, y, classInt) }
-func (b *Builder) Shr(x, y Expr) Expr     { return b.typedBinOp(ir.BinOpShR, x, y, classInt) }
+func (b *Builder) BitAnd(x, y Expr) Expr { return b.typedBinOp(ir.BinOpAnd, x, y, classInt) }
+func (b *Builder) BitOr(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpOr, x, y, classInt) }
+func (b *Builder) BitXor(x, y Expr) Expr { return b.typedBinOp(ir.BinOpXor, x, y, classInt) }
+func (b *Builder) Shl(x, y Expr) Expr    { return b.typedBinOp(ir.BinOpShL, x, y, classInt) }
+func (b *Builder) Shr(x, y Expr) Expr    { return b.typedBinOp(ir.BinOpShR, x, y, classInt) }
 
 // typedUnary is the shared bottom for the unary operators.
 func (b *Builder) typedUnary(op ir.UnaryOpCode, x Expr, class string) Expr {

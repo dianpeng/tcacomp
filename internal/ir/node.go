@@ -164,13 +164,13 @@ func (b *Base) IsNone() bool { return false }
 // SSADef — names survive only as InputParam debug payload.
 type Graph struct {
 	name         string
-	params       []Node // InputParam nodes (kernel roles only), in declaration order
-	cfg          *CFG   // Level 2 only: nil from NewGraph until Materialize
+	params       []Node     // InputParam nodes (kernel roles only), in declaration order
+	cfg          *CFG       // Level 2 only: nil from NewGraph until Materialize
 	ast          *ASTKernel // the AST-style CFG product of the "schedule" pass (quick-261021-ta3, D-01): SEPARATE from the legacy Level-2 cfg — nil until the pass attaches it, never set by Materialize
-	nextID       uint64 // next ID to hand out; monotonic
-	nodes        []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
-	end          Node   // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
-	materialized bool   // Materialize has run; cfg and the statement list exist
+	nextID       uint64     // next ID to hand out; monotonic
+	nodes        []Node     // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
+	end          Node       // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
+	materialized bool       // Materialize has run; cfg and the statement list exist
 }
 
 // NewID returns the graph's next monotonic ID. This is the ONLY source of

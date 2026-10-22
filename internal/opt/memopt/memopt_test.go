@@ -686,7 +686,7 @@ func TestMemoptRegistryWiring(t *testing.T) {
 // optimized fixture of families 2-8 (and the idempotence re-run).
 func TestMemoptVerifyGreenAfterRun(t *testing.T) {
 	fixtures := []struct {
-		name string
+		name  string
 		build func() *ir.Graph
 	}{
 		{"forward", func() *ir.Graph { g, _, _, _, _, _, _ := forwardFixture(); return g }},

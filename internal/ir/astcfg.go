@@ -84,7 +84,7 @@ func (k BlockKind) String() string {
 // statement: exactly one field is non-nil. Node carries a scheduled IR node
 // (a statement of the block); Block carries a nested loop block.
 type ASTItem struct {
-	Node  Node     // a scheduled statement; nil when Block is set
+	Node  Node      // a scheduled statement; nil when Block is set
 	Block *ASTBlock // a nested loop block; nil when Node is set
 }
 
@@ -244,10 +244,10 @@ type ASTLNT struct {
 // Gmem lists every live GMEM allocation in allocation order; LNTs lists the
 // per-LNT loop metadata in forest-root allocation order.
 type ASTKernel struct {
-	Body   *ASTBlock     // the kernel body — always a BlockGroup
-	Params []Node        // kernel input params, declaration order
+	Body   *ASTBlock      // the kernel body — always a BlockGroup
+	Params []Node         // kernel input params, declaration order
 	Gmem   []ASTGmemAlloc // every live GMEM allocation, allocation order
-	LNTs   []ASTLNT      // per-LNT SoC metadata, forest-root allocation order
+	LNTs   []ASTLNT       // per-LNT SoC metadata, forest-root allocation order
 }
 
 // AST returns the graph's AST-style CFG — the "schedule" pass's product

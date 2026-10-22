@@ -82,7 +82,7 @@ const (
 	// intrinsics the loop-tile-lower pass materializes exist only between
 	// that pass and codegen.
 
-	KindIntrinsicGridMap  // lowered launch-map query: IntrinsicGridMap(field, DoSoC const)
+	KindIntrinsicGridMap   // lowered launch-map query: IntrinsicGridMap(field, DoSoC const)
 	KindIntrinsicThreadMap // lowered launch-map query: IntrinsicThreadMap(field, DoSoC const)
 
 	KindEnd // sentinel: all kinds < KindEnd

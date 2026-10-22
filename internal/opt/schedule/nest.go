@@ -16,12 +16,12 @@ import "tcacomp/internal/ir"
 // KindIter-only and stays untouched). depth follows the spec: the outermost
 // loop is 1, each nesting level adds 1 ("outer most loop is 1").
 type forNest struct {
-	loop     ir.Node         // the KindForLoop this tree node represents
-	parent   *forNest        // nil for roots
-	children []*forNest      // loops nested in this one, allocation order
-	depth    int             // root = 1, child = parent + 1
+	loop     ir.Node          // the KindForLoop this tree node represents
+	parent   *forNest         // nil for roots
+	children []*forNest       // loops nested in this one, allocation order
+	depth    int              // root = 1, child = parent + 1
 	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk)
-	block    *ir.ASTBlock    // the LBBN Loop block built for this node, stamped during scheduling
+	block    *ir.ASTBlock     // the LBBN Loop block built for this node, stamped during scheduling
 }
 
 // forLoopForest derives the loop-nest forest over g's live (non-erased)
