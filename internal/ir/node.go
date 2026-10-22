@@ -67,8 +67,8 @@ type Base struct {
 	stmtID        uint64     // builder-pinned statement ID for Materialize (PinStatementID); 0 = Materialize draws from the counter
 	mark          bool       // transient mark-sweep state (D-15 exception — see mark.go); never IR content, never printed/serialized/verified
 	ty            Type       // computed-type cell (quick-261019-tu3): pass state, nil = not inferred; written only via MutContext.SetType, read via TypeOf. Never printed/serialized/verified — a type is not a chain invariant.
-	schedSN       int        // scheduling number (quick-261021-ta3, D-03): the rank of the AST block this node landed in, 0 = the prologue/kernel-body rank; written by the schedule pass via SetSched; pass state like ty/mark — never printed/serialized/verified
-	schedBlock    *ASTBlock  // scheduling linkage (quick-261021-ta3, D-03): the AST block this node landed in, nil = not yet scheduled; pass state, never printed/serialized/verified
+	schedSN       int        // scheduling number (quick-261021-ta3 D-03, semantics extended by quick-261022-b2m ruling 6): the propagated DEPTH REQUIREMENT — 0 = loop-invariant (prologue/kernel Group), r = requires depth r; with a Loop block "in-loop at depth r", with an epilogue Group "after that nest, still requiring depth r" (never an after-nest rank); written by the schedule pass via SetSched; pass state like ty/mark — never printed/serialized/verified
+	schedBlock    *ASTBlock  // scheduling linkage (quick-261021-ta3, D-03): the LANDING ZONE — the AST block this node was placed in, complementary to schedSN's depth requirement; nil = not yet scheduled; pass state, never printed/serialized/verified
 }
 
 // BasePtr returns the shared cell, implementing Node.
@@ -164,13 +164,13 @@ func (b *Base) IsNone() bool { return false }
 // SSADef — names survive only as InputParam debug payload.
 type Graph struct {
 	name         string
-	params       []Node // InputParam nodes (kernel roles only), in declaration order
-	cfg          *CFG   // Level 2 only: nil from NewGraph until Materialize
+	params       []Node     // InputParam nodes (kernel roles only), in declaration order
+	cfg          *CFG       // Level 2 only: nil from NewGraph until Materialize
 	ast          *ASTKernel // the AST-style CFG product of the "schedule" pass (quick-261021-ta3, D-01): SEPARATE from the legacy Level-2 cfg — nil until the pass attaches it, never set by Materialize
-	nextID       uint64 // next ID to hand out; monotonic
-	nodes        []Node // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
-	end          Node   // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
-	materialized bool   // Materialize has run; cfg and the statement list exist
+	nextID       uint64     // next ID to hand out; monotonic
+	nodes        []Node     // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
+	end          Node       // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
+	materialized bool       // Materialize has run; cfg and the statement list exist
 }
 
 // NewID returns the graph's next monotonic ID. This is the ONLY source of

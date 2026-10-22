@@ -24,6 +24,22 @@ package ir
 //	                       can be a single real statement OR another Block":
 //	                       exactly one of Node / Block is non-nil.
 //
+// EPILOGUE CONTRACT (quick-261022-b2m, rulings 6-7): epilogue Groups are no
+// longer permanently-empty pads — they receive the AFTER-NEST statements:
+// kernel-level consumers of in-loop values or effects (reduction shapes,
+// post-nest stores chained after in-loop stores) and the kernel end node,
+// which lands in the LAST LNT's epilogue. SchedSN and SchedBlock are
+// COMPLEMENTARY on those nodes: SN is the propagated DEPTH REQUIREMENT (0 =
+// loop-invariant, prologue/kernel Group; r with a Loop block = in-loop at
+// depth r; r with an epilogue Group = after that nest, still requiring
+// depth r) while the block is the landing zone. final_lower's reducer rule
+// ("using Reducer's own SN to learn its tightest Loop BB — OR using
+// reducer's first operand") reads exactly this duality: the reducer's own
+// SN names the reduced loop's depth, and its operand's SchedBlock IS that
+// loop's block. Every prologue/epilogue Group exposes its owning nest via
+// Nest() (nil outside clusters); loop blocks keep Loop() as their nest
+// identity.
+//
 // Persistent per-node scheduling state (locked decision D-03): alongside
 // these types, Base carries schedSN/schedBlock — the scheduling number and
 // the SN→block linkage final_lower (and reducer lowering) reads AFTER the
@@ -84,7 +100,7 @@ func (k BlockKind) String() string {
 // statement: exactly one field is non-nil. Node carries a scheduled IR node
 // (a statement of the block); Block carries a nested loop block.
 type ASTItem struct {
-	Node  Node     // a scheduled statement; nil when Block is set
+	Node  Node      // a scheduled statement; nil when Block is set
 	Block *ASTBlock // a nested loop block; nil when Node is set
 }
 
@@ -99,6 +115,7 @@ type ASTBlock struct {
 	dosoc int       // the loop's dosoc map dimension; -1 when absent
 	loc   int       // level of concurrency; 1 for sequential loops (and Groups)
 	items []ASTItem // statements and nested loop blocks, placement order
+	nest  *ASTLNT   // owning nest of a prologue/epilogue Group (ruling 7, quick-261022-b2m); nil for Loop blocks and Groups outside any cluster
 }
 
 // Kind returns the block's kind: Group or the Seq/CTA/ThrLoop class.
@@ -124,6 +141,15 @@ func (b *ASTBlock) DoSoC() int { return b.dosoc }
 // for Groups).
 func (b *ASTBlock) LoC() int { return b.loc }
 
+// Nest returns the owning loop-nest tree of a prologue/epilogue Group —
+// the O(1) back-pointer final_lower uses to map an epilogue-landed node
+// back to its producing nest (ruling 7, quick-261022-b2m) — or nil for
+// Loop blocks (their nest identity is Loop()) and for Groups outside any
+// cluster (the kernel body, the no-loop case). The schedule pass is the
+// sole producer: the pointer is set at cluster construction time via
+// NewASTGroupInNest and is stable for the kernel's life.
+func (b *ASTBlock) Nest() *ASTLNT { return b.nest }
+
 // Items returns a fresh copy of the block's statement items in placement
 // order; the receiver's slice is never aliased.
 func (b *ASTBlock) Items() []ASTItem { return append([]ASTItem(nil), b.items...) }
@@ -133,9 +159,18 @@ func (b *ASTBlock) Items() []ASTItem { return append([]ASTItem(nil), b.items...)
 func (b *ASTBlock) AppendItem(it ASTItem) { b.items = append(b.items, it) }
 
 // NewASTGroup creates an empty BlockGroup — a kernel body or one of the
-// prologue/epilogue pads around a loop-nest cluster (spec step 1.2).
+// prologue/epilogue pads around a loop-nest cluster (spec step 1.2) — with
+// NO owning nest (Nest() returns nil; ruling 7, quick-261022-b2m).
 func NewASTGroup() *ASTBlock {
 	return &ASTBlock{kind: BlockGroup, dosoc: -1, loc: 1}
+}
+
+// NewASTGroupInNest creates an empty BlockGroup whose Nest() back-pointer
+// is lnt (ruling 7, quick-261022-b2m): the prologue/epilogue pads around
+// ONE loop-nest cluster, so final_lower can recover the owning nest of any
+// epilogue-landed node in O(1). The schedule pass is the sole producer.
+func NewASTGroupInNest(lnt *ASTLNT) *ASTBlock {
+	return &ASTBlock{kind: BlockGroup, dosoc: -1, loc: 1, nest: lnt}
 }
 
 // NewASTLoop builds a Loop block from a live KindForLoop node (the LBBN
@@ -149,9 +184,11 @@ func NewASTGroup() *ASTBlock {
 // kernels with no LNT metadata and unit-test graphs schedule as sequential
 // loops), "dosoc" (absent → -1), "loc" (absent → 1). A soc value outside
 // {0,1,2} is a fail-closed error: silently scheduling an unknown
-// materialization class would emit the wrong loop kind downstream.
-// Non-KeyedAttribute trailing operands and non-const attribute values are
-// skipped (the loopAnnotations precedent, internal/opt/tiling/lower.go).
+// materialization class would emit the wrong loop kind downstream. Since
+// quick-261022-b2m (ME-02) ALL THREE keys fail closed on a non-const value:
+// a corrupted annotation must never be masked into the documented default.
+// Non-KeyedAttribute trailing operands are skipped (the loopAnnotations
+// precedent, internal/opt/tiling/lower.go).
 func NewASTLoop(loop Node) (*ASTBlock, error) {
 	if loop == nil || loop.BasePtr() == nil {
 		return nil, errors.New("ir: NewASTLoop on a nil node")
@@ -196,13 +233,23 @@ func NewASTLoop(loop Node) (*ASTBlock, error) {
 					loop.BasePtr().ID(), v)
 			}
 		case "dosoc":
-			if v, ok := ConstValueOf(val); ok {
-				blk.dosoc = int(v)
+			v, ok := ConstValueOf(val)
+			if !ok {
+				// ME-02 (quick-261022-b2m): a corrupted dosoc annotation must
+				// fail closed exactly like soc — silently dropping it would
+				// leave the block at the default and propagate that default
+				// into ASTLoopMeta, masking the corruption from final_lower's
+				// per-LNT runtime mapping and reducer specialization.
+				return nil, fmt.Errorf("ir: for-loop node %d carries a non-const dosoc annotation", loop.BasePtr().ID())
 			}
+			blk.dosoc = int(v)
 		case "loc":
-			if v, ok := ConstValueOf(val); ok {
-				blk.loc = int(v)
+			v, ok := ConstValueOf(val)
+			if !ok {
+				// ME-02 (quick-261022-b2m): same fail-closed rule as soc/dosoc.
+				return nil, fmt.Errorf("ir: for-loop node %d carries a non-const loc annotation", loop.BasePtr().ID())
 			}
+			blk.loc = int(v)
 		}
 	}
 	return blk, nil
@@ -242,12 +289,17 @@ type ASTLNT struct {
 // LNT in forest-root allocation order, [prologue Group, LBBN root block,
 // epilogue Group]; Params are the kernel input params in declaration order;
 // Gmem lists every live GMEM allocation in allocation order; LNTs lists the
-// per-LNT loop metadata in forest-root allocation order.
+// per-LNT loop metadata in forest-root allocation order. Since
+// quick-261022-b2m (ruling 7) LNTs is a []*ASTLNT — the schedule pass is
+// the sole producer and every prologue/epilogue Group points at its stable
+// LNT record through Nest(), so consumers can compare Group identity and
+// nest identity interchangeably (final_lower maps an epilogue-landed node
+// back to its owning nest).
 type ASTKernel struct {
-	Body   *ASTBlock     // the kernel body — always a BlockGroup
-	Params []Node        // kernel input params, declaration order
+	Body   *ASTBlock      // the kernel body — always a BlockGroup
+	Params []Node         // kernel input params, declaration order
 	Gmem   []ASTGmemAlloc // every live GMEM allocation, allocation order
-	LNTs   []ASTLNT      // per-LNT SoC metadata, forest-root allocation order
+	LNTs   []*ASTLNT      // per-LNT SoC metadata, forest-root allocation order (stable records; Nest() points here)
 }
 
 // AST returns the graph's AST-style CFG — the "schedule" pass's product
@@ -286,25 +338,34 @@ func (g *Graph) AttachAST(k *ASTKernel) error {
 	return nil
 }
 
-// SchedSN returns the node's scheduling number (quick-261021-ta3, D-03): the
-// rank of the AST block the schedule pass landed it in — 0 is the
-// legitimate prologue/kernel-body rank (loop-invariant by construction), a
-// positive rank r maps to the depth-r loop block of the owning LNT. Pass
-// state: nil-safe at the Base level (the zero value), never
-// printed/serialized/verified.
+// SchedSN returns the node's scheduling number (quick-261021-ta3 D-03;
+// semantics extended by quick-261022-b2m ruling 6): the propagated DEPTH
+// REQUIREMENT, complementary to the landing zone SchedBlock — 0 means
+// loop-invariant (prologue/kernel Group), r > 0 means "requires depth r".
+// With a Loop block that reads "in-loop at depth r"; with an epilogue
+// Group it reads "AFTER that nest, still requiring depth r" — never an
+// after-nest rank. That complementarity is exactly final_lower's reducer
+// dual route: a Reduce lands in its nest's epilogue with SN == the reduced
+// loop's depth, and its first operand's SchedBlock IS that loop's block —
+// either route identifies the loop. Pass state: nil-safe at the Base level
+// (the zero value), never printed/serialized/verified.
 func (b *Base) SchedSN() int { return b.schedSN }
 
-// SchedBlock returns the AST block the schedule pass landed the node in, or
-// nil while unscheduled — that is how final_lower tells leftovers from
-// placed nodes (D-03: the linkage persists on the node, readable after the
-// pass). Pass state, never printed/serialized/verified.
+// SchedBlock returns the AST block the schedule pass landed the node in —
+// the LANDING ZONE, complementary to SchedSN's depth requirement (ruling 6,
+// quick-261022-b2m) — or nil while unscheduled; that is how final_lower
+// tells leftovers from placed nodes (D-03: the linkage persists on the
+// node, readable after the pass). Pass state, never
+// printed/serialized/verified.
 func (b *Base) SchedBlock() *ASTBlock { return b.schedBlock }
 
 // SetSched stamps the node's persistent scheduling state — SN and landing
-// block together (D-03), so the two can never disagree. It is the single
-// writer both for the pass's anchoring/propagation phase (block nil) and
-// for its placement phase (block stamped). A zero SN is the legitimate
-// rank-0 prologue; a nil block means "not scheduled yet".
+// block together (D-03), so the two can never disagree at placement time.
+// It is the single writer both for the pass's anchoring/propagation phase
+// (block nil — SN is provisional depth state) and for its placement phase
+// (block stamped — epilogue nodes KEEP their propagated SN; ruling 6). A
+// zero SN is the legitimate rank-0 prologue; a nil block means "not
+// scheduled yet".
 func (b *Base) SetSched(sn int, blk *ASTBlock) {
 	b.schedSN = sn
 	b.schedBlock = blk

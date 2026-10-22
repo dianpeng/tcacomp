@@ -53,15 +53,15 @@ func TestEffectVerdictsMemoryFamily(t *testing.T) {
 	smem := g.NewMemNewSMem("ctor", val)
 	frag := g.NewFragNew("ctor", val)
 	memoryNodes := map[string]Node{
-		"memload":       g.NewMemLoad("ctor", out1, []Node{m}),
-		"memstore":      g.NewMemStore("ctor", out1, []Node{m}, val),
-		"memnew":        g.NewMemNew("ctor", val),
-		"memloadsmem":   g.NewMemLoadSMem("ctor", smem),
-		"memstoresmem":  g.NewMemStoreSMem("ctor", val, smem),
-		"memnewsmem":    smem,
-		"fragload":      g.NewFragLoad("ctor", frag),
-		"fragstore":     g.NewFragStore("ctor", val, frag),
-		"fragnew":       frag,
+		"memload":      g.NewMemLoad("ctor", out1, []Node{m}),
+		"memstore":     g.NewMemStore("ctor", out1, []Node{m}, val),
+		"memnew":       g.NewMemNew("ctor", val),
+		"memloadsmem":  g.NewMemLoadSMem("ctor", smem),
+		"memstoresmem": g.NewMemStoreSMem("ctor", val, smem),
+		"memnewsmem":   smem,
+		"fragload":     g.NewFragLoad("ctor", frag),
+		"fragstore":    g.NewFragStore("ctor", val, frag),
+		"fragnew":      frag,
 	}
 	for name, n := range memoryNodes {
 		if got := len(ImpactBy(n)); got != 0 {
@@ -79,15 +79,15 @@ func TestEffectVerdictsMemoryFamily(t *testing.T) {
 	piped := g.NewConst("ctor", f32, 5)
 	load := g.NewMemLoad("ctor", out1, []Node{m}) // effectful operand below
 	pureNodes := map[string]Node{
-		"binop":          g.NewBinOp("ctor", BinOpAdd, val, val),
-		"unaryop":        g.NewUnaryOp("ctor", UnaryOpNeg, val),
-		"select":         g.NewSelect("ctor", val, val, val),
-		"cast":           g.NewCast("ctor", f32, val),
-		"call":           g.NewCall("ctor", "exp", val),
-		"param":          g.NewParamRef("ctor", lp),
-		"map":            g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}),
-		"map-over-load":  g.NewMap("ctor", []Node{load}, NewLambda([]Node{lp}, body), []Node{m}),
-		"reduce":         g.NewReduce("ctor", piped, piped, NewLambda([]Node{lp}, body)),
+		"binop":         g.NewBinOp("ctor", BinOpAdd, val, val),
+		"unaryop":       g.NewUnaryOp("ctor", UnaryOpNeg, val),
+		"select":        g.NewSelect("ctor", val, val, val),
+		"cast":          g.NewCast("ctor", f32, val),
+		"call":          g.NewCall("ctor", "exp", val),
+		"param":         g.NewParamRef("ctor", lp),
+		"map":           g.NewMap("ctor", []Node{piped}, NewLambda([]Node{lp}, body), []Node{m}),
+		"map-over-load": g.NewMap("ctor", []Node{load}, NewLambda([]Node{lp}, body), []Node{m}),
+		"reduce":        g.NewReduce("ctor", piped, piped, NewLambda([]Node{lp}, body)),
 	}
 	for name, n := range pureNodes {
 		if e := EffectOf(n); e.Has() {

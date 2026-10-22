@@ -20,8 +20,8 @@ package ir
 // Value and the list of ref records for uses pointing AT this node.
 type SSAVar struct {
 	id     uint64
-	node   Node   // back-pointer to the owning node (nil-safe on zero var)
-	define Value  // the value this var defines (nil-safe on zero var)
+	node   Node            // back-pointer to the owning node (nil-safe on zero var)
+	define Value           // the value this var defines (nil-safe on zero var)
 	refs   []*ssaRefRecord // uses pointing at this var, in link (append) order
 }
 

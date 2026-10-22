@@ -7,7 +7,7 @@
 //
 //   - This top level (internal/analysis) holds the machinery SHARED by
 //     all analyses: the Analysis contract (analysis.go) and the registry
-//     + construct-everything factory (registry.go, factory.go).
+//   - construct-everything factory (registry.go, factory.go).
 //   - Each analysis lives in its own sub-module folder
 //     (internal/analysis/sideeffect, ...) and self-registers via a func
 //     init() calling analysis.Register with its AnalysisSpec.
