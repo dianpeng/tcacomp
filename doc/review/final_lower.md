@@ -806,3 +806,63 @@ AFTER scheduling — its insertion points, SoC specialization, and SN→block
 linkage are all scheduler outputs, and pre-scheduling introduction of
 Runtime* kinds would hit the fail-closed legality of every earlier pass
 (doc/opt.md L27–L30 order stands).
+
+### Round 2 (same day): remaining findings resolved — design now implementation-ready
+
+All actionable findings are now closed at the design level. Author rulings:
+
+- **FL-5 — RESOLVED**: full operand layout stated (#0 piped, #1
+  KeyedAttribute("init"), #2 optional As before the lambda, last = lambda);
+  reducer CONSTRUCTION carries the state — `RuntimeXXXReducer(%init, %lambda)`
+  — so the `Init()` call is argument-free. This also reconciles the
+  tca.md-vs-runtime_objects Init-signature divergence in tca.md's favor.
+- **FL-6 — RESOLVED**: "lambda type = body type" dropped; KindLambda stays
+  deliberately untyped; T is checked against the parameter-definition types
+  at Reduce lowering (tca.md §4.2).
+- **FL-7 / FL-14 — RESOLVED**: dedicated construction node per object (no
+  generic RuntimeConstruct); exactly two generic nodes — RuntimeCallMethod
+  (method payload, ordered side effect, never CSE) and RuntimeGetAttribute
+  (attribute payload, pure read on immutable objects); families: new
+  FamilyRuntime (construct/call/getattr) + FamilyCollective (the three
+  reducers, its first members); six-companion registration checklist; LIR
+  tier, final-lower-onward legality window.
+- **FL-8 — RESOLVED**: names are string PAYLOADS (intrinsicNode.field
+  precedent) with closed vocabularies — methods {Init, Reduce, Combine},
+  attributes {total_cta, total_thread_per_cta, index, dimension}.
+- **FL-9 — RESOLVED**: RuntimeCallMethod naming standardized; the sketch's
+  "Input #1" corrected to Input #0.
+- **FL-10 / FL-11 / FL-26 — RESOLVED**: runtime-internal combiner
+  application — the lambda is handed over at construction; the (prev, cur)
+  invocation is hidden from the compiler (prev = the runtime's member
+  field); NO lambda-call IR node in v0; current_value/init_value are
+  runtime-side helpers the lowering never emits. Lambda is pinned
+  capture-free (params + consts only) — hoisting is trivially sound (MLIR:
+  private func.func + symbol-ref; CUDA: file-scope __device__ function as
+  the runtime template's Lambda parameter).
+- **FL-15 — RESOLVED**: mapping objects prepend to the OWNING LNT's prologue
+  Group (one pair per LNT), not the kernel's first Group.
+- **FL-17 — RESOLVED (carrier)**: with the query rewrite below, the
+  per-LNT mapping construction reads its portion data through the same
+  preserved-record channel as the reducer provenance.
+- **FL-18 — RESOLVED structurally**: final_lower rewrites every launch-map
+  query into `RuntimeGetAttribute(%<LNT's mapping object>, field, dosoc)`
+  (SN → block → owning nest); the binding becomes explicit SSA for both
+  backends; the standalone query kinds are pre-final-lower material only.
+- **FL-20 — RESOLVED**: example shrunk to the v0 policy (≤1 CTA dim, one
+  independent warp dim), portions annotated as PortionCTA=10 /
+  PortionWarp=8 fractions.
+- **FL-22 — RESOLVED**: Map Lower debris disposal specified (RAUW →
+  explicit As erasure → orphaned lambda left to mark-sweep DCE), ordered
+  after Reducer Lower.
+- **FL-25 — RESOLVED (scoping)**: launch configuration is a codegen
+  contract item (tiling Params → kernel metadata → host launch wrapper +
+  runtime launch validation), not an IR node.
+- **FL-27 — RESOLVED**: T = element type of the Reduce's Input #0;
+  homogeneity per tca.md §4.2 checked at lowering.
+- Naming: the "Intrinsic" vocabulary is renamed to **Runtime** throughout
+  (runtime objects opaque to the user; lowered nodes are mechanical literal
+  representation with zero codegen assumptions).
+
+**Verdict after round 2: GO — the design doc is implementation-ready.** All
+28 findings are closed (resolved at design level or COMPAT-by-review);
+implementation may proceed on doc/optana/final_lower.md as amended.
