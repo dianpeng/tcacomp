@@ -33,8 +33,8 @@
 
 ## 1. Verdict summary
 
-**Verdict: compatible-with-named-fixes** (finalized in §8; the audit basis is §3–§4,
-completed below, the boundary and MLIR assessments are §5–§6).
+**Verdict: compatible-with-named-fixes** (required-fix list in §8; audit basis §3–§4,
+runtime-object boundary §5, MLIR assessment §6, consolidated findings §7).
 
 The architecture the doc proposes — a `RuntimeCallMethod` expression node over
 runtime-object constructor nodes (`Runtime{Sequential,Warp,Global}Reducer`,
@@ -561,3 +561,212 @@ Summary: items 1, 4, 5, 6, 7 are true information gaps in the doc (a backend wou
 have to INVENT semantics, with silent-wrong-answer risk for 4 and 5); items 3 and 8
 are contract gaps to close in the runtime library boundary (§5); items 2, 9, 11 are
 already carried by the system's contracts.
+
+## 5. Runtime object boundary (user point 4)
+
+### 5.1 The design's explicit runtime surface
+
+Enumerated from the target (this is what the generated backend needs to RUN):
+
+1. **Reducer<T> + Sequential/Warp/Global specializations** (L40–L83, L137–L140):
+   uniform interface Init/Reduce/Combine + helpers `init_value()`/`current_value()`
+   (L64–L76), constructor-only specialization (L80–L83).
+2. **KernelInfo** (L187–L214): constructor + `total_cta`/`total_thread_per_cta`
+   queries (L210–L211).
+3. **Per-LNT GridMapping + ThreadMapping** (L216–L264): constructors taking
+   (kernel_info, ndim, portions..., −1).
+4. **The RuntimeCallMethod dispatch surface.** Method names that can appear,
+   enumerated exhaustively from the doc: `Init` (L151), `current_value` (L156),
+   `Reduce` (L171), `Combine` (L173–L175), `total_cta` and `total_thread_per_cta`
+   (L210–L211), and the interface helper `init_value` (L67) — seven names. Any
+   closed registry the runtime implements must be exactly this set (plus future
+   warp-specialized queries, below).
+5. **Lambdas as callables** (L151, L160–L171): the `Lambda` argument of Init.
+
+### 5.2 Implicit reliance (pre-existing pipeline objects the output still needs)
+
+Loop primitives `thr_loop`/`cta_loop`/`seq_loop` (runtime_objects.md §5, inventory
+15–17); tile loaders/fills/buffers (inventory 19–27); barriers (§7, inventory 30);
+masks (§8, inventory 31) — including `warp_index`/`lane_index`/`is_first` queries
+(inventory 11) that the Warp reducer's down-reduce requires (§8.4 L636–L643); the
+launch contract (§1, inventory 1–6); umin/umax builtins (inventory 12–13). The doc
+neither duplicates nor disturbs these — correct layering.
+
+### 5.3 Two-direction cross-check vs doc/runtime_objects.md
+
+**Direction (a) — the doc implies, runtime_objects.md LACKS** (all GAPs to close in
+the inventory; mergeable as rows):
+
+| # | Implied by | Missing | Inventory ref |
+|---|------------|---------|---------------|
+| a1 | `RuntimeConstruct("KernelInfo")` generic node (L207) | A node-kind row: the KernelInfo OBJECT is entry 40, but the generic RuntimeConstruct KIND (or a dedicated KernelInfo kind, as the mappings got at L247) is unrecorded | entry 40 (L68) |
+| a2 | `Reducer<T>` template (L48) | The T-binding rule (T = the init KeyedAttribute's IR type; tca.md §4.2 L293 homogeneous rule) — absent from BOTH docs | entry 42 (L70) |
+| a3 | RuntimeCallMethod (L131–L136) | The C++ dispatch mechanism (virtual/template/switch) + tca:: qualification discipline (cg.md L28–L31) | entry 43 (L71) |
+| a4 | Init's `Lambda` argument (L151) | The lambda's runtime representation (free `__device__` function vs functor; capture discipline) — §11 L733 says "the reducer calls it internally" but not what "it" is | entry 42 (L70) |
+| a5 | "provide a SSAName" (L118) | Runtime-object symbol discipline for codegen (cg.md L18–L19's on-the-fly locals is the natural carrier; unstated) | — |
+| a6 | tiled reductions generally | Accumulator-tile/slot indices + validity tags (tca.md L686/L711/L727) — the recorded Reducer interface (§11 L733) is scalar-only, same as the doc; shared gap | entry 42 (L70) |
+
+**Direction (b) — runtime_objects.md already spec'd, checked for duplication or
+drift:**
+
+| # | Recorded | vs the doc | Verdict |
+|---|----------|-----------|---------|
+| b1 | Reducer interface §11 L733: `Init(init, lambda)` / `Reduce(value)` / `Combine()` + helpers, lambda NOT inlined | MATCHES doc L48–L77 exactly (no drift in the recorded surface) | COMPAT |
+| b2 | …but tca.md §5.10 L688–L696 specifies argument-free `Init()` | Three-way divergence: tca.md vs final_lower.md+runtime_objects.md. The init value is already carried by the Reduce's `init` KeyedAttribute (§9 L660 records `Reducer.Init(T init = <value>)`); the LAMBDA parameter is the substantive difference (tca.md never says where the combiner comes from). **Recommendation (advisory): the final_lower.md + §11 form wins** — it is the concrete implementable surface; tca.md gets a one-line amendment (its L686 already flags "Scalar interface names are illustrative") | named divergence |
+| b3 | Placement §8.4 L638 "Init BEFORE the element loop, Combine AFTER it" (+ loop-tiling Issue #1 ruling) | Doc 2.2/2.4 as read on tiled dims drift INSIDE the between loop (E3/FL-1) — the recorded contract wins; doc must fix | drift → FL-1 |
+| b4 | Map construction inputs §2.1 L196–L199 ("constructed at LNT entry from KernelInfo totals + the portion partition for this LNT") | Doc's constructors MATCH (kernel_info operand + portions); only the L220-vs-L245 self-contradiction drifts (FL-15) | COMPAT + FL-15 |
+| b5 | Per-LNT scoping §1.6 L152–L159, §2 L165–L169 (ONE map per kind per LNT) | Doc prose consistent; example portions 2+5+(−1)|10 and 2+(−1)|8 consistent with D3 | COMPAT |
+| b6 | `init` KeyedAttribute §9 L660 | Doc L99 matches | COMPAT |
+| b7 | Mask contract §8.1 (thread_map single supplier) + §8.4 ownership-mask warp down-reduce | Doc never mentions masks; Warp-reducer correctness DEPENDS on this contract — reference omission, not conflict | omission |
+| b8 | KernelInfo queries §11 L731 (`total_cta()`, `total_thread_per_cta()`) | Doc L210–L211 matches | COMPAT |
+
+## 6. MLIR translation complexity (user point 5)
+
+Per-construct mapping sketch and rating (LOW / MED / HIGH), then overall. Context:
+cg.md L5–L11 reserves `internal/cg/mlir` as the second backend and L15–L20 fixes the
+assumed input shape (verbs already lowered; map/reduce lowered to runtime primitive
+calls; SSAUse unresolved, locals generated on the fly).
+
+| Post-final-lower construct | MLIR mapping sketch | Rating |
+|----------------------------|---------------------|--------|
+| Seq/CTA/ThrLoop blocks | `scf.for` with soc/dosoc/loc KeyedAttributes as an attribute dict; bounds are SSA u32 chains (arith). Parallel semantics have NO native scf.for form: keep the CUDA design's shape — plain scf.for + mapping knowledge in the intrinsics (option i) — rather than scf.forall (option ii, only if a pass later wants parallel semantics) | MED (mechanical under option i) |
+| Group blocks | region/block sequencing; no construct — pure ordering | LOW |
+| Prototype block | `func.func` signature: InputParams → typed args; GMem allocations → pointer args sized from kernel metadata (astcfg.go L353–L355; schedule.md 4.2) | LOW |
+| RuntimeCallMethod | `func.call` to tca::-namespace runtime functions, object as a typed-pointer SSA value (runtime-struct alloca). Fits the per-LNT object model: objects are STATEFUL (reducer accumulators), which custom ops would have to model anyway; custom dialect ops pay off only for reduction pattern-matching (future). Method-name payload → callee symbol via a closed registry | LOW–MED |
+| Runtime*Reducer construction + reduction lambda | constructor `func.call`s; the lambda as an MLIR function symbol passed by reference (private `func.func` + symbol-ref operand, indirect call at Reduce time inside the runtime) | MED — entirely due to lambda materialization (FL-10/FL-26), the one non-mechanical step |
+| RuntimeGridMapping / RuntimeThreadMapping | constructor `func.call`s; portion constants as i32 args/attributes | LOW (once FL-17's source is stated) |
+| KindIntrinsicGridMap/ThreadMap | two small custom-dialect ops (index/dimension variants) or plain accessor `func.call`s | LOW |
+| KeyedAttribute payloads | MLIR attributes on the parent op | LOW |
+| Unresolved SSAUse | on-the-fly local naming — MLIR's SSA builder numbering does it natively (cg.md L18–L19 promise holds verbatim) | LOW |
+
+**Overall: MEDIUM.** Everything except (a) the lambda-as-function-value step and
+(b) the parallel-loop semantics convention is a 1:1 mapping, and (b) dissolves under
+option i (the current CUDA design's own answer). What MLIR wants that the IR does
+not carry — tying back to §4: the query→object binding (FL-18; in MLIR there is no
+lexical runtime scope, so the binding must become explicit — passing the mapping
+object's SSA value into the accessor, a mechanical rewrite final_lower could adopt
+to close FL-18 structurally for BOTH backends) and the accumulator-tile story
+(FL-24; memref types would carry it naturally if specified). Assessment against
+cg.md's assumed input: the doc's output DELIVERS point (2) (map/reduce lowered into
+runtime primitive calls — via RuntimeCallMethod + Map elimination) and preserves
+point (3) (SSAUse unresolved) — but only after the §8 fixes; as written, the FL-1
+placement defect lowers WRONG reductions silently in any backend, MLIR included.
+
+## 7. Consolidated findings table
+
+| ID | Severity | Element | One-line statement | Evidence |
+|----|----------|---------|--------------------|----------|
+| FL-1 | BLOCKING | E3 | 2.2/2.4 wrap the tile-INSIDE loop on tiled reduced dims → per-tile Init/Combine = per-tile partials, contradicting tca.md's placement law | final_lower.md L112–129; doc/tca.md §5.10 L725, L730–748; runtime_objects.md §8.4 L638 |
+| FL-2 | GAP | E3 | Doc never mentions the tile-between/tile-inside split; "the last dimension" is ambiguous exactly where tca.md warns | final_lower.md L35–L38, L112–L114; doc/tca.md §5.9 L618–L620 |
+| FL-3 | GAP | E4 | Reduced-dimension identification mechanism unspecified (no reduce<@r> annotation in the IR; op0→Map→AsOf derivation unstated; must precede Map elimination) | final_lower.md L112–L114; internal/ir/node_lambda.go:100-108, :158-178; doc/tca.md L133 |
+| FL-4 | CONTRADICTION | E4 | "last dimension of provided input" vs last dimension in the PRODUCING MAP's as order | final_lower.md L35; doc/tca.md §2.5 L81, §2.7 L133 |
+| FL-5 | MINOR | E4 | Operand layout omits the optional trailing As the catalog (and the doc's own sketch) carry | final_lower.md L141–144 vs L97–102; internal/ir/catalog.go:36 |
+| FL-6 | GAP | E1 | "type = body type" is not today's convention (KindLambda deliberately untyped); enforcing it is an unmotivated typeinfer change | final_lower.md L22–L23; internal/opt/typeinfer/typeinfer.go:65-75; internal/opt/typeinfer/rules.go:272-273 |
+| FL-7 | GAP | E5 | RuntimeCallMethod kind/tier/family/arity + the six companions unspecified (legality fails CLOSED on unknown kinds) | final_lower.md L131–136; internal/ir/node_intrinsic.go:21-24; internal/opt/legality.go:57 |
+| FL-8 | CONTRADICTION | E5 | Method name as a string OPERAND violates the node-operand convention; both precedents are string PAYLOADS | final_lower.md L135; internal/ir/node_intrinsic.go:29-43; internal/ir/catalog.go:68-69 |
+| FL-9 | MINOR | E5 | RuntimeCallMethod vs RuntimeMethodCall naming drift; "Input #1 of Reduce" contradicts the doc's own layout | final_lower.md L132 vs L210–L211, L158 |
+| FL-10 | GAP | E5 | Lambda invocation "something like, ExprCall" undefined (KindCall is registered-builtin-only); <ReducePrevious>/<current> nodes undefined — the retained KindParam refs are the real carriers | final_lower.md L104–L107, L160–L167; internal/ir/catalog.go:48; internal/ir/node_lambda.go:14-19 |
+| FL-11 | CONTRADICTION | E5 | Explicit lambda-call node sketched AND reducer-internal application claimed; runtime_objects.md records internal-only | final_lower.md L164–L171; doc/runtime_objects.md §11 L733 |
+| FL-12 | COMPAT | E2 | Reduce-inline exemption coherent (D9 acc↔piped/now↔init binding is wiring, not combiner semantics); ripple surface enumerated: simplify-verify split, SN-0 body landing, function-extraction duty | internal/opt/simplify/inline.go:29-47; internal/opt/simplify/verify.go:34-41; internal/ir/astcfg.go:407-428 |
+| FL-13 | GAP | E6 | Specialization selection rule unstated (reduced loop's ASTLoopMeta.Soc: 0→Sequential, 2→Warp, 1→Global) | final_lower.md L137–L140; internal/ir/astcfg.go:315-324; doc/optana/schedule.md L136–139 |
+| FL-14 | GAP | E6 | Node family unassigned; FamilyCollective is reserved-empty exactly for reducers | final_lower.md L137–140; internal/ir/kind.go:182-184 |
+| FL-15 | CONTRADICTION | E9 | Per-LNT mapping placement: prose "starting block of each Loop BB Cluster" vs IR comment "very first Group block in kernel" — prose matches per-LNT scoping | final_lower.md L220 vs L245; internal/ir/astcfg.go:205-211; runtime_objects.md §1.6 L152-159 |
+| FL-16 | COMPAT | E8 | KernelInfo concept + first-Group placement compatible (Body Group prepend; Prototype is the signature scope, not statements) — recorded as inventory entry 40 | final_lower.md L197–L207; internal/ir/astcfg.go:43-55, :335-341; runtime_objects.md L68, L731 |
+| FL-17 | GAP | E9 | Portion DATA SOURCE unspecified; the preserved "tiling-record" cache entry is the designed carrier | final_lower.md L249–L262; internal/ir/astcfg.go:63-66, :326-329 |
+| FL-18 | GAP | E9 | Query-intrinsic→object BINDING unspecified (lexical enclosure); codegen and MLIR both need it stated | internal/ir/node_intrinsic.go:26-43; runtime_objects.md §2.1 L184-185 |
+| FL-19 | COMPAT | E9 | Construction nodes COMPLEMENTARY to the already-emitted query intrinsics; portions consistent with the D3 ruling (Σ=10/8, −1 remainder, one map per kind per LNT) | internal/opt/tiling/lower_rewrite.go:322-386; runtime_objects.md §2.1 L196-199, L35-36 |
+| FL-20 | MINOR | E9 | Example shows 3 grid dims vs v0 ≤1-CTA-dim searcher policy; "20%" vs "2/8 = 25%" comment drift | final_lower.md L232–L234, L239 vs L261; runtime_objects.md Appendix B L772 |
+| FL-21 | COMPAT | E10 | No new semantic backend leak — same platform-model commitment the system already makes (soc/CTA/Thr vocabulary, CBLId/CTLId, tca:: objects); naming leaks cosmetic, renamable | §3 E10 ground; doc/cg.md L5-11, L28-31 |
+| FL-22 | CONTRADICTION | E7 | "Map DOES NOT HAVE Lambda at all" is false: inline strips lambda PARAMETERS, the lambda node with body survives; As/lambda debris disposal on elimination unspecified | final_lower.md L185; internal/opt/simplify/inline.go:112-131; internal/ir/mutate.go:203-213 |
+| FL-23 | GAP | §4 | Fused-consumer re-iteration after Combine (tca.md's rule) absent from the doc — backend would invent the wrong placement | final_lower.md L173–L176 (silent); doc/tca.md §5.10 L728, L744-748 |
+| FL-24 | GAP | §4 | Accumulator TILES + validity tags absent; scalar-only init_/current_ interface has no slot story (tca.md flags it) | final_lower.md L72–L76; doc/tca.md L686, L711, L727 |
+| FL-25 | GAP | §4 | Host-side launch configuration (gridDim/blockDim derivation) carried nowhere in the compiled-output contract | §4 item 3; runtime_objects.md §1 |
+| FL-26 | GAP | §4 | Lambda materialization as a C++ callable (capture/linkage) unspecified | final_lower.md L160–L162 |
+| FL-27 | GAP | §4 | Reducer<T> T-binding unspecified; tca.md §4.2's homogeneous-types rule is the answer to cite | final_lower.md L48; doc/tca.md L293 |
+| FL-28 | COMPAT | E3 | The dual SN/operand identification route is confirmed by the implementation's own contract comments (complementary SchedSN/SchedBlock) | internal/ir/astcfg.go:35-38, :414-418 |
+
+Counts: 28 findings — 1 BLOCKING, 5 CONTRADICTION, 13 GAP, 7 COMPAT, 2 MINOR.
+
+## 8. Verdict and required fixes
+
+**Overall verdict: compatible-with-named-fixes.**
+
+The architecture needs no rework: the RuntimeCallMethod-over-runtime-objects design
+is the completion of a surface the system already committed to
+(doc/runtime_objects.md §11 L723–L737, inventory entries 40–43), the per-LNT
+mapping constructors complete the already-emitted query intrinsics (FL-19), the
+pass slot exists (doc/opt.md L27–L30: scheduling → final lower → codegen), and the
+schedule pass's persistent state was built for exactly this consumer
+(internal/ir/astcfg.go:35-38). What blocks implementation as written is ONE
+algorithmic defect (FL-1: the reducer insertion points wrap the wrong loop on the
+normal tiled path, silently producing per-tile partials) plus the identification
+gap that would prevent even a corrected placement rule from being implemented
+(FL-2/FL-3); the remainder is specification closure (node taxonomy, payload
+conventions, lambda contract, data sources, bindings) and doc hygiene. No finding
+requires a new IR tier, a new pass, or an architectural change.
+
+Required fixes (each scoped to the doc section it amends):
+
+1. **§ Reducer Lower Integration (L111–L129) — FL-1/FL-2:** resolve the placement
+   loop to the tile-BETWEEN loop `@r_o` of the reduced dimension: `Init`
+   immediately before it, `Combine` immediately after (tca.md L725); the `Reduce`
+   call stays inside `@r_i` (tca.md L726). State how `@r_o` is discovered from the
+   identified inside loop (its offset/round dimvar chain, or the LNT loop metadata,
+   internal/ir/astcfg.go:326-333).
+2. **§ Reducer Lower Integration (L112–L114) — FL-3:** state the reduced-DIMENSION
+   identification mechanism: carry a `reduce<@r>`-equivalent annotation, or define
+   the Reduce.op0 → producing Map → `AsOf` → last-as-operand derivation
+   (reduce-after-reduce chains included, tca.md L93), and require it to run BEFORE
+   Map elimination rewrites op0.
+3. **§ Overview of Reducer (L35) — FL-4:** "last dimension of provided input" →
+   "last dimension in the producing map's `as` order" (tca.md L81/L133).
+4. **§ Runtime Object Node (L141–L144) — FL-5:** operand layout must include the
+   optional trailing As (internal/ir/catalog.go:36).
+5. **§ Runtime Object Node (L131–L136) — FL-7/FL-8/FL-9:** specify kind, tier,
+   family, arity and the six companions; the method name becomes a string PAYLOAD
+   (callNode.name / intrinsic-field precedent), never a string operand; unify the
+   RuntimeCallMethod/RuntimeMethodCall naming; fix the "Input #1" sketch line.
+6. **§ Runtime Object Node (L104–L107, L160–L171) — FL-10/FL-11:** resolve the
+   lambda-application contract to the reducer-internal form (runtime_objects.md
+   §11 L733); delete the explicit call-node sketch; define <ReducePrevious>/<current>
+   as the retained KindParam refs or drop the vocabulary.
+7. **§ Fix or Ensure Lambda (L22–L23) — FL-6:** drop "type = body type" or specify
+   the typeinfer amendment (removing KindLambda from the untyped whitelist) with
+   its motivation.
+8. **§ Map Lower (L180–L185) — FL-22:** correct "DOES NOT HAVE Lambda" to "has no
+   lambda parameters (the lambda node with body survives inline)"; specify
+   disposal of the orphaned As and lambda nodes on elimination.
+9. **§ Reducer Lower (L137–L140) — FL-13/FL-14:** state the specialization
+   selection (reduced loop's ASTLoopMeta.Soc: 0→Sequential, 2→Warp, 1→Global) and
+   the family assignment (FamilyCollective); mark RuntimeGlobalReducer
+   v0-unreachable forward scaffolding (tca.md L717).
+10. **§ Per LNT's Mapping Object Construction (L245) — FL-15/FL-17/FL-18:** fix the
+    placement comment to match the prose (each cluster's prologue Group); name the
+    preserved "tiling-record" cache entry as the portion source; state the
+    query→object lexical-enclosure binding.
+11. **§ Reducer Lower (new subsection) — FL-23/FL-24/FL-27:** add the
+    fused-consumer re-iteration rule (tca.md L728), the accumulator-tile/slot/
+    validity-tag story (tca.md L686/L711/L727), and the T-binding rule (tca.md
+    §4.2 L293).
+12. **Cross-doc alignment (advisory, one-line amendments owned by the author):**
+    tca.md §5.10 L688–L696 to note `Init(init, lambda)` as the concrete form
+    (runtime_objects.md §11 L733 already records it); runtime_objects.md entries
+    40/43 to record the KernelInfo node-kind decision, the closed seven-name method
+    registry (§5.1 item 4), and the C++ dispatch mechanism.
+
+## 9. Self-check
+
+- Every element E1–E10 carries exactly one verdict tag and dual citations (target
+  lines + system file:line or doc section) — verified per element in §3.
+- The E3 tiled-Init/Combine question is explicitly adjudicated (both readings of
+  "currentLoop" examined; the only supported reading contradicts tca.md L723-728).
+- The runtime-object boundary is cross-checked in BOTH directions with
+  inventory-entry references (§5.3 a1–a6, b1–b8).
+- Every post-lowering construct has a sketched MLIR mapping and the overall
+  complexity is rated with justification (§6, MEDIUM).
+- One overall verdict (compatible-with-named-fixes) + a 12-item numbered
+  required-fix list, each pointed at its doc section (§8).
+- The coverage table maps user points 1–5 to sections (§1).
+- doc/optana/final_lower.md is NOT modified by this review (the file is absent
+  from the review's working tree and was only ever read); the only file created
+  is doc/review/final_lower.md. No files under internal/, pkg/, runtime/ touched.
