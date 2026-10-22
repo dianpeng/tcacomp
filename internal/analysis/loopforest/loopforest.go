@@ -1,24 +1,49 @@
 // Package loopforest implements the loop-nest forest analysis of
 // doc/optana/loop_fusion.md ("Loop Nests/Forrest analysis" — the live
 // spec; the older "Loop Fusion" prose above it is superseded by GVN): it
-// enumerates ALL loop nests over the Level-1 sea so future consumers —
-// loop tiling per doc/optana/loop_tiling.md first among them — can walk
-// the nest structure without re-deriving it.
+// enumerates ALL loop nests over the Level-1 sea so consumers — loop
+// tiling per doc/optana/loop_tiling.md, the final schedule pass per
+// doc/optana/schedule.md — can walk the nest structure without re-deriving
+// it.
+//
+// GENERIC OVER THE LOOP CATEGORY (quick-261022-f5o): the analysis is ONE
+// algorithm serving BOTH loop dialects, driven by the ir-owned
+// ir.LoopNesting spec (internal/ir/loopspec.go, ruling D-01) — the HIR
+// KindIter suite (links by the EXPLICIT parent operand, ParentEdge) and
+// the LIR KindForLoop suite (links by BODY-OPERAND CONTAINMENT,
+// BodyRoot). At any pipeline stage exactly one dialect is live (tile-lower
+// retires every iter), so there is no stage detection; a hypothetical
+// mixed graph links coherently under the same rules.
+//
+// MEMBERSHIP EDGES ONLY (ruling D-04, the quick-261022-b2m lesson — THE
+// REASON THE SPEC INTERFACE EXISTS): linking uses ParentEdge and
+// BodyRoot-operand containment and NEVER the uniform data+effect closure.
+// tile-lower's repointChains (lower_rewrite.go P6) re-points every
+// post-nest consumer's ImpactBy edge at a FOREIGN nest's root loop ("the
+// ForLoop node as effect-def" denotes whole-loop completion), so loop
+// nodes are uniform-reachable from other nests' bodies: a closure-based
+// link would cross-nest sibling LNTs and destroy the loop-nest-tree
+// decomposition. Completion edges ORDER; membership edges NEST.
+//
+// DEPTH BASE (ruling D-02): roots are depth 0, children parent+1 — the
+// historic iter-forest convention. Every tiling consumer uses depths
+// relatively; the schedule pass is the sole absolute consumer and maps
+// tree.Depth+1 at its nest.go adapter.
 //
 // Rules:
-//   - MEMBERS: live KindIter nodes only. Erased iters are skipped;
-//     IterCluster/ForLoop/DimVar are NOT forest members.
-//   - REVERSED EDGES: an IR edge iter(x) -> iter(y) (x carries y as an
-//     operand — x is nested in y) becomes the forest edge y parent-of x,
-//     and x leaves the root set. The parent is the FIRST live-Iter
-//     operand in slot order — the doc's forest assumes each nested iter
-//     has ONE parental loop riding its operand list, so first wins,
-//     deterministic.
+//   - MEMBERS: live (non-erased) loop-header nodes only, per the spec's
+//     IsLoop. Erased loops are skipped; IterCluster/DimVar are never
+//     members.
+//   - LINK: a node's parent is its spec ParentEdge target when that target
+//     is a collected loop; otherwise the FIRST collected loop (allocation
+//     order) whose BodyRoot-derived operand-closure subtree contains it —
+//     first-match wins, deterministic. The containment closure walks
+//     OPERAND slots only (the same membership-edge discipline).
 //   - SEPARATE STRUCTURE: the forest is its own tree type, NEVER baked
 //     into IR nodes — computed on the fly, one snapshot per Analyze call.
 //   - READ-ONLY: per the analysis-package contract, Analyze never mutates
-//     the IR (no MutContext; only the AllocatedNodes/DataDeps/KindOf/
-//     BasePtr read faces).
+//     the IR (no MutContext; only AllocatedNodes/DataDeps/OperandsOf/
+//     KindOf/BasePtr read faces).
 package loopforest
 
 import (
@@ -27,9 +52,10 @@ import (
 )
 
 // init self-registers the analysis in the global analysis registry
-// (quick-261019-jck pattern): importing this package — directly or
-// through internal/analysis/all — is the single act that makes it visible
-// to analysis.Lookup/Registered/BuildAll.
+// (quick-261019-jck pattern; quick-261022-f5o D-06: name and result type
+// unchanged): importing this package — directly or through
+// internal/analysis/all — is the single act that makes it visible to
+// analysis.Lookup/Registered/BuildAll.
 func init() {
 	analysis.Register(analysis.AnalysisSpec{
 		Name:    "loop-forest", // stable public id — opt.Cache key convention
@@ -37,18 +63,18 @@ func init() {
 	})
 }
 
-// Tree is one loop-nest tree node: a live KindIter plus its forest links.
+// Tree is one loop-nest tree node: a live loop node plus its forest links.
 type Tree struct {
-	Iter     ir.Node // the KindIter this tree node represents
+	Iter     ir.Node // the loop node (KindIter or KindForLoop) this tree node represents
 	Parent   *Tree   // nil for roots
-	Children []*Tree // iters nested in this one, allocation order
-	Depth    int     // root = 0, child = parent + 1
+	Children []*Tree // loops nested in this one, allocation order
+	Depth    int     // root = 0, child = parent + 1 (D-02: the 0-based convention)
 }
 
 // Forest is the loop-nest forest over one graph snapshot (read-only
 // analysis). The zero value is the empty forest.
 type Forest struct {
-	trees map[ir.Node]*Tree // live iter -> its tree node
+	trees map[ir.Node]*Tree // live loops -> their tree nodes
 	roots []*Tree           // allocation order
 }
 
@@ -60,60 +86,87 @@ func (Forest) Name() string { return "loop-forest" }
 // slice is a fresh copy — callers may reorder it freely.
 func (f Forest) Roots() []*Tree { return append([]*Tree(nil), f.roots...) }
 
-// NodeOf returns iter's tree node, reporting whether it is a forest
-// member. Fail-closed (T-uoq-03): nil, erased, foreign, and non-Iter
+// NodeOf returns loop's tree node, reporting whether it is a forest
+// member. Fail-closed (T-uoq-03): nil, erased, foreign, and non-loop
 // nodes report false.
-func (f Forest) NodeOf(iter ir.Node) (*Tree, bool) {
-	if iter == nil || iter.BasePtr() == nil || iter.BasePtr().Erased() {
+func (f Forest) NodeOf(loop ir.Node) (*Tree, bool) {
+	if loop == nil || loop.BasePtr() == nil || loop.BasePtr().Erased() {
 		return nil, false
 	}
-	t, ok := f.trees[iter]
+	t, ok := f.trees[loop]
 	return t, ok
 }
 
-// Analyze computes the loop-nest forest over g's live iters — the doc's
-// algorithm verbatim:
+// Analyze computes the loop-nest forest over g's live loops — the generic
+// algorithm over ir.LoopNesting (D-02):
 //
-//  1. COLLECT: every live KindIter in g.AllocatedNodes() (allocation)
-//     order gets a Tree and starts as a root candidate.
-//  2. LINK (reversed edges): for each live iter x in allocation order,
-//     scan ir.DataDeps(x) in slot order; the FIRST dep y that is a live
-//     Iter collected in step 1 becomes x's parent — tree(x).Parent =
-//     tree(y), tree(x) appends to tree(y).Children — and x leaves the
-//     root set (it is reachable from its parent).
+//  1. COLLECT: every live spec.IsLoop node in g.AllocatedNodes()
+//     (allocation) order gets a Tree and starts as a root candidate.
+//
+//  2. LINK: for each loop x in allocation order — ParentEdge first: when
+//     x's explicit parent operand p is a collected loop, p is x's parent.
+//     Otherwise containment: the FIRST loop y (allocation order, y != x)
+//     whose BodyRoot-derived operand-closure subtree contains x becomes
+//     x's parent. The closures are computed lazily (at most one per loop)
+//     and walk OPERAND slots only — membership edges, never the uniform
+//     data+effect closure (D-04). x leaves the root set on either link.
+//
 //  3. DEPTH: DFS from each root in Roots() order — root 0, child =
-//     parent + 1. Cycle-safe by construction: mutually-referencing iters
-//     (impossible under def-before-use allocation, defensive anyway)
-//     remove each other from the root set and are never reached by the
-//     DFS — they keep Depth 0 and the algorithm still terminates.
+//     parent + 1. Cycle-safe by construction: mutually-parenting loops
+//     (impossible under def-before-use allocation, defensive anyway) keep
+//     each other out of the root set only when linked; an unlinked cycle
+//     is never reached past, so the DFS still terminates.
 //
 // A nil graph yields the zero Forest (no roots, NodeOf always false).
 func Analyze(g *ir.Graph) Forest {
 	if g == nil {
 		return Forest{}
 	}
+	spec := ir.LoopNesting
 	trees := make(map[ir.Node]*Tree)
-	var order []ir.Node // live iters in allocation order
+	var order []ir.Node // live loops in allocation order
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindIter {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !spec.IsLoop(n) {
 			continue
 		}
 		trees[n] = &Tree{Iter: n}
 		order = append(order, n)
 	}
 
+	// bodyCaches: lazily computed BodyRoot operand-closure per loop (the
+	// containment sets of the LINK step). Operand slots only, cycle-guarded.
+	bodyCaches := make(map[ir.Node]map[ir.Node]bool, len(order))
+	bodyOf := func(loop ir.Node) map[ir.Node]bool {
+		if set, ok := bodyCaches[loop]; ok {
+			return set
+		}
+		set := operandClosure(spec.BodyRoot(loop))
+		bodyCaches[loop] = set
+		return set
+	}
+
 	nonRoot := make(map[*Tree]bool)
 	for _, x := range order {
-		for _, d := range ir.DataDeps(x) {
-			parent, ok := trees[d]
-			if !ok {
-				continue // not a live-iter operand — keep scanning slots
+		xt := trees[x]
+		if p := spec.ParentEdge(x); p != nil {
+			if pt, ok := trees[p]; ok && pt != xt {
+				xt.Parent = pt
+				pt.Children = append(pt.Children, xt)
+				nonRoot[xt] = true
+				continue
 			}
-			xt := trees[x]
-			xt.Parent = parent
-			parent.Children = append(parent.Children, xt)
-			nonRoot[xt] = true // x is reachable from its parent: not a root
-			break              // single-parent convention: first live-Iter operand wins
+		}
+		for _, y := range order {
+			if y == x {
+				continue
+			}
+			if bodyOf(y)[x] {
+				yt := trees[y]
+				xt.Parent = yt
+				yt.Children = append(yt.Children, xt)
+				nonRoot[xt] = true // x is reachable from its parent: not a root
+				break              // first container in allocation order wins
+			}
 		}
 	}
 
@@ -135,4 +188,26 @@ func Analyze(g *ir.Graph) Forest {
 		setDepth(r, 0)
 	}
 	return Forest{trees: trees, roots: roots}
+}
+
+// operandClosure computes the transitive operand-slot closure from root,
+// allocation-visit order, cycle-guarded, skipping nil/erased nodes — the
+// membership-edge containment set (never DataDeps+ImpactBy; D-04).
+func operandClosure(root ir.Node) map[ir.Node]bool {
+	set := make(map[ir.Node]bool)
+	if root == nil {
+		return set
+	}
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+			return
+		}
+		set[x] = true
+		for _, d := range ir.OperandsOf(x) {
+			visit(d)
+		}
+	}
+	visit(root)
+	return set
 }

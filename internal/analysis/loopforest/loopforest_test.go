@@ -67,9 +67,11 @@ func TestName(t *testing.T) {
 }
 
 // TestFlatGraphAllSingletons pins the parentless shape: no iter→iter
-// operand edges, so every live root iter is its own depth-0 root in
-// allocation order — and only KindIter is collected (IterCluster, DimVar,
-// ForLoop are not forest members).
+// operand edges and no forloop body containment, so every live loop is its
+// own depth-0 root in allocation order. Since quick-261022-f5o the
+// analysis is GENERIC over the loop category (ir.LoopNesting): both
+// KindIter and KindForLoop are collected — the live (scaffolded) forloop
+// is a third flat root. IterCluster and DimVar are still never members.
 func TestFlatGraphAllSingletons(t *testing.T) {
 	g, dims, out := dimFixture("flat", 2)
 	f32 := ir.InternScalar(ir.TF32)
@@ -84,11 +86,11 @@ func TestFlatGraphAllSingletons(t *testing.T) {
 
 	f := loopforest.Analyze(g)
 	roots := f.Roots()
-	if len(roots) != 2 {
-		t.Fatalf("two unrelated iters must yield 2 roots, got %d", len(roots))
+	if len(roots) != 3 {
+		t.Fatalf("two unrelated iters plus the flat forloop must yield 3 roots, got %d", len(roots))
 	}
-	if roots[0].Iter != it1 || roots[1].Iter != it2 {
-		t.Fatalf("roots must be in allocation order [it1, it2]")
+	if roots[0].Iter != it1 || roots[1].Iter != it2 || roots[2].Iter != loop {
+		t.Fatalf("roots must be in allocation order [it1, it2, loop]")
 	}
 	for _, r := range roots {
 		if r.Depth != 0 {
@@ -101,18 +103,17 @@ func TestFlatGraphAllSingletons(t *testing.T) {
 			t.Fatal("a flat root must have no parent")
 		}
 	}
-	for _, it := range []ir.Node{it1, it2} {
+	for _, it := range []ir.Node{it1, it2, loop} {
 		if _, ok := f.NodeOf(it); !ok {
-			t.Fatalf("NodeOf must hold for live iter %d", it.BasePtr().ID())
+			t.Fatalf("NodeOf must hold for live loop %d", it.BasePtr().ID())
 		}
 	}
 	for name, node := range map[string]ir.Node{
 		"itercluster": cluster,
 		"dimvar":      dv,
-		"forloop":     loop,
 	} {
 		if _, ok := f.NodeOf(node); ok {
-			t.Fatalf("%s must not be a forest member (only KindIter is collected)", name)
+			t.Fatalf("%s must not be a forest member (only loop-header kinds are collected)", name)
 		}
 	}
 }
