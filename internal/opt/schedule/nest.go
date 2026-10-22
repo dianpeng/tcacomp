@@ -1,109 +1,77 @@
-// nest.go is the spec's Step 0 — the loop-nest forest analysis over the
-// lowered KindForLoop nodes (quick-261021-ta3, doc/optana/schedule.md).
-// It mirrors internal/analysis/loopforest's structure (collect → link →
-// depth DFS, allocation-order determinism, maps for membership only) but
-// differs in the EDGE MODEL on purpose: the iter forest links by reversed
-// operand edges (a nested iter carries its parent as an operand), while
-// ForLoop nesting is BODY-OPERAND CONTAINMENT (a nested ForLoop is
-// reachable from the parent's ops[2] — node_loop.go M1), so the
-// reversed-edge trick does not apply here.
+// nest.go holds ONLY the schedule pass's pass-local derivations on top of
+// the SHARED generic loop-nest forest analysis (quick-261022-f5o, D-05):
+// the forest itself — collect/link/depth over both loop dialects — lives
+// in internal/analysis/loopforest, driven by the ir-owned ir.LoopNesting
+// category spec. What stays here is what the analysis must NOT own:
+//
+//   - the forNest adapter shape the scheduler consumes (loop/parent/
+//     children/depth + the per-nest .body/.reach sets + the stamped block),
+//   - bodySetOf — the OPERAND-only body closure feeding capOp (the HI-02
+//     effectful floor),
+//   - reachSetOf — the UNIFORM closure (data + impact defs) feeding capUni
+//     and ownership (quick-261022-b2m CR-01: tile-lower makes SMEM fills
+//     loop members through effect chains, so containment must see them).
+//
+// See the loopforest package header for the two rulings this file rides
+// on: membership-edges-only linking (D-04 — repointChains completion edges
+// order, never nest) and the 0-based depth convention (D-02) — this
+// adapter maps tree.Depth+1 to the scheduler's 1-based convention ("the
+// outermost loop is 1", doc/optana/schedule.md) at this single point.
 package schedule
 
-import "tcacomp/internal/ir"
+import (
+	"tcacomp/internal/analysis/loopforest"
+	"tcacomp/internal/ir"
+)
 
-// forNest is one loop-nest tree node over a live KindForLoop — the schedule
-// pass's private forest type (the loopforest analysis package is HIR
-// KindIter-only and stays untouched). depth follows the spec: the outermost
-// loop is 1, each nesting level adds 1 ("outer most loop is 1").
+// forNest is one loop-nest tree node over a live KindForLoop — the
+// schedule pass's private mirror of a loopforest.Tree. depth follows the
+// spec: the outermost loop is 1, each nesting level adds 1 ("outer most
+// loop is 1") — the adapter's +1 mapping of the analysis's 0-based depth.
 type forNest struct {
 	loop     ir.Node          // the KindForLoop this tree node represents
 	parent   *forNest         // nil for roots
 	children []*forNest       // loops nested in this one, allocation order
-	depth    int              // root = 1, child = parent + 1
-	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk over OperandsOf) — forest LINKING and the HI-02 effectful floor
+	depth    int              // root = 1, child = parent + 1 (spec convention)
+	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk over OperandsOf) — the HI-02 effectful floor (capOp)
 	reach    map[ir.Node]bool // UNIFORM containment set (ops[2] walk over DataDeps+ImpactBy defs, quick-261022-b2m CR-01) — placement cap and ownership
 	block    *ir.ASTBlock     // the LBBN Loop block built for this node, stamped during scheduling
 }
 
-// forLoopForest derives the loop-nest forest over g's live (non-erased)
-// KindForLoop nodes — the doc's Step 0 verbatim:
-//
-//  1. COLLECT: every non-erased KindForLoop in g.AllocatedNodes()
-//     (allocation order) gets a forNest and starts as a root candidate —
-//     the loopforest collect pattern.
-//
-//  2. LINK by body-operand containment: for each loop y, its body subtree
-//     is the transitive operand closure from ops[2] (cycle-guarded). For
-//     each loop x in allocation order, its parent is the FIRST loop y
-//     (allocation order, y != x) whose body subtree contains x; x appends
-//     to y.children and leaves the root set. Containment is reachability
-//     in y's body walk: x's own subtree never contains its ancestors by
-//     construction, so first-match is deterministic.
-//
-//     The LINK step deliberately stays on the OPERAND-ONLY .body set even
-//     though placement uses the uniform .reach set (quick-261022-b2m):
-//     tile-lower's repointChains (lower_rewrite.go P6) re-points every
-//     post-nest consumer's ImpactBy edge at a FOREIGN nest's ROOT loop
-//     node — "the ForLoop node as effect-def" denotes whole-loop
-//     completion — so loop nodes are uniform-reachable from OTHER nests'
-//     bodies. Linking on .reach would cross-nest the forest and destroy
-//     the LNT decomposition; structural nesting is an operand fact, not
-//     an effect-ordering fact. (LO-02 — value-consumption conflation of
-//     the operand-only link — stays unfixed by design.)
-//
-//  3. DEPTH via DFS from each root in root order (root = 1, child =
-//     parent + 1), cycle-safe as in loopforest.
+// forLoopForest derives the schedule pass's nest list over g's live
+// KindForLoop nodes by MIRRORING the shared generic analysis
+// (loopforest.Analyze over ir.LoopNesting — the same analysis tiling
+// consumes; quick-261022-f5o D-05). The mirror keeps the forNest field
+// set the scheduler reads (scheduler.go needs zero changes): loop from
+// Tree.Iter, parent/children from the tree links (allocation order
+// preserved by the mirror walk), depth = Tree.Depth + 1 (the single
+// adaptation point of the D-02 depth-base ruling), and the pass-local
+// .body/.reach closures computed here per nest. The KindIter gate in the
+// scheduler's Run guarantees no HIR iters reach this forest; the analysis
+// would link them coherently regardless.
 //
 // A forest member that is not reachable from the sea roots (the Walk live
 // set) is dead building debris: the caller refuses it fail-closed rather
 // than scheduling garbage into the AST CFG.
 func forLoopForest(g *ir.Graph) []*forNest {
-	trees := make(map[ir.Node]*forNest)
-	var order []ir.Node // live (non-erased) for-loops in allocation order
-	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {
-			continue
+	f := loopforest.Analyze(g)
+	var mirror func(t *loopforest.Tree, parent *forNest) *forNest
+	mirror = func(t *loopforest.Tree, parent *forNest) *forNest {
+		fn := &forNest{
+			loop:   t.Iter,
+			parent: parent,
+			depth:  t.Depth + 1, // D-02: analysis 0-based → scheduler 1-based
+			body:   bodySetOf(t.Iter),
+			reach:  reachSetOf(t.Iter),
 		}
-		trees[n] = &forNest{loop: n, depth: 1}
-		order = append(order, n)
-	}
-
-	for _, y := range order {
-		trees[y].body = bodySetOf(y)
-		trees[y].reach = reachSetOf(y)
-	}
-	nonRoot := make(map[*forNest]bool)
-	for _, x := range order {
-		for _, y := range order {
-			if x.BasePtr() == y.BasePtr() {
-				continue
-			}
-			if trees[y].body[x] {
-				xt, yt := trees[x], trees[y]
-				xt.parent = yt
-				yt.children = append(yt.children, xt)
-				nonRoot[xt] = true
-				break // first container in allocation order wins
-			}
+		for _, c := range t.Children { // allocation order, preserved
+			fn.children = append(fn.children, mirror(c, fn))
 		}
+		return fn
 	}
-
-	roots := make([]*forNest, 0, len(order))
-	for _, x := range order {
-		if t := trees[x]; !nonRoot[t] {
-			roots = append(roots, t)
-		}
-	}
-
-	var setDepth func(t *forNest, d int)
-	setDepth = func(t *forNest, d int) {
-		t.depth = d
-		for _, c := range t.children {
-			setDepth(c, d+1)
-		}
-	}
-	for _, r := range roots {
-		setDepth(r, 1)
+	roots := make([]*forNest, 0, len(f.Roots()))
+	for _, r := range f.Roots() { // allocation order
+		roots = append(roots, mirror(r, nil))
 	}
 	return roots
 }
@@ -112,8 +80,10 @@ func forLoopForest(g *ir.Graph) []*forNest {
 // ops[2] (the loop body), allocation-visit order, cycle-guarded: the set
 // keyed by ir.Node identity answers body-containment questions
 // ("is x inside y's loop body") in O(1). Payload (ImpactBy) edges are not
-// part of the body-subtree relation — containment is operand structure
-// only, exactly as the nest LINK step specifies.
+// part of the body-subtree relation — this is the OPERAND-only set the
+// HI-02 effectful floor consumes (capOp). Forest LINKING uses the same
+// relation, but that now lives in the shared analysis (its
+// membership-edges discipline, D-04).
 func bodySetOf(n ir.Node) map[ir.Node]bool {
 	set := make(map[ir.Node]bool)
 	if n == nil {
@@ -152,6 +122,14 @@ func bodySetOf(n ir.Node) map[ir.Node]bool {
 // windows, wrong numerics). The uniform set makes the fill's cap the depth
 // of the deepest loop whose body reaches it through data OR impact edges:
 // it is an impact-predecessor of the in-body buffer access.
+//
+// NOTE the asymmetry with forest LINKING (D-04): placement containment is
+// UNIFORM (this set — a fill positioned by an effect chain belongs inside
+// its host loop), but nest STRUCTURE is membership-edges-only (a
+// completion edge to a foreign root must never nest two LNTs). The
+// distinction is edge-direction semantics: an impact-PREDECESSOR of an
+// in-body node is a same-iteration member; an impact edge AT a loop ROOT
+// is "after the whole loop".
 func reachSetOf(n ir.Node) map[ir.Node]bool {
 	set := make(map[ir.Node]bool)
 	if n == nil {
