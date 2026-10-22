@@ -186,12 +186,48 @@ func TestASTLoopShapeGuards(t *testing.T) {
 	}
 }
 
+// TestASTPrototype pins the Prototype block constructor (quick-261022-e2u,
+// D-1/D-2): kind BlockPrototype ("Prototype"), Group-like defaults (no loop
+// header info, DoSoC -1, LoC 1), empty items, no owning nest.
+func TestASTPrototype(t *testing.T) {
+	blk := NewASTPrototype()
+	if blk.Kind() != BlockPrototype {
+		t.Fatalf("NewASTPrototype kind = %s, want Prototype", blk.Kind())
+	}
+	if blk.Kind().String() != "Prototype" {
+		t.Fatalf("Kind().String() = %q, want Prototype", blk.Kind().String())
+	}
+	if blk.Loop() != nil || blk.IV() != nil || blk.Bound() != nil {
+		t.Fatal("a Prototype must carry no loop header info")
+	}
+	if blk.DoSoC() != -1 || blk.LoC() != 1 {
+		t.Fatalf("a Prototype's DoSoC/LoC = %d/%d, want -1/1", blk.DoSoC(), blk.LoC())
+	}
+	if got := blk.Items(); len(got) != 0 {
+		t.Fatalf("a fresh Prototype must be empty, got %d items", len(got))
+	}
+	if blk.Nest() != nil {
+		t.Fatal("a Prototype must carry no owning nest")
+	}
+	if BlockGroup == BlockPrototype || int(BlockPrototype) != 4 {
+		t.Fatalf("BlockPrototype = %d, want the append-only value 4 after BlockThrLoop", int(BlockPrototype))
+	}
+}
+
 func TestAttachASTRefusals(t *testing.T) {
 	g := NewGraph("attach")
 	if err := g.AttachAST(nil); err == nil {
 		t.Fatal("nil kernel must refuse")
 	}
-	if err := g.AttachAST(&ASTKernel{}); err == nil {
+	// quick-261022-e2u (D-2): the Prototype is validated FIRST.
+	if err := g.AttachAST(&ASTKernel{Body: NewASTGroup()}); err == nil {
+		t.Fatal("nil Prototype must refuse")
+	}
+	err := g.AttachAST(&ASTKernel{Prototype: NewASTGroup(), Body: NewASTGroup()})
+	if err == nil || !strings.Contains(err.Error(), "requires a BlockPrototype") {
+		t.Fatalf("a non-BlockPrototype Prototype = %v, want the kind-naming refusal", err)
+	}
+	if err := g.AttachAST(&ASTKernel{Prototype: NewASTPrototype()}); err == nil {
 		t.Fatal("nil Body must refuse")
 	}
 	loop := forLoopWithAttrs(t, g, 2, 0, 32)
@@ -199,17 +235,17 @@ func TestAttachASTRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := g.AttachAST(&ASTKernel{Body: loopBlk}); err == nil {
+	if err := g.AttachAST(&ASTKernel{Prototype: NewASTPrototype(), Body: loopBlk}); err == nil {
 		t.Fatal("a non-Group Body must refuse")
 	}
-	k := &ASTKernel{Body: NewASTGroup()}
+	k := &ASTKernel{Prototype: NewASTPrototype(), Body: NewASTGroup()}
 	if err := g.AttachAST(k); err != nil {
 		t.Fatalf("first attach = %v", err)
 	}
 	if g.AST() == nil {
 		t.Fatal("AST() must return the attached kernel")
 	}
-	if err := g.AttachAST(&ASTKernel{Body: NewASTGroup()}); err == nil {
+	if err := g.AttachAST(&ASTKernel{Prototype: NewASTPrototype(), Body: NewASTGroup()}); err == nil {
 		t.Fatal("double attach must refuse")
 	}
 	var nilg *Graph
@@ -236,5 +272,11 @@ func TestSetSchedRoundTrip(t *testing.T) {
 	c.BasePtr().SetSched(2, loopBlk)
 	if c.BasePtr().SchedSN() != 2 || c.BasePtr().SchedBlock() != loopBlk {
 		t.Fatal("SetSched(2, loopBlk) must round-trip")
+	}
+	// quick-261022-e2u (D-1): -1 is the legitimate signature-scope rank.
+	proto := NewASTPrototype()
+	c.BasePtr().SetSched(PrototypeSN, proto)
+	if c.BasePtr().SchedSN() != PrototypeSN || c.BasePtr().SchedBlock() != proto {
+		t.Fatal("SetSched(-1, proto) must round-trip: -1 is the legitimate prototype rank (the SN floor)")
 	}
 }

@@ -40,6 +40,20 @@ package ir
 // Nest() (nil outside clusters); loop blocks keep Loop() as their nest
 // identity.
 //
+// PROTOTYPE BLOCK (quick-261022-e2u, user ruling 2026-10-22 D-1..D-5):
+// live KindInputParam and live KindMemNew (GMEM — the launcher-provided
+// buffer, spec 4.2) nodes are placeholders to known states, NOT statements:
+// they anchor at SN -1 (PrototypeSN) into a kernel-signature Prototype
+// block (BlockPrototype) carried by the dedicated ASTKernel.Prototype field
+// and rendered FIRST in the compiled kernel. This makes the SN→lexical-scope
+// mapping TOTAL (-1 signature / 0 kernel / r depth-r loop) with zero special
+// conditions in the algorithm — propagation's meet is a max, so a -1 dep
+// contributes nothing. Params []Node and Gmem []ASTGmemAlloc stay as
+// STRUCTURED metadata views (D-5); the prototype block is the canonical
+// SCHEDULE view final_lower consumes. MemNewSMem/FragNew allocations and
+// extent consts stay NORMALLY scheduled at SN 0 (D-4) — they are in-kernel
+// declarations and values, not placeholders.
+//
 // Persistent per-node scheduling state (locked decision D-03): alongside
 // these types, Base carries schedSN/schedBlock — the scheduling number and
 // the SN→block linkage final_lower (and reducer lowering) reads AFTER the
@@ -78,6 +92,12 @@ const (
 	BlockCTALoop
 	// BlockThrLoop is a thread-parallel loop (soc 2).
 	BlockThrLoop
+	// BlockPrototype is the kernel-signature block (quick-261022-e2u,
+	// D-1/D-2): rendered FIRST in the compiled kernel, its items are the
+	// live KindInputParam and KindMemNew placeholder nodes anchored at
+	// PrototypeSN. Appended AFTER the loop kinds on purpose — append-only:
+	// BlockGroup must stay the zero value.
+	BlockPrototype
 )
 
 // String returns the diagnostic name of the block kind.
@@ -91,10 +111,27 @@ func (k BlockKind) String() string {
 		return "CTALoop"
 	case BlockThrLoop:
 		return "ThrLoop"
+	case BlockPrototype:
+		return "Prototype"
 	default:
 		return fmt.Sprintf("BlockKind(%d)", int(k))
 	}
 }
+
+// PrototypeSN is the scheduling number of the kernel-signature scope — the
+// Prototype block (quick-261022-e2u, D-1). It makes the SN→lexical-scope
+// mapping TOTAL:
+//
+//	-1 = signature scope (the Prototype block: live KindInputParam and
+//	     KindMemNew placeholders to known states)
+//	 0 = kernel scope (the prologue/kernel Group)
+//	 r >= 1 = depth-r loop
+//
+// Anchoring at -1 needs zero special conditions downstream: SN
+// propagation's meet operator is a MAX over deps, so a -1 dep contributes
+// nothing (the anchored-set exclusion during propagation/placement is the
+// only mechanism — exactly the loop-header discipline).
+const PrototypeSN = -1
 
 // ASTItem is one statement slot of an ASTBlock — the spec's recursive
 // statement: exactly one field is non-nil. Node carries a scheduled IR node
@@ -171,6 +208,17 @@ func NewASTGroup() *ASTBlock {
 // epilogue-landed node in O(1). The schedule pass is the sole producer.
 func NewASTGroupInNest(lnt *ASTLNT) *ASTBlock {
 	return &ASTBlock{kind: BlockGroup, dosoc: -1, loc: 1, nest: lnt}
+}
+
+// NewASTPrototype creates the empty kernel-signature Prototype block
+// (quick-261022-e2u, D-2): rendered FIRST in the compiled kernel — the
+// dedicated ASTKernel.Prototype field is its carrier, and the block is NOT
+// an item inside Body. Its items are the live KindInputParam and KindMemNew
+// placeholder nodes, each stamped SetSched(PrototypeSN, proto) by the
+// schedule pass. Same defaults as NewASTGroup (dosoc -1, loc 1, Nest()
+// nil).
+func NewASTPrototype() *ASTBlock {
+	return &ASTBlock{kind: BlockPrototype, dosoc: -1, loc: 1}
 }
 
 // NewASTLoop builds a Loop block from a live KindForLoop node (the LBBN
@@ -284,22 +332,32 @@ type ASTLNT struct {
 	Loops []ASTLoopMeta // outer→inner per-loop SoC metadata
 }
 
-// ASTKernel is the scheduled kernel (spec "Scheduling the CFG"): the Body
-// is always a BlockGroup ("Body: Which is a Group") whose items are, per
-// LNT in forest-root allocation order, [prologue Group, LBBN root block,
-// epilogue Group]; Params are the kernel input params in declaration order;
-// Gmem lists every live GMEM allocation in allocation order; LNTs lists the
-// per-LNT loop metadata in forest-root allocation order. Since
-// quick-261022-b2m (ruling 7) LNTs is a []*ASTLNT — the schedule pass is
-// the sole producer and every prologue/epilogue Group points at its stable
-// LNT record through Nest(), so consumers can compare Group identity and
-// nest identity interchangeably (final_lower maps an epilogue-landed node
-// back to its owning nest).
+// ASTKernel is the scheduled kernel (spec "Scheduling the CFG"): the
+// Prototype is the kernel-signature block rendered FIRST (quick-261022-e2u,
+// D-2); the Body is always a BlockGroup ("Body: Which is a Group") whose
+// items are, per LNT in forest-root allocation order, [prologue Group, LBBN
+// root block, epilogue Group] — the prototype is NOT an item inside Body;
+// Params are the kernel input params in declaration order; Gmem lists every
+// live GMEM allocation in allocation order; LNTs lists the per-LNT loop
+// metadata in forest-root allocation order. Since quick-261022-b2m (ruling
+// 7) LNTs is a []*ASTLNT — the schedule pass is the sole producer and every
+// prologue/epilogue Group points at its stable LNT record through Nest(),
+// so consumers can compare Group identity and nest identity
+// interchangeably (final_lower maps an epilogue-landed node back to its
+// owning nest).
 type ASTKernel struct {
-	Body   *ASTBlock      // the kernel body — always a BlockGroup
-	Params []Node         // kernel input params, declaration order
-	Gmem   []ASTGmemAlloc // every live GMEM allocation, allocation order
-	LNTs   []*ASTLNT      // per-LNT SoC metadata, forest-root allocation order (stable records; Nest() points here)
+	// Prototype is the kernel-signature block (quick-261022-e2u, D-2),
+	// rendered FIRST: one BlockPrototype whose items are exactly the live
+	// KindInputParam and KindMemNew placeholder nodes at PrototypeSN — the
+	// canonical SCHEDULE view of the kernel signature (D-5). Params and
+	// Gmem below stay as STRUCTURED metadata views of the same facts:
+	// Params keeps declaration order; Gmem pairs each MemNew with its
+	// extent (op[0]) for final_lower's launcher-buffer materialization.
+	Prototype *ASTBlock      // the kernel-signature block — always a BlockPrototype
+	Body      *ASTBlock      // the kernel body — always a BlockGroup
+	Params    []Node         // kernel input params, declaration order (metadata view, D-5)
+	Gmem      []ASTGmemAlloc // every live GMEM allocation, allocation order, extent paired (metadata view, D-5)
+	LNTs      []*ASTLNT      // per-LNT SoC metadata, forest-root allocation order (stable records; Nest() points here)
 }
 
 // AST returns the graph's AST-style CFG — the "schedule" pass's product
@@ -314,16 +372,24 @@ func (g *Graph) AST() *ASTKernel {
 }
 
 // AttachAST installs k as the graph's AST-style CFG. It is fail-closed: a
-// nil graph, nil kernel, nil Body, a non-Group Body (the spec: "Body:
-// Which is a Group"), or an already-attached AST (one schedule per graph —
-// re-runs are a manager-level re-run of the whole pipeline, not an in-place
-// reschedule) all refuse with an error and leave the graph untouched.
+// nil graph, nil kernel, a nil Prototype, a non-BlockPrototype Prototype
+// (quick-261022-e2u, D-2 — validated FIRST), nil Body, a non-Group Body
+// (the spec: "Body: Which is a Group"), or an already-attached AST (one
+// schedule per graph — re-runs are a manager-level re-run of the whole
+// pipeline, not an in-place reschedule) all refuse with an error and leave
+// the graph untouched.
 func (g *Graph) AttachAST(k *ASTKernel) error {
 	if g == nil {
 		return errors.New("ir: AttachAST on a nil graph")
 	}
 	if k == nil {
 		return errors.New("ir: AttachAST with a nil kernel")
+	}
+	if k.Prototype == nil {
+		return errors.New("ir: AttachAST with a nil Prototype")
+	}
+	if k.Prototype.Kind() != BlockPrototype {
+		return fmt.Errorf("ir: AttachAST requires a BlockPrototype Prototype, got %s", k.Prototype.Kind())
 	}
 	if k.Body == nil {
 		return errors.New("ir: AttachAST with a nil Body")
@@ -339,8 +405,10 @@ func (g *Graph) AttachAST(k *ASTKernel) error {
 }
 
 // SchedSN returns the node's scheduling number (quick-261021-ta3 D-03;
-// semantics extended by quick-261022-b2m ruling 6): the propagated DEPTH
-// REQUIREMENT, complementary to the landing zone SchedBlock — 0 means
+// semantics extended by quick-261022-b2m ruling 6 and quick-261022-e2u
+// D-1): the propagated DEPTH REQUIREMENT, complementary to the landing
+// zone SchedBlock — -1 means signature scope (a placeholder: live
+// KindInputParam/KindMemNew landed in the Prototype block), 0 means
 // loop-invariant (prologue/kernel Group), r > 0 means "requires depth r".
 // With a Loop block that reads "in-loop at depth r"; with an epilogue
 // Group it reads "AFTER that nest, still requiring depth r" — never an
@@ -364,8 +432,9 @@ func (b *Base) SchedBlock() *ASTBlock { return b.schedBlock }
 // It is the single writer both for the pass's anchoring/propagation phase
 // (block nil — SN is provisional depth state) and for its placement phase
 // (block stamped — epilogue nodes KEEP their propagated SN; ruling 6). A
-// zero SN is the legitimate rank-0 prologue; a nil block means "not
-// scheduled yet".
+// zero SN is the legitimate rank-0 prologue; -1 is the legitimate
+// signature-scope rank (PrototypeSN — the SN floor since quick-261022-e2u);
+// a nil block means "not scheduled yet".
 func (b *Base) SetSched(sn int, blk *ASTBlock) {
 	b.schedSN = sn
 	b.schedBlock = blk
