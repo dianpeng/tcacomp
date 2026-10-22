@@ -7,7 +7,10 @@ package ir
 // the persistent per-node scheduling state on Base (D-03). It touches
 // nothing of the legacy CFG, Materialize, the printer, or the goldens.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // forLoopWithAttrs builds a minimal KindForLoop node with the given soc /
 // dosoc / loc KeyedAttribute annotations over a hand-built dimvar header.
@@ -118,6 +121,57 @@ func TestASTLoopBadSocFailsClosed(t *testing.T) {
 	loop := forLoopWithAttrs(t, g, 7, 0, 1)
 	if _, err := NewASTLoop(loop); err == nil {
 		t.Fatal("soc=7 must refuse with an error, got nil")
+	}
+}
+
+// forLoopWithNonConstAttr builds a ForLoop whose soc is a valid const but
+// whose key attribute (dosoc or loc) carries a NON-CONST value node — the
+// ME-02 corruption shape (quick-261022-b2m).
+func forLoopWithNonConstAttr(t *testing.T, g *Graph, key string) Node {
+	t.Helper()
+	u32 := InternScalar(TU32)
+	dim := g.NewInputParam("ctor", RoleDim, "d", nil)
+	iv := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+	bound := g.NewBoundedDimVar("ctor", iv, g.NewConst("ctor", u32, 8))
+	socA := g.NewKeyedAttribute("ctor", "soc", g.NewConst("ctor", u32, 1))
+	nc := g.NewBinOp("ctor", BinOpAdd, g.NewConst("ctor", u32, 1), g.NewConst("ctor", u32, 2))
+	return g.NewForLoop("ctor", iv, bound, g.NewConst("ctor", u32, 0), socA,
+		g.NewKeyedAttribute("ctor", key, nc))
+}
+
+// TestASTLoopNonConstAttrsFailsClosed pins ME-02 (quick-261022-b2m): ALL
+// THREE annotation keys fail closed on a non-const value — a corrupted
+// dosoc or loc must error exactly like a corrupted soc, never be silently
+// masked into the documented default and propagated into ASTLoopMeta.
+func TestASTLoopNonConstAttrsFailsClosed(t *testing.T) {
+	for _, key := range []string{"dosoc", "loc"} {
+		g := NewGraph("nc-" + key)
+		loop := forLoopWithNonConstAttr(t, g, key)
+		_, err := NewASTLoop(loop)
+		if err == nil {
+			t.Fatalf("non-const %s must fail closed, got nil", key)
+		}
+		if want := "non-const " + key; !strings.Contains(err.Error(), want) {
+			t.Fatalf("non-const %s error = %q, want it to contain %q", key, err.Error(), want)
+		}
+	}
+}
+
+// TestASTGroupNestAccessor pins ruling 7 (quick-261022-b2m): a plain
+// NewASTGroup carries NO owning nest, while NewASTGroupInNest carries the
+// given LNT record — same pointer, O(1) identity for final_lower's
+// epilogue-to-nest mapping.
+func TestASTGroupNestAccessor(t *testing.T) {
+	if got := NewASTGroup().Nest(); got != nil {
+		t.Fatalf("plain group Nest() = %v, want nil", got)
+	}
+	lnt := &ASTLNT{}
+	blk := NewASTGroupInNest(lnt)
+	if blk.Kind() != BlockGroup {
+		t.Fatalf("in-nest group kind = %s, want Group", blk.Kind())
+	}
+	if got := blk.Nest(); got != lnt {
+		t.Fatalf("in-nest group Nest() = %p, want the same LNT pointer %p", got, lnt)
 	}
 }
 

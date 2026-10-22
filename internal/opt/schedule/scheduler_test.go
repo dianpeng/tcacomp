@@ -13,6 +13,7 @@ package schedule_test
 // never map order.
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -425,6 +426,258 @@ func TestKernelMetadata(t *testing.T) {
 	if lnt.Loops[0].Soc != 2 || lnt.Loops[0].Dosoc != 1 || lnt.Loops[0].Loc != 32 {
 		t.Fatalf("loop SoC metadata = %d/%d/%d, want 2/1/32",
 			lnt.Loops[0].Soc, lnt.Loops[0].Dosoc, lnt.Loops[0].Loc)
+	}
+}
+
+// TestReductionShapeEpilogue pins THE ruling-4/ruling-6 shape
+// (quick-261022-b2m, review probe 2 / CR-02): a kernel-level consumer of an
+// in-loop value — final_lower.md §"Reducer Lower Integration"'s reduction
+// shape, R = n * 2 consuming in-loop n — lands in its producing nest's
+// EPILOGUE Group (never in the prologue before its dependency), keeping
+// SN == 1 == the reduced loop's depth (the propagated DEPTH REQUIREMENT,
+// not an after-nest rank). The nest is recoverable through BOTH routes
+// final_lower documents: R's own SN/block-Nest() AND R's operand's
+// SchedBlock() == the ThrLoop block.
+func TestReductionShapeEpilogue(t *testing.T) {
+	f := newFx("redshape")
+	iv, bound := f.dimVar()
+	n := f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1))
+	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, n)
+	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+	R := f.g.NewBinOp("ctor", ir.BinOpMul, n, f.g.NewConst("ctor", f.f32, 2)) // kernel-level consumer of in-loop n
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop, R)
+
+	k := run(t, f.g)
+	blocks := bodyBlocks(t, k)
+	prologue, thr, epilogue := blocks[0], blocks[1], blocks[2]
+	if thr.Kind() != ir.BlockThrLoop {
+		t.Fatalf("root block kind = %s, want ThrLoop", thr.Kind())
+	}
+	// R: epilogue Group, SN 1 (== the reduced loop's depth), nest identity.
+	if R.BasePtr().SchedBlock() != epilogue {
+		t.Fatal("the reduction shape must land in its nest's epilogue Group (after the loop)")
+	}
+	if R.BasePtr().SchedSN() != 1 {
+		t.Fatalf("reduction shape SN = %d, want 1 (the reduced loop's depth — depth requirement, ruling 6)", R.BasePtr().SchedSN())
+	}
+	if nst := R.BasePtr().SchedBlock().Nest(); nst == nil || nst.Root.BasePtr() != loop.BasePtr() {
+		t.Fatal("the epilogue Group must identify the producing nest via Nest() (ruling 7)")
+	}
+	// DUAL ROUTE: R's operand's SchedBlock IS the loop block — either route
+	// identifies the loop (final_lower's "reducer's own SN OR its operand").
+	if n.BasePtr().SchedBlock() != thr {
+		t.Fatal("the in-loop operand's SchedBlock must be the ThrLoop block (the dual route)")
+	}
+	// n itself stays in the loop.
+	if indexOf(itemNodes(thr), n) < 0 || indexOf(itemNodes(thr), st) < 0 {
+		t.Fatal("the in-loop value and its store must stay in the ThrLoop block")
+	}
+	if indexOf(itemNodes(prologue), R) >= 0 {
+		t.Fatal("the reduction shape must NOT hoist to the prologue before its dependency (CR-02)")
+	}
+}
+
+// TestPostNestStoreEpilogue pins review probe 3 (CR-02's per-tensor effect
+// order): a kernel-level store chained (ImpactBy) after an in-loop store on
+// the same tensor lands in the nest's epilogue — the "after the whole loop"
+// order tile-lower's repointChains establishes — never in the prologue
+// before the loop's own store.
+func TestPostNestStoreEpilogue(t *testing.T) {
+	f := newFx("postnest")
+	out2 := f.tensor("out2")
+	iv, bound := f.dimVar()
+	st1b := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m},
+		f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1)))
+	loop := f.g.NewForLoop("ctor", iv, bound, st1b, f.loopAttrs(2, 0, 32)...)
+	st2 := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 7))
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out, out2}, loop, st2)
+
+	k := run(t, f.g)
+	blocks := bodyBlocks(t, k)
+	thr, epilogue := blocks[1], blocks[2]
+	if st2.BasePtr().SchedBlock() != epilogue || st2.BasePtr().SchedSN() != 1 {
+		t.Fatalf("post-nest store SN/block = %d/%p, want 1/epilogue", st2.BasePtr().SchedSN(), st2.BasePtr().SchedBlock())
+	}
+	if indexOf(itemNodes(thr), st1b) < 0 {
+		t.Fatal("the in-loop store must stay in the ThrLoop block")
+	}
+	if indexOf(itemNodes(epilogue), st2) < 0 {
+		t.Fatal("the post-nest store must land in the epilogue Group item list")
+	}
+}
+
+// TestEffectfulNoHoist pins HI-02 (quick-261022-b2m): a data-INVARIANT
+// effectful memory access floors inside its operand-containing loop, while
+// pure invariants and ALLOCATIONS still hoist to the prologue (the
+// allocation-exemption pin — a buffer is a shared declaration).
+func TestEffectfulNoHoist(t *testing.T) {
+	t.Run("invariant store stays in loop", func(t *testing.T) {
+		f := newFx("nohoist-store")
+		iv, bound := f.dimVar()
+		// axes reference the dim param, NOT the iv: the store is data-invariant.
+		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 1))
+		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
+
+		k := run(t, f.g)
+		blocks := bodyBlocks(t, k)
+		thr := blocks[1]
+		if st.BasePtr().SchedSN() != 1 || st.BasePtr().SchedBlock() != thr {
+			t.Fatalf("invariant effectful store SN/block = %d/%p, want 1/ThrLoop (HI-02 floor)", st.BasePtr().SchedSN(), st.BasePtr().SchedBlock())
+		}
+		if indexOf(itemNodes(thr), st) < 0 {
+			t.Fatal("the invariant store must be an ITEM of the loop block")
+		}
+	})
+	t.Run("pure hoists, allocation exempt", func(t *testing.T) {
+		f := newFx("nohoist-alloc")
+		iv, bound := f.dimVar()
+		inv := f.g.NewBinOp("ctor", ir.BinOpMul, f.g.NewConst("ctor", f.f32, 3), f.g.NewConst("ctor", f.f32, 4))
+		buf := f.g.NewMemNew("ctor", f.g.NewConst("ctor", f.u32, 128)) // allocation: exempt from the floor
+		load := f.g.NewMemLoad("ctor", buf, []ir.Node{iv})             // varies with the iv: in-loop
+		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewBinOp("ctor", ir.BinOpMul, load, inv))
+		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
+
+		k := run(t, f.g)
+		blocks := bodyBlocks(t, k)
+		prologue, thr := blocks[0], blocks[1]
+		if inv.BasePtr().SchedSN() != 0 || inv.BasePtr().SchedBlock() != prologue {
+			t.Fatal("the pure invariant must still hoist to the prologue (LICM intact)")
+		}
+		if buf.BasePtr().SchedSN() != 0 || buf.BasePtr().SchedBlock() != prologue {
+			t.Fatalf("allocation SN/block = %d/%p, want 0/prologue (the HI-02 exemption pin)", buf.BasePtr().SchedSN(), buf.BasePtr().SchedBlock())
+		}
+		if load.BasePtr().SchedSN() != 1 || load.BasePtr().SchedBlock() != thr {
+			t.Fatalf("the iv-varying load SN/block = %d/%p, want 1/ThrLoop", load.BasePtr().SchedSN(), load.BasePtr().SchedBlock())
+		}
+		if st.BasePtr().SchedSN() != 1 || st.BasePtr().SchedBlock() != thr {
+			t.Fatalf("the store SN/block = %d/%p, want 1/ThrLoop", st.BasePtr().SchedSN(), st.BasePtr().SchedBlock())
+		}
+	})
+}
+
+// TestBranchedNestRefusal pins HI-01 (quick-261022-b2m): two sibling loops
+// under one parent (both uniform and operand contained in the parent's body)
+// refuse fail-closed — byDepth would silently cross-product the siblings'
+// iteration spaces. Mirrors tile-lower's F3 contract.
+func TestBranchedNestRefusal(t *testing.T) {
+	f := newFx("branched")
+	out2 := f.tensor("out2")
+	iv1, bound1 := f.dimVar()
+	st1 := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 1))
+	inner1 := f.g.NewForLoop("ctor", iv1, bound1, st1, f.loopAttrs(0, -1, 1)...)
+	iv2, bound2 := f.dimVar()
+	st2 := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 2))
+	inner2 := f.g.NewForLoop("ctor", iv2, bound2, st2, f.loopAttrs(0, -1, 1)...)
+	ivO, boundO := f.dimVar()
+	both := f.g.NewBinOp("ctor", ir.BinOpAdd, inner1, inner2) // both siblings in one body closure
+	outer := f.g.NewForLoop("ctor", ivO, boundO, both, f.loopAttrs(1, -1, 1)...)
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out, out2}, outer)
+
+	err := (schedule.Scheduler{}).Run(nil, f.g)
+	if err == nil || !strings.Contains(err.Error(), "branched") {
+		t.Fatalf("Run on a branched nest = %v, want the branched-nest refusal", err)
+	}
+	if f.g.AST() != nil {
+		t.Fatal("the refused run must not attach an AST")
+	}
+	_ = outer
+}
+
+// TestIterClusterGate pins ME-03 (quick-261022-b2m): a LIVE KindIterCluster
+// (the legacy compound header, kept live through the store's value path) is
+// refused exactly like a live raw KindIter — an abstract HIR header must
+// never be scheduled as an ordinary AST statement.
+func TestIterClusterGate(t *testing.T) {
+	f := newFx("clustergate")
+	load := f.g.NewMemLoad("ctor", f.out, []ir.Node{f.m})
+	cl := f.g.NewIterCluster("ctor", []ir.Node{f.m}, load)
+	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, cl) // the cluster stays live here
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, st)
+
+	err := (schedule.Scheduler{}).Run(nil, f.g)
+	if err == nil || !strings.Contains(err.Error(), "KindIterCluster") {
+		t.Fatalf("Run with a live itercluster = %v, want the raw-HIR-iter guard", err)
+	}
+	if f.g.AST() != nil {
+		t.Fatal("the refused run must not attach an AST")
+	}
+}
+
+// TestUnreachableForLoopRefusal pins the ME-01 refusal path that was never
+// exercised: a non-erased ForLoop that no sea root reaches (building debris
+// alongside a valid kernel) is refused fail-closed, not scheduled.
+func TestUnreachableForLoopRefusal(t *testing.T) {
+	f := newFx("unreach")
+	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 1))
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, st)
+	// Debris: a plain (unchained) store under a ForLoop nothing roots at.
+	iv, bound := f.dimVar()
+	dst := f.g.NewMemStore("ctor", f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 2))
+	f.g.NewForLoop("ctor", iv, bound, dst)
+
+	err := (schedule.Scheduler{}).Run(nil, f.g)
+	if err == nil || !strings.Contains(err.Error(), "not reachable from the sea roots") {
+		t.Fatalf("Run with unreachable loop debris = %v, want the unreachable-loop refusal", err)
+	}
+	if f.g.AST() != nil {
+		t.Fatal("the refused run must not attach an AST")
+	}
+}
+
+// dumpAST renders a scheduled kernel deterministically (block kinds, node
+// kinds/IDs/SNs in placement order — no map iteration): the byte-identity
+// face for determinism comparisons.
+func dumpAST(k *ir.ASTKernel) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "lnts=%d gmem=%d params=%d\n", len(k.LNTs), len(k.Gmem), len(k.Params))
+	var walk func(blk *ir.ASTBlock, indent string)
+	walk = func(blk *ir.ASTBlock, indent string) {
+		if blk.Kind() == ir.BlockGroup {
+			nestRoot := uint64(0)
+			if blk.Nest() != nil {
+				nestRoot = blk.Nest().Root.BasePtr().ID()
+			}
+			fmt.Fprintf(&b, "%sGroup[nestroot=%d]\n", indent, nestRoot)
+		} else {
+			fmt.Fprintf(&b, "%s%s[loop=%d]\n", indent, blk.Kind(), blk.Loop().BasePtr().ID())
+		}
+		for _, it := range blk.Items() {
+			if it.Node != nil {
+				fmt.Fprintf(&b, "%s  %s#%d[sn=%d]\n", indent, it.Node.KindOf(), it.Node.BasePtr().ID(), it.Node.BasePtr().SchedSN())
+			} else {
+				walk(it.Block, indent+"  ")
+			}
+		}
+	}
+	walk(k.Body, "")
+	return b.String()
+}
+
+// TestSchedStateReset pins LO-01 (quick-261022-b2m): a retried Run never
+// inherits poisoned sched state. Pre-poison every node of a fixture with
+// SetSched(9, nil), schedule it, and compare the full AST dump against an
+// identical clean twin graph's dump — reset + determinism in one pin.
+func TestSchedStateReset(t *testing.T) {
+	build := func() *fx {
+		f := newFx("reset")
+		iv, bound := f.dimVar()
+		inv := f.g.NewBinOp("ctor", ir.BinOpMul, f.g.NewConst("ctor", f.f32, 3), f.g.NewConst("ctor", f.f32, 4))
+		varying := f.g.NewBinOp("ctor", ir.BinOpAdd, iv, inv)
+		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, varying)
+		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
+		return f
+	}
+	poisoned, clean := build(), build()
+	for _, n := range poisoned.g.AllocatedNodes() {
+		n.BasePtr().SetSched(9, nil)
+	}
+	kp := run(t, poisoned.g)
+	kc := run(t, clean.g)
+	if dp, dc := dumpAST(kp), dumpAST(kc); dp != dc {
+		t.Fatalf("poisoned-retry dump != clean dump:\n--- poisoned ---\n%s\n--- clean ---\n%s", dp, dc)
 	}
 }
 
