@@ -27,6 +27,7 @@
 | D3 | GMEM access | **Runtime `tca::rt::TensorView` wrapper objects** — generated code NEVER touches raw memory (see §3, the shim mandate) |
 | D4 | SMEM declaration placement | **Kernel-top hoist** — one dynamic `__shared__` pool + typed views at kernel top (see D5: static arrays are impossible at our budget) |
 | D5 | SMEM mechanism | **Dynamic shared memory** (`extern __shared__` + `cudaFuncSetAttribute` opt-in in the launcher). NOT static arrays: the design SMEM budget MaxCache = 64 KB exceeds the 48 KB static `__shared__` ceiling, and the worked example's lhs window is exactly 64 KB. Opt-in dynamic smem is the only compliant mechanism on sm_86 (per-block opt-in max 101,376 B, queried at runtime — never hardcoded) |
+| D8 | SMEM pool sizing | ONE hoisted `extern __shared__` pool for the whole kernel; every SMEM cache is a VIEW at a compiler-assigned offset into it. **v0 (no SMEM RA): assume worst case — zero reuse — pool size = Σ all buffer extents, views at disjoint offsets** (sub-optimal max, correct). A future opt pass performs liveness RA over all SMEM uses, sizes the pool to the MAXIMUM concurrently-live bytes, and lets non-overlapping live ranges share offsets (each cache becomes an overlapping reference into the pool). The emitted shape (one pool + offset views) is FINAL — the RA pass changes only the offsets and the pool size, never the emitter or the IR |
 | D6 | Memory shim | **ALL memory (GMEM/SMEM/FRAG) is accessed through `tca::rt` C++ wrapper objects**, never raw pointers. The wrappers take a compiler-emitted **layout descriptor**; v0 emits plain row-major / no-swizzle descriptors. The future GMEM coalescing (address shuffling) and SMEM swizzle (bank-conflict avoidance) passes change ONLY the descriptor the compiler emits — never the emitter, never the IR access nodes |
 | D7 | Slot-IV Combine | When a reducer carried slot indices (LR-13: between-loop DimVars as leading `Reduce` args), `Combine()` is materialized ONCE into a local holding a slot-addressable value; each use of the Combine value inside the re-iteration emits `<local>.Get(<in-scope slot dimvars...>)` in the SAME order as the `Reduce` slot args (forced: Combine runs once, consumption is per-slot) |
 
@@ -89,8 +90,9 @@ truth: `internal/ir/kind.go:32-107`, `internal/ir/catalog.go`.
   `tiling-provenance` (analysis-cache side table, `Preserved` through
   schedule) or receives it as an explicit `Options` field — the driver
   passes it; the IR carries it only implicitly via mapping portions.
-- **SMEM total**: Σ `MemNewSMem` extent consts (bytes). The launcher emits
-  it as the dynamic-smem size + `cudaFuncSetAttribute` opt-in.
+- **SMEM total**: Σ `MemNewSMem` extent consts (bytes) — the v0 worst-case
+  pool size (D8; the future SMEM-RA pass shrinks it). The launcher emits it
+  as the dynamic-smem size + `cudaFuncSetAttribute` opt-in.
 
 ### 1.4 Known driver caveats (affect the test harness, not the design)
 
@@ -277,7 +279,7 @@ internal/cg/cxx/        // the CUDA C++ backend (this document)
 
 | Kind | Emission |
 |------|----------|
-| `memnewsmem` | NOTHING at its scheduled position. Kernel-top (D4/D5): one `extern __shared__ __align__(16) char tca_smem[];` pool for the whole kernel + per-buffer typed views placed at deterministic compile-time offsets: `tca::rt::SmemView<float, 1> tca_s0(reinterpret_cast<float*>(tca_smem + 0), 16384);` — offset order = buffer allocation order (deterministic); total bytes → launcher |
+| `memnewsmem` | NOTHING at its scheduled position. Kernel-top (D4/D5/D8): ONE `extern __shared__ __align__(16) char tca_smem[];` pool for the whole kernel + per-buffer typed views at compiler-assigned offsets: `tca::rt::SmemView<float, 1> tca_s0(reinterpret_cast<float*>(tca_smem + <offset>), <window extents>);` — **v0 offsets: disjoint, in buffer allocation order (zero reuse, worst case); pool size = Σ extents**. The future SMEM-RA pass (D8) re-assigns offsets by liveness overlap and shrinks the pool to max concurrent bytes — same emitted shape, different offset/size numbers. Total pool bytes → launcher (dynamic smem size + opt-in) |
 | `fragnew` | per-thread wrapper at kernel top: `tca::rt::Frag<float, 1, 32> tca_f0;` (compile-time extents from the buffer tensor type) |
 | `memstoresmem` / `fragstore` (the FILL, `loadtile` attr) | variant call: `loadtile=1` → `tca::rt::LoadTileCta(tca_s0, lhs_v, <src base coords...>);` `loadtile=2` → `tca::rt::LoadTileThread(tca_f0, lhs_v, <src base coords...>);` — src coords = the fill's value `memload` axes (above-tie in-scope coords) PLUS the covered dims' round-base bivs, in TENSOR DIM ORDER (covered dim → its trailing biv operand; above-tie dim → its axis expr). The loader enumerates the window internally, bounds-clamps, and synchronizes (cooperative variant) — runtime_objects.md §6.4/6.5 |
 | `memloadsmem` / `fragload` | `T tca_v<N> = tca_s0.Get(<coord exprs...>);` — coords per covered dim (WARP dim: `threadmap index·T + i` already lowered into `RuntimeGetAttribute` + dimvar exprs; SEQ dim: plain dimvar) |
@@ -467,6 +469,7 @@ extern "C" void tca_<name>_launch(
 |------|------|
 | C++ runtime library implementation | THE next task — implements §8 (this doc + runtime_objects.md are its complete input) |
 | GMEM coalescing + SMEM swizzle passes | After codegen + library: low-hanging fruit — emit non-RowMajor descriptors (D6); zero emitter change |
+| SMEM liveness-RA pass | After codegen: pool sizing = max concurrently-live SMEM (v0 assumes zero reuse, D8); changes only the assigned view offsets + pool size — the one-pool-plus-views emission shape is final from day one |
 | MLIR backend (`internal/cg/mlir`) | Next version; the runtime-object nodes were designed mechanical-literal for exactly this |
 | CLI driver (`cmd/tcacomp`) | Blocked on `internal/syntax` (frontend does not exist yet); codegen ships as the Go API |
 | f16/bf16 compute-type policy | Runtime-library decision (scalfold `TypeTrait::Compute` precedent) |
