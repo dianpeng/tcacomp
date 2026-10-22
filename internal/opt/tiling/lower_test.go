@@ -192,7 +192,7 @@ func renderGraph(g *ir.Graph) string {
 			continue
 		}
 		fmt.Fprintf(&b, "%d:%s", n.BasePtr().ID(), n.KindOf())
-		if field := ir.IntrinsicFieldOf(n); field != "" {
+		if field := ir.RuntimeAttributeOf(n); field != "" {
 			fmt.Fprintf(&b, "(%s)", field)
 		}
 		for _, op := range ir.OperandsOf(n) {
@@ -499,11 +499,11 @@ func TestRewriteTailSaturatingGuard(t *testing.T) {
 	// The clamped offsets are the RANK forms: the M inside bound's clamp
 	// references the GridMap rank, the N inside bound's the ThreadMap rank.
 	mClamp := ir.OperandsOf(ir.OperandsOf(boundOf(t, mI))[1])[1]
-	if !subtreeHasKind(t, fx.g, mClamp, ir.KindIntrinsicGridMap) {
+	if !subtreeHasKind(t, fx.g, mClamp, ir.KindRuntimeGridQuery) {
 		t.Fatal("the CTA inside bound must clamp the grid-rank offset form")
 	}
 	nClamp := ir.OperandsOf(ir.OperandsOf(boundOf(t, nI))[1])[1]
-	if !subtreeHasKind(t, fx.g, nClamp, ir.KindIntrinsicThreadMap) {
+	if !subtreeHasKind(t, fx.g, nClamp, ir.KindRuntimeThreadQuery) {
 		t.Fatal("the WARP inside bound must clamp the thread-rank offset form")
 	}
 	assertVerifyAndRootReachable(t, fx.g)
@@ -539,10 +539,10 @@ func TestRewriteCTADim(t *testing.T) {
 	if len(axes) != 1 {
 		t.Fatalf("store must carry one rewritten axis, got %d", len(axes))
 	}
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicGridMap) {
+	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeGridQuery) {
 		t.Fatal("rewritten index must contain the GridMap rank query")
 	}
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicThreadMap) {
+	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeThreadQuery) {
 		t.Fatal("rewritten index must contain the coupled ThreadMap rank query")
 	}
 	// dosoc consts: grid dim 0 (GridMap) and thread dim 0 (ThreadMap).
@@ -576,10 +576,10 @@ func TestRewriteWarpDim(t *testing.T) {
 		t.Fatalf("WARP inside soc = %v, want 0 (sequential chunk walk)", got)
 	}
 	axes := ir.OperandsOf(store)[2:]
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicThreadMap) {
+	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeThreadQuery) {
 		t.Fatal("rewritten WARP index must contain the ThreadMap rank query")
 	}
-	if subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicGridMap) {
+	if subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeGridQuery) {
 		t.Fatal("a WARP-only LNT must contain no GridMap query")
 	}
 	assertVerifyAndRootReachable(t, fx.g)
@@ -721,6 +721,114 @@ func TestRewriteTypeinferRerun(t *testing.T) {
 	}
 }
 
+// TestProvenancePublished pins P-5 (quick-261022-l1o): after tile-lower over
+// a decided LNT, the cache holds the provenance record with one per-dim
+// entry per rewritten dim (Between/Inside/Soc/Tile; Inside nil and Between
+// == the single loop at T==1) and one per-LNT MappingPlan (grid [-1]
+// always; thread [warpPortion, -1] with warpPortion auto-resolved — 4 when
+// a CTA dim exists, 8 otherwise).
+func TestProvenancePublished(t *testing.T) {
+	fx := newChain32("prov", 1024, 2048, 512)
+	bodyStore(fx)
+	rec := recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
+		1: {SoC: SoCWARP, LoC: 8, TileSize: 32},
+		2: {SoC: SoCSequential, LoC: 1, TileSize: 1}, // T==1: the single-loop form
+	}, nil)
+	cache := opt.NewCache()
+	cache.Put(rec)
+	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g); err != nil {
+		t.Fatalf("tile-lower Run: %v", err)
+	}
+	got := cache.Get(ProvenanceName)
+	if got == nil {
+		t.Fatal("the provenance record must be published under tiling-provenance")
+	}
+	prov, ok := got.(*Provenance)
+	if !ok {
+		t.Fatalf("cache entry under %q is %T, want *Provenance", ProvenanceName, got)
+	}
+
+	// Per-dim entries keyed by the DIM InputParams (stable across the pass).
+	if len(prov.Dims) != 3 {
+		t.Fatalf("provenance must hold one entry per rewritten dim, got %d", len(prov.Dims))
+	}
+	nest := nestOf(t, fx.g) // M.b, N.b, K.b, M.i, N.i (K untiled: single loop)
+	for i, d := range []*struct {
+		dim       ir.Node
+		soc       SoCType
+		tile      int
+		wantTiled bool
+	}{
+		{fx.dims[0], SoCTA, 32, true},
+		{fx.dims[1], SoCWARP, 32, true},
+		{fx.dims[2], SoCSequential, 1, false},
+	} {
+		e, ok := prov.Dims[d.dim]
+		if !ok {
+			t.Fatalf("dim %d carries no provenance entry", i)
+		}
+		if e.Between == nil || e.Soc != d.soc || e.Tile != d.tile {
+			t.Fatalf("dim %d entry = %+v, want Between!=nil Soc=%v Tile=%d", i, e, d.soc, d.tile)
+		}
+		if d.wantTiled && e.Inside == nil {
+			t.Fatalf("dim %d (T>1) must record its tile-inside loop", i)
+		}
+		if !d.wantTiled {
+			if e.Inside != nil {
+				t.Fatalf("dim %d (T==1) must record Inside nil", i)
+			}
+			if e.Between.BasePtr() != nest[2].BasePtr() {
+				t.Fatal("at T==1 the entry's Between must be the single loop")
+			}
+		}
+	}
+
+	// Per-LNT plan: keyed by the generated nest root; grid [-1]; thread
+	// [4, -1] (a CTA dim exists → AutoWarpPortion).
+	if len(prov.LNTs) != 1 {
+		t.Fatalf("provenance must hold one plan per rewritten LNT, got %d", len(prov.LNTs))
+	}
+	plan, ok := prov.LNTs[nest[0]]
+	if !ok {
+		t.Fatal("the per-LNT plan must be keyed by the generated nest root ForLoop")
+	}
+	if len(plan.GridPortions) != 1 || plan.GridPortions[0] != -1 {
+		t.Fatalf("grid portions = %v, want [-1] (v0: the whole PortionCTA space)", plan.GridPortions)
+	}
+	if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[0] != AutoWarpPortion || plan.ThreadPortions[1] != -1 {
+		t.Fatalf("thread portions = %v, want [%d, -1] (CTA dim present → auto warp portion)", plan.ThreadPortions, AutoWarpPortion)
+	}
+	if prov.Name() != ProvenanceName {
+		t.Fatalf("Name() = %q, want %q", prov.Name(), ProvenanceName)
+	}
+}
+
+// TestProvenanceWarpOnlyPlan pins the auto-resolution's other branch: an
+// LNT with NO CTA dim resolves warpPortion to PortionWarp (8) — thread
+// [8, -1].
+func TestProvenanceWarpOnlyPlan(t *testing.T) {
+	fx := newChain32("prov-warp", 512)
+	bodyStore(fx)
+	rec := recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCWARP, LoC: 8, TileSize: 32},
+	}, nil)
+	cache := opt.NewCache()
+	cache.Put(rec)
+	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g); err != nil {
+		t.Fatalf("tile-lower Run: %v", err)
+	}
+	prov := cache.Get(ProvenanceName).(*Provenance)
+	if len(prov.LNTs) != 1 {
+		t.Fatalf("one plan expected, got %d", len(prov.LNTs))
+	}
+	for _, plan := range prov.LNTs {
+		if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[0] != PortionWarp || plan.ThreadPortions[1] != -1 {
+			t.Fatalf("thread portions = %v, want [%d, -1] (no CTA dim → full warp portion)", plan.ThreadPortions, PortionWarp)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -752,7 +860,7 @@ func subtreeHasKind(t *testing.T, g *ir.Graph, n ir.Node, k ir.Kind) bool {
 func assertDosocConst(t *testing.T, n ir.Node) {
 	t.Helper()
 	for _, x := range flattenSubtree(n) {
-		if x.KindOf() != ir.KindIntrinsicGridMap && x.KindOf() != ir.KindIntrinsicThreadMap {
+		if x.KindOf() != ir.KindRuntimeGridQuery && x.KindOf() != ir.KindRuntimeThreadQuery {
 			continue
 		}
 		d := ir.OperandsOf(x)[0]
@@ -980,10 +1088,10 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	if len(smemOps) != 2 {
 		t.Fatalf("the rhs access must carry 2 coordinates, got %d", len(smemOps))
 	}
-	if !subtreeHasKind(t, fx.g, smemOps[0], ir.KindIntrinsicThreadMap) {
+	if !subtreeHasKind(t, fx.g, smemOps[0], ir.KindRuntimeThreadQuery) {
 		t.Fatal("the rhs access's N coordinate must carry the ThreadMap rank query (R2 rank-in-index)")
 	}
-	if subtreeHasKind(t, fx.g, smemOps[1], ir.KindIntrinsicThreadMap) {
+	if subtreeHasKind(t, fx.g, smemOps[1], ir.KindRuntimeThreadQuery) {
 		t.Fatal("the rhs access's K coordinate (SEQ covered) must be the plain inside walk")
 	}
 	// Fill variants: lhs FRAG → 2 (LoadTileThread); rhs SMEM → 1
@@ -1029,7 +1137,7 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	}
 	// The m coordinate is the enclosing index expression: it references
 	// the launch-map machinery (M is the CTA dim), not a bare buffer loop.
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindIntrinsicGridMap) {
+	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeGridQuery) {
 		t.Fatal("the lhs fill's m coordinate must be the enclosing m index expression")
 	}
 	// The fill store's covered round base is the K between loop's dimvar.
@@ -1134,7 +1242,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 	}
 	src := ir.OperandsOf(fill)[0]
 	for _, ax := range ir.OperandsOf(src)[1:] {
-		if subtreeHasKind(t, fx.g, ax, ir.KindIntrinsicThreadMap) {
+		if subtreeHasKind(t, fx.g, ax, ir.KindRuntimeThreadQuery) {
 			t.Fatal("the cooperative fill's source coordinates must be CTA-uniform (no ThreadMap term, R1/HI-03)")
 		}
 	}
@@ -1184,7 +1292,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 	var dosoc float64
 	var haveRank bool
 	for _, n := range flattenSubtree(nCoord) {
-		if n.KindOf() == ir.KindIntrinsicThreadMap {
+		if n.KindOf() == ir.KindRuntimeThreadQuery {
 			haveRank = true
 			if v, ok := ir.ConstValueOf(ir.OperandsOf(n)[0]); ok {
 				dosoc = v
@@ -1659,7 +1767,7 @@ func TestDecideLowerComposition(t *testing.T) {
 	if access == nil {
 		t.Fatal("the store's value must read the window buffer through a MemLoadSMem access")
 	}
-	if !subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindIntrinsicThreadMap) {
+	if !subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindRuntimeThreadQuery) {
 		t.Fatal("the window access's K coordinate must carry the ThreadMap rank query (R2 rank-in-index)")
 	}
 

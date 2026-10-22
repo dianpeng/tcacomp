@@ -20,6 +20,7 @@ import (
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 	"tcacomp/internal/opt/schedule"
+	"tcacomp/internal/opt/tiling" // Preserved pin: the provenance record's cache name
 )
 
 // fx bundles a fixture graph's common kernel params.
@@ -513,6 +514,56 @@ func TestReductionShapeEpilogue(t *testing.T) {
 	}
 }
 
+// TestLambdaParamsExcludedFromPrototype pins P-9 (quick-261022-l1o): after
+// schedule over a Reduce-carrying graph, no RoleLambda InputParam is an
+// item of the Prototype block — lambda formals are extracted-function
+// material (the reduce-inline exemption keeps them alive as declared
+// formals), NOT kernel-signature placeholders. Un-anchored they stay
+// ordinary SN-0 nodes landing in the kernel/prologue Group.
+func TestLambdaParamsExcludedFromPrototype(t *testing.T) {
+	f := newFx("lambdaformals")
+	iv, bound := f.dimVar()
+	acc := f.g.NewLambdaInputParam("ctor", "acc", f.f32)
+	now := f.g.NewLambdaInputParam("ctor", "now", f.f32)
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", f.f32, 0),
+		f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1)),
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, red)
+	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
+
+	k := run(t, f.g)
+	for _, it := range k.Prototype.Items() {
+		if it.Node == nil {
+			continue
+		}
+		if role, ok := ir.RoleOf(it.Node); ok && role == ir.RoleLambda {
+			t.Fatalf("lambda formal node %d must NOT be a Prototype item (P-9: extracted-function material, not a signature placeholder)",
+				it.Node.BasePtr().ID())
+		}
+	}
+	// The formals stay live, land at SN 0 (ordinary un-anchored pure nodes),
+	// and the prototype still holds exactly the kernel params.
+	for name, p := range map[string]ir.Node{"acc": acc, "now": now} {
+		if p.BasePtr().Erased() {
+			t.Fatalf("the lambda formal %s must stay live (the reduce's combiner)", name)
+		}
+		if got := p.BasePtr().SchedSN(); got != 0 {
+			t.Fatalf("the lambda formal %s must stay an SN-0 node, got SN %d", name, got)
+		}
+	}
+	protoParams := 0
+	for _, it := range k.Prototype.Items() {
+		if it.Node != nil {
+			protoParams++
+		}
+	}
+	if protoParams != len(k.Params) {
+		t.Fatalf("prototype items = %d, want exactly the %d kernel params (lambda formals excluded)", protoParams, len(k.Params))
+	}
+}
+
 // TestPostNestStoreEpilogue pins review probe 3 (CR-02's per-tensor effect
 // order): a kernel-level store chained (ImpactBy) after an in-loop store on
 // the same tensor lands in the nest's epilogue — the "after the whole loop"
@@ -770,7 +821,9 @@ func TestFailClosedGates(t *testing.T) {
 
 // TestRegistry pins the pipeline contract: "schedule" is registered at
 // priority 900 with Requires pinning tile-lower, and the pass's Preserved
-// whitelist keeps the tiling-record cache entry for final_lower.
+// whitelist keeps the tiling-provenance cache entry for final-lower
+// (quick-261022-l1o P-5: the old vestigial "tiling-record" entry — a record
+// that provably dies at tile-lower — is replaced by the provenance).
 func TestRegistry(t *testing.T) {
 	spec, ok := opt.Lookup("schedule")
 	if !ok {
@@ -791,11 +844,11 @@ func TestRegistry(t *testing.T) {
 	p := schedule.Scheduler{}
 	preserved := false
 	for _, name := range p.Preserved() {
-		if name == "tiling-record" {
+		if name == tiling.ProvenanceName {
 			preserved = true
 		}
 	}
 	if !preserved {
-		t.Fatalf("schedule Preserved = %v, want it to keep tiling-record", p.Preserved())
+		t.Fatalf("schedule Preserved = %v, want it to keep %s", p.Preserved(), tiling.ProvenanceName)
 	}
 }

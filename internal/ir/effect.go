@@ -95,7 +95,14 @@ func (e Effect) String() string {
 // single-slot memory model serializes all operations on one memory region,
 // and the fresh-object rule keeps distinct allocations unmergeable. Pure
 // kinds — the scalar-expression family, map/reduce stages, the value-level
-// dimvar objects — are free. The verdict is node-local and self-scoped
+// dimvar objects — are free. P-2 (quick-261022-l1o) adds the one
+// final-lower arm: KindRuntimeCallMethod is FULL (an ordered method call on
+// a stateful reducer object — never pure, never GVN-CSE'd); every other
+// Runtime/Collective kind (the constructions, RuntimeGetAttribute) stays
+// free — the objects are immutable and no pass runs after final-lower, so
+// value-identical reducer constructions can never be CSE-merged anyway
+// (mirrored in lockstep by internal/analysis/sideeffect's baseVerdict).
+// The verdict is node-local and self-scoped
 // ([4].3); DCE liveness is root-reachability based (R3), so a memory op no
 // root path reaches is still dead-code-eligible.
 //
@@ -113,7 +120,7 @@ func EffectOf(n Node) Effect {
 		return NewEffectFree()
 	}
 	k := n.KindOf()
-	if k.Family() == FamilyMemory || k == KindReturn {
+	if k.Family() == FamilyMemory || k == KindReturn || k == KindRuntimeCallMethod {
 		return NewEffectFull()
 	}
 	return NewEffectFree()

@@ -134,6 +134,50 @@ func TestImplicitControlFlowEffectful(t *testing.T) {
 	}
 }
 
+// TestRuntimeFamilyBaseVerdicts pins the P-2 lockstep mirror
+// (quick-261022-l1o): baseVerdict marks every RuntimeCallMethod effectful
+// (the ir.EffectOf arm's exact twin — an ordered method call on a stateful
+// reducer object is never a GVN candidate), while every other Runtime/
+// Collective kind (the constructions, the getattr, the renamed queries)
+// stays pure — the objects are immutable, and no pass runs after
+// final-lower anyway, so value-identical constructions can never be
+// CSE-merged.
+func TestRuntimeFamilyBaseVerdicts(t *testing.T) {
+	g, _, _, _, _ := fixture()
+	ki := g.NewRuntimeKernelInfo("ctor")
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+	init := g.NewConst("ctor", ir.InternScalar(ir.TF32), 0)
+	acc := g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := g.NewBinOp("ctor", ir.BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))
+	lam := g.NewLambdaNode("ctor", []ir.Node{acc, now}, comb)
+	red := g.NewRuntimeWarpReducer("ctor", init, lam)
+	getattr := g.NewRuntimeGetAttribute("ctor", "index", gm, g.NewConst("ctor", ir.InternScalar(ir.TU32), 0))
+	gq := g.NewRuntimeGridQuery("ctor", "index", g.NewConst("ctor", ir.InternScalar(ir.TU32), 0))
+	callInit := g.NewRuntimeCallMethod("ctor", "Init", red)
+	callReduce := g.NewRuntimeCallMethod("ctor", "Reduce", red, init)
+	callCombine := g.NewRuntimeCallMethod("ctor", "Combine", red)
+
+	se := mustAnalyze(t, g)
+	for name, n := range map[string]ir.Node{
+		"kernelinfo": ki, "gridmapping": gm, "reducer": red,
+		"getattr": getattr, "gridquery": gq,
+	} {
+		if se.HasSideEffect(n) {
+			t.Fatalf("%s must stay PURE in the accumulated analysis (P-2 mirror)", name)
+		}
+	}
+	for name, n := range map[string]ir.Node{
+		"init call":    callInit,
+		"reduce call":  callReduce,
+		"combine call": callCombine,
+	} {
+		if !se.HasSideEffect(n) {
+			t.Fatalf("%s must be EFFECTFUL in the accumulated analysis (the baseVerdict mirror of ir.EffectOf's arm)", name)
+		}
+	}
+}
+
 // TestIterIsPure pins doc/optana/loop_fusion.md [1] ("The Iter node is
 // itself side effect free, though it is a control flow node"): in the
 // (biv, parent?) formation both a nest ROOT and a PARENTED iter query

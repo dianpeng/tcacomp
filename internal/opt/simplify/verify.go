@@ -31,10 +31,14 @@ func init() {
 //     format is fully lowered (clusters themselves may legitimately remain
 //     in legacy builder graphs, which Simplification skips by design).
 //
-//   - FULLY INLINED MAP/REDUCE BODIES: no lambda body contains a paramRef
-//     resolving to a parameter still declared in that stage's own record
-//     (surviving params with non-paramRef uses are fine — ClearLambdaParams
-//     keeps them deliberately).
+//   - FULLY INLINED MAP BODIES (Map-only since quick-261022-l1o): no MAP
+//     lambda body contains a paramRef resolving to a parameter still
+//     declared in that stage's own record. Reduce bodies are EXEMPT — the
+//     reduce-inline exemption (final_lower.md [1], LR-3) keeps the combiner
+//     as a function of its two declared formals, so Reduce bodies
+//     LEGITIMATELY reference their declared params; the runtime owns the
+//     application. Surviving params with non-paramRef uses are fine either
+//     way (ClearLambdaParams keeps them deliberately).
 //
 //   - PLACEMENT INVARIANTS: the Task-1 verifier checks (As
 //     unique-and-last, reduce's KeyedAttribute at operand 1, map
@@ -78,11 +82,13 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 		}
 	}
 
-	// FULLY INLINED BODIES: per live map/reduce, no body-reachable paramRef
-	// resolves to a param declared in that stage's own record.
+	// FULLY INLINED BODIES — MAP ONLY: per live map, no body-reachable
+	// paramRef resolves to a param declared in that stage's own record.
+	// Reduce bodies are exempt (the reduce-inline exemption: the combiner
+	// must survive as a function of its two formals).
 	for _, stage := range g.AllocatedNodes() {
 		switch stage.KindOf() {
-		case ir.KindMap, ir.KindReduce:
+		case ir.KindMap:
 		default:
 			continue
 		}

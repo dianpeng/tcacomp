@@ -133,7 +133,21 @@ func (r *scheduleRun) anchorSchedule() {
 			continue
 		}
 		switch n.KindOf() {
-		case ir.KindInputParam, ir.KindMemNew:
+		case ir.KindInputParam:
+			// P-9 (quick-261022-l1o): lambda formals are NOT kernel-signature
+			// placeholders — the reduce-inline exemption leaves a combiner's
+			// acc/now InputParams alive as declared formals, and they are
+			// extracted-function material (the review E2 ripple-5 model), not
+			// kernel parameters. Un-anchored they stay ordinary SN-0 nodes
+			// (pure, no operands) landing in the kernel Group like the lambda
+			// body — never items of the Prototype block.
+			if role, ok := ir.RoleOf(n); ok && role == ir.RoleLambda {
+				continue
+			}
+			r.anchor(n, ir.PrototypeSN)
+			r.prototype.AppendItem(ir.ASTItem{Node: n})
+			n.BasePtr().SetSched(ir.PrototypeSN, r.prototype)
+		case ir.KindMemNew:
 			// Placeholders to known states, NOT statements (e2u D-1): a
 			// MemNew's extent dep at SN 0 must not lift it out of the
 			// signature scope; a -1 dep contributes nothing to the max.

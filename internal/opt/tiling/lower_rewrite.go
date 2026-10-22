@@ -37,6 +37,7 @@ import (
 type dimRewrite struct {
 	iter      ir.Node // the original iter
 	biv       ir.Node // the original BIV (the record key)
+	dim       ir.Node // the dim InputParam (captured pre-erasure — the provenance key, P-5)
 	soc       SoCType // the effective space of concurrency
 	loc       int     // the effective level of concurrency
 	tile      int     // the effective tile size
@@ -153,6 +154,45 @@ func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 		return err
 	}
 	lr.rewrites = append(lr.rewrites, lw)
+	return lr.recordProvenance(lw)
+}
+
+// recordProvenance publishes this LNT's P-5 provenance entries
+// (quick-261022-l1o): one per-dim DimProvenance keyed by the DIM InputParam
+// (captured on the dimRewrite at expression-generation time — the iter
+// chains are ERASED by the time this runs, so the dim cannot be re-resolved
+// here) and one per-LNT MappingPlan keyed by the generated nest root. The
+// plan's portion vectors come from the pass's OWN Params at rewrite time
+// (the coupledThreads resolution rule): grid = [-1] always in v0 (every
+// rewritten LNT carries >= 1 CTA dim by the searcher's CTA-carrying
+// fallback); thread = [warpPortion, -1] with warpPortion =
+// Params.WarpPortion resolved — AutoWarpPortion=4 when a CTA dim exists,
+// else PortionWarp=8.
+func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
+	for _, d := range lw.dims {
+		if d.dim == nil {
+			return fmt.Errorf("tile-lower: dim of iter node %d was never captured (generateDimExprs corruption?)",
+				d.iter.BasePtr().ID())
+		}
+		lr.prov.Dims[d.dim] = DimProvenance{
+			Between: d.between,
+			Inside:  d.inside, // nil at T==1 (the single-loop form)
+			Soc:     d.soc,
+			Tile:    d.tile,
+		}
+	}
+	warpPortion := lr.params.WarpPortion
+	if warpPortion == 0 {
+		if hasCTADim(lw.dims) {
+			warpPortion = AutoWarpPortion
+		} else {
+			warpPortion = PortionWarp
+		}
+	}
+	lr.prov.LNTs[lw.lntRoot] = MappingPlan{
+		GridPortions:   []int{-1},
+		ThreadPortions: []int{warpPortion, -1},
+	}
 	return nil
 }
 
@@ -299,6 +339,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 		if err != nil {
 			return err
 		}
+		d.dim = dim // captured pre-erasure: the P-5 provenance key
 		extent, err := extentOfBiv(d.biv)
 		if err != nil {
 			return err
@@ -319,7 +360,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc)))
 				d.singleIVNode, d.singleBound = d.singleIV, extent
 				d.singleAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc))}
-				rank := lr.g.NewIntrinsicGridMap(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
+				rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
 				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
 				d.roundBase = d.indexExpr
 			case SoCWARP:
@@ -327,7 +368,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*32)))
 				d.singleIVNode, d.singleBound = d.singleIV, extent
 				d.singleAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32))}
-				rank := lr.g.NewIntrinsicThreadMap(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
+				rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
 				d.roundBase = d.indexExpr
 			}
@@ -354,7 +395,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			// inside = the COUPLED warp walk at ELEMENT stride.
 			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*d.tile)))
 			d.betweenBound = extent
-			rank := lr.g.NewIntrinsicGridMap(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
+			rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
 			offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
 			d.insideBound = lr.tileMax(d.tile, extent, offset)
@@ -371,7 +412,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(coupled)))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc))}
 			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(coupled))}
-			threadRank := lr.g.NewIntrinsicThreadMap(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
+			threadRank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV), threadRank)
 			d.roundBase = offset
@@ -383,7 +424,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			stride := d.loc * 32 * d.tile
 			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(stride)))
 			d.betweenBound = extent
-			rank := lr.g.NewIntrinsicThreadMap(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
+			rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
 			d.insideBound = lr.tileMax(d.tile, extent, offset)

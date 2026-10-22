@@ -353,8 +353,18 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &tensorDimOfNode{Base: b}
 	case KindInductionVariable:
 		n = &inductionVariableNode{Base: b}
-	case KindIntrinsicGridMap, KindIntrinsicThreadMap:
-		n = &intrinsicNode{Base: b}
+	case KindRuntimeGridQuery, KindRuntimeThreadQuery:
+		n = &runtimeQueryNode{Base: b}
+	case KindRuntimeKernelInfo:
+		n = &runtimeKernelInfoNode{Base: b}
+	case KindRuntimeGridMapping, KindRuntimeThreadMapping:
+		n = &runtimeMappingNode{Base: b}
+	case KindRuntimeSequentialReducer, KindRuntimeWarpReducer, KindRuntimeGlobalReducer:
+		n = &runtimeReducerNode{Base: b}
+	case KindRuntimeCallMethod:
+		n = &runtimeCallNode{Base: b}
+	case KindRuntimeGetAttribute:
+		n = &runtimeGetAttributeNode{Base: b}
 	default:
 		n = &rawNode{Base: b}
 	}

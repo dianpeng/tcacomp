@@ -28,6 +28,7 @@ import (
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
 	_ "tcacomp/internal/opt/all"
+	"tcacomp/internal/opt/tiling" // the preserved provenance record's name + type (sibling opt package, data only)
 )
 
 // matmulGraphK builds the review probe's matmul shape with the third chain
@@ -304,6 +305,51 @@ func TestPipelineEndNodeEpilogue(t *testing.T) {
 	nst := end.BasePtr().SchedBlock().Nest()
 	if nst == nil || nst.Root.BasePtr() != k.LNTs[len(k.LNTs)-1].Root.BasePtr() {
 		t.Fatal("the end node's epilogue must identify the last LNT via Nest() by Root identity (ruling 7)")
+	}
+}
+
+// TestPipelinePreservesTilingProvenance pins P-5's preservation chain
+// (quick-261022-l1o): tile-lower publishes the tiling provenance under
+// tiling.ProvenanceName and its own Preserved keeps it alive past its run;
+// schedule's Preserved [tiling.ProvenanceName] keeps it alive past
+// scheduling — after the full default pipeline the manager's cache still
+// holds the *Provenance, one per-LNT plan keyed by each scheduled nest's
+// root loop, ready for final-lower's fail-closed fetch.
+func TestPipelinePreservesTilingProvenance(t *testing.T) {
+	g := matmulGraphK("mm-prov", 1024)
+	pm := opt.NewManager(opt.BuildPipeline())
+	if err := pm.Run(g); err != nil {
+		t.Fatalf("default pipeline run = %v", err)
+	}
+	k := g.AST()
+	if k == nil {
+		t.Fatal("the pipeline must attach the schedule pass's AST")
+	}
+	got := pm.Cache().Get(tiling.ProvenanceName)
+	if got == nil {
+		t.Fatalf("the tiling provenance must survive scheduling through the Preserved chain (tile-lower + schedule)")
+	}
+	prov, ok := got.(*tiling.Provenance)
+	if !ok {
+		t.Fatalf("cache entry under %q is %T, want *tiling.Provenance", tiling.ProvenanceName, got)
+	}
+	if len(k.LNTs) == 0 {
+		t.Fatal("the matmul fixture must schedule at least one LNT")
+	}
+	if len(prov.LNTs) != len(k.LNTs) {
+		t.Fatalf("provenance plans = %d, want one per scheduled LNT (%d)", len(prov.LNTs), len(k.LNTs))
+	}
+	for _, lnt := range k.LNTs {
+		plan, ok := prov.LNTs[lnt.Root]
+		if !ok {
+			t.Fatalf("LNT root node %d carries no mapping plan", lnt.Root.BasePtr().ID())
+		}
+		if len(plan.GridPortions) != 1 || plan.GridPortions[0] != -1 {
+			t.Fatalf("grid portions = %v, want [-1]", plan.GridPortions)
+		}
+		if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[1] != -1 {
+			t.Fatalf("thread portions = %v, want [warpPortion, -1]", plan.ThreadPortions)
+		}
 	}
 }
 

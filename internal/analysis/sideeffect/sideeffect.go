@@ -187,15 +187,26 @@ func baseVerdict(n ir.Node) bool {
 	switch k {
 	case ir.KindIterCluster, ir.KindForLoop, ir.KindReturn:
 		return true // [2.3]: the conservative closure of "Iter node"
+	case ir.KindRuntimeCallMethod:
+		// P-2 (quick-261022-l1o), the lockstep mirror of ir.EffectOf's arm:
+		// a method call on a stateful reducer object is an ORDERED side
+		// effect — never pure, never GVN-CSE'd. Every other Runtime/
+		// Collective kind (the constructions, RuntimeGetAttribute) stays
+		// free: the objects are immutable and no pass runs after
+		// final-lower, so value-identical constructions can never be
+		// CSE-merged anyway.
+		return true
 	}
 	return false
 }
 
 // orderSensitive classifies the kinds through which the accumulated taint
-// may PROPAGATE (amendment C): FamilyMemory ∪ FamilyLoop ∪ {Return} plus
-// the documented hook for future collective kinds (FamilyCollective has no
-// member kinds yet — when reduce lowering lands, its collective kinds join
-// HERE, not in baseVerdict). Pure kinds are absent BY SPEC: a pure
+// may PROPAGATE (amendment C): FamilyMemory ∪ FamilyLoop ∪ {Return} ∪
+// FamilyCollective (its first members landed with final lowering,
+// quick-261022-l1o: the three RuntimeXXXReducer constructions — conservative
+// taint propagation through a construction whose operands somehow turned
+// effectful; the constructions themselves are pure, P-2). Pure kinds are
+// absent BY SPEC: a pure
 // consumer of an effectful value stays pure (identity keying, amendment
 // D, keeps its GVN participation sound).
 func orderSensitive(k ir.Kind) bool {
