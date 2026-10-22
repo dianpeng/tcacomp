@@ -34,6 +34,8 @@ import (
 //	...   transformation passes slot between as they land
 //	900   scheduling (schedule — sea-of-nodes → AST-style CFG + LICM; the
 //	      final_lower transition point)
+//	950   final lowering (final-lower — reducers/maps/runtime objects over
+//	      the scheduled AST CFG; codegen consumes only its output)
 //
 // Smaller priority = earlier. Equal priorities keep registration order
 // (stable sort), which is also the order init()s run in when only all.go

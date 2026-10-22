@@ -115,13 +115,17 @@ func countOccurrences(blk *ir.ASTBlock, n ir.Node) int {
 }
 
 // bodyBlocks returns the kernel body's top-level block items (the per-LNT
-// [prologue, LBBN root, epilogue] clusters) in order.
+// [prologue, LBBN root, epilogue] clusters) in order. Node items are
+// SKIPPED: since final lowering joined the default pipeline
+// (quick-261022-l1o) the kernel Body legitimately carries statement items —
+// the RuntimeKernelInfo prepended as its FIRST item (LR-11) — beside the
+// cluster blocks.
 func bodyBlocks(t *testing.T, k *ir.ASTKernel) []*ir.ASTBlock {
 	t.Helper()
 	var out []*ir.ASTBlock
 	for _, it := range k.Body.Items() {
 		if it.Block == nil {
-			t.Fatalf("kernel body item = node %d, want a block cluster", it.Node.BasePtr().ID())
+			continue // a kernel-level statement item (the KernelInfo prepend)
 		}
 		out = append(out, it.Block)
 	}

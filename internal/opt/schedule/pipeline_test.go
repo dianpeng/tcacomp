@@ -312,14 +312,23 @@ func TestPipelineEndNodeEpilogue(t *testing.T) {
 // (quick-261022-l1o): tile-lower publishes the tiling provenance under
 // tiling.ProvenanceName and its own Preserved keeps it alive past its run;
 // schedule's Preserved [tiling.ProvenanceName] keeps it alive past
-// scheduling — after the full default pipeline the manager's cache still
-// holds the *Provenance, one per-LNT plan keyed by each scheduled nest's
-// root loop, ready for final-lower's fail-closed fetch.
+// scheduling — after a pipeline run THROUGH schedule the manager's cache
+// still holds the *Provenance, one per-LNT plan keyed by each scheduled
+// nest's root loop, ready for final-lower's fail-closed fetch. (The prefix
+// stops at schedule: final-lower CONSUMES the provenance and — running
+// last with Preserved nil — would legitimately drop it from the cache.)
 func TestPipelinePreservesTilingProvenance(t *testing.T) {
 	g := matmulGraphK("mm-prov", 1024)
-	pm := opt.NewManager(opt.BuildPipeline())
+	var prefix []opt.Pass
+	for _, p := range opt.BuildPipeline() {
+		if p.ID() == "final-lower" {
+			break
+		}
+		prefix = append(prefix, p)
+	}
+	pm := opt.NewManager(prefix)
 	if err := pm.Run(g); err != nil {
-		t.Fatalf("default pipeline run = %v", err)
+		t.Fatalf("pipeline-through-schedule run = %v", err)
 	}
 	k := g.AST()
 	if k == nil {
