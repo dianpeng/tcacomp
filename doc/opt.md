@@ -1,0 +1,32 @@
+# Goal
+
+- Optimization passes
+  - dce
+    - remove trivial dead code
+    - this only works for none side effect node
+  - simplification
+    - lower itercluster into iter
+    - inline lambda into source code
+  - type inference
+    - mark type
+  - gvn
+    - CSE
+    - **loop fusion**, free yeah!
+  - memory-opt
+    - notes this performs load-store forward + dead load elimination
+      - which caused by the loop fusion automatically via GVN
+  - loop tiling
+    - rewrite the loop into tiling based
+    - **decide tile memory/SMEM cache**
+    - format the problem into a combinatory optimization problem solve it via a solver
+      - notes we DO NOT use ployhedral since we do not have data dependency in loop nests
+        - totally a overkill
+      - get optimal tile size
+    - parallisation assignment
+  - loop tiling rewrite
+  - scheduling
+    - includes LICM
+    - build CFG bounded instructions
+  - final lower
+
+- Code Generation
