@@ -15,6 +15,7 @@ package finallower_test
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -930,6 +931,54 @@ func TestTiledReduceEndToEnd(t *testing.T) {
 	runRedFx(t, rx2)
 	if a, b := astShape(k), astShape(rx2.f.g.AST()); a != b {
 		t.Fatalf("twin tiled-reduce runs differ:\n--- 1 ---\n%s\n--- 2 ---\n%s", a, b)
+	}
+}
+
+// TestConstLiteralDedup pins the canonical-literal invariant: GVN (priority
+// 110) dedups pure nodes long BEFORE the passes that mint most const atoms
+// (tile-lower's rebuilt bounds, schedule-era expressions, final-lower's own
+// constructions), so without a post-lowering canonicalization the same
+// literal survives as duplicate nodes. After final-lower at most ONE live
+// const node may exist per (type, value) pair, and the graph must still
+// verify clean.
+func TestConstLiteralDedup(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	runRedFx(t, rx)
+	g := rx.f.g
+
+	type key struct {
+		ty   *ir.NumericType
+		bits uint64
+	}
+	seen := make(map[key]ir.Node)
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindConst {
+			continue
+		}
+		v, ok := ir.ConstValueOf(n)
+		if !ok {
+			continue
+		}
+		// The DECLARED payload type (ConstTypeOf, set at construction) —
+		// the typeinfer-computed cell is nil for most post-typeinfer
+		// consts, which are exactly the duplicates this pins against.
+		ty := ir.ConstTypeOf(n)
+		if ty == nil {
+			ty = ir.TypeOf(n)
+		}
+		nt, ok := ty.(*ir.NumericType)
+		if !ok || nt == nil {
+			continue
+		}
+		k := key{nt, math.Float64bits(v)}
+		if first, dup := seen[k]; dup {
+			t.Fatalf("duplicate literal const: node #%d and node #%d both carry %v of %v",
+				first.BasePtr().ID(), n.BasePtr().ID(), v, nt)
+		}
+		seen[k] = n
+	}
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("verify after the canonicalization: %v", vs)
 	}
 }
 

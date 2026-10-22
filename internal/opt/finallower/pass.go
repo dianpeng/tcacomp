@@ -128,9 +128,17 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return err
 	}
 
+	// Literal canonicalization: GVN (110) predates the passes that mint most
+	// const atoms (tile-lower/schedule/final-lower), so without this step the
+	// codegen-ready IR carries duplicate literal nodes per (type, value).
+	if err := lr.canonicalizeConsts(); err != nil {
+		return err
+	}
+
 	// The erased-item sweep: no AST item anywhere may reference an erased
-	// node (Map bodies, retired queries, Reduce nodes). The query rewrite
-	// replaced its own items in place; everything else lands here.
+	// node (Map bodies, retired queries, Reduce nodes, duplicate literals).
+	// The query rewrite replaced its own items in place; everything else
+	// lands here.
 	lr.sweepErasedItems()
 
 	// The chain-consistency gate: the pass's products must verify clean.
