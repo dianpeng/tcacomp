@@ -77,7 +77,8 @@ func (Pass) Preserved() []string { return nil }
 // Run lowers a scheduled kernel to codegen-ready IR:
 //
 //	gates (nil graph / no AST / provenance fetch fail-closed)
-//	  → lowerReducers (reducer.go; the interim gate errors until that task)
+//	  → lowerReducers (reducer.go, LR-1..LR-3/LR-7/LR-8/LR-13/LR-14 — FIRST:
+//	     the @r derivation needs the producing Maps alive, LR-2)
 //	  → lowerMaps (maplower.go, LR-9)
 //	  → insertRuntimeObjects + rewriteQueries (objects.go, LR-11/LR-12)
 //	  → the erased-item sweep (P-6's RemoveItemsIf over every block)
@@ -251,6 +252,30 @@ func (lr *lowering) findItem(n ir.Node) (*ir.ASTBlock, int) {
 	return search(lr.ast.Body)
 }
 
+// findBlockItem locates blk's PARENT: the block holding blk as a Block item
+// , plus that item's index, or (nil, -1). A loop's parental block — the
+// bracket insertion point — is found through the loop's own SchedBlock.
+func (lr *lowering) findBlockItem(blk *ir.ASTBlock) (*ir.ASTBlock, int) {
+	var search func(parent *ir.ASTBlock) (*ir.ASTBlock, int)
+	search = func(parent *ir.ASTBlock) (*ir.ASTBlock, int) {
+		for i, it := range parent.Items() {
+			if it.Block == blk {
+				return parent, i
+			}
+			if it.Block != nil {
+				if b, idx := search(it.Block); b != nil {
+					return b, idx
+				}
+			}
+		}
+		return nil, -1
+	}
+	if blk == nil || blk == lr.ast.Body {
+		return nil, -1
+	}
+	return search(lr.ast.Body)
+}
+
 // scopeDepth returns the SN scope of a block per the TOTAL mapping
 // (quick-261022-e2u): kernel Body Group → 0; an LNT prologue Group → 0; a
 // Loop block → its nest depth r (1-based, the owning LNT's Loops index+1).
@@ -273,24 +298,6 @@ func (lr *lowering) scopeDepth(blk *ir.ASTBlock) int {
 		}
 	}
 	return 0
-}
-
-// lowerReducers is the INTERIM Task-2 gate: any live KindReduce at this
-// stage is a named error — the full reducer lowering (the bracket law,
-// specialization, slot IVs, re-iteration) lands with the reducer task of
-// this plan (quick-261022-l1o task 3), which replaces this method with the
-// call into reducer.go. The gate keeps Task 2's map/object/query lowering
-// honest: a graph carrying a Reduce must NEVER silently pass through with
-// its reduction unlowered.
-func (lr *lowering) lowerReducers() error {
-	for _, n := range lr.g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindReduce {
-			continue
-		}
-		return fmt.Errorf("final-lower: live reduce node %d — reducer lowering lands with the reducer task (interim gate)",
-			n.BasePtr().ID())
-	}
-	return nil
 }
 
 // sweepErasedItems removes every AST item whose Node is nil or tombstoned

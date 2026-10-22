@@ -23,6 +23,7 @@ import (
 	"tcacomp/internal/opt/finallower"
 	"tcacomp/internal/opt/schedule"
 	"tcacomp/internal/opt/tiling"
+	"tcacomp/internal/opt/typeinfer"
 )
 
 // ---------------------------------------------------------------------------
@@ -213,8 +214,8 @@ func TestGates(t *testing.T) {
 		t.Fatalf("a wrong-typed provenance entry must fail closed naming the type, got %v", err)
 	}
 
-	// The interim reducer gate: a live KindReduce at this stage errors
-	// naming the reducer task.
+	// The @r derivation gate: a Reduce piping a value with NO producing
+	// Map/As chain is a hard diagnostic (LR-2 — never a guess).
 	f3 := newChain("redgate", 512)
 	lhs := f3.tensor("lhs", 0)
 	load := f3.g.NewMemLoad("ctor", lhs, []ir.Node{f3.iv(0)})
@@ -228,8 +229,8 @@ func TestGates(t *testing.T) {
 		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
 	})
 	if err := runFinalLower(t, f3.g, cache3); err == nil ||
-		!strings.Contains(err.Error(), "reducer task") {
-		t.Fatalf("a live Reduce must hit the interim gate naming the reducer task, got %v", err)
+		!strings.Contains(err.Error(), "no producing Map/As chain") {
+		t.Fatalf("a broken producing chain must fail closed naming the derivation, got %v", err)
 	}
 }
 
@@ -509,4 +510,497 @@ func kindOf(n ir.Node) ir.Kind {
 		return ir.KindInvalid
 	}
 	return n.KindOf()
+}
+
+// ---------------------------------------------------------------------------
+// Reducer lower (Task 3): bracket law, specialization, slot IVs, RAUW,
+// re-iteration, integration
+// ---------------------------------------------------------------------------
+
+// redFx is the tiled-reduce fixture: dims m (CTA T=32) and k (WARP T=64),
+// lhs[m,k] loaded over both IVs (chained), piped through an INLINED-shape
+// Map as=[m,k], reduced by a two-formal combiner (the exemption shape), and
+// stored into out[m] (m-only axes — the reduction-shape tail the scheduler
+// lands in the nest epilogue). typeinfer runs for the homogeneity types.
+type redFx struct {
+	f      *fx
+	load   ir.Node
+	mp     ir.Node
+	red    ir.Node
+	init   ir.Node
+	lambda ir.Node
+	store  ir.Node
+}
+
+// newRedFx builds the fixture; variant knobs: extraDim (append a foreign
+// dim to the Map's as — the no-provenance probe) and poison (a return value
+// referencing the k IV — the reduced-dimvar probe).
+func newRedFx(t *testing.T, extraDim, poison bool) *redFx {
+	t.Helper()
+	f := newChain("red", 1024, 512)
+	lhs := f.tensor("lhs", 0, 1)
+	out := f.tensor("out", 0)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1)})
+	as := append([]ir.Node(nil), f.dims...)
+	if extraDim {
+		as = append(as, f.g.NewInputParam("ctor", ir.RoleDim, "dx", nil))
+	}
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), as)
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	init := f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0)
+	red := f.g.NewReduce("ctor", init, mp, ir.NewLambda([]ir.Node{acc, now}, comb))
+	lambda := ir.LambdaOf(red)
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0)}, red)
+	values := []ir.Node{store}
+	if poison {
+		// A type-legal epilogue consumer referencing BOTH the Reduce (→
+		// Combine after the RAUW) and the reduced k dimvar: cast<kIV> + red.
+		// tile-lower RAUWs the HIR k-IV use onto k's lowered index
+		// expression, so the moved consumer's closure reaches the reduced
+		// loop dimvars.
+		kf32 := f.g.NewCast("ctor", ir.InternScalar(ir.TF32), f.iv(1))
+		values = append(values, f.g.NewBinOp("ctor", ir.BinOpAdd, kf32, red))
+	}
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, values...)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	return &redFx{f: f, load: load, mp: mp, red: red, init: init, lambda: lambda, store: store}
+}
+
+// runRedFx drives the REAL tile-lower + schedule over the fixture with the
+// pinned decisions (m CTA T=32, k WARP T=64 — the tiled matmul-like shape
+// with m strictly between X and home), then final-lower, failing on error.
+func runRedFx(t *testing.T, fx *redFx) *opt.Cache {
+	t.Helper()
+	cache := runTileLowerSchedule(t, fx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	if err := runFinalLower(t, fx.f.g, cache); err != nil {
+		t.Fatalf("final-lower over the tiled reduce: %v", err)
+	}
+	return cache
+}
+
+// provenanceOf resolves the fixture's per-dim provenance entries.
+func provenanceOf(t *testing.T, cache *opt.Cache) *tiling.Provenance {
+	t.Helper()
+	prov, ok := cache.Get(tiling.ProvenanceName).(*tiling.Provenance)
+	if !ok || prov == nil {
+		t.Fatal("fixture setup: no provenance")
+	}
+	return prov
+}
+
+// TestReducerBracketPlacement pins LR-1 on the tiled path: exactly one
+// argument-free Init item immediately BEFORE X's item and one Combine item
+// immediately AFTER it, both in X's PARENTAL block (M.b's Loop block —
+// never inside the k tiling loops), asserted by ITEM IDENTITY; the
+// construction is a RuntimeWarpReducer (X's Soc 2, LR-7) appended to the
+// owning prologue at SN 0 carrying (%init, %lambda); the Reduce call sits
+// inside the home (k tile-inside) block after the piped producer's item
+// with args (betweenIVs..., %piped) per LR-13.
+func TestReducerBracketPlacement(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	mDim, kDim := rx.f.dims[0], rx.f.dims[1]
+	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	prov := provenanceOf(t, cache)
+	kprov := prov.Dims[kDim]
+	X, home := kprov.Between, kprov.Inside
+	if X == nil || home == nil {
+		t.Fatal("fixture setup: k must be tiled (Between+Inside)")
+	}
+
+	if err := runFinalLower(t, rx.f.g, cache); err != nil {
+		t.Fatalf("final-lower: %v", err)
+	}
+	g, k := rx.f.g, rx.f.g.AST()
+
+	// The construction: exactly one WarpReducer, operands (init, combiner
+	// lambda), in the owning LNT's prologue at SN 0.
+	reds := liveOfKind(g, ir.KindRuntimeWarpReducer)
+	if len(reds) != 1 || len(liveOfKind(g, ir.KindRuntimeSequentialReducer)) != 0 ||
+		len(liveOfKind(g, ir.KindRuntimeGlobalReducer)) != 0 {
+		t.Fatalf("exactly one WARP reducer construction expected (Soc 2), got %d warp", len(reds))
+	}
+	construction := reds[0]
+	ops := ir.OperandsOf(construction)
+	if len(ops) != 2 || ops[0].BasePtr() != rx.init.BasePtr() || ops[1].BasePtr() != rx.lambda.BasePtr() {
+		t.Fatalf("the construction must carry (init, lambda) — construction carries ALL state (LR-3), got %v", ops)
+	}
+	if construction.BasePtr().SchedSN() != 0 {
+		t.Fatal("the construction must be stamped SN 0")
+	}
+
+	// The bracket: Init@X-1, X, Combine@X+1 in X's PARENTAL block, by item
+	// identity (X appears as a BLOCK item — find its parental block).
+	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if parentBlk == nil || xIdx < 0 {
+		t.Fatal("X must be an AST item")
+	}
+	items := parentBlk.Items()
+	initCall, combineCall := callOf(g, "Init"), callOf(g, "Combine")
+	if initCall == nil || combineCall == nil {
+		t.Fatal("exactly one Init and one Combine call must exist")
+	}
+	if got := ir.OperandsOf(initCall); len(got) != 1 || got[0].BasePtr() != construction.BasePtr() {
+		t.Fatalf("Init must be argument-free over the reducer, got %v", got)
+	}
+	if items[xIdx-1].Node == nil || items[xIdx-1].Node.BasePtr() != initCall.BasePtr() {
+		t.Fatalf("Init must sit immediately BEFORE X's item (index %d-1)", xIdx)
+	}
+	if items[xIdx].Block == nil || items[xIdx].Block.Loop().BasePtr() != X.BasePtr() {
+		t.Fatalf("X's item must be the bracket center at index %d", xIdx)
+	}
+	if items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatalf("Combine must sit immediately AFTER X's item (index %d+1)", xIdx)
+	}
+	// Never inside the k tiling loops: the bracket block must not be X's or
+	// home's block (it is M.b's).
+	if parentBlk == X.BasePtr().SchedBlock() || parentBlk == home.BasePtr().SchedBlock() {
+		t.Fatal("Init/Combine must bracket X from X's PARENTAL block, never inside the k tiling loops")
+	}
+
+	// The Reduce call: inside home's block, after the piped producer's item,
+	// args (betweenIV, piped) — the between loop is m's tile-inside loop
+	// (strictly between X and home on the chain).
+	reduceCall := callOf(g, "Reduce")
+	if reduceCall == nil {
+		t.Fatal("exactly one Reduce call must exist")
+	}
+	homeBlk := home.BasePtr().SchedBlock()
+	homeItems := homeBlk.Items()
+	callIdx := -1
+	for i, it := range homeItems {
+		if it.Node != nil && it.Node.BasePtr() == reduceCall.BasePtr() {
+			callIdx = i
+		}
+	}
+	if callIdx < 0 {
+		t.Fatal("the Reduce call must be an item of the home block")
+	}
+	if callIdx == 0 || homeItems[callIdx-1].Node == nil ||
+		homeItems[callIdx-1].Node.BasePtr() != rx.load.BasePtr() {
+		t.Fatal("the Reduce call must sit immediately after the piped producer's (load's) item")
+	}
+	callOps := ir.OperandsOf(reduceCall)
+	if len(callOps) != 3 || callOps[2].BasePtr() != rx.load.BasePtr() {
+		t.Fatalf("the Reduce call carries (betweenIV, piped) — the piped operand must resolve at the load after Map Lower, got %v", callOps)
+	}
+	mProv := prov.Dims[mDim]
+	if mProv.Inside == nil || callOps[1].BasePtr() != ir.OperandsOf(mProv.Inside)[0].BasePtr() {
+		t.Fatal("the slot-index argument must be the m tile-inside loop's IV (the single between loop)")
+	}
+	_ = mDim
+}
+
+// TestReducerCombineRAUW pins 2.4: EVERY former use of the Reduce points at
+// the Combine call (the store's value operand), the Reduce node and its
+// KeyedAttribute are erased, and the combiner lambda stays LIVE through the
+// construction's operand.
+func TestReducerCombineRAUW(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	runRedFx(t, rx)
+	g := rx.f.g
+
+	if !rx.red.BasePtr().Erased() {
+		t.Fatal("the Reduce node must be erased")
+	}
+	combineCall := callOf(g, "Combine")
+	if combineCall == nil {
+		t.Fatal("the Combine call must exist")
+	}
+	if ops := ir.OperandsOf(rx.store); ops[0] == nil || ops[0].BasePtr() != combineCall.BasePtr() {
+		t.Fatalf("the store's value must resolve at the Combine call, got %v", ops[0])
+	}
+	for _, u := range ir.UsesOf(combineCall) {
+		_ = u // the Combine value is consumed (the store); uses exist
+	}
+	if len(ir.UsesOf(combineCall)) == 0 {
+		t.Fatal("the Combine call must carry its moved consumers' uses")
+	}
+	if !rx.lambda.BasePtr().Erased() && len(ir.UsesOf(rx.lambda)) == 0 {
+		t.Fatal("the combiner lambda must stay live through the construction's operand")
+	}
+	if rx.lambda.BasePtr().Erased() {
+		t.Fatal("the combiner lambda must NEVER be erased (the runtime owns the application)")
+	}
+}
+
+// TestReducerReiteration pins LR-14/P-12: the epilogue out-store MOVES into
+// a fresh sequential re-iteration Loop block over the between dim (m),
+// nested immediately after Combine in X's parental block; the re-iteration
+// loop carries the SAME dim + bound as the m tile-inside loop; the store's
+// m coordinate references the RE-ITERATION dimvar (rebuilt, not the shared
+// original); and no moved consumer references a reduced-dim dimvar.
+func TestReducerReiteration(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	cache := runRedFx(t, rx)
+	prov := provenanceOf(t, cache)
+	g, k := rx.f.g, rx.f.g.AST()
+
+	X, home := prov.Dims[rx.f.dims[1]].Between, prov.Dims[rx.f.dims[1]].Inside
+	mInside := prov.Dims[rx.f.dims[0]].Inside
+	// X appears as a BLOCK item (its own Loop block) — locate the parental
+	// block via the block, not the loop node.
+	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if parentBlk == nil {
+		t.Fatal("fixture setup: X must be an item")
+	}
+	items := parentBlk.Items()
+	combineCall := callOf(g, "Combine")
+	if combineCall == nil || items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatal("fixture setup: Combine must sit immediately after X")
+	}
+	// The re-iteration block sits immediately after Combine.
+	if len(items) <= xIdx+2 || items[xIdx+2].Block == nil {
+		t.Fatal("a re-iteration Loop block must sit immediately after Combine")
+	}
+	reit := items[xIdx+2].Block
+	if reit.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("the re-iteration block must be a SeqLoop, got %s", reit.Kind())
+	}
+	// The re-iteration loop: same dim, same bound as the m tile-inside loop.
+	reitLoop := reit.Loop()
+	mLoopIV, reitIV := ir.OperandsOf(mInside)[0], ir.OperandsOf(reitLoop)[0]
+	if ir.OperandsOf(mLoopIV)[0].BasePtr() != ir.OperandsOf(reitIV)[0].BasePtr() {
+		t.Fatal("the re-iteration must walk the SAME dim (m)")
+	}
+	mMax := ir.OperandsOf(ir.OperandsOf(mInside)[1])[1]
+	reitMax := ir.OperandsOf(ir.OperandsOf(reitLoop)[1])[1]
+	if mMax.BasePtr() != reitMax.BasePtr() {
+		t.Fatal("the re-iteration must carry the SAME bound expression node")
+	}
+	// The store moved INTO the re-iteration block; the end node did NOT.
+	found := false
+	for _, it := range reit.Items() {
+		if it.Node != nil && it.Node.BasePtr() == rx.store.BasePtr() {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the epilogue out-store must MOVE into the re-iteration block")
+	}
+	for _, lnt := range k.LNTs {
+		for _, it := range k.Body.Items() {
+			if it.Block != nil && it.Block.Kind() == ir.BlockGroup && it.Block.Nest() == lnt {
+				for _, e := range it.Block.Items() {
+					if e.Node != nil && e.Node.BasePtr() == rx.store.BasePtr() {
+						t.Fatal("the store must no longer sit in the epilogue")
+					}
+				}
+			}
+		}
+	}
+	// The store's m coordinate references the RE-ITERATION dimvar (the
+	// rebuilt spine), never the original m tile-inside IV.
+	axis := ir.OperandsOf(rx.store)[2]
+	cl := subtreeOf(axis)
+	if !cl[reitIV] {
+		t.Fatal("the store's m coordinate must reference the re-iteration dimvar")
+	}
+	if cl[mLoopIV] {
+		t.Fatal("the store's m coordinate must NOT reference the original m tile-inside dimvar (shared with the in-nest loads)")
+	}
+	// No moved consumer references a reduced-dim dimvar.
+	for _, loop := range []ir.Node{X, home} {
+		iv := ir.OperandsOf(loop)[0]
+		if cl[iv] {
+			t.Fatal("the moved store must not reference a reduced-dim dimvar")
+		}
+	}
+	_ = g
+}
+
+// TestReducerNegativeProbes pins the fail-closed family: a reduced dim with
+// no provenance entry, a piped type/init mismatch (doc/tca.md §4.2), and a
+// consumer referencing a reduced-dim dimvar.
+func TestReducerNegativeProbes(t *testing.T) {
+	// (a) No provenance entry: the Map's as carries a foreign third dim.
+	rx := newRedFx(t, true, false)
+	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	err := runFinalLower(t, rx.f.g, cache)
+	if err == nil || !strings.Contains(err.Error(), "no tiling provenance entry") {
+		t.Fatalf("a foreign reduced dim must fail closed naming the provenance, got %v", err)
+	}
+
+	// (b) Type mismatch: the init's type cell hand-corrupted to f16 against
+	// the f32 piped element (the check probes FINAL-LOWER's own gate —
+	// typeinfer itself would refuse a genuinely mismatched graph earlier).
+	rx2 := newRedFx(t, false, false)
+	mctx := &ir.MutContext{Pass: "test"}
+	if err := mctx.SetType(rx2.init, ir.InternScalar(ir.TF16)); err != nil {
+		t.Fatalf("fixture setup: %v", err)
+	}
+	cache2 := runTileLowerSchedule(t, rx2.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	err = runFinalLower(t, rx2.f.g, cache2)
+	if err == nil || !strings.Contains(err.Error(), "homogeneous reducer contract") {
+		t.Fatalf("an f16/f32 piped-init mismatch must fail closed naming the contract, got %v", err)
+	}
+
+	// (c) A moved consumer referencing a reduced-dim dimvar.
+	rx3 := newRedFx(t, false, true)
+	cache3 := runTileLowerSchedule(t, rx3.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	err = runFinalLower(t, rx3.f.g, cache3)
+	if err == nil || !strings.Contains(err.Error(), "reduced-dim dimvar") {
+		t.Fatalf("a consumer referencing a reduced-dim dimvar must fail closed, got %v", err)
+	}
+}
+
+// TestQueryOutsideLNT pins P-11's hard diagnostic: a query whose SchedBlock
+// resolves to NO LNT (here: hand-stamped into the kernel Body Group after
+// scheduling) cannot be bound.
+func TestQueryOutsideLNT(t *testing.T) {
+	f, _, _, _ := mapOnlyFx(t)
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+	})
+	stray := f.g.NewRuntimeGridQuery("test", "index", f.g.NewConst("test", ir.InternScalar(ir.TU32), 0))
+	stray.BasePtr().SetSched(0, f.g.AST().Body)
+	err := runFinalLower(t, f.g, cache)
+	if err == nil || !strings.Contains(err.Error(), "outside every LNT") {
+		t.Fatalf("a query outside every LNT must fail closed, got %v", err)
+	}
+}
+
+// TestTiledReduceEndToEnd pins the full post-pass shape over the tiled
+// reduce kernel: zero Map/Reduce/query nodes (the producing Map AND its
+// Reduce both lower in ONE run — the LR-2 order pin), exactly one
+// KernelInfo first statement, one mapping pair in the prologue, the
+// complete reducer statement set in the right blocks, ir.Verify green, and
+// no AST item referencing an erased node.
+func TestTiledReduceEndToEnd(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	runRedFx(t, rx)
+	g, k := rx.f.g, rx.f.g.AST()
+
+	for _, kind := range []ir.Kind{ir.KindMap, ir.KindReduce,
+		ir.KindRuntimeGridQuery, ir.KindRuntimeThreadQuery} {
+		if got := liveOfKind(g, kind); len(got) != 0 {
+			t.Fatalf("live %s nodes survive, got %d", kind, len(got))
+		}
+	}
+	// The combiner lambda is the ONE surviving lambda (held by the
+	// construction); the producing Map's lambda debris is gone.
+	lams := liveOfKind(g, ir.KindLambda)
+	if len(lams) != 1 || lams[0].BasePtr() != rx.lambda.BasePtr() {
+		t.Fatalf("exactly the combiner lambda survives, got %d", len(lams))
+	}
+	kis := liveOfKind(g, ir.KindRuntimeKernelInfo)
+	if len(kis) != 1 {
+		t.Fatal("exactly one KernelInfo")
+	}
+	if items := k.Body.Items(); items[0].Node == nil || items[0].Node.KindOf() != ir.KindRuntimeKernelInfo {
+		t.Fatal("the KernelInfo must be the kernel Body's first item")
+	}
+	// The complete reducer statement set exists and is stamped.
+	for _, m := range []string{"Init", "Reduce", "Combine"} {
+		if callOf(g, m) == nil {
+			t.Fatalf("the %s call must exist", m)
+		}
+	}
+	// Structural health: verify green, linkage consistent, no erased items.
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("the lowered kernel must verify clean, got %v", vs)
+	}
+	walkItems(k.Body, func(n ir.Node, containing *ir.ASTBlock) {
+		if n.BasePtr().Erased() {
+			t.Fatalf("AST item references erased node %d (%s)", n.BasePtr().ID(), n.KindOf())
+		}
+	})
+	// Determinism.
+	rx2 := newRedFx(t, false, false)
+	runRedFx(t, rx2)
+	if a, b := astShape(k), astShape(rx2.f.g.AST()); a != b {
+		t.Fatalf("twin tiled-reduce runs differ:\n--- 1 ---\n%s\n--- 2 ---\n%s", a, b)
+	}
+}
+
+// callOf returns the unique live RuntimeCallMethod carrying the method
+// payload, or nil when not exactly one exists.
+func callOf(g *ir.Graph, method string) ir.Node {
+	var found ir.Node
+	for _, n := range liveOfKind(g, ir.KindRuntimeCallMethod) {
+		if ir.RuntimeMethodOf(n) != method {
+			continue
+		}
+		if found != nil {
+			return nil // not unique
+		}
+		found = n
+	}
+	return found
+}
+
+// findItemIn locates node's AST item (block + index) over the whole kernel.
+func findItemIn(k *ir.ASTKernel, n ir.Node) (*ir.ASTBlock, int) {
+	var search func(blk *ir.ASTBlock) (*ir.ASTBlock, int)
+	search = func(blk *ir.ASTBlock) (*ir.ASTBlock, int) {
+		for i, it := range blk.Items() {
+			if it.Node != nil && it.Node.BasePtr() == n.BasePtr() {
+				return blk, i
+			}
+			if it.Block != nil {
+				if b, idx := search(it.Block); b != nil {
+					return b, idx
+				}
+			}
+		}
+		return nil, -1
+	}
+	return search(k.Body)
+}
+
+// findParentOfBlock locates blk's parental block (holding blk as a Block
+// item) and that item's index — the loop-bracket position.
+func findParentOfBlock(k *ir.ASTKernel, blk *ir.ASTBlock) (*ir.ASTBlock, int) {
+	var search func(parent *ir.ASTBlock) (*ir.ASTBlock, int)
+	search = func(parent *ir.ASTBlock) (*ir.ASTBlock, int) {
+		for i, it := range parent.Items() {
+			if it.Block == blk {
+				return parent, i
+			}
+			if it.Block != nil {
+				if b, idx := search(it.Block); b != nil {
+					return b, idx
+				}
+			}
+		}
+		return nil, -1
+	}
+	return search(k.Body)
+}
+
+// subtreeOf collects n's live data-subtree nodes (self included).
+func subtreeOf(n ir.Node) map[ir.Node]bool {
+	set := make(map[ir.Node]bool)
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+			return
+		}
+		set[x] = true
+		for _, d := range ir.OperandsOf(x) {
+			visit(d)
+		}
+	}
+	visit(n)
+	return set
 }
