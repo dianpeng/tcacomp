@@ -99,10 +99,15 @@ func (e Effect) String() string {
 // ([4].3); DCE liveness is root-reachability based (R3), so a memory op no
 // root path reaches is still dead-code-eligible.
 //
-// Consumers (grep-audited at quick-261018-nga): the scheduler's LICM calls
-// sit strictly BEHIND the licmHoistableKinds whitelist (scalar-expression
-// kinds only, all free before and after this amendment), and neither DCE,
-// Materialize's isEffectKind, nor the legality windows consult EffectOf.
+// Consumers (grep-audited at quick-261018-nga, refreshed at
+// quick-261022-b2m after the schedule rewrite deleted the statement-level
+// scheduler and its licmHoistableKinds whitelist): the schedule pass now
+// gates effectful hoisting itself — a memory-ACCESS kind with invariant
+// operands floors at its operand-containing loop (HI-02), while the
+// allocation kinds (MemNew/MemNewSMem/FragNew) are exempt: hoisting a
+// shared declaration is semantics-preserving. Neither DCE, Materialize's
+// isEffectKind, nor the legality windows consult EffectOf (that part is
+// unchanged).
 func EffectOf(n Node) Effect {
 	if n == nil {
 		return NewEffectFree()

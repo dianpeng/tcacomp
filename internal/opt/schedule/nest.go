@@ -20,7 +20,8 @@ type forNest struct {
 	parent   *forNest         // nil for roots
 	children []*forNest       // loops nested in this one, allocation order
 	depth    int              // root = 1, child = parent + 1
-	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk)
+	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk over OperandsOf) — forest LINKING and the HI-02 effectful floor
+	reach    map[ir.Node]bool // UNIFORM containment set (ops[2] walk over DataDeps+ImpactBy defs, quick-261022-b2m CR-01) — placement cap and ownership
 	block    *ir.ASTBlock     // the LBBN Loop block built for this node, stamped during scheduling
 }
 
@@ -30,6 +31,7 @@ type forNest struct {
 //  1. COLLECT: every non-erased KindForLoop in g.AllocatedNodes()
 //     (allocation order) gets a forNest and starts as a root candidate —
 //     the loopforest collect pattern.
+//
 //  2. LINK by body-operand containment: for each loop y, its body subtree
 //     is the transitive operand closure from ops[2] (cycle-guarded). For
 //     each loop x in allocation order, its parent is the FIRST loop y
@@ -37,6 +39,18 @@ type forNest struct {
 //     to y.children and leaves the root set. Containment is reachability
 //     in y's body walk: x's own subtree never contains its ancestors by
 //     construction, so first-match is deterministic.
+//
+//     The LINK step deliberately stays on the OPERAND-ONLY .body set even
+//     though placement uses the uniform .reach set (quick-261022-b2m):
+//     tile-lower's repointChains (lower_rewrite.go P6) re-points every
+//     post-nest consumer's ImpactBy edge at a FOREIGN nest's ROOT loop
+//     node — "the ForLoop node as effect-def" denotes whole-loop
+//     completion — so loop nodes are uniform-reachable from OTHER nests'
+//     bodies. Linking on .reach would cross-nest the forest and destroy
+//     the LNT decomposition; structural nesting is an operand fact, not
+//     an effect-ordering fact. (LO-02 — value-consumption conflation of
+//     the operand-only link — stays unfixed by design.)
+//
 //  3. DEPTH via DFS from each root in root order (root = 1, child =
 //     parent + 1), cycle-safe as in loopforest.
 //
@@ -56,6 +70,7 @@ func forLoopForest(g *ir.Graph) []*forNest {
 
 	for _, y := range order {
 		trees[y].body = bodySetOf(y)
+		trees[y].reach = reachSetOf(y)
 	}
 	nonRoot := make(map[*forNest]bool)
 	for _, x := range order {
@@ -116,6 +131,47 @@ func bodySetOf(n ir.Node) map[ir.Node]bool {
 		set[x] = true
 		for _, d := range ir.OperandsOf(x) {
 			visit(d)
+		}
+	}
+	visit(ops[2])
+	return set
+}
+
+// reachSetOf computes the UNIFORM containment closure starting at n's ops[2]
+// (quick-261022-b2m, CR-01): identical to bodySetOf (cycle-guarded, starts
+// at the body operand, skips nil/erased) except the walk expands ir.DataDeps
+// AND ir.ImpactBy payload defs — the EXACT edge relation of tiling's
+// lowerRun.reachableFrom (lower_rewrite.go). USER PRINCIPLE, locked for this
+// task: the effect chain (ImpactBy) is treated IDENTICALLY to use-def/input
+// edges throughout the scheduling model. Tile-lower's cache insertion
+// (lower_cache.go PHASE 4, F8) places SMEM fills OUTSIDE the body-operand
+// subtree on purpose — the fill becomes a loop member through the
+// pass-built effect chains and re-executes per fill-key epoch — so an
+// operand-only containment set gives every fill cap 0 and the old clamp
+// hoisted multi-round fills into the once-only kernel prologue (stale SMEM
+// windows, wrong numerics). The uniform set makes the fill's cap the depth
+// of the deepest loop whose body reaches it through data OR impact edges:
+// it is an impact-predecessor of the in-body buffer access.
+func reachSetOf(n ir.Node) map[ir.Node]bool {
+	set := make(map[ir.Node]bool)
+	if n == nil {
+		return set
+	}
+	ops := ir.OperandsOf(n)
+	if len(ops) < 3 || ops[2] == nil {
+		return set
+	}
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+			return
+		}
+		set[x] = true
+		for _, d := range ir.DataDeps(x) {
+			visit(d)
+		}
+		for _, u := range ir.ImpactBy(x) {
+			visit(u.Def())
 		}
 	}
 	visit(ops[2])

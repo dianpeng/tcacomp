@@ -210,8 +210,20 @@ func TestSingleNestLICM(t *testing.T) {
 	if iv.BasePtr().SchedBlock() != thr || bound.BasePtr().SchedBlock() != thr {
 		t.Fatal("the loop header (iv/bound) must land in the Loop block")
 	}
-	if end.BasePtr().SchedBlock() != prologue {
-		t.Fatal("the unenclosed end node clamps to rank 0 (the prologue)")
+	// CR-02 pin (quick-261022-b2m): the end node's deps live in the loop
+	// (the root loop itself at depth 1, the chained store), so it lands in
+	// the epilogue Group — AFTER the nest — keeping SN 1: the propagated
+	// DEPTH REQUIREMENT, not an after-nest rank (ruling 6). The old
+	// assertion clamped it to the prologue and encoded the CR-02 inversion
+	// (a block executing BEFORE its own dependencies) as spec.
+	if end.BasePtr().SchedBlock() != epilogue {
+		t.Fatal("the end node must land in the epilogue Group (after its producing nest)")
+	}
+	if end.BasePtr().SchedSN() != 1 {
+		t.Fatalf("end node SN = %d, want 1 (the propagated depth requirement, ruling 6)", end.BasePtr().SchedSN())
+	}
+	if end.BasePtr().SchedBlock().Nest() == nil || end.BasePtr().SchedBlock().Nest().Root.BasePtr() != loop.BasePtr() {
+		t.Fatal("the epilogue Group must expose its owning nest via Nest() (ruling 7)")
 	}
 	if countOccurrences(k.Body, varying) != 1 || countOccurrences(k.Body, st) != 1 {
 		t.Fatal("every node must be placed exactly once")
@@ -331,8 +343,22 @@ func TestMultipleLNTs(t *testing.T) {
 	if len(itemNodes(bPro)) != 0 {
 		t.Fatal("B's prologue must stay empty (rank-0 nodes are claimed by the first LNT)")
 	}
-	if len(itemNodes(aEpi)) != 0 || len(itemNodes(bEpi)) != 0 {
-		t.Fatal("epilogue Groups are empty landing pads (D-04)")
+	// CR-02 pin (quick-261022-b2m): the end node's deps span BOTH nests
+	// (both roots and both in-loop stores), so it lands in the LAST
+	// contributing root's epilogue — B's — keeping SN 1 (its propagated
+	// depth requirement; both roots sit at depth 1); A's epilogue stays
+	// empty (D-04 landing pads plus the pass-placed after-nest consumers).
+	if indexOf(itemNodes(aEpi), f.g.End()) >= 0 {
+		t.Fatal("A's epilogue must stay empty (the end node's home is the LAST contributing root)")
+	}
+	if indexOf(itemNodes(bEpi), f.g.End()) < 0 {
+		t.Fatal("the end node must land in B's (the last root's) epilogue Group")
+	}
+	if f.g.End().BasePtr().SchedSN() != 1 {
+		t.Fatalf("end node SN = %d, want 1 (the propagated depth requirement, ruling 6)", f.g.End().BasePtr().SchedSN())
+	}
+	if nst := f.g.End().BasePtr().SchedBlock().Nest(); nst == nil || nst.Root.BasePtr() != loopB.BasePtr() {
+		t.Fatal("the end node's epilogue must identify B's LNT via Nest() (ruling 7)")
 	}
 	if indexOf(itemNodes(aRoot), stA) < 0 || indexOf(itemNodes(bRoot), stB) < 0 {
 		t.Fatal("each nest's store must land in its own LBBN root block")
