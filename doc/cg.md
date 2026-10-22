@@ -326,20 +326,27 @@ runtime (loop_tile_lower.md §4):
 
 | soc | Block kind | Iterator | Semantics (runtime-owned) |
 |-----|-----------|----------|---------------------------|
-| 0 | BlockSeqLoop | `tca::rt::SeqIterator(bound)` | native `base = 0; base < max; base += step` rounds; no bailout |
-| 1 | BlockCTALoop | `tca::rt::CtaIterator(tca_gm, dosoc, bound)` | CTA-uniform round walk, step = LoC·T; GUARDED — out-of-range CTA rank = whole-body no-op (amended rule) |
-| 2 | BlockThrLoop | `tca::rt::ThrIterator(tca_tm, dosoc, bound)` | CTA-uniform trip count, per-thread owned chunk/rank; out-of-range thread = whole-body no-op for the ENTIRE body — the guard is inside the iterator, bodies may diverge, scaffolding converges |
+| 0 | BlockSeqLoop | `tca::rt::SeqIterator(init, step, bound)` | native `base = init; base < max; base += step` rounds; no bailout |
+| 1 | BlockCTALoop | `tca::rt::CtaIterator(gm, dosoc, loc, init, step, bound)` | CTA-uniform round walk (step = LoC·T) |
+| 2 | BlockThrLoop | `tca::rt::ThrIterator(tm, dosoc, loc, init, step, bound)` | CTA-uniform trip count, per-thread owned chunk/rank |
 
-- Iterator ctor args: the LNT's mapping object (by `dosoc` kind: grid vs
-  thread), the loop's `dosoc` dimension, the bound = the `bdimvar` max
-  expression (the lowered `umin` chain — F1 — emitted verbatim as a u32
-  expression), `loc` where the runtime needs the concurrency quantum.
-  `it.Index()` returns the current round-base value (the dimvar identity
-  `(init=0, step)`); ranks (`map.index(d)·T`) are already in-body offset
+- Iterator ctor args (as implemented): the LNT's mapping object (by `soc`
+  class: grid vs thread), the loop's `dosoc` dimension, its `loc`
+  concurrency, the dimvar identity `(init, step)` as literals, and the
+  bound = the `bdimvar` max expression (the lowered `umin` chain — F1 —
+  emitted verbatim as a u32 expression). `it.Index()` returns the current
+  round-base value; ranks (`map.index(d)·T`) are already in-body offset
   terms inside the lowered expressions — never inside the iterator.
-- Trip counts are CTA-uniform by construction (F1 + 0-based between loops),
-  which is what makes collective uniform-call safety structural
-  (runtime_objects.md §7.2).
+- **Guard semantics (tca.md §5.12 "predicated, not exited"):** `Has()` is
+  the CTA-UNIFORM round walk — every thread of the CTA executes the same
+  iterations, so collective runtime calls inside the body stay uniformly
+  reached. Per-thread/per-CTA validity is enforced INSIDE the shim — the
+  views' bounds-checked Get/Set and the loaders' tail clamping suppress
+  out-of-range effects — never by an emitted branch, never by the iterator
+  bailing early. The whole-body no-op is the SEMANTIC contract; predication
+  is the mechanism. Trip counts are CTA-uniform by construction (F1 +
+  0-based between loops), which makes collective uniform-call safety
+  structural (runtime_objects.md §7.2).
 
 ## 8. Runtime library surface (the contract for the FOLLOW-UP task)
 
@@ -380,9 +387,9 @@ struct ThreadMapping {                                    // per-CTA thread spac
 };
 
 // ---- loop iterators (§7) --------------------------------------------
-struct SeqIterator  { __device__ SeqIterator(unsigned bound);  __device__ bool Has(); __device__ void Next(); __device__ unsigned Index(); };
-struct CtaIterator  { __device__ CtaIterator(GridMapping&, unsigned dosoc, unsigned bound); /* + Has/Next/Index, guarded whole-body no-op */ };
-struct ThrIterator  { __device__ ThrIterator(ThreadMapping&, unsigned dosoc, unsigned bound); /* + Has/Next/Index, guarded whole-body no-op */ };
+struct SeqIterator { __device__ SeqIterator(unsigned init, unsigned step, unsigned bound); __device__ bool Has(); __device__ void Next(); __device__ unsigned Index(); };
+struct CtaIterator { __device__ CtaIterator(GridMapping&, unsigned dosoc, unsigned loc, unsigned init, unsigned step, unsigned bound); /* + Has/Next/Index; Has() is the CTA-uniform round walk */ };
+struct ThrIterator { __device__ ThrIterator(ThreadMapping&, unsigned dosoc, unsigned loc, unsigned init, unsigned step, unsigned bound); /* + Has/Next/Index; same uniform contract */ };
 
 // ---- the memory shim (§3, D3/D6) ------------------------------------
 enum class Layout : unsigned { RowMajor = 0 /* future: swizzle/coalescing */ };
@@ -463,7 +470,38 @@ extern "C" void tca_<name>_launch(
   comparison, compute-sanitizer. Codegen's job stops at: the emitted `.cu`
   compiles against the real runtime headers once they exist.
 
-## 11. Out of scope / follow-ups
+## 11. Implementation notes (quick-261022-cxx — pinned by the goldens)
+
+- **Loader coordinate convention** (§6 M-3 fill, as implemented): the
+  loader call is `LoadTile*(dst_view, src_view, coords...)` with the merged
+  coordinate tuple in TENSOR DIM ORDER — `len(axes) == rank` uses the fill
+  source-load's axes verbatim (the FRAG all-axes form); `len(axes) +
+  len(bivs) == rank` merges (covered positions take their round-base biv,
+  the rest their axis); anything else fails closed (the FRAG
+  mixed-with-skips form — the v0 search policy never produces it).
+- **Scheduler-anchored lambda items**: the schedule pass anchors the
+  surviving combiner lambda's params and body as items (typically in the
+  owning LNT's prologue). The kernel-body walk skips the whole lambda
+  operand closure — the lambda emits file-scope (§6 L-1).
+- **`keyedattribute` items**: the scheduler may anchor annotation nodes as
+  items; they are metadata and emit nothing.
+- **Dead locals**: scheduler-placed pure items (late-hoisted bound chains)
+  can materialize `auto` locals that go unused in their C++ scope. Harmless
+  (nvcc elides them); pinned by the goldens.
+- **Duplicate attribute reads**: post-GVN passes (tile-lower onward) mint
+  `RuntimeGetAttribute` nodes GVN never saw, so e.g. two identical
+  `threadmap.index(1)` reads may survive. Cheap pure accessors; acceptable
+  v0 (a post-final-lower GVN re-run would fold them).
+- **KNOWN PIPELINE GAP pinned by the matmul golden**: the schedule pass
+  currently places the cooperative fill AFTER the tile-inside loops within
+  the between-round body (the sea's ImpactBy chain says fill-first; the
+  item placement does not realize it). The emitted C++ therefore reads the
+  SMEM buffer before the round's fill. This is a schedule-pass defect (the
+  review's fill-placement family), NOT an emitter behavior — the emitter
+  renders item order faithfully by contract (§1.1). The golden pins
+  current pipeline output and will churn when the schedule fix lands.
+
+## 12. Out of scope / follow-ups
 
 | Item | Note |
 |------|------|
