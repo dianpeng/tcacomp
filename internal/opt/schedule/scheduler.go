@@ -495,24 +495,10 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 		}
 	}
 
-	// Fail-closed net: every live node landed in exactly one block (loops
-	// via the LBBN, statements via the rank placement). A leftover names
-	// the offending IDs — never a silently partial AST.
-	var leftover []uint64
-	for _, n := range nodes {
-		if live[n] && n.BasePtr().SchedBlock() == nil {
-			leftover = append(leftover, n.BasePtr().ID())
-		}
-	}
-	if len(leftover) > 0 {
-		sort.Slice(leftover, func(i, j int) bool { return leftover[i] < leftover[j] })
-		return fmt.Errorf("schedule: %d live nodes landed in no block (ids: %v)", len(leftover), leftover)
-	}
-
 	// STEP 2: kernel metadata — Params pass through; Gmem lists every live
 	// GMEM allocation in allocation order with its extent (op[0]); the LNT
-	// SoC metadata was assembled per nest above. Attach; do NOT set
-	// materialized, do NOT touch g.cfg (D-01).
+	// SoC metadata was assembled per nest above. Do NOT set materialized, do
+	// NOT touch g.cfg (D-01).
 	var gmem []ir.ASTGmemAlloc
 	for _, n := range nodes {
 		if live[n] && n.KindOf() == ir.KindMemNew {
@@ -523,12 +509,22 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 			gmem = append(gmem, ir.ASTGmemAlloc{New: n, Extent: extent})
 		}
 	}
-	return g.AttachAST(&ir.ASTKernel{
+	ast := &ir.ASTKernel{
 		Body:   kernel,
 		Params: g.Params(),
 		Gmem:   gmem,
 		LNTs:   lnts,
-	})
+	}
+
+	// Cross-block ordering net (locked decision 2, quick-261022-b2m): the
+	// empirical guard of the placement model — every live node landed
+	// (leftover, subsuming the old net) and no live node's block executes
+	// before a live data/effect dependency's block. Runs post-placement,
+	// pre-attach: an error leaves the AST unattached.
+	if err := verifyBlockOrder(ast, nodes, live); err != nil {
+		return err
+	}
+	return g.AttachAST(ast)
 }
 
 // nestRoot walks to the forest root of t's tree (the LNT identity the
