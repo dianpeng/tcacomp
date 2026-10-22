@@ -770,3 +770,39 @@ Required fixes (each scoped to the doc section it amends):
 - doc/optana/final_lower.md is NOT modified by this review (the file is absent
   from the review's working tree and was only ever read); the only file created
   is doc/review/final_lower.md. No files under internal/, pkg/, runtime/ touched.
+
+---
+
+## 10. Resolution addendum (2026-10-22, post-review)
+
+After this review, the reducer-placement fix was agreed with the author and
+`doc/optana/final_lower.md` was amended. Status changes at the DESIGN-DOC
+level (implementation still pending — no code has changed):
+
+- **FL-1 (BLOCKING) — RESOLVED**: insertion points 2.2/2.4 now bracket
+  X = the OUTERMOST loop over the reduced dim (tile-between on the tiled
+  path; the single loop when T==1). The per-tile-partial reading is gone;
+  tca.md §5.10's law is cited inline.
+- **FL-2 — RESOLVED**: the tile-between/tile-inside split is explicit in the
+  algorithm (step 1), including the home-loop vs bracket-loop distinction.
+- **FL-3 — RESOLVED (design)**: @r identification specified — Input #0 →
+  producing Map → `ir.AsOf` → last dim of the As order; fail-closed; ordered
+  before Map Lower (which the doc now states as a sequencing requirement).
+- **FL-4 — RESOLVED**: "Overview of Reducer" now says "last dimension of the
+  producing Map's as order", matching tca.md §2.7 rule 3.
+- **FL-13 — RESOLVED**: specialization selection stated — X's
+  `ASTLoopMeta.Soc`: 0→Sequential, 2(thr)→Warp, 1(cta)→Global.
+- **FL-17 — PARTIAL**: the new "Tiling Provenance Record" section establishes
+  the designed carrier (preserved tiling-record, per-dim entries keyed by the
+  DIM node: Between/Inside/Soc/Tile). The per-LNT mapping-portion fields are
+  still to be specified when the mapping-construction section is amended.
+- **FL-23 / FL-24 — RESOLVED (design)**: the amended steps carry tca.md
+  §5.10 points 3–4 — the accumulator-tile slot index on Reduce
+  (`Reduce(@m_i, %current_value)`) and fused-consumer re-iteration after
+  Combine.
+
+Also confirmed in discussion (no doc change needed): final lowering stays
+AFTER scheduling — its insertion points, SoC specialization, and SN→block
+linkage are all scheduler outputs, and pre-scheduling introduction of
+Runtime* kinds would hit the fail-closed legality of every earlier pass
+(doc/opt.md L27–L30 order stands).
