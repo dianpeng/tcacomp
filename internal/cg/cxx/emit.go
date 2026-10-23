@@ -122,6 +122,9 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Body statements emit one indent level into the function (the kernel
+	// top declarations set the level; quick-261023-ten's indentation fix).
+	e.deep = 1
 	top, err := e.kernelTop()
 	if err != nil {
 		return nil, err
@@ -129,6 +132,7 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 	if err := e.walkBody(); err != nil {
 		return nil, err
 	}
+	e.deep = 0
 	lamText, err := e.lambdaSection()
 	if err != nil {
 		return nil, err
@@ -149,10 +153,15 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 			fmt.Fprintf(&cu, "// dynamic SMEM pool: %d B (v0: disjoint offsets, zero reuse)\n", e.smemCap)
 		}
 	}
+	// The kernel lives in the anonymous namespace — the launcher is the
+	// TU's only exported symbol (quick-261023-ten, the scalfold engine
+	// precedent: kernels are internal, wrappers are the surface).
+	fmt.Fprintf(&cu, "namespace {\n\n")
 	fmt.Fprintf(&cu, "__global__ void __launch_bounds__(%d) %s(%s) {\n", e.opts.MaxThreadsPerCTA, e.kernelSym, sig)
 	cu.WriteString(top)
 	cu.WriteString(e.sb.String())
 	cu.WriteString("}\n\n")
+	cu.WriteString("}  // namespace\n\n")
 	cu.WriteString(launch)
 
 	cmake, err := e.cmake()

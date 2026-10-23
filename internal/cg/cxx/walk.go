@@ -99,7 +99,9 @@ func (e *emitter) kernelTop() (string, error) {
 	// The SMEM pool (D5: dynamic — the 64 KB budget exceeds the 48 KB
 	// static ceiling) and its disjoint v0 offset views (D8).
 	if len(e.buffers) > 0 {
-		e.c("dynamic SMEM pool (%d B): one pool, disjoint v0 offsets — the future RA pass overlaps them", e.smemCap)
+		if e.comments >= cg.CommentSections {
+			write(fmt.Sprintf("// dynamic SMEM pool (%d B): one pool, disjoint v0 offsets — the future RA pass overlaps them", e.smemCap))
+		}
 		write("extern __shared__ __align__(16) char tca_smem[];")
 		for _, buf := range e.buffers {
 			view, err := e.smemViewDecl(buf, write)

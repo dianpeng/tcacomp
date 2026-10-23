@@ -246,14 +246,15 @@ func TestKernelMetaNames(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 	cu := string(res.Files["mm.cu"])
+	// The kernel is anonymous-namespace internal; the Tensor-protocol
+	// launcher is the exported surface (quick-261023-ten).
 	for _, want := range []string{
+		"namespace {",
 		"__global__ void __launch_bounds__(512) MatmulScale(",
-		"extern \"C\" void MatmulScaleLaunch(",
-		"MatmulScaleCombine0", // not emitted by this fixture (no reducer) — see below
+		"void MatmulScaleLaunch(",
+		"const tca::Tensor<float, 2u>& lhs",
+		"tca::Tensor<float, 3u>& out",
 	} {
-		if want == "MatmulScaleCombine0" {
-			continue // store-chain fixture has no reducer; the symbol form is pinned by the reduce golden
-		}
 		if !strings.Contains(cu, want) {
 			t.Fatalf("emitted .cu missing %q", want)
 		}

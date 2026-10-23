@@ -371,6 +371,25 @@ namespace tca::rt {
 // PortionWarp=8 warps, >= 256 threads; device SMEM ceiling >= kernel total).
 void ValidateLaunch(dim3 grid, dim3 block, unsigned smemBytes);
 
+// ---- the user-facing tensor (the launcher contract type, quick-261023-ten) ----
+// Tensor wraps DEVICE memory: the data pointer, the runtime shape, and the
+// layout descriptor in one object — the mutually understood contract
+// between the end user and every generated launcher. Non-owning (the user
+// owns the allocation); host-constructible; pass-by-reference.
+template <typename T, unsigned Rank>
+struct Tensor {
+  Tensor(T* data, /*unsigned dims[Rank]*/...);   // row-major, contiguous
+  template <typename... Dims> static Tensor From(T* data, Dims... dims);
+  T* Data() const;                                // the device pointer
+  unsigned Dim(unsigned axis) const;              // the runtime shape
+  unsigned Rank() const;
+  Layout layout() const;                          // v0: Layout::RowMajor
+};
+
+// Host-side validate-and-throw (throws std::runtime_error with the message).
+[[noreturn]] void Throw(const char* what);
+#define TCA_REQUIRE(cond, what) /* throw unless cond */
+
 // Device-side: the totals supplier (constructed from gridDim/blockDim).
 struct KernelInfo {
   __device__ KernelInfo();
@@ -436,30 +455,45 @@ device attributes (never hardcode 101,376). `Slotable` = scalar for slotless
 reducers, a slot-addressable value with `Get(ivs...)` when the reducer was
 lowered with slot IVs (D7).
 
-## 9. Host launcher + build (per kernel)
+## 9. Host launcher + build (per kernel) — the Tensor contract protocol
+
+The kernel lives in the ANONYMOUS namespace (quick-261023-ten): the
+launcher is the translation unit's only exported symbol (the scalfold
+engine precedent — kernels internal, wrappers the surface). The user-facing
+signature speaks `tca::Tensor<T, Rank>` — device memory + shape + layout in
+one object — never loose `(ptr, dim, dim, ...)` lists:
 
 ```c++
-extern "C" void tca_<name>_launch(
-    /* dims + scalars + tensor pointers, EXACTLY the kernel signature order */,
-    void* tca_workspace /* nullptr: launcher allocates MemNew temps */,
-    cudaStream_t stream) {
+namespace {
+__global__ void __launch_bounds__(MaxThreadsPerCTA) <Name>(uint32_t d0, ..., /* raw internal signature */ ...) { ... }
+}  // namespace
+
+void <Name>Launch(tca::Tensor<float, 3u>& out, const tca::Tensor<float, 2u>& lhs, const tca::Tensor<float, 2u>& rhs, cudaStream_t tca_stream) {
+  // The contract, enforced by the launcher itself: every dim parameter is
+  // DERIVED from its first tensor occurrence (signature order) and every
+  // other occurrence must AGREE — mismatched shapes are a named hard error.
+  const uint32_t d0 = out.Dim(0u);
+  TCA_REQUIRE(lhs.Dim(0u) == d0, "lhs.Dim(0) must equal d0 (dim d0)");
+  ...
   tca::rt::ValidateLaunch(dim3(MaxCTA), dim3(MaxThreadsPerCTA), <smemBytes>);
-  if (<kernel has MemNew temps>) { /* cudaMalloc/cudaFree bracket, v0-empty */ }
-  cudaFuncSetAttribute(tca_kernel_<name>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, <smemBytes>);  // opt-in, only when > 48KB
-  tca_kernel_<name><<<MaxCTA, MaxThreadsPerCTA, <smemBytes>, stream>>>(...);
+  cudaFuncSetAttribute(<Name>, cudaFuncAttributeMaxDynamicSharedMemorySize, <smemBytes>);  // only when > 48KB
+  <Name><<<dim3(MaxCTA), dim3(MaxThreadsPerCTA), <smemBytes>, tca_stream>>>(d0, ..., out.Data(), lhs.Data(), rhs.Data());
   TCA_CUDA_CHECK(cudaGetLastError());
 }
 ```
 
-- `MaxCTA`/`MaxThreadsPerCTA` are BAKED compile-time constants in the
-  launcher (from tiling `Params`, §1.3) — the launch config is static, per
-  the tiling model.
-- Generated `CMakeLists.txt`: `project(tca_<name> LANGUAGES CXX CUDA)`,
-  `CUDA_ARCHITECTURES 86` (pinned — never `native`), `CXX/CUDA_STANDARD 20`,
-  `add_library(tca_<name> OBJECT <name>.cu)` linking the tcacomp runtime
-  target + `CUDA::cudart`, `--expt-relaxed-constexpr` if the runtime needs
-  it (scalfold does; keep the knob in the generated file from day one).
+- Read-only tensors arrive as `const tca::Tensor<T, Rank>&`; stored outputs
+  as `tca::Tensor<T, Rank>&` (the same read/write classification as the
+  kernel signature's const-qualification).
+- Scalar parameters pass through by value; a dim parameter NO tensor
+  carries stays an explicit `uint32_t` launcher argument (v0 fixtures never
+  hit this — every dim appears in at least one tensor).
+- `MaxCTA`/`MaxThreadsPerCTA` are BAKED constants (tiling `Params`, §1.3).
+- Generated `CMakeLists.txt`: `project(<Name> LANGUAGES CXX CUDA)`,
+  `CUDA_ARCHITECTURES` pinned to the target SM (never `native`),
+  `CXX/CUDA_STANDARD 20`, `add_library(<Name> OBJECT <name>.cu)` linking
+  the tcacomp runtime + `CUDA::cudart`, `--expt-relaxed-constexpr` kept as
+  a knob (scalfold needs it).
 
 ## 10. Testing
 

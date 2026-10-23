@@ -3,63 +3,66 @@
 
 // Mm: launch 100 CTAs x 512 threads (tiling Params; the runtime asserts divisibility)
 // dynamic SMEM pool: 65536 B (v0: disjoint offsets, zero reuse)
+namespace {
+
 __global__ void __launch_bounds__(512) Mm(uint32_t d0, uint32_t d1, uint32_t d2, float* __restrict__ out, const float* __restrict__ lhs, const float* __restrict__ rhs) {
   tca::rt::TensorView<float, 3u> out_v(out, d0, d1, d2);
   tca::rt::TensorView<const float, 2u> lhs_v(lhs, d0, d2);
   tca::rt::TensorView<const float, 2u> rhs_v(rhs, d1, d2);
+  // dynamic SMEM pool (65536 B): one pool, disjoint v0 offsets — the future RA pass overlaps them
   extern __shared__ __align__(16) char tca_smem[];
   tca::rt::SmemView<float, 1u> lhs_tile(reinterpret_cast<float*>(tca_smem + 0u), 16384u);
 
-// dynamic SMEM pool (65536 B): one pool, disjoint v0 offsets — the future RA pass overlaps them
-tca::rt::KernelInfo kinfo;
-// LNT #0: d0=CTA(T=64,LoC=100) d1=sequential(T=64,LoC=1) d2=thread/warp(T=64,LoC=256) d0=thread/warp(T=64,LoC=256) d1=sequential(T=64,LoC=1) d2=sequential(T=64,LoC=1)
-{
-  // CTA-space mapping (portions -1 — the launch grammar this nest remaps)
-  tca::rt::GridMapping grid_map0(kinfo, -1);
-  // per-CTA thread-space mapping (portions 4, -1)
-  tca::rt::ThreadMapping thread_map1(kinfo, 4, -1);
-  auto c0 = 1024u;
-  auto v0 = grid_map0.index(0u);
-  auto c1 = 64u;
-  auto v1 = (v0 * c1);
-  auto v2 = thread_map1.index(0u);
-  auto v3 = thread_map1.index(1u);
-  auto v4 = (v3 * c1);
-  auto c2 = 65536u;
-  // @d0 tile-between rounds — CTA, T=64, LoC=100 (map dim 0)
-  for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 6400u, c0); d0_it0.Has(); d0_it0.Next()) {
-    auto v5 = (v1 + d0_it0.Index());
-    auto v6 = tca::rt::umin(v5, c0);
-    auto v7 = (c0 - v6);
-    auto v8 = tca::rt::umin(c1, v7);
-    // @d1 tile-between rounds — sequential, T=64, LoC=1
-    for (auto d1_it1 = tca::rt::SeqIterator(0u, 64u, c0); d1_it1.Has(); d1_it1.Next()) {
-      auto v9 = tca::rt::umin(d1_it1.Index(), c0);
-      auto v10 = (c0 - v9);
-      auto v11 = tca::rt::umin(c1, v10);
-      // @d2 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 1)
-      for (auto d2_it2 = tca::rt::ThrIterator(thread_map1, 1u, 256u, 0u, 16384u, c0); d2_it2.Has(); d2_it2.Next()) {
-        auto v12 = (v4 + d2_it2.Index());
-        auto v13 = tca::rt::umin(v12, c0);
-        auto v14 = (c0 - v13);
-        auto v15 = tca::rt::umin(c1, v14);
-        // cooperative tile fill of lhs (LoadTileCta) — the runtime owns the copy, the barriers, and tail clamping
-        tca::rt::LoadTileCta(lhs_tile, lhs_v, v5, d2_it2.Index());
-        // @d0 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 0)
-        for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 256u, 0u, 256u, v8); d0_it3.Has(); d0_it3.Next()) {
-          auto v16 = (v5 + d0_it3.Index());
-          auto v17 = (v16 + v2);
-          // @d1 inside walk (tile elements) — T=64
-          for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v11); d1_it4.Has(); d1_it4.Next()) {
-            auto v18 = (d1_it1.Index() + d1_it4.Index());
-            // @d2 inside walk (tile elements) — T=64
-            for (auto d2_it5 = tca::rt::SeqIterator(0u, 1u, v15); d2_it5.Has(); d2_it5.Next()) {
-              auto v19 = (v12 + d2_it5.Index());
-              auto v20 = rhs_v.Get(v18, v19);
-              auto v21 = (v4 + d2_it5.Index());
-              auto v22 = lhs_tile.Get(v21);
-              auto v23 = (v22 * v20);
-              out_v.Set(v23, v17, v18, v19);
+  tca::rt::KernelInfo kinfo;
+  // LNT #0: d0=CTA(T=64,LoC=100) d1=sequential(T=64,LoC=1) d2=thread/warp(T=64,LoC=256) d0=thread/warp(T=64,LoC=256) d1=sequential(T=64,LoC=1) d2=sequential(T=64,LoC=1)
+  {
+    // CTA-space mapping (portions -1 — the launch grammar this nest remaps)
+    tca::rt::GridMapping grid_map0(kinfo, -1);
+    // per-CTA thread-space mapping (portions 4, -1)
+    tca::rt::ThreadMapping thread_map1(kinfo, 4, -1);
+    auto c0 = 1024u;
+    auto v0 = grid_map0.index(0u);
+    auto c1 = 64u;
+    auto v1 = (v0 * c1);
+    auto v2 = thread_map1.index(0u);
+    auto v3 = thread_map1.index(1u);
+    auto v4 = (v3 * c1);
+    auto c2 = 65536u;
+    // @d0 tile-between rounds — CTA, T=64, LoC=100 (map dim 0)
+    for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 6400u, c0); d0_it0.Has(); d0_it0.Next()) {
+      auto v5 = (v1 + d0_it0.Index());
+      auto v6 = tca::rt::umin(v5, c0);
+      auto v7 = (c0 - v6);
+      auto v8 = tca::rt::umin(c1, v7);
+      // @d1 tile-between rounds — sequential, T=64, LoC=1
+      for (auto d1_it1 = tca::rt::SeqIterator(0u, 64u, c0); d1_it1.Has(); d1_it1.Next()) {
+        auto v9 = tca::rt::umin(d1_it1.Index(), c0);
+        auto v10 = (c0 - v9);
+        auto v11 = tca::rt::umin(c1, v10);
+        // @d2 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 1)
+        for (auto d2_it2 = tca::rt::ThrIterator(thread_map1, 1u, 256u, 0u, 16384u, c0); d2_it2.Has(); d2_it2.Next()) {
+          auto v12 = (v4 + d2_it2.Index());
+          auto v13 = tca::rt::umin(v12, c0);
+          auto v14 = (c0 - v13);
+          auto v15 = tca::rt::umin(c1, v14);
+          // cooperative tile fill of lhs (LoadTileCta) — the runtime owns the copy, the barriers, and tail clamping
+          tca::rt::LoadTileCta(lhs_tile, lhs_v, v5, d2_it2.Index());
+          // @d0 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 0)
+          for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 256u, 0u, 256u, v8); d0_it3.Has(); d0_it3.Next()) {
+            auto v16 = (v5 + d0_it3.Index());
+            auto v17 = (v16 + v2);
+            // @d1 inside walk (tile elements) — T=64
+            for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v11); d1_it4.Has(); d1_it4.Next()) {
+              auto v18 = (d1_it1.Index() + d1_it4.Index());
+              // @d2 inside walk (tile elements) — T=64
+              for (auto d2_it5 = tca::rt::SeqIterator(0u, 1u, v15); d2_it5.Has(); d2_it5.Next()) {
+                auto v19 = (v12 + d2_it5.Index());
+                auto v20 = rhs_v.Get(v18, v19);
+                auto v21 = (v4 + d2_it5.Index());
+                auto v22 = lhs_tile.Get(v21);
+                auto v23 = (v22 * v20);
+                out_v.Set(v23, v17, v18, v19);
+              }
             }
           }
         }
@@ -67,11 +70,19 @@ tca::rt::KernelInfo kinfo;
     }
   }
 }
-}
 
-extern "C" void MmLaunch(uint32_t d0, uint32_t d1, uint32_t d2, float* __restrict__ out, const float* __restrict__ lhs, const float* __restrict__ rhs, cudaStream_t tca_stream) {
+}  // namespace
+
+void MmLaunch(tca::Tensor<float, 3u>& out, const tca::Tensor<float, 2u>& lhs, const tca::Tensor<float, 2u>& rhs, cudaStream_t tca_stream) {
+  const uint32_t d0 = out.Dim(0u);
+  const uint32_t d1 = out.Dim(1u);
+  const uint32_t d2 = out.Dim(2u);
+  TCA_REQUIRE(lhs.Dim(0u) == d0, "lhs.Dim(0) must equal d0 (dim d0)");
+  TCA_REQUIRE(lhs.Dim(1u) == d2, "lhs.Dim(1) must equal d2 (dim d2)");
+  TCA_REQUIRE(rhs.Dim(0u) == d1, "rhs.Dim(0) must equal d1 (dim d1)");
+  TCA_REQUIRE(rhs.Dim(1u) == d2, "rhs.Dim(1) must equal d2 (dim d2)");
   tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 65536u);
   cudaFuncSetAttribute(Mm, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536u);
-  Mm<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 65536u, tca_stream>>>(d0, d1, d2, out, lhs, rhs);
+  Mm<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 65536u, tca_stream>>>(d0, d1, d2, out.Data(), lhs.Data(), rhs.Data());
   TCA_CUDA_CHECK(cudaGetLastError());
 }
