@@ -246,12 +246,23 @@ const ProvenanceName = "tiling-provenance"
 // "per-dim provenance entry"): the tile-BETWEEN forloop (== the single loop
 // when T==1), the tile-INSIDE forloop (nil when T==1), the effective SoC
 // (mirrors ASTLoopMeta — LR-7's specialization input), and the effective
-// tile size (1 = untiled).
+// tile size (1 = untiled). For SoCTA dims the entry additionally carries
+// the COUPLED tile-inside walk's materialization facts (its ThreadMap slot
+// and thread count) — final-lower's per-element ownership-gate walk over a
+// reduce's output dims mirrors exactly this form (the 2026-10-23 reducer
+// redirect).
 type DimProvenance struct {
 	Between ir.Node
 	Inside  ir.Node // nil at T==1
 	Soc     SoCType
 	Tile    int
+	// CoupledDoSoC is the CTA dim's coupled inside-walk ThreadMap slot
+	// (-1 = the dim is not CTA-assigned).
+	CoupledDoSoC int
+	// CoupledThreads is the coupled inside-walk thread count (0 = not
+	// CTA-assigned): the flat-init walk's step and the ownership-gate
+	// walk's step.
+	CoupledThreads int
 }
 
 // MappingPlan is one LNT's runtime mapping construction data (LR-11/P-3):
@@ -272,6 +283,11 @@ type MappingPlan struct {
 type Provenance struct {
 	Dims map[ir.Node]DimProvenance
 	LNTs map[ir.Node]MappingPlan
+	// MaxThreadsPerCTA is the launch thread budget the pass rewrote against:
+	// final-lower's reducer staging extent (#warps = MaxThreadsPerCTA/32,
+	// ruling D8 2026-10-23) reads it from here so the staging allocation can
+	// never disagree with the launch grammar the maps assert against.
+	MaxThreadsPerCTA int
 }
 
 // Name satisfies analysis.Analysis structurally (the single-method Name()

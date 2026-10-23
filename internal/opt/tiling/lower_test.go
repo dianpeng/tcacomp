@@ -511,8 +511,10 @@ func TestRewriteTailSaturatingGuard(t *testing.T) {
 
 // TestRewriteCTADim pins the CTA template: between step LoC×T; the in-body
 // GridMap rank expression feeds offset = rank×T + round; the inside loop
-// strides the coupled thread count; the index expression chains
-// offset + inside + coupled thread rank.
+// strides the coupled thread count; the flat-index ruling (2026-10-23)
+// makes the inside IV's INIT the zero-operand flat thread query and the
+// index expression offset + inside — the tuple-coordinate +index(threadDim)
+// add is DELETED (finding C1).
 func TestRewriteCTADim(t *testing.T) {
 	fx := newChain32("cta", 4096)
 	store := bodyStore(fx)
@@ -532,9 +534,17 @@ func TestRewriteCTADim(t *testing.T) {
 	if got := dimvarStep(t, inside); got != 256 {
 		t.Fatalf("CTA inside step = %v, want coupled threads = 256", got)
 	}
+	// The inside IV's INIT is the FLAT zero-operand thread query
+	// (Index() = flatRank + i*coupledThreads — the single-owner mechanism).
+	iv := ir.OperandsOf(inside)[0]
+	init := ir.OperandsOf(iv)[1]
+	if init == nil || init.KindOf() != ir.KindRuntimeThreadQuery || len(ir.OperandsOf(init)) != 0 {
+		t.Fatalf("CTA inside IV init = %v, want the zero-operand flat thread query", init)
+	}
 	// The store's axis (its only operand tree referencing the loop) must
-	// resolve to offset + inside + thread_rank: chase it down to a
-	// GridMap and a ThreadMap intrinsic.
+	// resolve to offset + insideIV: a GridMap rank query for the offset and
+	// NO one-operand (tuple-coordinate) thread query — the +index(threadDim)
+	// term is deleted.
 	axes := ir.OperandsOf(store)[2:]
 	if len(axes) != 1 {
 		t.Fatalf("store must carry one rewritten axis, got %d", len(axes))
@@ -542,11 +552,11 @@ func TestRewriteCTADim(t *testing.T) {
 	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeGridQuery) {
 		t.Fatal("rewritten index must contain the GridMap rank query")
 	}
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeThreadQuery) {
-		t.Fatal("rewritten index must contain the coupled ThreadMap rank query")
+	for _, x := range flattenSubtree(axes[0]) {
+		if x.KindOf() == ir.KindRuntimeThreadQuery && len(ir.OperandsOf(x)) != 0 {
+			t.Fatalf("rewritten index carries a tuple-coordinate thread query %d — the +index(threadDim) add is deleted", x.BasePtr().ID())
+		}
 	}
-	// dosoc consts: grid dim 0 (GridMap) and thread dim 0 (ThreadMap).
-	assertDosocConst(t, axes[0])
 	assertVerifyAndRootReachable(t, fx.g)
 }
 
@@ -855,15 +865,21 @@ func subtreeHasKind(t *testing.T, g *ir.Graph, n ir.Node, k ir.Kind) bool {
 	return found
 }
 
-// assertDosocConst pins that every intrinsic in the subtree carries a
-// const-u32 DoSoC operand (the PHASE 0 shape in the generated product).
+// assertDosocConst pins that every TUPLE-FORM intrinsic in the subtree
+// carries a const-u32 DoSoC operand (the PHASE 0 shape in the generated
+// product). The zero-operand FLAT index() query (the 2026-10-23 ruling)
+// carries no DoSoC by definition and is skipped.
 func assertDosocConst(t *testing.T, n ir.Node) {
 	t.Helper()
 	for _, x := range flattenSubtree(n) {
 		if x.KindOf() != ir.KindRuntimeGridQuery && x.KindOf() != ir.KindRuntimeThreadQuery {
 			continue
 		}
-		d := ir.OperandsOf(x)[0]
+		ops := ir.OperandsOf(x)
+		if len(ops) == 0 {
+			continue // the flat index() form — no DoSoC operand
+		}
+		d := ops[0]
 		if d == nil || d.KindOf() != ir.KindConst {
 			t.Fatalf("intrinsic node %d carries a non-const DoSoC", x.BasePtr().ID())
 		}

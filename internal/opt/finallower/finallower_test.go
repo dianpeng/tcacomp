@@ -406,8 +406,10 @@ func TestQueryRewrite(t *testing.T) {
 		}
 	}
 	// Every live getattr is well-formed: attribute ∈ {index, dimension}
-	// (the queries' vocabulary), operand 0 is a mapping construction, and
-	// exactly one const-u32 arg.
+	// (the queries' vocabulary), operand 0 is a mapping construction, and the
+	// args follow the flat-index() ruling (2026-10-23): "index" may carry NO
+	// extra arg (the zero-arg flat form) or the DoSoC const (the tuple
+	// coordinate form); "dimension" keeps exactly one const-u32 arg.
 	getattrs := liveOfKind(f.g, ir.KindRuntimeGetAttribute)
 	if len(getattrs) == 0 {
 		t.Fatal("the CTA dim's index expressions must have produced queries, so getattrs must exist")
@@ -418,14 +420,18 @@ func TestQueryRewrite(t *testing.T) {
 			t.Fatalf("getattr attribute = %q, want index|dimension (the query vocabulary)", attr)
 		}
 		ops := ir.OperandsOf(ga)
-		if len(ops) != 2 || ops[0] == nil {
-			t.Fatalf("index/dimension getattr must carry [mapping, DoSoC], got %v", ops)
+		if len(ops) < 1 || len(ops) > 2 || ops[0] == nil {
+			t.Fatalf("index/dimension getattr must carry [mapping] or [mapping, DoSoC], got %v", ops)
 		}
 		if k := ops[0].KindOf(); k != ir.KindRuntimeGridMapping && k != ir.KindRuntimeThreadMapping {
 			t.Fatalf("getattr operand 0 kind = %s, want a mapping construction", k)
 		}
-		if v, ok := ir.ConstValueOf(ops[1]); !ok || v < 0 {
-			t.Fatalf("getattr DoSoC arg must be a const, got %v", ops[1])
+		if len(ops) == 2 {
+			if v, ok := ir.ConstValueOf(ops[1]); !ok || v < 0 {
+				t.Fatalf("getattr DoSoC arg must be a const, got %v", ops[1])
+			}
+		} else if attr != "index" {
+			t.Fatalf("attribute %q must carry its DoSoC arg (only the flat index() form goes argless)", attr)
 		}
 	}
 	// The mapping objects are USED (the binding is explicit SSA).

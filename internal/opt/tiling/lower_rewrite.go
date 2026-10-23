@@ -180,7 +180,28 @@ func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 			Soc:     d.soc,
 			Tile:    d.tile,
 		}
+		// The CTA dim's coupled inside-walk facts (the flat-index ruling's
+		// materialization): the ThreadMap slot the coupled walk rides and its
+		// thread count. Final-lower's reducer redirect and any future
+		// ownership-gate walk read these instead of re-deriving the portion
+		// arithmetic (D3's counting invariant lives here, at the pass that
+		// built the walk).
+		if d.soc == SoCTA && !d.single {
+			lr.prov.Dims[d.dim] = DimProvenance{
+				Between:        d.between,
+				Inside:         d.inside,
+				Soc:            d.soc,
+				Tile:           d.tile,
+				CoupledDoSoC:   d.threadDim,
+				CoupledThreads: d.coupledThreads,
+			}
+		}
 	}
+	// The launch thread budget rides the record for the same reason the
+	// portion plans do: final-lower's reducer staging extent (#warps =
+	// MaxThreadsPerCTA/32) must match the launch grammar the maps assert
+	// against — it is read from here, never re-derived.
+	lr.prov.MaxThreadsPerCTA = lr.params.MaxThreadsPerCTA
 	warpPortion := lr.params.WarpPortion
 	if warpPortion == 0 {
 		if hasCTADim(lw.dims) {
@@ -334,6 +355,23 @@ func (lr *lowerRun) tileMax(tile int, extent, offset ir.Node) ir.Node {
 // verifier's nil-def check, and SetDef refuses a zero handle).
 func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 	cta := hasCTADim(lw.dims)
+	// The CTA dim's ThreadMap slot (the coupled walk's group id dim) — the
+	// MIRROR-GATE term's DoSoC (2026-10-23 reducer redirect): an independent
+	// WARP dim's strip offset gains index(ctaThreadDim)*extent so the upper
+	// group mirrors (the threads whose coupled-group coordinate is nonzero)
+	// saturate their tile max to zero trips — they hold the identity init
+	// under a uniform reduction bracket instead of double-counting. Pure
+	// offset arithmetic over the F1 tail-clamp machinery; no new query, no
+	// branch. At most one CTA dim exists per LNT (the v0 policy).
+	ctaThreadDim := -1
+	if cta {
+		for _, d := range lw.dims {
+			if d.soc == SoCTA {
+				ctaThreadDim = d.threadDim
+				break
+			}
+		}
+	}
 	for _, d := range lw.dims {
 		dim, err := dimOfIter(d.iter)
 		if err != nil {
@@ -391,8 +429,17 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			d.roundBase = d.betweenIV
 		case SoCTA:
 			// between for (a = 0; a < A; a += LoC*T), LoC = MaxCTA; in-body
-			// cta_rank = GridMap(dosoc,"index"); offset = rank*T + round;
-			// inside = the COUPLED warp walk at ELEMENT stride.
+			// cta_rank = GridMap(dosoc,"index"); offset = rank*T + round.
+			// Inside = the COUPLED warp walk at ELEMENT stride — the
+			// FLAT-INDEX FORM (ruling 2026-10-23): the IV's INIT is the
+			// no-arg flat thread query (the thread's absolute 1-D rank),
+			// step = the coupled thread count, bound = the materialized tile
+			// max; indexExpr = offset + insideIV (Index() = flatRank +
+			// i*coupled) — the separate +index(threadDim) tuple-coordinate
+			// add is DELETED (it supplies only the slowest-axis coordinate,
+			// never a 0..coupled-1 element rank — finding C1). Threads with
+			// flatRank >= tile_max take zero trips: single-owner exact while
+			// tile <= coupled.
 			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*d.tile)))
 			d.betweenBound = extent
 			rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
@@ -409,24 +456,36 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 					d.iter.BasePtr().ID(), coupled)
 			}
 			d.coupledThreads = coupled
-			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(coupled)))
+			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim,
+				lr.g.NewRuntimeThreadQueryFlat(lowerOrigin), lr.u32c(float64(coupled)))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc)), lr.attr("tile", float64(d.tile))}
 			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(coupled)), lr.attr("tile", float64(d.tile))}
-			threadRank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
-			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
-				lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV), threadRank)
+			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV)
 			d.roundBase = offset
 		case SoCWARP:
 			// between for (b = 0; b < B; b += nThreads*T) — each thread owns
 			// a whole T-chunk (the composition-semantics ruling); in-body
 			// thread_rank = ThreadMap(dosoc,"index"); offset = rank*T + round;
 			// inside = SEQUENTIAL over the owned chunk.
+			//
+			// MIRROR GATE (2026-10-23 reducer redirect): the offset gains
+			// index(ctaThreadDim)*extent — the threads of the CTA dim's
+			// coupled group beyond the first (tid vs tid+groupExtent mirrors)
+			// saturate their tile max to ZERO trips, so a uniform reduction
+			// bracket never double-counts their (identical) strip partials.
+			// Pure offset arithmetic through the F1 saturating bound — no new
+			// query kind, no branch; the lower group's threads are unchanged.
 			stride := d.loc * 32 * d.tile
 			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(stride)))
 			d.betweenBound = extent
 			rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
+			if ctaThreadDim >= 0 {
+				gate := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(ctaThreadDim)))
+				offset = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset,
+					lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, gate, extent))
+			}
 			d.insideBound = lr.tileMax(d.tile, extent, offset)
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32)), lr.attr("tile", float64(d.tile))}
