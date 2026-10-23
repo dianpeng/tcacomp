@@ -1,0 +1,211 @@
+// tca/view.h — Layout + the memory shim (doc/rt.md §4.4).
+//
+// Every memory access goes through a view carrying a layout descriptor (the
+// cg.md D6 seam): v0 ships Layout::RowMajor only — the future coalescing /
+// swizzle passes change descriptors, never call sites. GMEM views are
+// bounds-PREDICATED (an out-of-range point is suppressed, never a wild
+// access); SMEM/FRAG views are in-window by construction.
+#ifndef TCA_RT_VIEW_H_
+#define TCA_RT_VIEW_H_
+
+// Host-compilation shim (see mapping.h).
+#if !defined(__CUDACC__) && !defined(TCA_HOST_SHIM)
+#define TCA_HOST_SHIM 1
+#define __device__
+#define __host__
+#endif
+
+namespace tca {
+namespace rt {
+
+enum class Layout : unsigned { RowMajor = 0 /* future: swizzle/coalescing */ };
+
+namespace detail {
+
+// Row-major shape shared by all three view kinds: extents + precomputed
+// strides. Get/Set map logical coordinates through the layout descriptor
+// (v0: identity + stride math).
+template <unsigned Rank>
+struct RowMajorShape {
+  unsigned dims[Rank] = {};
+  unsigned strides[Rank] = {};
+
+  __host__ __device__ void set_dims(const unsigned (&d)[Rank]) {
+    for (unsigned i = 0u; i < Rank; ++i) dims[i] = d[i];
+    strides[Rank - 1u] = 1u;
+    for (unsigned i = Rank - 1u; i-- > 0u;) strides[i] = strides[i + 1u] * dims[i + 1u];
+  }
+
+  template <typename... Coords>
+  __host__ __device__ unsigned offset(Coords... coords) const {
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    unsigned off = 0u;
+    for (unsigned i = 0u; i < Rank; ++i) off += c[i] * strides[i];
+    return off;
+  }
+
+  template <typename... Coords>
+  __host__ __device__ bool in_range(Coords... coords) const {
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    for (unsigned i = 0u; i < Rank; ++i) {
+      if (c[i] >= dims[i]) return false;
+    }
+    return true;
+  }
+
+  __host__ __device__ unsigned offset_arr(const unsigned (&c)[Rank]) const {
+    unsigned off = 0u;
+    for (unsigned i = 0u; i < Rank; ++i) off += c[i] * strides[i];
+    return off;
+  }
+
+  __host__ __device__ bool in_range_arr(const unsigned (&c)[Rank]) const {
+    for (unsigned i = 0u; i < Rank; ++i) {
+      if (c[i] >= dims[i]) return false;
+    }
+    return true;
+  }
+};
+
+}  // namespace detail
+
+// TensorView — a GMEM window. Get is bounds-PREDICATED (tca.md §5.11): any
+// coordinate >= its dimension suppresses the access and yields T{} — the
+// whole-body-no-op mechanism for guarded iterations. Set silently drops
+// out-of-range writes (one structural owner per address). T may be
+// const-qualified (Set is then simply never instantiated).
+template <typename T, unsigned Rank>
+class TensorView {
+ public:
+  static constexpr unsigned kRank = Rank;
+
+  template <typename... Dims>
+  __host__ __device__ TensorView(T* data, Dims... dims) : data_(data) {
+    static_assert(sizeof...(Dims) == Rank, "dimension count mismatch");
+    const unsigned d[Rank] = {static_cast<unsigned>(dims)...};
+    shape_.set_dims(d);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ T Get(Coords... coords) const {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    return GetAt(c);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ void Set(T v, Coords... coords) {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    SetAt(v, c);
+  }
+
+  __host__ __device__ T GetAt(const unsigned (&coords)[Rank]) const {
+    if (!shape_.in_range_arr(coords)) return T{};  // suppression — safe padding
+    return data_[shape_.offset_arr(coords)];
+  }
+
+  __host__ __device__ void SetAt(T v, const unsigned (&coords)[Rank]) {
+    if (!shape_.in_range_arr(coords)) return;  // out-of-range: silently dropped
+    data_[shape_.offset_arr(coords)] = v;
+  }
+
+  __host__ __device__ unsigned Dim(unsigned axis) const { return shape_.dims[axis]; }
+
+ private:
+  T* data_;
+  detail::RowMajorShape<Rank> shape_{};
+};
+
+// SmemView — a dynamic-pool slice. Indexed in-window by construction: Get/Set
+// are unchecked (the loaders own tail clamping).
+template <typename T, unsigned Rank>
+class SmemView {
+ public:
+  static constexpr unsigned kRank = Rank;
+
+  template <typename... Extents>
+  __host__ __device__ SmemView(T* base, Extents... extents) : base_(base) {
+    static_assert(sizeof...(Extents) == Rank, "extent count mismatch");
+    const unsigned e[Rank] = {static_cast<unsigned>(extents)...};
+    shape_.set_dims(e);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ T Get(Coords... coords) const {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    return GetAt(c);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ void Set(T v, Coords... coords) {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    SetAt(v, c);
+  }
+
+  __host__ __device__ T GetAt(const unsigned (&coords)[Rank]) const {
+    return base_[shape_.offset_arr(coords)];
+  }
+
+  __host__ __device__ void SetAt(T v, const unsigned (&coords)[Rank]) {
+    base_[shape_.offset_arr(coords)] = v;
+  }
+
+  __host__ __device__ unsigned Extent(unsigned axis) const { return shape_.dims[axis]; }
+
+ private:
+  T* base_;
+  detail::RowMajorShape<Rank> shape_{};
+};
+
+// Frag — a per-thread register tile. Same Get/Set face, extents from Dims
+// (compile-time). Not exercised by the v0 goldens but part of the registered
+// surface.
+template <typename T, unsigned Rank, unsigned... Dims>
+class Frag {
+ public:
+  static constexpr unsigned kRank = Rank;
+  static constexpr unsigned kElems = (Dims * ... * 1u);
+
+  __host__ __device__ Frag() {
+    static_assert(Rank >= 1u, "Frag rank must be >= 1");
+    static_assert(sizeof...(Dims) == Rank, "extent count mismatch");
+    const unsigned e[Rank] = {Dims...};
+    shape_.set_dims(e);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ T Get(Coords... coords) const {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    return GetAt(c);
+  }
+
+  template <typename... Coords>
+  __host__ __device__ void Set(T v, Coords... coords) {
+    static_assert(sizeof...(Coords) == Rank, "coordinate count mismatch");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    SetAt(v, c);
+  }
+
+  __host__ __device__ T GetAt(const unsigned (&coords)[Rank]) const {
+    return data_[shape_.offset_arr(coords)];
+  }
+
+  __host__ __device__ void SetAt(T v, const unsigned (&coords)[Rank]) {
+    data_[shape_.offset_arr(coords)] = v;
+  }
+
+  __host__ __device__ unsigned Extent(unsigned axis) const { return shape_.dims[axis]; }
+
+ private:
+  detail::RowMajorShape<Rank> shape_{};
+  T data_[kElems > 0u ? kElems : 1u] = {};
+};
+
+}  // namespace rt
+}  // namespace tca
+
+#endif  // TCA_RT_VIEW_H_
