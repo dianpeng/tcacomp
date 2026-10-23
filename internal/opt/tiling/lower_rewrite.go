@@ -353,13 +353,13 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			case SoCSequential:
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
 				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.singleAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1)}
+				d.singleAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
 				d.indexExpr, d.roundBase = d.singleIV, d.singleIV
 			case SoCTA:
 				// Single CTA loop at stride LoC: index = iv + grid_rank.
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc)))
 				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.singleAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc))}
+				d.singleAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc)), lr.attr("tile", float64(d.tile))}
 				rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
 				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
 				d.roundBase = d.indexExpr
@@ -367,7 +367,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				// Single thread-parallel loop at stride LoC×32.
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*32)))
 				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.singleAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32))}
+				d.singleAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32)), lr.attr("tile", float64(d.tile))}
 				rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
 				d.roundBase = d.indexExpr
@@ -385,8 +385,8 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			d.betweenBound = extent
 			d.insideBound = lr.tileMax(d.tile, extent, d.betweenIV)
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
-			d.betweenAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1)}
-			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1)}
+			d.betweenAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
+			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.betweenIV, d.insideIV)
 			d.roundBase = d.betweenIV
 		case SoCTA:
@@ -410,8 +410,8 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			}
 			d.coupledThreads = coupled
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(coupled)))
-			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc))}
-			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(coupled))}
+			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc)), lr.attr("tile", float64(d.tile))}
+			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(coupled)), lr.attr("tile", float64(d.tile))}
 			threadRank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV), threadRank)
@@ -429,8 +429,8 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
 			d.insideBound = lr.tileMax(d.tile, extent, offset)
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
-			d.betweenAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32))}
-			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1)}
+			d.betweenAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32)), lr.attr("tile", float64(d.tile))}
+			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV)
 			d.roundBase = offset
 		}

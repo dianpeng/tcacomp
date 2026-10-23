@@ -233,6 +233,52 @@ func TestDeterminism(t *testing.T) {
 	}
 }
 
+// TestKernelMetaNames pins quick-261023-cgq: the KindKernelMeta
+// instrumentation node carries the frontend-specified kernel and launcher
+// symbols through the whole pipeline to codegen (anchored in the
+// Prototype, never swept by DCE, never a parameter).
+func TestKernelMetaNames(t *testing.T) {
+	g := matmulStoreGraph("mm")
+	g.NewKernelMeta("ctor", "MatmulScale", "MatmulScaleLaunch")
+	runPipeline(t, g)
+	res, err := Emit(g, emitOptions())
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	cu := string(res.Files["mm.cu"])
+	for _, want := range []string{
+		"__global__ void __launch_bounds__(512) MatmulScale(",
+		"extern \"C\" void MatmulScaleLaunch(",
+		"MatmulScaleCombine0", // not emitted by this fixture (no reducer) — see below
+	} {
+		if want == "MatmulScaleCombine0" {
+			continue // store-chain fixture has no reducer; the symbol form is pinned by the reduce golden
+		}
+		if !strings.Contains(cu, want) {
+			t.Fatalf("emitted .cu missing %q", want)
+		}
+	}
+	for _, stale := range []string{"tca_kernel_", "tca_mm_launch", "tca_lambda_"} {
+		if strings.Contains(cu, stale) {
+			t.Fatalf("emitted .cu still carries the old symbol family %q", stale)
+		}
+	}
+	if !strings.Contains(string(res.Files["CMakeLists.txt"]), "add_library(MatmulScale OBJECT") {
+		t.Fatal("the CMake target must follow the kernel symbol")
+	}
+}
+
+// TestKernelMetaValidation pins the fail-closed identifier gate: a
+// user-specified name that cannot compile is a hard error, never silent.
+func TestKernelMetaValidation(t *testing.T) {
+	g := matmulStoreGraph("mm")
+	g.NewKernelMeta("ctor", "bad kernel name!", "")
+	runPipeline(t, g)
+	if _, err := Emit(g, emitOptions()); err == nil || !strings.Contains(err.Error(), "not a valid C++ identifier") {
+		t.Fatalf("an invalid kernel name must fail closed, got %v", err)
+	}
+}
+
 // TestGates pins the fail-closed entry surface.
 func TestGates(t *testing.T) {
 	if _, err := Emit(nil, emitOptions()); err == nil || !strings.Contains(err.Error(), "nil graph") {

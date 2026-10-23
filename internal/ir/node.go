@@ -170,6 +170,7 @@ type Graph struct {
 	nextID       uint64     // next ID to hand out; monotonic
 	nodes        []Node     // every node ever allocated, in allocation order (never shrinks; erased nodes stay tombstoned) — the sea's sweep registry
 	end          Node       // R2: the graph's ONE end node (the first KindReturn created); nil until a return exists — Level-1 Walk/Verify/DCE root beside the RoleTensor params (R3)
+	meta         Node       // the graph's KindKernelMeta naming metadata (quick-261023-cgq); nil until the frontend sets it — Level-1 DCE root (never swept)
 	materialized bool       // Materialize has run; cfg and the statement list exist
 }
 
@@ -323,6 +324,8 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &memNewNode{Base: b}
 	case KindReturn:
 		n = &returnNode{Base: b}
+	case KindKernelMeta:
+		n = &kernelMetaNode{Base: b}
 	case KindDimVar:
 		n = &dimVarNode{Base: b}
 	case KindBoundedDimVar:

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"tcacomp/internal/cg"
 	"tcacomp/internal/ir"
 )
 
@@ -34,10 +35,12 @@ func (e *emitter) signature() (string, error) {
 				return "", err
 			}
 			_ = dims
+			// __restrict__: the restrict-alias rule is structural in the IR
+			// (kernel tensors never alias) — claim the free perf hint.
 			if e.stored[p] {
-				parts = append(parts, ts+"* "+name)
+				parts = append(parts, ts+"* __restrict__ "+name)
 			} else {
-				parts = append(parts, "const "+ts+"* "+name)
+				parts = append(parts, "const "+ts+"* __restrict__ "+name)
 			}
 		default:
 			return "", fmt.Errorf("cxx: param %s carries role %d — not a kernel signature role", name, int(role))
@@ -88,7 +91,7 @@ func (e *emitter) kernelTop() (string, error) {
 		if !e.stored[p] {
 			qual = "const "
 		}
-		view := name + "_v"
+		view := e.local(name + "_v")
 		e.tensorView[p] = view
 		write(fmt.Sprintf("tca::rt::TensorView<%s%s, %du> %s(%s, %s);", qual, ts, uint(len(dims)), view, name, strings.Join(args, ", ")))
 	}
@@ -96,6 +99,7 @@ func (e *emitter) kernelTop() (string, error) {
 	// The SMEM pool (D5: dynamic — the 64 KB budget exceeds the 48 KB
 	// static ceiling) and its disjoint v0 offset views (D8).
 	if len(e.buffers) > 0 {
+		e.c("dynamic SMEM pool (%d B): one pool, disjoint v0 offsets — the future RA pass overlaps them", e.smemCap)
 		write("extern __shared__ __align__(16) char tca_smem[];")
 		for _, buf := range e.buffers {
 			view, err := e.smemViewDecl(buf, write)
@@ -133,7 +137,11 @@ func (e *emitter) smemViewDecl(buf ir.Node, write func(string)) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	local := fmt.Sprintf("tca_s%d", len(e.smemView))
+	base := fmt.Sprintf("smem%d", len(e.smemView))
+	if tn, ok := e.bufTensor[buf]; ok && tn != "" {
+		base = identSanitize(tn) + "_tile"
+	}
+	local := e.local(base)
 	e.smemView[buf] = local
 	var exts []string
 	for _, d := range dims {
@@ -193,10 +201,26 @@ func (e *emitter) dimParam(name string) ir.Node {
 	return nil
 }
 
-// walkBody emits the kernel Body: items in placement order — the seed doc's
-// "naturally visit all BB", concretely the ASTKernel walk of doc/cg.md §1.1.
+// walkBody emits the kernel Body's items at FUNCTION scope — no wrapping
+// braces for the Body Group itself (quick-261023-cgq): its only direct
+// items are the KernelInfo declaration and the per-LNT lexical Groups,
+// which carry their own scopes; a redundant outer scope pair is noise.
 func (e *emitter) walkBody() error {
-	return e.walkBlock(e.k.Body)
+	for _, it := range e.k.Body.Items() {
+		if it.Block != nil {
+			if err := e.walkBlock(it.Block); err != nil {
+				return err
+			}
+			continue
+		}
+		if it.Node == nil {
+			continue
+		}
+		if err := e.statement(it.Node); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // walkBlock emits one AST block. Groups render as plain C++ scopes; Loop
@@ -207,6 +231,9 @@ func (e *emitter) walkBlock(blk *ir.ASTBlock) error {
 		return nil
 	}
 	if blk.Kind() == ir.BlockGroup {
+		if blk.Nest() != nil {
+			e.lntHeader(blk.Nest())
+		}
 		e.line("{")
 		e.deep++
 		if err := e.walkItems(blk); err != nil {
@@ -236,4 +263,36 @@ func (e *emitter) walkItems(blk *ir.ASTBlock) error {
 		}
 	}
 	return nil
+}
+
+// lntHeader emits the per-LNT summary comment (quick-261023-cgq): every
+// loop of the nest with its dim, materialization class, tile, and LoC —
+// the tiling decision a reviewer needs, synthesized from the loop
+// annotations the IR already carries.
+func (e *emitter) lntHeader(lnt *ir.ASTLNT) {
+	if e.comments < cg.CommentSections {
+		return
+	}
+	idx := 0
+	for i, l := range e.k.LNTs {
+		if l == lnt {
+			idx = i
+			break
+		}
+	}
+	var parts []string
+	for _, m := range lnt.Loops {
+		dim := "dim"
+		if ops := ir.OperandsOf(m.Loop); len(ops) >= 1 && ops[0] != nil {
+			if ivOps := ir.OperandsOf(ops[0]); len(ivOps) == 3 && ivOps[0] != nil {
+				dim = identSanitize(ir.InputParamNameOf(ivOps[0]))
+			}
+		}
+		if t, ok := e.loopTile(m.Loop); ok {
+			parts = append(parts, fmt.Sprintf("%s=%s(T=%d,LoC=%d)", dim, socName(m.Soc), t, m.Loc))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=%s(LoC=%d)", dim, socName(m.Soc), m.Loc))
+		}
+	}
+	e.c("LNT #%d: %s", idx, strings.Join(parts, " "))
 }

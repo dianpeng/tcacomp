@@ -29,6 +29,8 @@
 | D5 | SMEM mechanism | **Dynamic shared memory** (`extern __shared__` + `cudaFuncSetAttribute` opt-in in the launcher). NOT static arrays: the design SMEM budget MaxCache = 64 KB exceeds the 48 KB static `__shared__` ceiling, and the worked example's lhs window is exactly 64 KB. Opt-in dynamic smem is the only compliant mechanism on sm_86 (per-block opt-in max 101,376 B, queried at runtime — never hardcoded) |
 | D8 | SMEM pool sizing | ONE hoisted `extern __shared__` pool for the whole kernel; every SMEM cache is a VIEW at a compiler-assigned offset into it. **v0 (no SMEM RA): assume worst case — zero reuse — pool size = Σ all buffer extents, views at disjoint offsets** (sub-optimal max, correct). A future opt pass performs liveness RA over all SMEM uses, sizes the pool to the MAXIMUM concurrently-live bytes, and lets non-overlapping live ranges share offsets (each cache becomes an overlapping reference into the pool). The emitted shape (one pool + offset views) is FINAL — the RA pass changes only the offsets and the pool size, never the emitter or the IR |
 | D6 | Memory shim | **ALL memory (GMEM/SMEM/FRAG) is accessed through `tca::rt` C++ wrapper objects**, never raw pointers. The wrappers take a compiler-emitted **layout descriptor**; v0 emits plain row-major / no-swizzle descriptors. The future GMEM coalescing (address shuffling) and SMEM swizzle (bank-conflict avoidance) passes change ONLY the descriptor the compiler emits — never the emitter, never the IR access nodes |
+| D9 | Google-style symbols | Function symbols are PascalCase (quick-261023-cgq): kernel `<Name>`, launcher `<Name>Launch`, combiner `<Kernel>Combine<i>`. The names come from the frontend via the **KindKernelMeta** instrumentation node (Prototype-anchored, DCE-rooted, string payloads; empty payload = derive); the fallback derives PascalCase from the graph name. Invalid identifiers fail closed. Locals are snake_case (Google-compatible): `v<n>`/`c<n>` values, `<dim>_it<n>` iterators, `<tensor>_tile`/`<tensor>_frag` buffers, `grid_map<n>`/`thread_map<n>`/`reducer<n>`/`kinfo` objects — all collision-guarded against kernel parameter names. Tensor params carry `__restrict__` (the restrict-alias rule is structural); the kernel carries `__launch_bounds__(MaxThreadsPerCTA)` |
+| D10 | Comment instrumentation | `cg.Options.Comments` (none/sections/verbose, default sections): section comments synthesized from facts the IR already carries — the LNT header (per-loop dim/soc/tile/LoC from the soc/dosoc/loc/**tile** annotations, the tile annotation added quick-261023-cgq on the same KeyedAttribute channel), loop lines (tile-between rounds vs inside walk), fill loader contracts, reducer bracket lines, the launch header. Verbose additionally stamps hoisted locals with their minting pass (node PassOrigin). No new IR kinds for comments |
 | D7 | Slot-IV Combine | When a reducer carried slot indices (LR-13: between-loop DimVars as leading `Reduce` args), `Combine()` is materialized ONCE into a local holding a slot-addressable value; each use of the Combine value inside the re-iteration emits `<local>.Get(<in-scope slot dimvars...>)` in the SAME order as the `Reduce` slot args (forced: Combine runs once, consumption is per-slot) |
 
 - The provided IR has following shape
@@ -492,10 +494,15 @@ extern "C" void tca_<name>_launch(
 - **Dead locals**: scheduler-placed pure items (late-hoisted bound chains)
   can materialize `auto` locals that go unused in their C++ scope. Harmless
   (nvcc elides them); pinned by the goldens.
-- **Duplicate attribute reads**: post-GVN passes (tile-lower onward) mint
-  `RuntimeGetAttribute` nodes GVN never saw, so e.g. two identical
-  `threadmap.index(1)` reads may survive. Cheap pure accessors; acceptable
-  v0 (a post-final-lower GVN re-run would fold them).
+- **Duplicate attribute reads RESOLVED (quick-261023-cgq)**: the emitter
+  CSEs pure item materializations by emitted-text key — two identical
+  expressions reuse the first local. (The IR-level alternative, a
+  post-final-lower GVN re-run, stays available if ever needed.)
+- **Dead pure items RESOLVED (quick-261023-cgq)**: a referenced-closure
+  precompute (statement items' operand closure + loop bound chains; dimvar/
+  annotation operands sealed — their values emit as inline literals) skips
+  scheduler-anchored pure items nothing reads. Const locals renumber
+  compactly.
 - **RESOLVED (quick-261023-lex)**: the fill-after-reads placement gap is
   FIXED in the schedule pass — rank-r statements now INSERT before their
   block's embedded sub-block (they used to append after it, and the old

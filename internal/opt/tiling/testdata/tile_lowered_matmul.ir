@@ -1,8 +1,8 @@
-statement #137:
+statement #149:
   memstore(%out[runtimegridquery(index, 0) * 64 + @d0(init=0, step=6400) + @d0(init=0, step=256) + runtimethreadquery(index, 0)][@d1(init=0, step=64) + @d1(init=0, step=1)][runtimethreadquery(index, 1) * 64 + @d2(init=0, step=16384) + @d2(init=0, step=1)], %2 * %14)
 
-statement #138:
+statement #150:
   return %out
 
-statement #139:
+statement #151:
   memstoresmem(%3[@d2(init=0, step=16384)][loadtile=1], %52)

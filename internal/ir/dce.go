@@ -101,6 +101,7 @@ func markReachable(g *Graph) map[Node]bool {
 		stack = append(stack, n)
 	}
 	push(g.end)
+	push(g.meta) // the naming metadata node has no uses — still never swept (quick-261023-cgq)
 	for i := len(g.params) - 1; i >= 0; i-- {
 		push(g.params[i])
 	}

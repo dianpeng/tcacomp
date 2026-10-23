@@ -16,8 +16,9 @@ import (
 func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 	switch n.KindOf() {
 	case ir.KindRuntimeKernelInfo:
-		e.objName[n] = "tca_ki"
-		e.line("tca::rt::KernelInfo tca_ki;")
+		name := e.local("kinfo")
+		e.objName[n] = name
+		e.line("tca::rt::KernelInfo " + name + ";")
 		return nil
 
 	case ir.KindRuntimeGridMapping, ir.KindRuntimeThreadMapping:
@@ -39,11 +40,17 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 			}
 			ports = append(ports, strconv.FormatInt(int64(v), 10))
 		}
-		cls, local := "GridMapping", fmt.Sprintf("tca_gm%d", e.mapN)
+		cls, base := "GridMapping", "grid_map"
 		if n.KindOf() == ir.KindRuntimeThreadMapping {
-			cls, local = "ThreadMapping", fmt.Sprintf("tca_tm%d", e.mapN)
+			cls, base = "ThreadMapping", "thread_map"
 		}
+		local := e.local(fmt.Sprintf("%s%d", base, e.mapN))
 		e.mapN++
+		if cls == "GridMapping" {
+			e.c("CTA-space mapping (portions %s — the launch grammar this nest remaps)", strings.Join(ports, ", "))
+		} else {
+			e.c("per-CTA thread-space mapping (portions %s)", strings.Join(ports, ", "))
+		}
 		e.objName[n] = local
 		if cls == "GridMapping" {
 			e.curGrid = local
@@ -76,8 +83,16 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		case ir.KindRuntimeGlobalReducer:
 			cls = "GlobalReducer"
 		}
-		local := fmt.Sprintf("tca_r%d", e.redN)
+		local := e.local(fmt.Sprintf("reducer%d", e.redN))
 		e.redN++
+		scope := "sequential"
+		switch cls {
+		case "WarpReducer":
+			scope = "warp"
+		case "GlobalReducer":
+			scope = "global (CTA)"
+		}
+		e.c("%s reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim", scope)
 		e.objName[n] = local
 		e.line(fmt.Sprintf("tca::rt::%s<%s> %s(%s, %s);", cls, ts, local, init, e.lambdaName(ops[1])))
 		return nil
@@ -124,6 +139,7 @@ func (e *emitter) stmtCallMethod(n ir.Node) error {
 		if len(args) != 0 {
 			return fmt.Errorf("cxx: reducer Init %d must be argument-free", n.BasePtr().ID())
 		}
+		e.c("reduction bracket opens (argument-free; re-initializes from the construction-time init)")
 		e.line(obj + ".Init();")
 		return nil
 
@@ -161,12 +177,13 @@ func (e *emitter) stmtCallMethod(n ir.Node) error {
 		if len(args) != 0 {
 			return fmt.Errorf("cxx: reducer Combine %d must be argument-free", n.BasePtr().ID())
 		}
-		name := e.allocVal()
 		// D7: a slotted Combine materializes ONCE; uses inside the
 		// re-iteration read slots via Get(slot ivs...).
 		if slots, ok := e.slots[ops[0]]; ok && len(slots) > 0 {
 			e.slottedVal[n] = slots
 		}
+		e.c("one Combine — every participant receives the final value")
+		name := e.allocVal()
 		e.line("auto " + name + " = " + obj + ".Combine();")
 		e.values[n] = name
 		return nil
@@ -191,10 +208,18 @@ func (e *emitter) registerLambda(lam ir.Node) error {
 	return nil
 }
 
-// lambdaName is the lambda's file-scope function symbol (keyed by its
-// stable node ID).
+// lambdaName is the lambda's file-scope function symbol (quick-261023-cgq,
+// Google style): <Kernel>Combine<i>, indexed by emission order — never the
+// unstable node ID.
 func (e *emitter) lambdaName(lam ir.Node) string {
-	return fmt.Sprintf("tca_lambda_%d", lam.BasePtr().ID())
+	i := 0
+	for _, l := range e.lambdas {
+		if l == lam {
+			break
+		}
+		i++
+	}
+	return fmt.Sprintf("%sCombine%d", e.kernelSym, i)
 }
 
 // lambdaSection hoists every surviving combiner lambda to file scope as a
@@ -226,7 +251,7 @@ func (e *emitter) lambdaSection() (string, error) {
 
 		var decls []string
 		for i, p := range params {
-			name := fmt.Sprintf("tca_p%d", i)
+			name := fmt.Sprintf("p%d", i)
 			e.lambdaParams[p] = name
 			decls = append(decls, "T "+name)
 		}

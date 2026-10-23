@@ -2,67 +2,72 @@
 #include "tca/runtime.h"
 
 template <typename T>
-__device__ static __forceinline__ T tca_lambda_30(T tca_p0, T tca_p1) {
-  return (tca_p0 + tca_p1);
+__device__ static __forceinline__ T RedwarpCombine0(T p0, T p1) {
+  return (p0 + p1);
 }
 
-__global__ void tca_kernel_redwarp(uint32_t d0, uint32_t d1, const float* lhs, float* out) {
+// Redwarp: launch 100 CTAs x 512 threads (tiling Params; the runtime asserts divisibility)
+__global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out) {
   tca::rt::TensorView<const float, 2u> lhs_v(lhs, d0, d1);
   tca::rt::TensorView<float, 1u> out_v(out, d0);
 
+tca::rt::KernelInfo kinfo;
+// LNT #0: d0=CTA(T=32,LoC=100) d1=thread/warp(T=64,LoC=256) d0=thread/warp(T=32,LoC=256) d1=sequential(T=64,LoC=1)
 {
-  tca::rt::KernelInfo tca_ki;
-  {
-    tca::rt::GridMapping tca_gm0(tca_ki, -1);
-    tca::rt::ThreadMapping tca_tm1(tca_ki, 4, -1);
-    auto tca_c0 = 1024u;
-    auto tca_c1 = 512u;
-    auto tca_c2 = 0.0f;
-    auto tca_c3 = 3200u;
-    auto tca_v0 = tca_gm0.index(0u);
-    auto tca_c4 = 32u;
-    auto tca_v1 = (tca_v0 * tca_c4);
-    auto tca_c5 = 256u;
-    auto tca_c6 = 100u;
-    auto tca_c7 = 2u;
-    auto tca_v2 = tca_tm1.index(0u);
-    auto tca_c8 = 16384u;
-    auto tca_v3 = tca_tm1.index(1u);
-    auto tca_c9 = 64u;
-    auto tca_v4 = (tca_v3 * tca_c9);
-    tca::rt::WarpReducer<float> tca_r0(tca_c2, tca_lambda_30);
-    for (auto tca_it0 = tca::rt::CtaIterator(tca_gm0, 0u, 100u, 0u, 3200u, tca_c0); tca_it0.Has(); tca_it0.Next()) {
-      auto tca_v5 = (tca_v1 + tca_it0.Index());
-      auto tca_v6 = tca::rt::umin(tca_v5, tca_c0);
-      auto tca_v7 = (tca_c0 - tca_v6);
-      auto tca_v8 = tca::rt::umin(tca_c4, tca_v7);
-      tca_r0.Init();
-      for (auto tca_it1 = tca::rt::ThrIterator(tca_tm1, 1u, 256u, 0u, 16384u, tca_c1); tca_it1.Has(); tca_it1.Next()) {
-        auto tca_v9 = (tca_v4 + tca_it1.Index());
-        auto tca_v10 = tca::rt::umin(tca_v9, tca_c1);
-        auto tca_v11 = (tca_c1 - tca_v10);
-        auto tca_v12 = tca::rt::umin(tca_c9, tca_v11);
-        for (auto tca_it2 = tca::rt::ThrIterator(tca_tm1, 0u, 256u, 0u, 256u, tca_v8); tca_it2.Has(); tca_it2.Next()) {
-          auto tca_v13 = (tca_v5 + tca_it2.Index());
-          auto tca_v14 = (tca_v13 + tca_v2);
-          for (auto tca_it3 = tca::rt::SeqIterator(0u, 1u, tca_v12); tca_it3.Has(); tca_it3.Next()) {
-            auto tca_v15 = (tca_v9 + tca_it3.Index());
-            auto tca_v16 = lhs_v.Get(tca_v14, tca_v15);
-            tca_r0.Reduce(tca_it2.Index(), tca_v16);
-          }
+  // CTA-space mapping (portions -1 — the launch grammar this nest remaps)
+  tca::rt::GridMapping grid_map0(kinfo, -1);
+  // per-CTA thread-space mapping (portions 4, -1)
+  tca::rt::ThreadMapping thread_map1(kinfo, 4, -1);
+  auto c0 = 1024u;
+  auto c1 = 512u;
+  auto c2 = 0.0f;
+  auto v0 = grid_map0.index(0u);
+  auto c3 = 32u;
+  auto v1 = (v0 * c3);
+  auto v2 = thread_map1.index(0u);
+  auto v3 = thread_map1.index(1u);
+  auto c4 = 64u;
+  auto v4 = (v3 * c4);
+  // warp reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim
+  tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0);
+  // @d0 tile-between rounds — CTA, T=32, LoC=100 (map dim 0)
+  for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 3200u, c0); d0_it0.Has(); d0_it0.Next()) {
+    auto v5 = (v1 + d0_it0.Index());
+    auto v6 = tca::rt::umin(v5, c0);
+    auto v7 = (c0 - v6);
+    auto v8 = tca::rt::umin(c3, v7);
+    // reduction bracket opens (argument-free; re-initializes from the construction-time init)
+    reducer0.Init();
+    // @d1 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 1)
+    for (auto d1_it1 = tca::rt::ThrIterator(thread_map1, 1u, 256u, 0u, 16384u, c1); d1_it1.Has(); d1_it1.Next()) {
+      auto v9 = (v4 + d1_it1.Index());
+      auto v10 = tca::rt::umin(v9, c1);
+      auto v11 = (c1 - v10);
+      auto v12 = tca::rt::umin(c4, v11);
+      // @d0 tile-between rounds — thread/warp, T=32, LoC=256 (map dim 0)
+      for (auto d0_it2 = tca::rt::ThrIterator(thread_map1, 0u, 256u, 0u, 256u, v8); d0_it2.Has(); d0_it2.Next()) {
+        auto v13 = (v5 + d0_it2.Index());
+        auto v14 = (v13 + v2);
+        // @d1 inside walk (tile elements) — T=64
+        for (auto d1_it3 = tca::rt::SeqIterator(0u, 1u, v12); d1_it3.Has(); d1_it3.Next()) {
+          auto v15 = (v9 + d1_it3.Index());
+          auto v16 = lhs_v.Get(v14, v15);
+          reducer0.Reduce(d0_it2.Index(), v16);
         }
       }
-      auto tca_v17 = tca_r0.Combine();
-      for (auto tca_it4 = tca::rt::SeqIterator(0u, 1u, tca_v8); tca_it4.Has(); tca_it4.Next()) {
-        out_v.Set(tca_v17.Get(tca_it4.Index()), ((tca_v5 + tca_it4.Index()) + tca_v2));
-      }
+    }
+    // one Combine — every participant receives the final value
+    auto v17 = reducer0.Combine();
+    // @d0 walk — sequential, LoC=1
+    for (auto d0_it4 = tca::rt::SeqIterator(0u, 1u, v8); d0_it4.Has(); d0_it4.Next()) {
+      out_v.Set(v17.Get(d0_it4.Index()), ((v5 + d0_it4.Index()) + v2));
     }
   }
 }
 }
 
-extern "C" void tca_redwarp_launch(uint32_t d0, uint32_t d1, const float* lhs, float* out, cudaStream_t tca_stream) {
+extern "C" void RedwarpLaunch(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out, cudaStream_t tca_stream) {
   tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u);
-  tca_kernel_redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u, tca_stream>>>(d0, d1, lhs, out);
+  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u, tca_stream>>>(d0, d1, lhs, out);
   TCA_CUDA_CHECK(cudaGetLastError());
 }

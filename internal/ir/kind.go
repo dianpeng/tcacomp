@@ -1,7 +1,10 @@
 package ir
 
 // Kind identifies the operator of an IR node. The enumeration is versioned
-// (IR-03): KindVersion 3 is the tinycudaopto re-organization (quick-261018-bl0)
+// (IR-03): KindVersion 6 inserts KindKernelMeta after KindReturn
+// (quick-261023-cgq — the frontend naming instrumentation node), which
+// renumbered the bridge/LIR constants ONCE, deliberately (the v4
+// KindReturn-insertion precedent). KindVersion 3 is the tinycudaopto re-organization (quick-261018-bl0)
 // — the enum was renumbered ONCE, deliberately, here: HIR kinds group before
 // LIR kinds (D-3), the generic Load/Store and the LoadTile/StoreTile kinds are
 // gone, and the GMEM MemLoad/MemStore/MemNew family plus the lowered
@@ -27,7 +30,7 @@ type Kind uint32
 // re-organization; v4 = the Input-list restructure (quick-261019-ktm); v5 =
 // the Input/ImpactBy-only convention (quick-261019-ktm revision: KindLambda
 // joined the HIR tier). Each renumbered the LIR constants once, deliberately.
-const KindVersion = 5
+const KindVersion = 6
 
 const (
 	KindInvalid Kind = iota // unused slot; verifier and legality reject it
@@ -51,6 +54,7 @@ const (
 	KindCall        // scalar-expr: registered pure builtin call
 	KindInputParam  // var: graph-owned kernel/lambda input parameter
 	KindReturn      // end: kernel return — the graph's single end node
+	KindKernelMeta  // var: graph-owned naming metadata (kernel/launcher symbol payloads) — quick-261023-cgq
 
 	// --- HIR tier, Input-list restructure additions (quick-261019-ktm) ---
 	// Every incoming reference of a Map/Reduce rides its Input (operand)
@@ -144,6 +148,8 @@ func (k Kind) String() string {
 		return "inputparam"
 	case KindReturn:
 		return "return"
+	case KindKernelMeta:
+		return "kernelmeta"
 	case KindIterClusterProject:
 		return "iterclusterproject"
 	case KindKeyedAttribute:

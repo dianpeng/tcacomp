@@ -270,6 +270,11 @@ func contentHash(n Node) uint64 {
 		// D2/D13: the attribute key is identity content ("init" vs any
 		// other key distinguishes attributes wrapping the same value).
 		return mixString(valueHashOffset, t.key)
+	case *kernelMetaNode:
+		// quick-261023-cgq: the name payloads are identity content (the
+		// callNode.name precedent). The graph holds at most one, so this
+		// arm exists for the content contract's totality, not for CSE.
+		return mixString(mixString(valueHashOffset, t.kernelName), t.launcherName)
 	case *runtimeQueryNode:
 		// §5 companion 6 (quick-261021-jay): the field selector is
 		// identity content (the callNode.name precedent) — the DoSoC is
@@ -329,6 +334,9 @@ func contentEqual(a, b Node) bool {
 	case *iterClusterProjectNode:
 		tb, ok := b.(*iterClusterProjectNode)
 		return ok && ta.idx == tb.idx
+	case *kernelMetaNode:
+		tb, ok := b.(*kernelMetaNode)
+		return ok && ta.kernelName == tb.kernelName && ta.launcherName == tb.launcherName
 	case *keyedAttributeNode:
 		tb, ok := b.(*keyedAttributeNode)
 		return ok && ta.key == tb.key

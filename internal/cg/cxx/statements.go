@@ -63,10 +63,18 @@ func (e *emitter) statement(n ir.Node) error {
 }
 
 // ensureLocal guarantees a materialized local exists for the (pure) item
-// node, declaring it at its item position on first materialization.
+// node, declaring it at its item position on first materialization. Two
+// quality guards (quick-261023-cgq): an item the emitted statements never
+// reference emits NOTHING (B1 — dead locals are warnings), and an item
+// whose expression text duplicates an earlier one REUSES that local (B2 —
+// post-GVN passes mint duplicate attribute reads the compiler-side CSE
+// never saw).
 func (e *emitter) ensureLocal(n ir.Node) error {
 	if _, ok := e.values[n]; ok {
 		return nil // referenced earlier — already declared
+	}
+	if !e.pureRef[n] {
+		return nil // never referenced by any emitted statement or loop header
 	}
 	text, err := e.emitExpr(n)
 	if err != nil {
@@ -75,15 +83,20 @@ func (e *emitter) ensureLocal(n ir.Node) error {
 	if _, ok := e.values[n]; ok {
 		return nil // the const path declared itself
 	}
+	if first, ok := e.cseText[text]; ok {
+		e.values[n] = first // identical pure expression — reuse the first local
+		return nil
+	}
 	name := e.allocVal()
-	e.line("auto " + name + " = " + text + ";")
+	e.cseText[text] = name
+	e.line("auto " + name + " = " + text + ";" + e.provenance(n))
 	e.values[n] = name
 	return nil
 }
 
-// allocVal hands out the next value local (tca_vN).
+// allocVal hands out the next value local (v0, v1, ... — collision-checked).
 func (e *emitter) allocVal() string {
-	name := fmt.Sprintf("tca_v%d", e.valN)
+	name := e.local(fmt.Sprintf("v%d", e.valN))
 	e.valN++
 	return name
 }

@@ -101,6 +101,9 @@ func (e *emitter) stmtFill(n ir.Node) error {
 	loader := "tca::rt::LoadTileThread"
 	if v == 1 {
 		loader = "tca::rt::LoadTileCta"
+		e.c("cooperative tile fill of %s (LoadTileCta) — the runtime owns the copy, the barriers, and tail clamping", ir.InputParamNameOf(tensor))
+	} else {
+		e.c("per-thread tile fill of %s (LoadTileThread) — no synchronization", ir.InputParamNameOf(tensor))
 	}
 	e.line(loader + "(" + bufView + ", " + view + ", " + join(coords) + ");")
 	return nil

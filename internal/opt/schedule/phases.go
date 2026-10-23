@@ -156,6 +156,13 @@ func (r *scheduleRun) anchorSchedule() {
 			r.anchor(n, ir.PrototypeSN)
 			r.prototype.AppendItem(ir.ASTItem{Node: n})
 			n.BasePtr().SetSched(ir.PrototypeSN, r.prototype)
+		case ir.KindKernelMeta:
+			// quick-261023-cgq: the naming metadata node anchors in the
+			// Prototype beside the params — pure signature-scope payload,
+			// never a statement, read by codegen for the emitted symbols.
+			r.anchor(n, ir.PrototypeSN)
+			r.prototype.AppendItem(ir.ASTItem{Node: n})
+			n.BasePtr().SetSched(ir.PrototypeSN, r.prototype)
 		}
 	}
 }

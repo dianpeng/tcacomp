@@ -48,6 +48,7 @@ var catalog = []kindEntry{
 	{KindCall, TierHIR, FamilyScalarExpr, -1, "registered pure builtin call: (builtin, args...)"},
 	{KindInputParam, TierHIR, FamilyAbstract, 0, "graph-owned kernel/lambda input parameter (named)"},
 	{KindReturn, TierHIR, FamilyAbstract, -1, "end node: kernel return (values...); graph's single end"},
+	{KindKernelMeta, TierHIR, FamilyAbstract, 0, "graph-owned naming metadata: kernel/launcher symbol string payloads; anchored in the Prototype block (quick-261023-cgq)"},
 	{KindIterClusterProject, TierHIR, FamilyAbstract, 1, "IterCluster input slot i bound to a Map's param i: (cluster), idx payload"},
 	{KindKeyedAttribute, TierHIR, FamilyAbstract, 1, "named attribute riding an Input list: (value), key payload"},
 	{KindAs, TierHIR, FamilyAbstract, -1, "as-order clause: dim params in order; trailing on Map/Reduce value inputs"},

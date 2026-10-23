@@ -64,8 +64,28 @@ func (e *emitter) walkLoop(blk *ir.ASTBlock) error {
 	if err2 != nil {
 		return err2
 	}
-	it := fmt.Sprintf("tca_it%d", e.itN)
+	dimName := "dim"
+	if d := ivOps[0]; d != nil {
+		if role, ok := ir.RoleOf(d); ok && role == ir.RoleDim {
+			dimName = identSanitize(ir.InputParamNameOf(d))
+		}
+	}
+	it := e.local(fmt.Sprintf("%s_it%d", dimName, e.itN))
 	e.itN++
+	dimNote := ""
+	if blk.DoSoC() >= 0 {
+		dimNote = fmt.Sprintf(" (map dim %d)", blk.DoSoC())
+	}
+	inside := soc == 0 && stepLit == "1u"
+	if tile, ok := e.loopTile(loop); ok {
+		if inside {
+			e.c("@%s inside walk (tile elements) — T=%d%s", dimName, tile, dimNote)
+		} else {
+			e.c("@%s tile-between rounds — %s, T=%d, LoC=%d%s", dimName, socName(soc), tile, blk.LoC(), dimNote)
+		}
+	} else {
+		e.c("@%s walk — %s, LoC=%d%s", dimName, socName(soc), blk.LoC(), dimNote)
+	}
 
 	var ctor string
 	switch soc {
@@ -122,4 +142,31 @@ func (e *emitter) requireSocAttr(loop ir.Node, soc int) error {
 		return nil
 	}
 	return fmt.Errorf("cxx: loop %d carries no soc annotation", loop.BasePtr().ID())
+}
+
+// socName renders the materialization class for comments.
+func socName(soc int) string {
+	switch soc {
+	case 1:
+		return "CTA"
+	case 2:
+		return "thread/warp"
+	default:
+		return "sequential"
+	}
+}
+
+// loopTile reads the loop's tile annotation (quick-261023-cgq: tile-lower
+// stamps it beside soc/dosoc/loc — the same KeyedAttribute channel).
+func (e *emitter) loopTile(loop ir.Node) (int, bool) {
+	for _, op := range ir.OperandsOf(loop)[3:] {
+		key, val := ir.KeyedAttributeOf(op)
+		if key != "tile" || val == nil {
+			continue
+		}
+		if v, ok := ir.ConstValueOf(val); ok {
+			return int(v), true
+		}
+	}
+	return 0, false
 }

@@ -761,6 +761,9 @@ func (r *renderer) value(n Node) string {
 		}
 		b.WriteString(")")
 		return b.String()
+	case *kernelMetaNode:
+		// kernelmeta("mm", "mm_launch"): the symbol payloads, quoted.
+		return fmt.Sprintf("kernelmeta(%q, %q)", t.kernelName, t.launcherName)
 	case *runtimeKernelInfoNode:
 		return "runtimekernelinfo()"
 	case *runtimeMappingNode:

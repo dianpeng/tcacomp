@@ -114,7 +114,7 @@ func (e *emitter) materializeConst(n ir.Node) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("tca_c%d", e.constN)
+	name := e.local(fmt.Sprintf("c%d", e.constN))
 	e.constN++
 	e.line("auto " + name + " = " + lit + ";")
 	e.values[n] = name

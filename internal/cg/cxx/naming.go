@@ -181,3 +181,66 @@ func callTarget(name string) (string, error) {
 		return "", fmt.Errorf("cxx: unregistered builtin call %q", name)
 	}
 }
+
+// pascalIdent renders a Google-C++-style function-symbol base from a graph
+// or user name (quick-261023-cgq): non-alphanumeric runs split words, each
+// word capitalizes — "matmul_scale" → "MatmulScale", "mm" → "Mm".
+func pascalIdent(s string) string {
+	var b strings.Builder
+	upper := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			if upper {
+				b.WriteRune(r - 'a' + 'A')
+			} else {
+				b.WriteRune(r)
+			}
+			upper = false
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			upper = false
+		default:
+			upper = true
+		}
+	}
+	return b.String()
+}
+
+// checkIdent fails closed on a name that is not a valid C++ identifier —
+// a user-specified KernelMeta name that cannot compile must never be
+// emitted silently.
+func checkIdent(kind, s string) error {
+	if s == "" {
+		return fmt.Errorf("cxx: %s name is empty", kind)
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return fmt.Errorf("cxx: %s name %q is not a valid C++ identifier", kind, s)
+		}
+	}
+	return nil
+}
+
+// identSanitize maps an arbitrary IR debug payload (dim names, tensor
+// names) into a safe identifier fragment (letters/digits/underscore).
+func identSanitize(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "x"
+	}
+	return b.String()
+}
