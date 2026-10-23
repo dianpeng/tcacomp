@@ -151,7 +151,9 @@ func TestRuntimeFamilyBaseVerdicts(t *testing.T) {
 	now := g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
 	comb := g.NewBinOp("ctor", ir.BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))
 	lam := g.NewLambdaNode("ctor", []ir.Node{acc, now}, comb)
-	red := g.NewRuntimeWarpReducer("ctor", init, lam)
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	staging := g.NewMemNewSMem("ctor", g.NewConst("ctor", ir.InternScalar(ir.TU32), 64))
+	red := g.NewRuntimeWarpReducer("ctor", init, lam, tm, staging)
 	getattr := g.NewRuntimeGetAttribute("ctor", "index", gm, g.NewConst("ctor", ir.InternScalar(ir.TU32), 0))
 	gq := g.NewRuntimeGridQuery("ctor", "index", g.NewConst("ctor", ir.InternScalar(ir.TU32), 0))
 	callInit := g.NewRuntimeCallMethod("ctor", "Init", red)
@@ -160,12 +162,21 @@ func TestRuntimeFamilyBaseVerdicts(t *testing.T) {
 
 	se := mustAnalyze(t, g)
 	for name, n := range map[string]ir.Node{
-		"kernelinfo": ki, "gridmapping": gm, "reducer": red,
+		"kernelinfo": ki, "gridmapping": gm,
 		"getattr": getattr, "gridquery": gq,
 	} {
 		if se.HasSideEffect(n) {
 			t.Fatalf("%s must stay PURE in the accumulated analysis (P-2 mirror)", name)
 		}
+	}
+	// R1 (2026-10-23): the warp/global construction now carries the staging
+	// MemNewSMem operand — a FamilyMemory node, base-effectful — so the
+	// ACCUMULATED verdict through FamilyCollective's order-sensitivity
+	// (amendment C) reads effectful. That is the documented conservative
+	// propagation, not a base verdict: the construction itself stays
+	// base-pure (P-2), and no pass runs after final-lower to act on it.
+	if !se.HasSideEffect(red) {
+		t.Fatal("the warp reducer's accumulated verdict must be effectful (conservative taint through its R1 staging allocation operand)")
 	}
 	for name, n := range map[string]ir.Node{
 		"init call":    callInit,

@@ -149,8 +149,11 @@ func (g *Graph) newRuntimeMapping(k Kind, origin string, ki Node, portions []int
 }
 
 // runtimeReducerNode: one specialized reducer construction; ops = [init,
-// lambda] exactly (LR-3: construction carries ALL state). Shared by the
-// three specializations — the kind discriminates seq/warp/global.
+// lambda] for the sequential specialization, [init, lambda, thread mapping,
+// staging allocation] for warp/global (R1/R2 ruling 2026-10-23: the
+// construction carries ALL state — combiner, mapping, and the compiler-pool
+// staging row). Shared by the three specializations — the kind
+// discriminates seq/warp/global.
 type runtimeReducerNode struct {
 	*Base
 	operandList
@@ -165,18 +168,24 @@ func (g *Graph) NewRuntimeSequentialReducer(origin string, init, lambda Node) No
 	return g.NewNode(KindRuntimeSequentialReducer, origin, init, lambda)
 }
 
-// NewRuntimeWarpReducer creates the warp-scope reducer construction (X's Soc
-// 2). Same operand contract as NewRuntimeSequentialReducer.
-func (g *Graph) NewRuntimeWarpReducer(origin string, init, lambda Node) Node {
-	return g.NewNode(KindRuntimeWarpReducer, origin, init, lambda)
+// NewRuntimeWarpReducer creates the warp-scope reducer construction (X's
+// Soc 2). Operand contract per the R1/R2 ruling (2026-10-23): (typed init,
+// combiner lambda, the owning LNT's RuntimeThreadMapping, the staging
+// KindMemNewSMem — one #warps row in the compiler's dynamic-SMEM pool).
+// Warp/lane/count identity is runtime-internal, derived from the mapping;
+// the staging row is the ctor-provided SmemView source. The verifier pins
+// all four operands and their kinds.
+func (g *Graph) NewRuntimeWarpReducer(origin string, init, lambda, threadMap, staging Node) Node {
+	return g.NewNode(KindRuntimeWarpReducer, origin, init, lambda, threadMap, staging)
 }
 
 // NewRuntimeGlobalReducer creates the global (CTA-scope) reducer
-// construction (X's Soc 1). v0-unreachable forward scaffolding — registered
-// per the interface-uniformity ruling, never emitted on reachable inputs
-// (tca.md §5.10: no CTA-parallel reduced dims in v0).
-func (g *Graph) NewRuntimeGlobalReducer(origin string, init, lambda Node) Node {
-	return g.NewNode(KindRuntimeGlobalReducer, origin, init, lambda)
+// construction (X's Soc 1). Same 4-operand contract as the warp reducer
+// (R1/R2). v0-unreachable forward scaffolding — registered per the
+// interface-uniformity ruling, never emitted on reachable inputs (tca.md
+// §5.10: no CTA-parallel reduced dims in v0).
+func (g *Graph) NewRuntimeGlobalReducer(origin string, init, lambda, threadMap, staging Node) Node {
+	return g.NewNode(KindRuntimeGlobalReducer, origin, init, lambda, threadMap, staging)
 }
 
 // runtimeCallNode: a METHOD call on a runtime object — ops = [object,

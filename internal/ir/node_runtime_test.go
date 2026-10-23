@@ -33,6 +33,16 @@ func combinerOf(g *Graph) Node {
 	return g.NewLambdaNode("ctor", []Node{acc, now}, body)
 }
 
+// warpReducerOf builds the R1 4-operand warp construction face: a
+// KernelInfo + ThreadMapping pair and a 64-B staging row (16 warps × f32),
+// then the reducer over (init, lambda, mapping, staging).
+func warpReducerOf(g *Graph) Node {
+	ki := g.NewRuntimeKernelInfo("ctor")
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	staging := g.NewMemNewSMem("ctor", u32const(g, 64))
+	return g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g), tm, staging)
+}
+
 // TestRuntimeAttributeOfQueries pins the renamed read face: the query field
 // payload round-trips through the constructors and RuntimeAttributeOf
 // (shared with the GetAttribute payload); foreign nodes report "".
@@ -59,7 +69,7 @@ func TestRuntimeAttributeOfQueries(t *testing.T) {
 // through the constructor; foreign nodes report "".
 func TestRuntimeMethodOf(t *testing.T) {
 	g := NewGraph("methodof")
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	call := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	if got := RuntimeMethodOf(call); got != "Combine" {
 		t.Fatalf("RuntimeMethodOf(call) = %q, want %q", got, "Combine")
@@ -142,7 +152,7 @@ func runtimeFx() (*Graph, Node, Node, Node, Node, Node, Node, Node) {
 	ki := g.NewRuntimeKernelInfo("ctor")
 	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
 	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	init := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combine := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	idx := g.NewRuntimeGetAttribute("ctor", "index", gm, u32const(g, 0))
@@ -228,12 +238,12 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	expect("red-missing", func(g *Graph) {
 		raw := g.NewNode(KindRuntimeWarpReducer, "ctor", f32const(g, 0))
 		g.NewReturn("ctor", raw)
-	}, "exactly (init, lambda)")
+	}, "unwired")
 
 	// CallMethod: unknown payload, non-object operand 0, method on a
 	// non-reducer object.
 	expect("call-badpayload", func(g *Graph) {
-		red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+		red := warpReducerOf(g)
 		call := g.NewRuntimeCallMethod("ctor", "current_value", red)
 		g.NewReturn("ctor", call)
 	}, "\"Init\", \"Reduce\", \"Combine\"")
@@ -500,7 +510,7 @@ func TestRuntimeObjectValueNumbering(t *testing.T) {
 	// differing payload — unequal content hash (compared through the
 	// package-private contentHash, since EffectOf excludes calls from the
 	// Value surface under a real analysis).
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	initCall := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combineCall := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	if contentHash(initCall) == contentHash(combineCall) {

@@ -254,7 +254,9 @@ func TestRuntimeObjectRules(t *testing.T) {
 	acc := g.NewLambdaInputParam("t", "acc", f32T())
 	now := g.NewLambdaInputParam("t", "now", f32T())
 	comb := g.NewBinOp("t", ir.BinOpAdd, g.NewParamRef("t", acc), g.NewParamRef("t", now))
-	red := g.NewRuntimeWarpReducer("t", init, g.NewLambdaNode("t", []ir.Node{acc, now}, comb))
+	red := g.NewRuntimeWarpReducer("t", init, g.NewLambdaNode("t", []ir.Node{acc, now}, comb),
+		g.NewRuntimeThreadMapping("t", g.NewRuntimeKernelInfo("t"), []int{4, -1}),
+		g.NewMemNewSMem("t", g.NewConst("t", ir.InternScalar(ir.TU32), 64)))
 	callInit := g.NewRuntimeCallMethod("t", "Init", red)
 	callReduce := g.NewRuntimeCallMethod("t", "Reduce", red, init)
 	callCombine := g.NewRuntimeCallMethod("t", "Combine", red)

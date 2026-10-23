@@ -655,14 +655,17 @@ func provenanceOf(t *testing.T, cache *opt.Cache) *tiling.Provenance {
 	return prov
 }
 
-// TestReducerBracketPlacement pins LR-1 on the tiled path: exactly one
-// argument-free Init item immediately BEFORE X's item and one Combine item
-// immediately AFTER it, both in X's PARENTAL block (M.b's Loop block —
-// never inside the k tiling loops), asserted by ITEM IDENTITY; the
-// construction is a RuntimeWarpReducer (X's Soc 2, LR-7) appended to the
-// owning prologue at SN 0 carrying (%init, %lambda); the Reduce call sits
-// inside the home (k tile-inside) block after the piped producer's item
-// with args (betweenIVs..., %piped) per LR-13.
+// TestReducerBracketPlacement pins the R3 bracket law on the tiled path:
+// the construction is a RuntimeWarpReducer (X's Soc 2, LR-7 + R1/R2)
+// carrying (%init, %lambda, ThreadMapping, staging MemNewSMem — one
+// #warps × sizeof(T) = 64 B row at 512 threads/f32), inserted with the
+// staging row at the owning prologue's head end, both stamped SN 0; the
+// between (m tile-inside) loop DISSOLVES and a fresh UNIFORM sequential
+// ELEMENT loop takes X's position in X's parental block, hosting per
+// element [Init (item 0) → X's block → Combine → the moved store]; the
+// Reduce call sits inside home (nested in X) right after the piped
+// producer's item with the VALUE as its single argument (R1 — the slot
+// dimvars are gone).
 func TestReducerBracketPlacement(t *testing.T) {
 	rx := newRedFx(t, false, false)
 	mDim, kDim := rx.f.dims[0], rx.f.dims[1]
@@ -676,14 +679,25 @@ func TestReducerBracketPlacement(t *testing.T) {
 	if X == nil || home == nil {
 		t.Fatal("fixture setup: k must be tiled (Between+Inside)")
 	}
+	mInside := prov.Dims[mDim].Inside
+	if mInside == nil {
+		t.Fatal("fixture setup: m must be tiled (the between dim)")
+	}
+	// Capture the dissolved loop's facts BEFORE final-lower (its operand
+	// slots read unwired once erased).
+	mInsideIV := ir.OperandsOf(mInside)[0]
+	mDimParam := ir.OperandsOf(mInsideIV)[0]
+	mMax := ir.OperandsOf(ir.OperandsOf(mInside)[1])[1]
 
 	if err := runFinalLower(t, rx.f.g, cache); err != nil {
 		t.Fatalf("final-lower: %v", err)
 	}
 	g, k := rx.f.g, rx.f.g.AST()
 
-	// The construction: exactly one WarpReducer, operands (init, combiner
-	// lambda), in the owning LNT's prologue at SN 0.
+	// The construction: exactly one WarpReducer with the R1 4-operand face
+	// (init, lambda, ThreadMapping, staging), both it and the staging row
+	// in the owning LNT's prologue at SN 0. The staging row is 64 B — 16
+	// warps (512/32) × 4 B of f32.
 	reds := liveOfKind(g, ir.KindRuntimeWarpReducer)
 	if len(reds) != 1 || len(liveOfKind(g, ir.KindRuntimeSequentialReducer)) != 0 ||
 		len(liveOfKind(g, ir.KindRuntimeGlobalReducer)) != 0 {
@@ -691,49 +705,81 @@ func TestReducerBracketPlacement(t *testing.T) {
 	}
 	construction := reds[0]
 	ops := ir.OperandsOf(construction)
-	if len(ops) != 2 || ops[0].BasePtr() != rx.init.BasePtr() || ops[1].BasePtr() != rx.lambda.BasePtr() {
-		t.Fatalf("the construction must carry (init, lambda) — construction carries ALL state (LR-3), got %v", ops)
+	if len(ops) != 4 || ops[0].BasePtr() != rx.init.BasePtr() || ops[1].BasePtr() != rx.lambda.BasePtr() {
+		t.Fatalf("the construction must carry (init, lambda, ThreadMapping, staging) — construction carries ALL state (LR-3 + R1/R2), got %d operands", len(ops))
 	}
-	if construction.BasePtr().SchedSN() != 0 {
-		t.Fatal("the construction must be stamped SN 0")
+	if ops[2].KindOf() != ir.KindRuntimeThreadMapping {
+		t.Fatalf("operand 2 must be the owning LNT's ThreadMapping (R2), got %s", ops[2].KindOf())
 	}
-
-	// The bracket: Init@X-1, X, Combine@X+1 in X's PARENTAL block, by item
-	// identity (X appears as a BLOCK item — find its parental block).
-	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
-	if parentBlk == nil || xIdx < 0 {
-		t.Fatal("X must be an AST item")
+	if ops[3].KindOf() != ir.KindMemNewSMem {
+		t.Fatalf("operand 3 must be the staging KindMemNewSMem (R1), got %s", ops[3].KindOf())
 	}
-	items := parentBlk.Items()
-	initCall, combineCall := callOf(g, "Init"), callOf(g, "Combine")
-	if initCall == nil || combineCall == nil {
-		t.Fatal("exactly one Init and one Combine call must exist")
+	staging := ops[3]
+	if v, ok := ir.ConstValueOf(ir.OperandsOf(staging)[0]); !ok || v != 64 {
+		t.Fatalf("the staging row must be 64 B (16 warps x f32 at 512 threads), got %v", v)
 	}
-	if got := ir.OperandsOf(initCall); len(got) != 1 || got[0].BasePtr() != construction.BasePtr() {
-		t.Fatalf("Init must be argument-free over the reducer, got %v", got)
+	if got := len(liveOfKind(g, ir.KindRuntimeThreadMapping)); got != 1 {
+		t.Fatalf("exactly one ThreadMapping (the staging/mapping operand), got %d", got)
 	}
-	if items[xIdx-1].Node == nil || items[xIdx-1].Node.BasePtr() != initCall.BasePtr() {
-		t.Fatalf("Init must sit immediately BEFORE X's item (index %d-1)", xIdx)
+	if ops[2].BasePtr() != liveOfKind(g, ir.KindRuntimeThreadMapping)[0].BasePtr() {
+		t.Fatal("the construction's mapping operand must be the owning LNT's ThreadMapping")
 	}
-	if items[xIdx].Block == nil || items[xIdx].Block.Loop().BasePtr() != X.BasePtr() {
-		t.Fatalf("X's item must be the bracket center at index %d", xIdx)
-	}
-	if items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
-		t.Fatalf("Combine must sit immediately AFTER X's item (index %d+1)", xIdx)
-	}
-	// Never inside the k tiling loops: the bracket block must not be X's or
-	// home's block (it is M.b's).
-	if parentBlk == X.BasePtr().SchedBlock() || parentBlk == home.BasePtr().SchedBlock() {
-		t.Fatal("Init/Combine must bracket X from X's PARENTAL block, never inside the k tiling loops")
+	if staging.BasePtr().SchedSN() != 0 || construction.BasePtr().SchedSN() != 0 {
+		t.Fatal("the staging row and the construction must be stamped SN 0")
 	}
 
-	// The Reduce call: inside home's block, after the piped producer's item,
-	// args (betweenIV, piped) — the between loop is m's tile-inside loop
-	// (strictly between X and home on the chain).
-	reduceCall := callOf(g, "Reduce")
-	if reduceCall == nil {
-		t.Fatal("exactly one Reduce call must exist")
+	// The element loop: X's block moved INTO a fresh uniform SeqLoop that
+	// took X's position in X's parental block. Locate the element block as
+	// Init's containing block.
+	initCall, combineCall, reduceCall := callOf(g, "Init"), callOf(g, "Combine"), callOf(g, "Reduce")
+	if initCall == nil || combineCall == nil || reduceCall == nil {
+		t.Fatal("exactly one Init, one Reduce, and one Combine call must exist")
 	}
+	elemBlk, initIdx := findItemIn(k, initCall)
+	if elemBlk == nil || initIdx != 0 {
+		t.Fatalf("Init must be item 0 of the element loop block, got index %d", initIdx)
+	}
+	if elemBlk.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("the element bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
+	}
+	items := elemBlk.Items()
+	if len(items) < 3 || items[1].Block == nil || items[1].Block.Loop().BasePtr() != X.BasePtr() {
+		t.Fatal("X's block must be the item right after Init inside the element loop")
+	}
+	if items[2].Node == nil || items[2].Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatal("Combine must sit immediately after X's block inside the element loop")
+	}
+	// The element loop: same dim and same bound expression as the DISSOLVED
+	// m tile-inside loop; uniform init 0 / step 1; a FRESH dimvar.
+	elemLoop := elemBlk.Loop()
+	elemIV := ir.OperandsOf(elemLoop)[0]
+	if mInsideIV.BasePtr() == elemIV.BasePtr() {
+		t.Fatal("the element loop must mint a FRESH dimvar, never reuse the dissolved between IV")
+	}
+	if d := ir.OperandsOf(elemIV)[0]; d.BasePtr() != mDimParam.BasePtr() {
+		t.Fatal("the element loop must walk the SAME dim (m) as the dissolved between loop")
+	}
+	elemMax := ir.OperandsOf(ir.OperandsOf(elemLoop)[1])[1]
+	if mMax.BasePtr() != elemMax.BasePtr() {
+		t.Fatal("the element loop must carry the SAME clamped bound expression node")
+	}
+	if v, ok := ir.ConstValueOf(ir.OperandsOf(elemIV)[1]); !ok || v != 0 {
+		t.Fatal("the element loop's init must be the const 0 (uniform walk)")
+	}
+	if v, ok := ir.ConstValueOf(ir.OperandsOf(elemIV)[2]); !ok || v != 1 {
+		t.Fatal("the element loop's step must be the const 1 (uniform walk)")
+	}
+	// The dissolved between loop is ERASED (its per-thread walk is gone).
+	if !mInside.BasePtr().Erased() {
+		t.Fatal("the dissolved between loop must be erased")
+	}
+	if !mInsideIV.BasePtr().Erased() {
+		t.Fatal("the dissolved between dimvar must be erased")
+	}
+
+	// The Reduce call: inside home's block (home nested inside X, X inside
+	// the element loop), right after the piped producer's (load's) item,
+	// with the VALUE as its single argument.
 	homeBlk := home.BasePtr().SchedBlock()
 	homeItems := homeBlk.Items()
 	callIdx := -1
@@ -750,14 +796,30 @@ func TestReducerBracketPlacement(t *testing.T) {
 		t.Fatal("the Reduce call must sit immediately after the piped producer's (load's) item")
 	}
 	callOps := ir.OperandsOf(reduceCall)
-	if len(callOps) != 3 || callOps[2].BasePtr() != rx.load.BasePtr() {
-		t.Fatalf("the Reduce call carries (betweenIV, piped) — the piped operand must resolve at the load after Map Lower, got %v", callOps)
+	if len(callOps) != 2 || callOps[0].BasePtr() != construction.BasePtr() || callOps[1].BasePtr() != rx.load.BasePtr() {
+		t.Fatalf("the Reduce call must carry (reducer, value) — R1's scalar protocol, the piped operand resolving at the load after Map Lower — got %d operands", len(callOps))
 	}
-	mProv := prov.Dims[mDim]
-	if mProv.Inside == nil || callOps[1].BasePtr() != ir.OperandsOf(mProv.Inside)[0].BasePtr() {
-		t.Fatal("the slot-index argument must be the m tile-inside loop's IV (the single between loop)")
+	// Home is nested inside X, X inside the element loop, the element loop
+	// inside X's ORIGINAL parental block (the CTA rounds block).
+	if !blockNested(homeBlk, X.BasePtr().SchedBlock()) {
+		t.Fatal("home must stay nested inside X")
 	}
-	_ = mDim
+	if !blockNested(X.BasePtr().SchedBlock(), elemBlk) {
+		t.Fatal("X must be nested inside the element loop")
+	}
+}
+
+// blockNested reports whether inner is outer or nested inside it.
+func blockNested(inner, outer *ir.ASTBlock) bool {
+	if inner == outer {
+		return true
+	}
+	for _, it := range outer.Items() {
+		if it.Block != nil && blockNested(inner, it.Block) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestReducerCombineRAUW pins 2.4: EVERY former use of the Reduce points at
@@ -793,59 +855,57 @@ func TestReducerCombineRAUW(t *testing.T) {
 	}
 }
 
-// TestReducerReiteration pins LR-14/P-12: the epilogue out-store MOVES into
-// a fresh sequential re-iteration Loop block over the between dim (m),
-// nested immediately after Combine in X's parental block; the re-iteration
-// loop carries the SAME dim + bound as the m tile-inside loop; the store's
-// m coordinate references the RE-ITERATION dimvar (rebuilt, not the shared
-// original); and no moved consumer references a reduced-dim dimvar.
-func TestReducerReiteration(t *testing.T) {
+// TestReducerElementLoopConsumers pins R3's consumer half: the epilogue
+// out-store MOVES into the fresh element loop AFTER Combine (the
+// single-owner gated store — the emitter wraps it in
+// ThreadMapping::is_first_in_cta()), leaving the epilogue with only the
+// end node; the store's m coordinate references the FRESH element dimvar
+// (rebuilt spine — the dissolved between IV is erased); and no moved
+// consumer references a reduced-dim dimvar.
+func TestReducerElementLoopConsumers(t *testing.T) {
 	rx := newRedFx(t, false, false)
-	cache := runRedFx(t, rx)
+	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
 	prov := provenanceOf(t, cache)
+	mInsideIV := ir.OperandsOf(prov.Dims[rx.f.dims[0]].Inside)[0]
+	if err := runFinalLower(t, rx.f.g, cache); err != nil {
+		t.Fatalf("final-lower: %v", err)
+	}
 	g, k := rx.f.g, rx.f.g.AST()
 
 	X, home := prov.Dims[rx.f.dims[1]].Between, prov.Dims[rx.f.dims[1]].Inside
-	mInside := prov.Dims[rx.f.dims[0]].Inside
-	// X appears as a BLOCK item (its own Loop block) — locate the parental
-	// block via the block, not the loop node.
-	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
-	if parentBlk == nil {
-		t.Fatal("fixture setup: X must be an item")
+	initCall, combineCall := callOf(g, "Init"), callOf(g, "Combine")
+	if initCall == nil || combineCall == nil {
+		t.Fatal("fixture setup: the bracket calls must exist")
 	}
-	items := parentBlk.Items()
-	combineCall := callOf(g, "Combine")
-	if combineCall == nil || items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
-		t.Fatal("fixture setup: Combine must sit immediately after X")
+	elemBlk, _ := findItemIn(k, initCall)
+	if elemBlk == nil || elemBlk.Kind() != ir.BlockSeqLoop {
+		t.Fatal("fixture setup: the element loop block must host Init")
 	}
-	// The re-iteration block sits immediately after Combine.
-	if len(items) <= xIdx+2 || items[xIdx+2].Block == nil {
-		t.Fatal("a re-iteration Loop block must sit immediately after Combine")
+	elemIV := ir.OperandsOf(elemBlk.Loop())[0]
+
+	// Combine sits after X's block; the store sits after Combine, inside
+	// the element loop; the end node did NOT move.
+	items := elemBlk.Items()
+	combineIdx := -1
+	for i, it := range items {
+		if it.Node != nil && it.Node.BasePtr() == combineCall.BasePtr() {
+			combineIdx = i
+		}
 	}
-	reit := items[xIdx+2].Block
-	if reit.Kind() != ir.BlockSeqLoop {
-		t.Fatalf("the re-iteration block must be a SeqLoop, got %s", reit.Kind())
+	if combineIdx < 0 {
+		t.Fatal("fixture setup: Combine must sit inside the element loop")
 	}
-	// The re-iteration loop: same dim, same bound as the m tile-inside loop.
-	reitLoop := reit.Loop()
-	mLoopIV, reitIV := ir.OperandsOf(mInside)[0], ir.OperandsOf(reitLoop)[0]
-	if ir.OperandsOf(mLoopIV)[0].BasePtr() != ir.OperandsOf(reitIV)[0].BasePtr() {
-		t.Fatal("the re-iteration must walk the SAME dim (m)")
-	}
-	mMax := ir.OperandsOf(ir.OperandsOf(mInside)[1])[1]
-	reitMax := ir.OperandsOf(ir.OperandsOf(reitLoop)[1])[1]
-	if mMax.BasePtr() != reitMax.BasePtr() {
-		t.Fatal("the re-iteration must carry the SAME bound expression node")
-	}
-	// The store moved INTO the re-iteration block; the end node did NOT.
 	found := false
-	for _, it := range reit.Items() {
+	for _, it := range items[combineIdx+1:] {
 		if it.Node != nil && it.Node.BasePtr() == rx.store.BasePtr() {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("the epilogue out-store must MOVE into the re-iteration block")
+		t.Fatal("the epilogue out-store must MOVE into the element loop after Combine")
 	}
 	for _, lnt := range k.LNTs {
 		for _, it := range k.Body.Items() {
@@ -858,15 +918,16 @@ func TestReducerReiteration(t *testing.T) {
 			}
 		}
 	}
-	// The store's m coordinate references the RE-ITERATION dimvar (the
-	// rebuilt spine), never the original m tile-inside IV.
+
+	// The store's m coordinate references the FRESH element dimvar (the
+	// rebuilt spine), never the dissolved between IV (erased).
 	axis := ir.OperandsOf(rx.store)[2]
 	cl := subtreeOf(axis)
-	if !cl[reitIV] {
-		t.Fatal("the store's m coordinate must reference the re-iteration dimvar")
+	if !cl[elemIV] {
+		t.Fatal("the store's m coordinate must reference the fresh element dimvar")
 	}
-	if cl[mLoopIV] {
-		t.Fatal("the store's m coordinate must NOT reference the original m tile-inside dimvar (shared with the in-nest loads)")
+	if !mInsideIV.BasePtr().Erased() {
+		t.Fatal("the dissolved between dimvar must be erased (R3)")
 	}
 	// No moved consumer references a reduced-dim dimvar.
 	for _, loop := range []ir.Node{X, home} {

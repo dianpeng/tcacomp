@@ -323,16 +323,30 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		// remainder rule).
 		checkRuntimeMappingShape(n, t, vs)
 	case *runtimeReducerNode:
-		// LR-3/P-3: exactly (typed init value, KindLambda) — swapped,
-		// missing, or mis-typed operands are shape violations. A missing
-		// operand leaves an unwired slot (the generic nil-def check also
-		// fires); the count check reads OperandsOf, whose slot count covers
+		// LR-3/P-3 + R1/R2 (2026-10-23): the sequential specialization
+		// carries exactly (typed init value, KindLambda); the warp/global
+		// specializations carry exactly (typed init, KindLambda,
+		// RuntimeThreadMapping, staging KindMemNewSMem). Swapped, missing,
+		// or mis-typed operands are shape violations. A missing operand
+		// leaves an unwired slot (the generic nil-def check also fires);
+		// the count check reads OperandsOf, whose slot count covers
 		// unwired slots, so probe nil explicitly for the named message.
+		want := 2
+		if n.KindOf() == KindRuntimeWarpReducer || n.KindOf() == KindRuntimeGlobalReducer {
+			want = 4
+		}
 		ops := OperandsOf(t)
-		if len(ops) != 2 || ops[0] == nil || ops[1] == nil {
+		if len(ops) != want {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s must carry exactly (init, lambda), got %d operands", n.KindOf(), len(ops))))
+				fmt.Sprintf("%s must carry exactly %d operands, got %d", n.KindOf(), want, len(ops))))
 			break
+		}
+		for i, op := range ops {
+			if op == nil {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("%s operand %d is unwired", n.KindOf(), i)))
+				break
+			}
 		}
 		if init := operandAt(t, 0); init != nil && TypeOf(init) == nil && ConstTypeOf(init) == nil {
 			// "Typed" reads either the computed cell (the real flow:
@@ -346,6 +360,16 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		if lam := operandAt(t, 1); lam != nil && lam.KindOf() != KindLambda {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
 				"reducer construction operand 1 must be the combiner KindLambda node"))
+		}
+		if want == 4 {
+			if tm := operandAt(t, 2); tm != nil && tm.KindOf() != KindRuntimeThreadMapping {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("%s operand 2 must be the owning LNT's RuntimeThreadMapping (R2), got %s", n.KindOf(), tm.KindOf())))
+			}
+			if st := operandAt(t, 3); st != nil && st.KindOf() != KindMemNewSMem {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("%s operand 3 must be the staging KindMemNewSMem (R1), got %s", n.KindOf(), st.KindOf())))
+			}
 		}
 	case *runtimeCallNode:
 		// P-3: the method vocabulary is closed {Init, Reduce, Combine} and

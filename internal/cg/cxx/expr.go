@@ -16,7 +16,7 @@ func (e *emitter) emitExpr(n ir.Node) (string, error) {
 		return "", fmt.Errorf("cxx: nil expression operand")
 	}
 	if name, ok := e.values[n]; ok {
-		return e.slottedRead(n, name)
+		return name, nil
 	}
 	switch n.KindOf() {
 	case ir.KindConst:
@@ -73,38 +73,6 @@ func (e *emitter) emitExpr(n ir.Node) (string, error) {
 		return "", fmt.Errorf("cxx: node %d (%s) is not emittable as an expression — it must be materialized at its statement first",
 			n.BasePtr().ID(), n.KindOf())
 	}
-}
-
-// slottedRead adapts a materialized local to its use site: a slotted
-// Combine (D7) is consumed per-slot inside the re-iteration as
-// local.Get(slot ivs...), the slot iterators resolved from the dim scope in
-// the Reduce call's slot-arg order. Every other local reads bare.
-func (e *emitter) slottedRead(n ir.Node, name string) (string, error) {
-	dims, ok := e.slottedVal[n]
-	if !ok {
-		return name, nil
-	}
-	var args []string
-	for _, d := range dims {
-		it, ok := e.dimLookup(d)
-		if !ok {
-			return "", fmt.Errorf("cxx: slotted Combine %d used outside the re-iteration of dim %q", n.BasePtr().ID(), ir.InputParamNameOf(d))
-		}
-		args = append(args, it+".Index()")
-	}
-	return name + ".Get(" + join(args) + ")", nil
-}
-
-// dimLookup resolves a dim InputParam to the innermost in-scope iterator
-// over it (the scope stack is searched top-down, so shadowing re-iteration
-// dimvars win).
-func (e *emitter) dimLookup(dim ir.Node) (string, bool) {
-	for i := len(e.dimScope) - 1; i >= 0; i-- {
-		if it, ok := e.dimScope[i][dim]; ok {
-			return it, true
-		}
-	}
-	return "", false
 }
 
 // materializeConst declares a deduped constant's local at first use
