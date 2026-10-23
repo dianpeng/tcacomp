@@ -518,9 +518,12 @@ func (lr *lowerRun) checkNoBarriers() error {
 	return nil
 }
 
-// checkFragSites pins "every FRAG site satisfies the fully-unroll
-// condition": all covered dims sequential (the decide judge's ClassFRAG
-// criterion, re-asserted fail-closed at surgery time).
+// checkFragSites pins "every FRAG site's covered dims are never
+// CTA-assigned": sequential (the classic fully-unroll class) or WARP under
+// the C1b precedence (2026-10-23 — a thread-varying non-covered coordinate
+// forces FRAG; the per-thread window indexes the WARP-covered dim by its
+// plain inside coordinate). A CTA-covered dim is refused at tier time and
+// must never reach a FRAG record entry.
 func (lr *lowerRun) checkFragSites(rec *Record, dropped map[uint64]bool) error {
 	for id, sd := range rec.Sites {
 		if !sd.Promoted || dropped[id] || sd.Class != ClassFRAG {
@@ -532,8 +535,8 @@ func (lr *lowerRun) checkFragSites(rec *Record, dropped map[uint64]bool) error {
 				continue
 			}
 			for _, d := range fill.covered {
-				if lr.decisions[d.iter].SoC != SoCSequential {
-					return fmt.Errorf("tile-lower: FRAG site %d covers non-sequential iter node %d (the fully-unroll precondition)",
+				if lr.decisions[d.iter].SoC == SoCTA {
+					return fmt.Errorf("tile-lower: FRAG site %d covers CTA-assigned iter node %d (the R2 refusal; a CTA-covered record entry is corruption)",
 						id, d.iter.BasePtr().ID())
 				}
 			}

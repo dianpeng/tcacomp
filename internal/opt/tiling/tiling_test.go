@@ -345,10 +345,12 @@ func TestSearchWindow(t *testing.T) {
 	}
 }
 
-// TestPromotionJudge pins the amended judge (R2 tier rule + F4 drop-rule
-// gate + F6 frag budget + the per-thread reuse gate): classification is by
-// the SoC of the site's COVERED dims — ANY CTA-covered dim refuses the
-// site; ANY WARP-covered dim yields the SMEM window class; all-SEQ covered
+// TestPromotionJudge pins the amended judge (R2 tier rule + C1b forced-FRAG
+// precedence + F4 drop-rule gate + F6 frag budget + the per-thread reuse
+// gate): ANY CTA-covered dim refuses the site; a thread-varying NON-covered
+// INS coordinate (any referenced INS iter assigned CTA or WARP outside the
+// covered set) forces ClassFRAG regardless of the covered dims' SoC; else
+// ANY WARP-covered dim yields the SMEM window class and all-SEQ covered
 // dims yield FRAG (subject to the per-thread byte and reuse gates); ANY
 // covered dim at tile 1 blocks promotion (the judge-side F4 gate, matching
 // the lower's drop rule).
@@ -386,10 +388,23 @@ func TestPromotionJudge(t *testing.T) {
 			j.promoted, j.class, j.bytes, j.reuse)
 	}
 
-	// A WARP-covered dim (lhs covers K): SMEM window class — bytes are the
-	// whole group's round window (#threads_d x T), not the bare tile.
+	// A WARP-covered dim with a thread-varying NON-covered INS coordinate
+	// (lhs covers K, M is the CTA dim): C1b (2026-10-23) forces FRAG —
+	// the per-thread window indexes the covered dim by its plain inside
+	// coordinate, so bytes price per-thread (alloc 1), not per group.
 	iters, ctx = soc(
 		IterDecision{SoCTA, 100, 32}, IterDecision{SoCSequential, 1, 32}, IterDecision{SoCWARP, 8, 32})
+	j = judgeSite(sl, iters, ctx, p)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 4*32 {
+		t.Fatalf("a thread-varying non-covered INS coordinate must force FRAG (128 B), got (%v, %s, %d B)",
+			j.promoted, j.class, j.bytes)
+	}
+
+	// A WARP-covered dim with NO thread-varying non-covered INS coordinate
+	// (M sequential): the covered set classifies — SMEM window class, bytes
+	// the whole group's round window (#threads_d x T).
+	iters, ctx = soc(
+		IterDecision{SoCSequential, 1, 32}, IterDecision{SoCSequential, 1, 32}, IterDecision{SoCWARP, 8, 32})
 	j = judgeSite(sl, iters, ctx, p)
 	wantBytes := 4 * (8 * 32) * 32 // 8 warps = 256 threads, T 32
 	if !j.promoted || j.class != ClassSMEM || j.bytes != wantBytes {
@@ -531,12 +546,15 @@ func TestCoupledPortionFloor(t *testing.T) {
 		q := p
 		q.WarpPortion = 7 // floor-legal: 8-7 = 1 coupled portion
 		cache, rec := runDecide(t, fx.g, q)
-		// Corrupt the record's warp LoC to the full 8 portions: the
-		// coupled walk is starved, verify must flag it (the F2 record
-		// check runs on published records).
+		// Corrupt the record into a starved warp allocation: flip one
+		// non-CTA iter to WARP at the full 8 portions — the coupled walk
+		// is starved, verify must flag it (the F2 record check runs on
+		// published records). The flip manufactures the warp dim whether
+		// or not the winning schedule carries one.
 		quantum := (q.MaxThreadsPerCTA / 32) / PortionWarp
 		for biv, d := range rec.Iters {
-			if d.SoC == SoCWARP {
+			if d.SoC != SoCTA {
+				d.SoC = SoCWARP
 				d.LoC = PortionWarp * quantum
 				rec.Iters[biv] = d
 				break
@@ -562,23 +580,53 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	p := DefaultParams()
 	rec := runPass(t, fx.g, p)
 
-	dM := decisionOf(t, rec, fx.iters[0])
 	dN := decisionOf(t, rec, fx.iters[1])
-	dK := decisionOf(t, rec, fx.iters[2])
 
-	// Independent window-bytes + per-thread reuse arithmetic over the
-	// record's own schedule. alloc_d = the execution slots partitioning
-	// dim d's round window; the owning thread's inside-walk trips are T_d,
-	// except a CTA dim's coupled walk: ceil(T / coupledThreads).
-	alloc := func(d IterDecision) int {
-		switch d.SoC {
-		case SoCWARP:
-			return d.LoC * 32
-		case SoCTA:
-			return d.LoC
-		default:
-			return 1
+	// Independent class-aware bytes + per-thread reuse arithmetic over the
+	// record's own schedule (C1b, 2026-10-23): a thread-varying NON-covered
+	// INS coordinate forces FRAG (per-thread pricing — alloc 1 per covered
+	// dim); otherwise a WARP-covered dim prices the whole group's round
+	// window (#threads_d x T) under the SMEM class, and all-SEQ covered
+	// dims price per-thread under FRAG. A CTA dim's coupled walk trips are
+	// ceil(T / coupledThreads); every other dim's are T_d.
+	facts := overlapOf(fx, p)
+	classAndBytes := func(sf SiteFacts) (CacheClass, int, bool) {
+		coveredSet := make(map[ir.Node]bool, len(sf.Covered))
+		for _, c := range sf.Covered {
+			coveredSet[c] = true
 		}
+		forcedFrag := false
+		for _, it := range sf.INS {
+			if coveredSet[it] {
+				continue
+			}
+			switch decisionOf(t, rec, it).SoC {
+			case SoCTA, SoCWARP:
+				forcedFrag = true
+			}
+		}
+		class := ClassFRAG
+		if !forcedFrag {
+			for _, c := range sf.Covered {
+				if decisionOf(t, rec, c).SoC == SoCWARP {
+					class = ClassSMEM
+				}
+			}
+		}
+		e, ok := elemTypeOf(sf.Load)
+		if !ok {
+			return class, 0, false
+		}
+		bytes := elemBytes(e)
+		for _, c := range sf.Covered {
+			d := decisionOf(t, rec, c)
+			perDim := d.TileSize
+			if class == ClassSMEM && d.SoC == SoCWARP {
+				perDim *= d.LoC * 32
+			}
+			bytes *= perDim
+		}
+		return class, bytes, true
 	}
 	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
 	coupled := (PortionWarp - AutoWarpPortion) * quantum * 32 // the chosen schedule carries a CTA dim
@@ -588,22 +636,25 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 		}
 		return d.TileSize
 	}
-	// lhs: covered {K} -> bytes 4·alloc(K)·T_k; reuse dims {N} -> trips(N).
-	lhsBytes := 4 * alloc(dK) * dK.TileSize
+	// lhs: covered {K} -> forced FRAG (M is the CTA dim, non-covered INS):
+	// bytes 4·T_k; reuse dims {N} -> trips(N).
+	lhsClass, lhsBytes, _ := classAndBytes(siteOf(t, facts, lhs))
+	// rhs: covered {N,K} all-SEQ covered set -> FRAG: bytes 4·T_n·T_k
+	// (declines the F6 gate before reuse is computed — the record keeps
+	// reuse 0); reuse dims {M} would be trips(M).
+	rhsClass, rhsBytes, _ := classAndBytes(siteOf(t, facts, rhs))
 	lhsReuse := trips(dN)
-	// rhs: covered {N,K} -> bytes 4·alloc(N)·T_n·alloc(K)·T_k; reuse dims {M}.
-	rhsBytes := 4 * alloc(dN) * dN.TileSize * alloc(dK) * dK.TileSize
-	rhsReuse := trips(dM)
+	rhsReuse := 0 // F6-declined before the reuse gate
 
 	sl, _ := rec.SiteDecisionOf(lhs)
 	sr, _ := rec.SiteDecisionOf(rhs)
-	if sl.Bytes != lhsBytes || sl.Reuse != lhsReuse {
-		t.Fatalf("lhs record bytes/reuse = %d/%d, independent arithmetic says %d/%d",
-			sl.Bytes, sl.Reuse, lhsBytes, lhsReuse)
+	if sl.Class != lhsClass || sl.Bytes != lhsBytes || sl.Reuse != lhsReuse {
+		t.Fatalf("lhs record class/bytes/reuse = %s/%d/%d, independent arithmetic says %s/%d/%d",
+			sl.Class, sl.Bytes, sl.Reuse, lhsClass, lhsBytes, lhsReuse)
 	}
-	if sr.Bytes != rhsBytes || sr.Reuse != rhsReuse {
-		t.Fatalf("rhs record bytes/reuse = %d/%d, independent arithmetic says %d/%d",
-			sr.Bytes, sr.Reuse, rhsBytes, rhsReuse)
+	if sr.Class != rhsClass || sr.Bytes != rhsBytes || sr.Reuse != rhsReuse {
+		t.Fatalf("rhs record class/bytes/reuse = %s/%d/%d, independent arithmetic says %s/%d/%d",
+			sr.Class, sr.Bytes, sr.Reuse, rhsClass, rhsBytes, rhsReuse)
 	}
 
 	traffic := 0
@@ -692,19 +743,39 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 				}
 				traffic, smem, frag := 0, 0, 0
 				for _, sf := range facts.CS {
-					// The mirror judge: tier rule + gates, independent formulas.
-					promoted, ctaCovered, tileOne := true, false, false
-					class := ClassFRAG
+					// The mirror judge: C1b tier rule + gates, independent
+					// formulas. A thread-varying NON-covered INS coordinate
+					// forces FRAG regardless of the covered dims' SoC; else
+					// a WARP-covered dim yields the SMEM window class.
+					coveredSet := make(map[ir.Node]bool, len(sf.Covered))
 					for _, c := range sf.Covered {
-						d := iters[c]
-						if d.SoC == SoCTA {
+						coveredSet[c] = true
+					}
+					promoted, ctaCovered, tileOne := true, false, false
+					forcedFrag := false
+					for _, c := range sf.Covered {
+						if iters[c].SoC == SoCTA {
 							ctaCovered = true
 						}
-						if d.TileSize == 1 {
+						if iters[c].TileSize == 1 {
 							tileOne = true
 						}
-						if d.SoC == SoCWARP {
-							class = ClassSMEM
+					}
+					for _, it := range sf.INS {
+						if coveredSet[it] {
+							continue
+						}
+						switch iters[it].SoC {
+						case SoCTA, SoCWARP:
+							forcedFrag = true
+						}
+					}
+					class := ClassFRAG
+					if !forcedFrag {
+						for _, c := range sf.Covered {
+							if iters[c].SoC == SoCWARP {
+								class = ClassSMEM
+							}
 						}
 					}
 					if ctaCovered || tileOne || len(sf.Covered) == 0 {
@@ -717,7 +788,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 						for _, c := range sf.Covered {
 							d := iters[c]
 							perDim := d.TileSize
-							if d.SoC == SoCWARP {
+							if class == ClassSMEM && d.SoC == SoCWARP {
 								perDim *= d.LoC * 32
 							}
 							bytes *= perDim
@@ -777,10 +848,15 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 }
 
 // addWarpWindowLNT appends one 3-deep chain (root->mid->leaf, extents 64)
-// with two co-traversed rank-2 loads referencing {root, leaf}: SET @ leaf,
-// tie mid, covered {leaf}. When the leaf is WARP-assigned the sites are
-// SMEM windows of 4 x (#threads x T) bytes each; with WarpPortion 1 the
-// group is 64 threads, so each site costs 256·T bytes.
+// with two co-traversed rank-2 loads whose only ITER subscript is {leaf}
+// (the second axis is a constant — it contributes no INS): the operational
+// tie rule (first inner->outer level NOT in INS) then places the tie at mid
+// with covered {leaf} and reuse dims {mid}. The CTA-assigned root stays OUT
+// of the loads' INS so it cannot act as a thread-varying non-covered INS
+// coordinate (C1b would force FRAG and the SMEM-window expectations below
+// would not manifest). When the leaf is WARP-assigned the sites are SMEM
+// windows of 4 x (#threads x T) bytes each; with WarpPortion 1 the group is
+// 64 threads, so each site costs 256·T bytes.
 func addWarpWindowLNT(g *ir.Graph, tag string) (root, mid, leaf, lp, lq ir.Node) {
 	f32 := ir.InternScalar(ir.TF32)
 	dim := func(name string) ir.Node { return g.NewInputParam("ctor", ir.RoleDim, name, nil) }
@@ -798,8 +874,8 @@ func addWarpWindowLNT(g *ir.Graph, tag string) (root, mid, leaf, lp, lq ir.Node)
 			leaf = parent
 		}
 	}
-	lp = g.NewMemLoad("ctor", tensorParam(g, tag+"_p", 2), []ir.Node{iv(g, root), iv(g, leaf)})
-	lq = g.NewMemLoad("ctor", tensorParam(g, tag+"_q", 2), []ir.Node{iv(g, root), iv(g, leaf)})
+	lp = g.NewMemLoad("ctor", tensorParam(g, tag+"_p", 2), []ir.Node{iv(g, leaf), g.NewConst("ctor", f32, 0)})
+	lq = g.NewMemLoad("ctor", tensorParam(g, tag+"_q", 2), []ir.Node{iv(g, leaf), g.NewConst("ctor", f32, 0)})
 	return root, mid, leaf, lp, lq
 }
 

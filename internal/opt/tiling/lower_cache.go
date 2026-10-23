@@ -123,7 +123,9 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 		for _, it := range sf.Covered {
 			m[it] = dec(it)
 		}
-		return siteWindowBytes(sf, m)
+		// The record's class decides the pricing model (the C1b precedence
+		// may have forced FRAG over a WARP-covered dim — per-thread bytes).
+		return siteWindowBytes(sf, m, rec.Sites[sf.Load.BasePtr().ID()].Class)
 	}
 	// kernelSum returns (smem, frag) over every promoted, non-dropped site
 	// — the SAME window-bytes sums the decide feasibility and tiling-verify
@@ -277,23 +279,46 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		return fmt.Errorf("tile-lower: site %d promotes an empty covered set (M2: filtered at the decide pass)", id)
 	}
 
-	// Tier re-derivation (R2, ruled 2026-10-21): classify by the SoC of the
-	// COVERED dims — ANY CTA-covered dim REFUSES the site (no coherent fill
-	// variant under the v0 mechanics; a promoted record entry saying
-	// otherwise is corruption), any WARP-covered dim makes the SMEM window
-	// class, all-sequential makes the FRAG class. The record must agree.
-	class := ClassFRAG
+	// Tier re-derivation (R2 + C1b, ruled 2026-10-21/23): classify by the SoC
+	// of the COVERED dims — ANY CTA-covered dim REFUSES the site (no coherent
+	// fill variant under the v0 mechanics; a promoted record entry saying
+	// otherwise is corruption) — with the C1b PRECEDENCE: a THREAD-VARYING
+	// non-covered source coordinate (any INS iter not covered, assigned CTA
+	// or WARP) forces ClassFRAG regardless of the covered dims' SoC (a
+	// cooperative SMEM fill is CTA-uniform, R1; the judge applies the same
+	// predicate — the record must agree). Otherwise any WARP-covered dim
+	// makes the SMEM window class, all-sequential makes the FRAG class.
 	for _, d := range covered {
 		if d.soc == SoCTA {
 			return fmt.Errorf("tile-lower: site %d covers CTA-assigned iter node %d — a CTA-covered tile has no coherent fill variant and is refused (R2 tier rule; the record's promoted entry is corrupted)",
 				id, d.iter.BasePtr().ID())
 		}
-		if d.soc == SoCWARP {
-			class = ClassSMEM
+	}
+	forcedFrag := false
+	for _, it := range sf.INS {
+		if coveredSet[it] {
+			continue
+		}
+		d, ok := lr.byIter[it]
+		if !ok {
+			return fmt.Errorf("tile-lower: site %d references iter node %d in its INS, which the rewrite did not produce (corrupted facts?)", id, it.BasePtr().ID())
+		}
+		if d.soc == SoCTA || d.soc == SoCWARP {
+			forcedFrag = true // C1b: a thread-varying non-covered coordinate
+			break
+		}
+	}
+	class := ClassFRAG
+	if !forcedFrag {
+		for _, d := range covered {
+			if d.soc == SoCWARP {
+				class = ClassSMEM
+				break
+			}
 		}
 	}
 	if class != sd.Class {
-		return fmt.Errorf("tile-lower: site %d record class %s disagrees with the R2 tier rule over its covered dims (%s) — record corruption",
+		return fmt.Errorf("tile-lower: site %d record class %s disagrees with the R2/C1b tier rule over its covered dims (%s) — record corruption",
 			id, sd.Class, class)
 	}
 
@@ -322,9 +347,12 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 
 	// Buffer: the R2 WINDOW model — per covered dim, WARP dims contribute
 	// the whole group's round window (#threads_d = LoC_d x 32 elements of
-	// T_d each), SEQ dims contribute T_d. The byte total is exactly the
-	// decide side's siteWindowBytes product (one budget, both halves). The
-	// tile TENSOR TYPE binds via SetType — the typeinfer MemLoadSMem rule's
+	// T_d each) for the SMEM class; a C1b forced-FRAG site prices and sizes
+	// its WARP-covered dim per thread (T_d alone — each thread holds its own
+	// chunk). SEQ dims contribute T_d either way. The byte total is exactly
+	// the decide side's siteWindowBytes product with the same class (one
+	// budget, both halves).
+	// The tile TENSOR TYPE binds via SetType — the typeinfer MemLoadSMem rule's
 	// own message names this pass as the binder ("cache lowering must bind
 	// buffer types first"), the one documented exception to P8's
 	// no-self-typing.
@@ -332,7 +360,7 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	dims := make([]ir.DimRef, 0, len(covered))
 	for _, d := range covered {
 		extent := d.tile
-		if d.soc == SoCWARP {
+		if d.soc == SoCWARP && class == ClassSMEM {
 			extent = d.loc * 32 * d.tile // the group window, rank-in-index (R2)
 		}
 		bytes *= extent
@@ -366,23 +394,32 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// covered and above-tie iters substitutes the covered index expressions
 	// with their round bases; unreferenced positions stay absent (the
 	// partial deref keeps them as the slice's trailing dims).
+	//
+	// C1b (2026-10-23): a FRAG fill whose covered set includes a WARP dim
+	// rides that position's coordinate on the AXES path as the dim's round
+	// base (rank*T + round) — the chunk ORIGIN moves with the thread, and
+	// the biv path cannot carry it (stmtFill's bivDim demands a dimvar).
+	// A SEQ-covered dim keeps the biv path (its round base IS a dimvar).
 	origAxes := ir.OperandsOf(sf.Load)[1:]
 	fillAxes := make([]ir.Node, 0, len(origAxes))
 	for pos, axis := range origAxes {
 		if pos >= len(sf.AxesIters) || len(sf.AxesIters[pos]) == 0 {
 			continue // unreferenced position: absent
 		}
-		coveredHere, aboveHere := false, false
+		coveredHere, aboveHere, warpCoveredHere := false, false, false
 		for _, it := range sf.AxesIters[pos] {
 			if coveredSet[it] {
 				coveredHere = true
+				if d, ok := lr.byIter[it]; ok && d.soc == SoCWARP {
+					warpCoveredHere = true
+				}
 			} else {
 				aboveHere = true // INS at or outer than the fill key
 			}
 		}
 		switch {
-		case coveredHere && !aboveHere:
-			continue // the loader enumerates the covered tile dim
+		case coveredHere && !aboveHere && !(class == ClassFRAG && warpCoveredHere):
+			continue // the loader enumerates the covered tile dim (biv path)
 		case class == ClassSMEM:
 			// Uniform-base substitution for EVERY referenced dim of the
 			// position (R1: CTA-uniform coordinates only). A WARP dim
@@ -401,9 +438,12 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 				return fmt.Errorf("tile-lower: site %d axis %d holds no substitutable index expression (corrupted rewrite?)", id, pos)
 			}
 			fillAxes = append(fillAxes, rebuilt)
-		case coveredHere && aboveHere:
-			// FRAG, mixed position: covered dims ride their round bases,
-			// above-tie dims keep their full index expressions.
+		case coveredHere:
+			// FRAG: covered dims ride their round bases (a WARP-covered
+			// position carries the per-thread chunk origin rank*T + round;
+			// a mixed position keeps the above-tie dims' full index
+			// expressions — the fill key dim's inside coordinate
+			// re-executes the fill per epoch).
 			rebuilt, n := lr.rebuildAxis(axis, lr.coveredBaseSubs(covered))
 			if n == 0 {
 				return fmt.Errorf("tile-lower: site %d axis %d mixes covered and above-tie iters but holds no covered index expression (corrupted rewrite?)", id, pos)
@@ -429,13 +469,19 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// Fill store + variant annotation (§6's tier rule): SMEM window class →
 	// cooperative LoadTileCta (1); FRAG class → per-thread LoadTileThread
 	// (2). The covered round bases ride the store's trailing biv operands:
-	// between dimvars only — uniform for the cooperative loader (R1/R2).
+	// between dimvars only — uniform for the cooperative loader (R1/R2). A
+	// C1b forced-FRAG site's WARP-covered dim is EXCLUDED — its chunk
+	// origin (rank*T + round) carries the per-thread term and already rides
+	// the fill's axes path (stmtFill's bivDim demands dimvars).
 	variant := loadTileThread
 	if class == ClassSMEM {
 		variant = loadTileCta
 	}
 	roundBases := make([]ir.Node, 0, len(covered))
 	for _, d := range covered {
+		if class == ClassFRAG && d.soc == SoCWARP {
+			continue
+		}
 		roundBases = append(roundBases, d.betweenIV)
 	}
 	variantAttr := lr.attr("loadtile", variant)
@@ -450,14 +496,17 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// dims' in-tile coordinates (M4) — R2 rank-in-index: a WARP-covered
 	// dim's index is thread_map.index(d)·T_d + i (d = the dim's ThreadMap
 	// slot — one map per LNT, tuple coordinates, §7bis — NOT a hardcoded 0
-	// and NOT the bare inside coordinate); SEQ dims index by their plain
-	// inside coordinate. The accesses chain after the fill on the buffer's
-	// own effect chain — this is also the F8 structural splice: the fill
-	// becomes reachable from the host loop's body-operand subtree through
-	// its readers and is ordered before them.
+	// and NOT the bare inside coordinate) for the SMEM window class; a C1b
+	// forced-FRAG site is a per-thread window — every covered dim indexes
+	// by its plain inside coordinate (the thread identity is implicit in
+	// the fragment's registers). SEQ dims index by their plain inside
+	// coordinate either way. The accesses chain after the fill on the
+	// buffer's own effect chain — this is also the F8 structural splice:
+	// the fill becomes reachable from the host loop's body-operand subtree
+	// through its readers and is ordered before them.
 	coords := make([]ir.Node, 0, len(covered))
 	for _, d := range covered {
-		if d.soc == SoCWARP {
+		if d.soc == SoCWARP && class == ClassSMEM {
 			rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			shifted := lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(float64(d.tile)))
 			coords = append(coords, lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, shifted, d.insideIV))
