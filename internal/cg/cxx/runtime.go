@@ -83,6 +83,7 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		case ir.KindRuntimeGlobalReducer:
 			cls = "GlobalReducer"
 		}
+		slots := e.slotCount[n] // the slot tile extent; 0 = slotless (scalar Combine)
 		local := e.local(fmt.Sprintf("reducer%d", e.redN))
 		e.redN++
 		scope := "sequential"
@@ -94,7 +95,7 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		}
 		e.c("%s reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim", scope)
 		e.objName[n] = local
-		e.line(fmt.Sprintf("tca::rt::%s<%s> %s(%s, %s);", cls, ts, local, init, e.lambdaName(ops[1])))
+		e.line(fmt.Sprintf("tca::rt::%s<%s, %du> %s(%s, %s);", cls, ts, uint(slots), local, init, e.lambdaName(ops[1])))
 		return nil
 	}
 }

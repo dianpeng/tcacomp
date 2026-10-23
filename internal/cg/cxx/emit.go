@@ -40,6 +40,7 @@ type emitter struct {
 	dimScope     []map[ir.Node]string  // dim InputParam → iterator local, loop-scoped stack
 	objName      map[ir.Node]string    // runtime construction → local
 	slots        map[ir.Node][]ir.Node // reducer construction → slot dim params (D7)
+	slotCount    map[ir.Node]int       // reducer construction → slot TILE EXTENT (the <T, Slots> template arg)
 	slottedVal   map[ir.Node][]ir.Node // slotted Combine node → its slot dim params
 	lambdas      []ir.Node             // surviving KindLambda in first-reference order
 	lambdaOwned  map[ir.Node]bool      // the operand closure of every surviving lambda — skipped in the kernel walk (hoisted file-scope instead)
@@ -98,6 +99,7 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 		iters:       map[ir.Node]string{},
 		objName:     map[ir.Node]string{},
 		slots:       map[ir.Node][]ir.Node{},
+		slotCount:   map[ir.Node]int{},
 		slottedVal:  map[ir.Node][]ir.Node{},
 		lambdaOwned: map[ir.Node]bool{},
 		paramNames:  map[string]bool{},
@@ -273,6 +275,7 @@ func (e *emitter) prescan() error {
 	if err := walk(e.k.Body); err != nil {
 		return err
 	}
+	e.scanReducerSlots()
 	e.buildPureRefs()
 
 	// The lambda-owned closure: the scheduler anchors the surviving
@@ -285,6 +288,67 @@ func (e *emitter) prescan() error {
 		}
 	}
 	return nil
+}
+
+// scanReducerSlots pre-collects each reducer construction's slot facts
+// from its Reduce calls (quick-261023-rt: the construction emits BEFORE the
+// calls in walk order, so the <T, Slots> template argument needs the
+// reverse lookup). Slots is the slot TILE EXTENT — the product of the slot
+// dims' tile sizes, taken from the owning inside loops' tile annotations
+// (the accumulator tile is one entry per logical output; the runtime's
+// static scratch is stage[Slots][PortionWarp]). Deterministic: the first
+// Reduce call wins; the emission-time consistency check still guards
+// arity drift.
+func (e *emitter) scanReducerSlots() {
+	ivTile := map[ir.Node]int{}
+	var index func(blk *ir.ASTBlock)
+	index = func(blk *ir.ASTBlock) {
+		if blk.Loop() != nil && blk.IV() != nil {
+			if t, ok := e.loopTile(blk.Loop()); ok {
+				ivTile[blk.IV()] = t
+			}
+		}
+		for _, it := range blk.Items() {
+			if it.Block != nil {
+				index(it.Block)
+			}
+		}
+	}
+	index(e.k.Body)
+
+	var walk func(blk *ir.ASTBlock)
+	walk = func(blk *ir.ASTBlock) {
+		for _, it := range blk.Items() {
+			if it.Node != nil && it.Node.KindOf() == ir.KindRuntimeCallMethod &&
+				ir.RuntimeMethodOf(it.Node) == "Reduce" {
+				ops := ir.OperandsOf(it.Node)
+				if len(ops) > 1 && ops[0] != nil {
+					if _, seen := e.slots[ops[0]]; !seen {
+						count, dims := 1, []ir.Node{}
+						for _, a := range ops[1 : len(ops)-1] {
+							ops2 := ir.OperandsOf(a)
+							if len(ops2) != 3 || ops2[0] == nil {
+								continue
+							}
+							dims = append(dims, ops2[0])
+							t, ok := ivTile[a]
+							if !ok || t < 1 {
+								continue // no tile fact: slots collapse to 1 (slotless scalars)
+							}
+							count *= t
+						}
+						e.slots[ops[0]] = dims
+						e.slotCount[ops[0]] = count
+					}
+				}
+				continue
+			}
+			if it.Block != nil {
+				walk(it.Block)
+			}
+		}
+	}
+	walk(e.k.Body)
 }
 
 // buildPureRefs computes which scheduler-anchored PURE items are actually

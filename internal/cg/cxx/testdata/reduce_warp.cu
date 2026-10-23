@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
     auto c4 = 64u;
     auto v4 = (v3 * c4);
     // warp reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim
-    tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0);
+    tca::rt::WarpReducer<float, 32u> reducer0(c2, RedwarpCombine0);
     // @d0 tile-between rounds — CTA, T=32, LoC=100 (map dim 0)
     for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 3200u, c0); d0_it0.Has(); d0_it0.Next()) {
       auto v5 = (v1 + d0_it0.Index());
