@@ -141,7 +141,19 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 	if err != nil {
 		return err
 	}
-	if err := prologue.InsertItemAt(len(prologue.Items()), ir.ASTItem{Node: construction}); err != nil {
+	// Quick-261023-lex: the LNT cluster is ONE lexical Group embedding the
+	// nest, so "appended to the prologue" is the END OF THE HEAD REGION —
+	// immediately BEFORE the embedded root-loop Block item — never the end
+	// of the Group (that would place the construction after the nest, out
+	// of scope for every Init/Reduce/Combine call).
+	headEnd := len(prologue.Items())
+	for i, it := range prologue.Items() {
+		if it.Block != nil {
+			headEnd = i
+			break
+		}
+	}
+	if err := prologue.InsertItemAt(headEnd, ir.ASTItem{Node: construction}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting the reducer construction: %w", red.BasePtr().ID(), err)
 	}
 	construction.BasePtr().SetSched(0, prologue)

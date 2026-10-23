@@ -82,8 +82,19 @@ for (...) { // (1) section #1: header part of the BB
   - (1) Recursively create a Loop BB corresponding to all nested iteration loops
     - Notes, mapping specific LIR loop node to corresponding Loop BB
     - The result generated here is called Loop BB Nest, ie LBBN
-  - (2) For each LNT, additionally prepend a Group block before the LBBN and append a Group block after LBBN
-    - The prologue and epilogue BB is useful for landing internal code
+  - (2) For each LNT, ONE lexical Group block EMBEDDING the LBBN inside it
+    - AMENDED 2026-10-23 (quick-261023-lex, author ruling): the original
+      prepend/append sibling pair [prologue Group, LBBN, epilogue Group]
+      is SUPERSEDED — a sibling prologue Group closes its lexical scope
+      before the nest opens, stranding every declaration codegen places
+      there (runtime objects, hoisted invariants) out of scope at their
+      use sites. The LNT cluster is ONE lexical Group whose items are
+      [head items (the old prologue region), the LBBN root as an embedded
+      statement, after-nest items (the old epilogue region — no separate
+      tail BB; after-nest placement is just an item position after the
+      nest)]. All old semantics — SN depth requirements, effect ordering,
+      the end-node landing — carry over positionally. Nest()/P-11 binding
+      and the epilogue SN rule are unchanged (the Group carries Nest())
   - (3) Scheduling Numbering
     - (3.1) Scheduling Numbering Initialization
       - Give each IR node in sea-of-nodes GRAPH an attribute, scheduling number, denoted as SN
@@ -165,8 +176,8 @@ for (...) { // (1) section #1: header part of the BB
 
 - The compiled-kernel output shape is
   - 1) One PrototypeBlock FIRST (the signature scope)
-  - 2) Then the concatenated per-LNT Loop BB clusters, each with its
-    prologue/epilogue Groups, unchanged
+  - 2) Then the concatenated per-LNT LEXICAL Groups (quick-261023-lex):
+    each embeds its LBBN — [head items, the LBBN root, after-nest items]
 - The SN → lexical-scope mapping is TOTAL
   - SN -1 = signature scope (the Prototype block)
   - SN 0 = kernel scope (the prologue/kernel Group)

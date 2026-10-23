@@ -63,8 +63,12 @@ Codegen is NOT a pipeline pass — it is a consumer invoked after
   placeholders (kernel signature) and `KindMemNew` (GMEM temporaries) —
   `astcfg.go:43-55`.
 - `ASTKernel.Body` — top-level `BlockGroup` containing, per LNT in allocation
-  order: `[prologue Group, loop-root block, epilogue Group]`; `KindReturn`
-  lands in the LAST LNT's epilogue.
+  order, that LNT's LEXICAL Group (quick-261023-lex): `[head items (the old
+  prologue region), the embedded loop-root block, after-nest items (no
+  separate tail BB)]`; `KindReturn` lands in the LAST LNT's after-nest
+  region. The Group renders as ONE C++ scope so the head region's
+  declarations scope over the nest — a sibling prologue Group would close
+  before the nest opens.
 - `ASTBlock` kinds: `BlockGroup` / `BlockSeqLoop` / `BlockCTALoop` /
   `BlockThrLoop`, carrying `Loop/IV/Bound/DoSoC/LoC` (`astcfg.go:73-151`).
 - Items are in final placement order — the emitter walks `Items()` and emits
@@ -492,14 +496,14 @@ extern "C" void tca_<name>_launch(
   `RuntimeGetAttribute` nodes GVN never saw, so e.g. two identical
   `threadmap.index(1)` reads may survive. Cheap pure accessors; acceptable
   v0 (a post-final-lower GVN re-run would fold them).
-- **KNOWN PIPELINE GAP pinned by the matmul golden**: the schedule pass
-  currently places the cooperative fill AFTER the tile-inside loops within
-  the between-round body (the sea's ImpactBy chain says fill-first; the
-  item placement does not realize it). The emitted C++ therefore reads the
-  SMEM buffer before the round's fill. This is a schedule-pass defect (the
-  review's fill-placement family), NOT an emitter behavior — the emitter
-  renders item order faithfully by contract (§1.1). The golden pins
-  current pipeline output and will churn when the schedule fix lands.
+- **RESOLVED (quick-261023-lex)**: the fill-after-reads placement gap is
+  FIXED in the schedule pass — rank-r statements now INSERT before their
+  block's embedded sub-block (they used to append after it, and the old
+  block-granular order net masked the inversion). The matmul golden now
+  pins the fill at the TOP of its K-between host body, before every reader.
+  The cross-block order net compares ITEM-POSITION PATHS (lexicographic),
+  not block DFS-entry indices — required since one lexical Group holds
+  items both before and after its embedded nest.
 
 ## 12. Out of scope / follow-ups
 

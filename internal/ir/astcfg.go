@@ -241,9 +241,13 @@ func NewASTGroup() *ASTBlock {
 }
 
 // NewASTGroupInNest creates an empty BlockGroup whose Nest() back-pointer
-// is lnt (ruling 7, quick-261022-b2m): the prologue/epilogue pads around
-// ONE loop-nest cluster, so final_lower can recover the owning nest of any
-// epilogue-landed node in O(1). The schedule pass is the sole producer.
+// is lnt (ruling 7, quick-261022-b2m): ONE loop-nest cluster's LEXICAL
+// Group (quick-261023-lex) — the head region (prologue items), the embedded
+// LBBN root, and the after-nest (epilogue) items all live as items of this
+// ONE Group — so final_lower can recover the owning nest of any node in the
+// cluster in O(1) and codegen's C++ scoping is correct (a sibling prologue
+// Group would close before the nest opens). The schedule pass is the sole
+// producer.
 func NewASTGroupInNest(lnt *ASTLNT) *ASTBlock {
 	return &ASTBlock{kind: BlockGroup, dosoc: -1, loc: 1, nest: lnt}
 }
@@ -373,8 +377,11 @@ type ASTLNT struct {
 // ASTKernel is the scheduled kernel (spec "Scheduling the CFG"): the
 // Prototype is the kernel-signature block rendered FIRST (quick-261022-e2u,
 // D-2); the Body is always a BlockGroup ("Body: Which is a Group") whose
-// items are, per LNT in forest-root allocation order, [prologue Group, LBBN
-// root block, epilogue Group] — the prototype is NOT an item inside Body;
+// items are, per LNT in forest-root allocation order, that LNT's LEXICAL
+// Group (quick-261023-lex): [head items (the old prologue region), the
+// embedded LBBN root block, after-nest items (the old epilogue region)] —
+// there is no separate prologue/tail block; the prototype is NOT an item
+// inside Body;
 // Params are the kernel input params in declaration order; Gmem lists every
 // live GMEM allocation in allocation order; LNTs lists the per-LNT loop
 // metadata in forest-root allocation order. Since quick-261022-b2m (ruling

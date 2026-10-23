@@ -28,41 +28,39 @@ __global__ void tca_kernel_mm(uint32_t d0, uint32_t d1, uint32_t d2, float* out,
     auto tca_c7 = 65536u;
     auto tca_v5 = tca_tm1.index(1u);
     auto tca_v6 = (tca_v5 * tca_c2);
-  }
-  for (auto tca_it0 = tca::rt::CtaIterator(tca_gm0, 0u, 100u, 0u, 6400u, tca_c0); tca_it0.Has(); tca_it0.Next()) {
-    for (auto tca_it1 = tca::rt::SeqIterator(0u, 64u, tca_c0); tca_it1.Has(); tca_it1.Next()) {
-      for (auto tca_it2 = tca::rt::ThrIterator(tca_tm1, 1u, 256u, 0u, 16384u, tca_c0); tca_it2.Has(); tca_it2.Next()) {
-        for (auto tca_it3 = tca::rt::ThrIterator(tca_tm1, 0u, 256u, 0u, 256u, tca::rt::umin(tca_c2, (tca_c0 - tca::rt::umin((tca_v1 + tca_it0.Index()), tca_c0)))); tca_it3.Has(); tca_it3.Next()) {
-          for (auto tca_it4 = tca::rt::SeqIterator(0u, 1u, tca::rt::umin(tca_c2, (tca_c0 - tca::rt::umin(tca_it1.Index(), tca_c0)))); tca_it4.Has(); tca_it4.Next()) {
-            for (auto tca_it5 = tca::rt::SeqIterator(0u, 1u, tca::rt::umin(tca_c2, (tca_c0 - tca::rt::umin((tca_v4 + tca_it2.Index()), tca_c0)))); tca_it5.Has(); tca_it5.Next()) {
-              auto tca_v7 = ((tca_v4 + tca_it2.Index()) + tca_it5.Index());
-              auto tca_v8 = rhs_v.Get((tca_it1.Index() + tca_it4.Index()), tca_v7);
-              auto tca_v9 = (tca_v6 + tca_it5.Index());
-              auto tca_v10 = tca_s0.Get(tca_v9);
-              auto tca_v11 = (tca_v10 * tca_v8);
-              out_v.Set(tca_v11, (((tca_v1 + tca_it0.Index()) + tca_it3.Index()) + tca_v2), (tca_it1.Index() + tca_it4.Index()), tca_v7);
+    for (auto tca_it0 = tca::rt::CtaIterator(tca_gm0, 0u, 100u, 0u, 6400u, tca_c0); tca_it0.Has(); tca_it0.Next()) {
+      auto tca_v7 = (tca_v1 + tca_it0.Index());
+      auto tca_v8 = tca::rt::umin(tca_v7, tca_c0);
+      auto tca_v9 = (tca_c0 - tca_v8);
+      auto tca_v10 = tca::rt::umin(tca_c2, tca_v9);
+      for (auto tca_it1 = tca::rt::SeqIterator(0u, 64u, tca_c0); tca_it1.Has(); tca_it1.Next()) {
+        auto tca_v11 = tca::rt::umin(tca_it1.Index(), tca_c0);
+        auto tca_v12 = (tca_c0 - tca_v11);
+        auto tca_v13 = tca::rt::umin(tca_c2, tca_v12);
+        for (auto tca_it2 = tca::rt::ThrIterator(tca_tm1, 1u, 256u, 0u, 16384u, tca_c0); tca_it2.Has(); tca_it2.Next()) {
+          auto tca_v14 = (tca_v4 + tca_it2.Index());
+          auto tca_v15 = tca::rt::umin(tca_v14, tca_c0);
+          auto tca_v16 = (tca_c0 - tca_v15);
+          auto tca_v17 = tca::rt::umin(tca_c2, tca_v16);
+          tca::rt::LoadTileCta(tca_s0, lhs_v, tca_v7, tca_it2.Index());
+          for (auto tca_it3 = tca::rt::ThrIterator(tca_tm1, 0u, 256u, 0u, 256u, tca_v10); tca_it3.Has(); tca_it3.Next()) {
+            auto tca_v18 = (tca_v7 + tca_it3.Index());
+            auto tca_v19 = (tca_v18 + tca_v2);
+            for (auto tca_it4 = tca::rt::SeqIterator(0u, 1u, tca_v13); tca_it4.Has(); tca_it4.Next()) {
+              auto tca_v20 = (tca_it1.Index() + tca_it4.Index());
+              for (auto tca_it5 = tca::rt::SeqIterator(0u, 1u, tca_v17); tca_it5.Has(); tca_it5.Next()) {
+                auto tca_v21 = (tca_v14 + tca_it5.Index());
+                auto tca_v22 = rhs_v.Get(tca_v20, tca_v21);
+                auto tca_v23 = (tca_v6 + tca_it5.Index());
+                auto tca_v24 = tca_s0.Get(tca_v23);
+                auto tca_v25 = (tca_v24 * tca_v22);
+                out_v.Set(tca_v25, tca_v19, tca_v20, tca_v21);
+              }
             }
-            auto tca_v12 = (tca_it1.Index() + tca_it4.Index());
           }
-          auto tca_v13 = ((tca_v1 + tca_it0.Index()) + tca_it3.Index());
-          auto tca_v14 = (tca_v13 + tca_v2);
         }
-        auto tca_v15 = (tca_v4 + tca_it2.Index());
-        auto tca_v16 = tca::rt::umin(tca_v15, tca_c0);
-        auto tca_v17 = (tca_c0 - tca_v16);
-        auto tca_v18 = tca::rt::umin(tca_c2, tca_v17);
-        tca::rt::LoadTileCta(tca_s0, lhs_v, (tca_v1 + tca_it0.Index()), tca_it2.Index());
       }
-      auto tca_v19 = tca::rt::umin(tca_it1.Index(), tca_c0);
-      auto tca_v20 = (tca_c0 - tca_v19);
-      auto tca_v21 = tca::rt::umin(tca_c2, tca_v20);
     }
-    auto tca_v22 = (tca_v1 + tca_it0.Index());
-    auto tca_v23 = tca::rt::umin(tca_v22, tca_c0);
-    auto tca_v24 = (tca_c0 - tca_v23);
-    auto tca_v25 = tca::rt::umin(tca_c2, tca_v24);
-  }
-  {
   }
 }
 }

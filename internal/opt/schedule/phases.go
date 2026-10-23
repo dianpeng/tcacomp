@@ -361,8 +361,8 @@ func (r *scheduleRun) bestEpilogueHome(n ir.Node, rootIndexOf map[*forNest]int, 
 
 // buildKernel is SPEC STEP 1 (per-LNT scheduling) plus the cluster
 // concatenation into the kernel Body group: the no-loop degenerate body,
-// or one [prologue, LBBN, epilogue] cluster per forest root in allocation
-// order.
+// or one LEXICAL Group cluster per forest root in allocation order
+// (quick-261023-lex: [head items, embedded LBBN, after-nest items]).
 func (r *scheduleRun) buildKernel() error {
 	r.kernel = ir.NewASTGroup()
 	if len(r.roots) == 0 {
@@ -400,29 +400,38 @@ func (r *scheduleRun) scheduleFlatBody() error {
 	return nil
 }
 
-// scheduleCluster builds ONE LNT's [prologue Group, LBBN root, epilogue
-// Group] cluster: the LNT record FIRST (ruling 7 — the Groups' Nest()
+// scheduleCluster builds ONE LNT's LEXICAL Group cluster (quick-261023-lex,
+// the author ruling): the LNT record FIRST (ruling 7 — the Group's Nest()
 // target), the LBBN (spec step 1.1), per-rank placement for the in-loop
-// class (spec step 1.4), and the epilogue-class collection.
+// class (spec step 1.4) into the Group's HEAD region, the LBBN root as a
+// statement INSIDE the Group — the nest is embedded, so the head region's
+// declarations (runtime objects, hoisted invariants) lexically scope over
+// it — and the after-nest (epilogue) class appended after the nest inside
+// the SAME Group. The old [prologue Group, root, epilogue Group] sibling
+// triple is deleted: a sibling prologue Group closes its C++ scope before
+// the nest opens, stranding every declaration codegen places there; and a
+// separate tail Group is redundant — after-nest placement is just an item
+// position after the nest in the lexical Group (all old semantics — SN
+// depth requirements, effect ordering, the end-node landing — carry over
+// positionally).
 func (r *scheduleRun) scheduleCluster(root *forNest) error {
 	rootBlock, metas, err := buildLBBN(root)
 	if err != nil {
 		return err
 	}
 	lnt := &ir.ASTLNT{Root: root.loop, Loops: metas}
-	prologue, epilogue := ir.NewASTGroupInNest(lnt), ir.NewASTGroupInNest(lnt)
+	lex := ir.NewASTGroupInNest(lnt)
 	byDepth := blocksByDepth(root)
 	for rank := 0; rank <= root.maxDepth(); rank++ {
-		if err := r.placeRank(rank, prologue, byDepth[rank], root); err != nil {
+		if err := r.placeRank(rank, lex, byDepth[rank], root); err != nil {
 			return err
 		}
 	}
-	if err := r.placeEpilogue(root, epilogue); err != nil {
+	lex.AppendItem(ir.ASTItem{Block: rootBlock}) // the nest: embedded, the head scopes over it
+	if err := r.placeEpilogue(root, lex); err != nil {
 		return err
 	}
-	r.kernel.AppendItem(ir.ASTItem{Block: prologue})
-	r.kernel.AppendItem(ir.ASTItem{Block: rootBlock})
-	r.kernel.AppendItem(ir.ASTItem{Block: epilogue})
+	r.kernel.AppendItem(ir.ASTItem{Block: lex})
 	r.lnts = append(r.lnts, lnt)
 	return nil
 }
@@ -469,8 +478,24 @@ func (r *scheduleRun) placeRank(rank int, prologue, target *ir.ASTBlock, root *f
 	if err != nil {
 		return err
 	}
+	// Insert BEFORE the block's first sub-block item (quick-261023-lex):
+	// buildLBBN pre-builds the nesting, so the rank-(r+1) loop block is
+	// already an item of target — appending rank-r statements would place
+	// them AFTER the very loop that consumes them (the old block-granular
+	// order net masked this; the item-position net exposed it). Rank-r
+	// statements at their required depth execute before the deeper loops —
+	// always legal, and the only correct order when a deeper loop's
+	// bounds/axes consume them.
+	ins := len(target.Items())
+	for i, it := range target.Items() {
+		if it.Block != nil {
+			ins = i
+			break
+		}
+	}
 	for _, n := range ordered {
-		target.AppendItem(ir.ASTItem{Node: n})
+		target.InsertItemAt(ins, ir.ASTItem{Node: n})
+		ins++
 		n.BasePtr().SetSched(rank, target) // persistent SN + linkage (D-03)
 		r.claimed[n] = true
 	}

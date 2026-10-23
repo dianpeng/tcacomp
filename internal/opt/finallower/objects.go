@@ -67,9 +67,10 @@ func (lr *lowering) insertRuntimeObjects() error {
 	return nil
 }
 
-// prologueOf resolves the LNT's prologue Group: the kernel Body item whose
-// Block is a Group with Nest() == lnt (the schedule pass's cluster layout —
-// [prologue, LBBN root, epilogue] per LNT). A missing prologue is a named
+// prologueOf resolves the LNT's lexical Group (quick-261023-lex: the
+// schedule pass's per-LNT cluster is ONE Group embedding the nest — the
+// head region is the prologue): the kernel Body item whose Block is a
+// Group with Nest() == lnt. A missing group is a named
 // error.
 func (lr *lowering) prologueOf(lnt *ir.ASTLNT) (*ir.ASTBlock, error) {
 	for _, it := range lr.ast.Body.Items() {

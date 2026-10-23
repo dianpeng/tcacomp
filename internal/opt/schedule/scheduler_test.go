@@ -114,8 +114,9 @@ func countOccurrences(blk *ir.ASTBlock, n ir.Node) int {
 	return c
 }
 
-// bodyBlocks returns the kernel body's top-level block items (the per-LNT
-// [prologue, LBBN root, epilogue] clusters) in order. Node items are
+// bodyBlocks returns the kernel body's top-level block items — since
+// quick-261023-lex, ONE lexical Group per LNT (head items + the embedded
+// LBBN root + after-nest items). Node items are
 // SKIPPED: since final lowering joined the default pipeline
 // (quick-261022-l1o) the kernel Body legitimately carries statement items —
 // the RuntimeKernelInfo prepended as its FIRST item (LR-11) — beside the
@@ -128,6 +129,59 @@ func bodyBlocks(t *testing.T, k *ir.ASTKernel) []*ir.ASTBlock {
 			continue // a kernel-level statement item (the KernelInfo prepend)
 		}
 		out = append(out, it.Block)
+	}
+	return out
+}
+
+// rootBlockOf returns lex's embedded root-loop block — the LNT's nest is a
+// statement INSIDE its lexical Group (quick-261023-lex). v0 nests are
+// chains: the first (and only) Block item.
+func rootBlockOf(t *testing.T, lex *ir.ASTBlock) *ir.ASTBlock {
+	t.Helper()
+	for _, it := range lex.Items() {
+		if it.Block != nil {
+			return it.Block
+		}
+	}
+	t.Fatal("the lexical Group carries no embedded loop nest")
+	return nil
+}
+
+// afterRoot reports whether n is an item of lex positioned AFTER the
+// embedded root block — the old epilogue region, now just an item position
+// (quick-261023-lex).
+func afterRoot(t *testing.T, lex *ir.ASTBlock, n ir.Node) bool {
+	t.Helper()
+	rootIdx := -1
+	for i, it := range lex.Items() {
+		if it.Block != nil {
+			rootIdx = i
+			break
+		}
+	}
+	if rootIdx < 0 {
+		t.Fatal("the lexical Group carries no embedded loop nest")
+	}
+	for i, it := range lex.Items() {
+		if it.Node != nil && it.Node.BasePtr() == n.BasePtr() {
+			return i > rootIdx
+		}
+	}
+	return false
+}
+
+// headNodes returns lex's HEAD-region node items — those before the
+// embedded root block (the old prologue region).
+func headNodes(t *testing.T, lex *ir.ASTBlock) []ir.Node {
+	t.Helper()
+	var out []ir.Node
+	for _, it := range lex.Items() {
+		if it.Block != nil {
+			break // the head ends at the embedded nest
+		}
+		if it.Node != nil {
+			out = append(out, it.Node)
+		}
 	}
 	return out
 }
@@ -198,13 +252,14 @@ func TestSingleNestLICM(t *testing.T) {
 
 	k := run(t, f.g)
 	blocks := bodyBlocks(t, k)
-	if len(blocks) != 3 {
-		t.Fatalf("body items = %d blocks, want [prologue, ThrLoop, epilogue]", len(blocks))
+	if len(blocks) != 1 {
+		t.Fatalf("body items = %d blocks, want ONE lexical Group per LNT", len(blocks))
 	}
-	prologue, thr, epilogue := blocks[0], blocks[1], blocks[2]
-	if prologue.Kind() != ir.BlockGroup || thr.Kind() != ir.BlockThrLoop || epilogue.Kind() != ir.BlockGroup {
-		t.Fatalf("block kinds = [%s %s %s], want [Group ThrLoop Group]",
-			prologue.Kind(), thr.Kind(), epilogue.Kind())
+	prologue, thr := blocks[0], rootBlockOf(t, blocks[0])
+	epilogue := prologue // the after-nest region is an item position in the SAME Group
+	if prologue.Kind() != ir.BlockGroup || thr.Kind() != ir.BlockThrLoop {
+		t.Fatalf("cluster kinds = [%s %s], want [Group(lexical) ThrLoop]",
+			prologue.Kind(), thr.Kind())
 	}
 	if thr.Loop().BasePtr() != loop.BasePtr() {
 		t.Fatal("the ThrLoop block must materialize the ForLoop node")
@@ -270,10 +325,10 @@ func TestNestedNestSinglePlacement(t *testing.T) {
 
 	k := run(t, f.g)
 	blocks := bodyBlocks(t, k)
-	if len(blocks) != 3 {
-		t.Fatalf("body items = %d blocks, want [prologue, CTALoop, epilogue]", len(blocks))
+	if len(blocks) != 1 {
+		t.Fatalf("body items = %d blocks, want ONE lexical Group per LNT", len(blocks))
 	}
-	cta := blocks[1]
+	cta := rootBlockOf(t, blocks[0])
 	if cta.Kind() != ir.BlockCTALoop {
 		t.Fatalf("outer block kind = %s, want CTALoop", cta.Kind())
 	}
@@ -341,11 +396,12 @@ func TestMultipleLNTs(t *testing.T) {
 
 	k := run(t, f.g)
 	blocks := bodyBlocks(t, k)
-	if len(blocks) != 6 {
-		t.Fatalf("body items = %d blocks, want [A-pro, A-LBBN, A-epi, B-pro, B-LBBN, B-epi]", len(blocks))
+	if len(blocks) != 2 {
+		t.Fatalf("body items = %d blocks, want ONE lexical Group per LNT [A, B]", len(blocks))
 	}
-	aPro, aRoot, aEpi := blocks[0], blocks[1], blocks[2]
-	bPro, bRoot, bEpi := blocks[3], blocks[4], blocks[5]
+	aPro, aRoot := blocks[0], rootBlockOf(t, blocks[0])
+	bPro, bRoot := blocks[1], rootBlockOf(t, blocks[1])
+	aEpi, bEpi := aPro, bPro // after-nest: item positions in the same Groups
 	if aRoot.Kind() != ir.BlockThrLoop || bRoot.Kind() != ir.BlockCTALoop {
 		t.Fatalf("LBBN roots = [%s %s], want [ThrLoop CTALoop] in allocation order", aRoot.Kind(), bRoot.Kind())
 	}
@@ -361,8 +417,8 @@ func TestMultipleLNTs(t *testing.T) {
 	if countOccurrences(k.Body, inv) != 1 {
 		t.Fatal("the shared invariant must be placed exactly once (A's prologue only)")
 	}
-	if len(itemNodes(bPro)) != 0 {
-		t.Fatal("B's prologue must stay empty (rank-0 nodes are claimed by the first LNT)")
+	if len(headNodes(t, bPro)) != 0 {
+		t.Fatal("B's head region must stay empty (rank-0 nodes are claimed by the first LNT)")
 	}
 	// CR-02 pin (quick-261022-b2m): the end node's deps span BOTH nests
 	// (both roots and both in-loop stores), so it lands in the LAST
@@ -370,10 +426,13 @@ func TestMultipleLNTs(t *testing.T) {
 	// depth requirement; both roots sit at depth 1); A's epilogue stays
 	// empty (D-04 landing pads plus the pass-placed after-nest consumers).
 	if indexOf(itemNodes(aEpi), f.g.End()) >= 0 {
-		t.Fatal("A's epilogue must stay empty (the end node's home is the LAST contributing root)")
+		t.Fatal("A's cluster must not hold the end node (its home is the LAST contributing root)")
 	}
 	if indexOf(itemNodes(bEpi), f.g.End()) < 0 {
-		t.Fatal("the end node must land in B's (the last root's) epilogue Group")
+		t.Fatal("the end node must land in B's (the last root's) after-nest region")
+	}
+	if !afterRoot(t, bEpi, f.g.End()) {
+		t.Fatal("the end node must sit AFTER B's embedded nest (the old epilogue position)")
 	}
 	if f.g.End().BasePtr().SchedSN() != 1 {
 		t.Fatalf("end node SN = %d, want 1 (the propagated depth requirement, ruling 6)", f.g.End().BasePtr().SchedSN())
@@ -397,14 +456,14 @@ func TestNoLNTMetadata(t *testing.T) {
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 	k := run(t, f.g)
-	blocks := bodyBlocks(t, k)
-	if blocks[1].Kind() != ir.BlockSeqLoop {
-		t.Fatalf("attrs-less loop block = %s, want SeqLoop", blocks[1].Kind())
+	seq := rootBlockOf(t, bodyBlocks(t, k)[0])
+	if seq.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("attrs-less loop block = %s, want SeqLoop", seq.Kind())
 	}
-	if blocks[1].LoC() != 1 || blocks[1].DoSoC() != -1 {
-		t.Fatalf("defaults LoC/DoSoC = %d/%d, want 1/-1", blocks[1].LoC(), blocks[1].DoSoC())
+	if seq.LoC() != 1 || seq.DoSoC() != -1 {
+		t.Fatalf("defaults LoC/DoSoC = %d/%d, want 1/-1", seq.LoC(), seq.DoSoC())
 	}
-	if indexOf(itemNodes(blocks[1]), st) < 0 {
+	if indexOf(itemNodes(seq), st) < 0 {
 		t.Fatal("the store must land in the SeqLoop block")
 	}
 	_ = loop
@@ -490,7 +549,8 @@ func TestReductionShapeEpilogue(t *testing.T) {
 
 	k := run(t, f.g)
 	blocks := bodyBlocks(t, k)
-	prologue, thr, epilogue := blocks[0], blocks[1], blocks[2]
+	prologue, thr := blocks[0], rootBlockOf(t, blocks[0])
+	epilogue := prologue // after-nest: an item position in the same Group
 	if thr.Kind() != ir.BlockThrLoop {
 		t.Fatalf("root block kind = %s, want ThrLoop", thr.Kind())
 	}
@@ -513,8 +573,8 @@ func TestReductionShapeEpilogue(t *testing.T) {
 	if indexOf(itemNodes(thr), n) < 0 || indexOf(itemNodes(thr), st) < 0 {
 		t.Fatal("the in-loop value and its store must stay in the ThrLoop block")
 	}
-	if indexOf(itemNodes(prologue), R) >= 0 {
-		t.Fatal("the reduction shape must NOT hoist to the prologue before its dependency (CR-02)")
+	if !afterRoot(t, prologue, R) {
+		t.Fatal("the reduction shape must sit AFTER the nest (never hoisted before its dependency, CR-02)")
 	}
 }
 
@@ -585,7 +645,7 @@ func TestPostNestStoreEpilogue(t *testing.T) {
 
 	k := run(t, f.g)
 	blocks := bodyBlocks(t, k)
-	thr, epilogue := blocks[1], blocks[2]
+	thr, epilogue := rootBlockOf(t, blocks[0]), blocks[0] // after-nest: same Group
 	if st2.BasePtr().SchedBlock() != epilogue || st2.BasePtr().SchedSN() != 1 {
 		t.Fatalf("post-nest store SN/block = %d/%p, want 1/epilogue", st2.BasePtr().SchedSN(), st2.BasePtr().SchedBlock())
 	}
@@ -611,8 +671,7 @@ func TestEffectfulNoHoist(t *testing.T) {
 		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 		k := run(t, f.g)
-		blocks := bodyBlocks(t, k)
-		thr := blocks[1]
+		thr := rootBlockOf(t, bodyBlocks(t, k)[0])
 		if st.BasePtr().SchedSN() != 1 || st.BasePtr().SchedBlock() != thr {
 			t.Fatalf("invariant effectful store SN/block = %d/%p, want 1/ThrLoop (HI-02 floor)", st.BasePtr().SchedSN(), st.BasePtr().SchedBlock())
 		}
@@ -632,7 +691,7 @@ func TestEffectfulNoHoist(t *testing.T) {
 
 		k := run(t, f.g)
 		blocks := bodyBlocks(t, k)
-		prologue, thr := blocks[0], blocks[1]
+		prologue, thr := blocks[0], rootBlockOf(t, blocks[0])
 		if inv.BasePtr().SchedSN() != 0 || inv.BasePtr().SchedBlock() != prologue {
 			t.Fatal("the pure invariant must still hoist to the prologue (LICM intact)")
 		}

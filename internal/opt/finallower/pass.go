@@ -185,10 +185,10 @@ type lowering struct {
 }
 
 // blockIndex builds the block→LNT index per P-11: for each LNT, its
-// prologue/epilogue Groups (found via the kernel Body items whose
-// Block.Nest() == lnt) and the Loop-block span (the subtree rooted at the
-// Body item whose Block.Loop() == lnt.Root) all map to that LNT. The kernel
-// Body Group itself and the Prototype belong to NO LNT.
+// LEXICAL Group (the kernel Body item whose Block.Nest() == lnt) and the
+// Group's whole subtree — the embedded LBBN loop blocks included
+// (quick-261023-lex: the nest is an item inside the group, not a sibling).
+// The kernel Body Group itself and the Prototype belong to NO LNT.
 func (lr *lowering) blockIndex() map[*ir.ASTBlock]*ir.ASTLNT {
 	if lr.lntsIx {
 		return lr.byLNT
@@ -196,28 +196,19 @@ func (lr *lowering) blockIndex() map[*ir.ASTBlock]*ir.ASTLNT {
 	lr.byLNT = make(map[*ir.ASTBlock]*ir.ASTLNT)
 	for _, lnt := range lr.ast.LNTs {
 		for _, it := range lr.ast.Body.Items() {
-			if it.Block == nil {
+			if it.Block == nil || it.Block.Kind() != ir.BlockGroup || it.Block.Nest() != lnt {
 				continue
 			}
-			blk := it.Block
-			if blk.Kind() == ir.BlockGroup {
-				if blk.Nest() == lnt {
-					lr.byLNT[blk] = lnt
-				}
-				continue
-			}
-			if blk.Loop() != nil && lnt.Root != nil && blk.Loop().BasePtr() == lnt.Root.BasePtr() {
-				var stamp func(b *ir.ASTBlock)
-				stamp = func(b *ir.ASTBlock) {
-					lr.byLNT[b] = lnt
-					for _, sub := range b.Items() {
-						if sub.Block != nil {
-							stamp(sub.Block)
-						}
+			var stamp func(b *ir.ASTBlock)
+			stamp = func(b *ir.ASTBlock) {
+				lr.byLNT[b] = lnt
+				for _, sub := range b.Items() {
+					if sub.Block != nil {
+						stamp(sub.Block)
 					}
 				}
-				stamp(blk)
 			}
+			stamp(it.Block)
 		}
 	}
 	lr.lntsIx = true

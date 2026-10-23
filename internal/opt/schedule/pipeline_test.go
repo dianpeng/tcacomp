@@ -142,27 +142,27 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 		t.Fatalf("prototype items = %d, want exactly the %d live params", got, len(k1.Params))
 	}
 
-	// Structure: one LNT; the body's top-level items are exactly
-	// [prologue Group, root LBBN block, epilogue Group].
+	// Structure: one LNT; the body's top-level block items are exactly ONE
+	// lexical Group embedding the LBBN root (quick-261023-lex).
 	if len(k1.LNTs) != 1 {
 		t.Fatalf("LNTs = %d, want 1", len(k1.LNTs))
 	}
 	blocks := bodyBlocks(t, k1)
-	if len(blocks) != 3 {
-		t.Fatalf("body top-level blocks = %d, want [prologue, LBBN, epilogue]", len(blocks))
+	if len(blocks) != 1 {
+		t.Fatalf("body top-level blocks = %d, want ONE lexical Group per LNT", len(blocks))
 	}
-	if blocks[0].Kind() != ir.BlockGroup || blocks[2].Kind() != ir.BlockGroup {
-		t.Fatal("the cluster pads must be Groups")
+	if blocks[0].Kind() != ir.BlockGroup {
+		t.Fatal("the LNT cluster must be a lexical Group")
 	}
-	if blocks[0].Nest() != k1.LNTs[0] || blocks[2].Nest() != k1.LNTs[0] {
-		t.Fatal("the prologue/epilogue Groups must carry the LNT record via Nest()")
+	if blocks[0].Nest() != k1.LNTs[0] {
+		t.Fatal("the lexical Group must carry the LNT record via Nest()")
 	}
 	// Loop-kind/depth structure — the observed stable dump: the tile-lowered
 	// M→N→K chain materializes as six loops, CTA→Seq→Thr→Thr→Seq→Seq.
 	wantKinds := []ir.BlockKind{ir.BlockCTALoop, ir.BlockSeqLoop, ir.BlockThrLoop,
 		ir.BlockThrLoop, ir.BlockSeqLoop, ir.BlockSeqLoop}
 	var gotKinds []ir.BlockKind
-	for b := blocks[1]; b != nil; {
+	for b := rootBlockOf(t, blocks[0]); b != nil; {
 		gotKinds = append(gotKinds, b.Kind())
 		next := (*ir.ASTBlock)(nil)
 		for _, it := range b.Items() { // nests are chains: at most one child block

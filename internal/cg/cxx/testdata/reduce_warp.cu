@@ -31,34 +31,32 @@ __global__ void tca_kernel_redwarp(uint32_t d0, uint32_t d1, const float* lhs, f
     auto tca_c9 = 64u;
     auto tca_v4 = (tca_v3 * tca_c9);
     tca::rt::WarpReducer<float> tca_r0(tca_c2, tca_lambda_30);
-  }
-  for (auto tca_it0 = tca::rt::CtaIterator(tca_gm0, 0u, 100u, 0u, 3200u, tca_c0); tca_it0.Has(); tca_it0.Next()) {
-    tca_r0.Init();
-    for (auto tca_it1 = tca::rt::ThrIterator(tca_tm1, 1u, 256u, 0u, 16384u, tca_c1); tca_it1.Has(); tca_it1.Next()) {
-      for (auto tca_it2 = tca::rt::ThrIterator(tca_tm1, 0u, 256u, 0u, 256u, tca::rt::umin(tca_c4, (tca_c0 - tca::rt::umin((tca_v1 + tca_it0.Index()), tca_c0)))); tca_it2.Has(); tca_it2.Next()) {
-        for (auto tca_it3 = tca::rt::SeqIterator(0u, 1u, tca::rt::umin(tca_c9, (tca_c1 - tca::rt::umin((tca_v4 + tca_it1.Index()), tca_c1)))); tca_it3.Has(); tca_it3.Next()) {
-          auto tca_v5 = ((tca_v4 + tca_it1.Index()) + tca_it3.Index());
-          auto tca_v6 = lhs_v.Get((((tca_v1 + tca_it0.Index()) + tca_it2.Index()) + tca_v2), tca_v5);
-          tca_r0.Reduce(tca_it2.Index(), tca_v6);
+    for (auto tca_it0 = tca::rt::CtaIterator(tca_gm0, 0u, 100u, 0u, 3200u, tca_c0); tca_it0.Has(); tca_it0.Next()) {
+      auto tca_v5 = (tca_v1 + tca_it0.Index());
+      auto tca_v6 = tca::rt::umin(tca_v5, tca_c0);
+      auto tca_v7 = (tca_c0 - tca_v6);
+      auto tca_v8 = tca::rt::umin(tca_c4, tca_v7);
+      tca_r0.Init();
+      for (auto tca_it1 = tca::rt::ThrIterator(tca_tm1, 1u, 256u, 0u, 16384u, tca_c1); tca_it1.Has(); tca_it1.Next()) {
+        auto tca_v9 = (tca_v4 + tca_it1.Index());
+        auto tca_v10 = tca::rt::umin(tca_v9, tca_c1);
+        auto tca_v11 = (tca_c1 - tca_v10);
+        auto tca_v12 = tca::rt::umin(tca_c9, tca_v11);
+        for (auto tca_it2 = tca::rt::ThrIterator(tca_tm1, 0u, 256u, 0u, 256u, tca_v8); tca_it2.Has(); tca_it2.Next()) {
+          auto tca_v13 = (tca_v5 + tca_it2.Index());
+          auto tca_v14 = (tca_v13 + tca_v2);
+          for (auto tca_it3 = tca::rt::SeqIterator(0u, 1u, tca_v12); tca_it3.Has(); tca_it3.Next()) {
+            auto tca_v15 = (tca_v9 + tca_it3.Index());
+            auto tca_v16 = lhs_v.Get(tca_v14, tca_v15);
+            tca_r0.Reduce(tca_it2.Index(), tca_v16);
+          }
         }
-        auto tca_v7 = ((tca_v1 + tca_it0.Index()) + tca_it2.Index());
-        auto tca_v8 = (tca_v7 + tca_v2);
       }
-      auto tca_v9 = (tca_v4 + tca_it1.Index());
-      auto tca_v10 = tca::rt::umin(tca_v9, tca_c1);
-      auto tca_v11 = (tca_c1 - tca_v10);
-      auto tca_v12 = tca::rt::umin(tca_c9, tca_v11);
+      auto tca_v17 = tca_r0.Combine();
+      for (auto tca_it4 = tca::rt::SeqIterator(0u, 1u, tca_v8); tca_it4.Has(); tca_it4.Next()) {
+        out_v.Set(tca_v17.Get(tca_it4.Index()), ((tca_v5 + tca_it4.Index()) + tca_v2));
+      }
     }
-    auto tca_v13 = tca_r0.Combine();
-    for (auto tca_it4 = tca::rt::SeqIterator(0u, 1u, tca::rt::umin(tca_c4, (tca_c0 - tca::rt::umin((tca_v1 + tca_it0.Index()), tca_c0)))); tca_it4.Has(); tca_it4.Next()) {
-      out_v.Set(tca_v13.Get(tca_it4.Index()), (((tca_v1 + tca_it0.Index()) + tca_it4.Index()) + tca_v2));
-    }
-    auto tca_v14 = (tca_v1 + tca_it0.Index());
-    auto tca_v15 = tca::rt::umin(tca_v14, tca_c0);
-    auto tca_v16 = (tca_c0 - tca_v15);
-    auto tca_v17 = tca::rt::umin(tca_c4, tca_v16);
-  }
-  {
   }
 }
 }
