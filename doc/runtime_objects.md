@@ -67,7 +67,7 @@
 | 39 | Tail clamping inside loaders | Numerical / index | [spec'd] | loop_tile_lower.md §4 layering, §7bis "Bounds checking" |
 | 40 | KernelInfo runtime object | Spec'd future | [spec'd] | final_lower.md "Initial Runtime Object Construction" |
 | 41 | RuntimeGridMapping / RuntimeThreadMapping IR nodes | Spec'd future | [spec'd] | final_lower.md "Per LNT's Mapping Object Construction" |
-| 42 | Reducer<T> + Seq/Warp/Global specializations | Spec'd future | [spec'd] | final_lower.md "Reducer Lower" |
+| 42 | Reducer<T> + Seq/Warp/Global specializations | Delivered (R1/R2/R3 ruling 2026-10-23) | `runtime/tca/reducer.h`; IR kinds `runtimesequentialreducer`/`runtimewarpreducer`/`runtimeglobalreducer` | final_lower.md "Reducer Lower" as amended; doc/rt.md §4.6; doc/tca.md §5.10 |
 | 43 | RuntimeCallMethod node | Spec'd future | [spec'd] | final_lower.md "Runtime Object Node" |
 | 44 | storetile / StoreTileCta / StoreTileThread variants | Spec'd future | [spec'd] (v0 explicitly out of scope: loads-only) | doc/tca.md §5.11; loop_tile_lower.md §6 "Loads-only scope" |
 
@@ -633,14 +633,19 @@ derive it; deterministic, divergence-proof, CPU-testable.
 Within a full tile the mask is 0xFFFFFFFF — the warp-multiple LoC rule
 guarantees non-tail iterations get the fast path for free.
 
-### 8.4 Reducer composition [spec'd]
+### 8.4 Reducer composition [amended by R1/R2/R3, 2026-10-23]
 
-Reducer placement composes: Init BEFORE the element loop, Combine AFTER it;
-the warp down-reduce at Combine time runs over the OWNERSHIP mask (which
-lanes own ≥ 1 partial) — also a prefix, since accumulation is lane-strided.
-Warp down-reduce over a prefix mask uses the standard tree pattern
-(boundary lanes may pull undefined values from outside the mask; only lane
-0's accumulation is consumed).
+Reducer placement composes per output element: the R3 element loop hosts
+[Init -> reduced-dim walks (Reduce(value)) -> Combine], so `Combine`'s warp
+down-reduce is called uniformly by every CTA thread once per element. The
+down-reduce runs over the FULL warp (out-of-coverage lanes hold the
+identity initializer from their saturated zero-trip walks — the arithmetic
+mirror gate — so a full `0xffffffff` shuffle mask is legal); lane 0 stages
+the warp partial at its `warp_index()`, `__syncthreads` follows, and every
+thread folds all staged warp partials in ascending order from the identity
+(the replicated-local-combine broadcast: every participant receives the
+element's final value, and the single-owner store gate
+`is_first_in_cta()` picks the writer).
 
 ---
 
@@ -730,10 +735,10 @@ runtime library design accounts for them.
 |--------|--------|---------------------------|
 | `KernelInfo` | [spec'd] | One runtime object at kernel entry holding all cuda kernel info: `total_cta()`, `total_thread_per_cta()`. Constructed at the very first block (final_lower.md "Initial Runtime Object Construction"). |
 | `RuntimeGridMapping` / `RuntimeThreadMapping` IR nodes | [spec'd] | Per-LNT mapping-object construction PREPENDED to each Loop BB Cluster's starting block: `RuntimeGridMapping(kernel_info, ndim, portion..., -1)` / `RuntimeThreadMapping(...)` — the compiler-side constructors of the §2 map objects (final_lower.md "Per LNT's Mapping Object Construction"). |
-| `Reducer<T>` + Seq/Warp/Global specializations | [spec'd] | `Init(init, lambda)` before the reduction loop; `Reduce(value)` per step; `Combine()` after (GMEM sync); helpers `init_value()`, `current_value()`. The Reduce lambda body is NOT inlined — the reducer calls it internally (final_lower.md "Reducer Lower"). |
+| `Reducer<T>` + Seq/Warp/Global specializations | DELIVERED (R1/R2, 2026-10-23) | Scalar-only protocol: ctor `(T init, T (*fn)(T, T))` for Seq and `(T init, T (*fn)(T, T), const ThreadMapping& map, SmemView<T, 1u> staging)` for Warp/Global; `Init()` argument-free per output element; `Reduce(value)` one element per call; `Combine()` returns `T` (warp: shuffle down-tree -> `is_first_in_warp()` stages at `warp_index()` -> `__syncthreads` -> replicated fold over `warp_count()` from the identity). The staging row is COMPILER-OWNED (one `#warps x sizeof(T)` dynamic-pool allocation per reducer, R1/D8); warp/lane/count identity derives from the mapping (R2) — no slot arguments, no runtime-static scratch. The combiner lambda body is NOT inlined — the reducer calls it internally. |
 | `RuntimeCallMethod` node | [spec'd] | Method call on a runtime IR node: input #0 = the runtime object, #1 = method name, #2-K = parameters (final_lower.md "Runtime Object Node"). |
 | `storetile` variants (StoreTileCta/StoreTileThread) | [spec'd] | Matching store-side variants; v0 loads-only, never emitted (tca.md §5.11). |
-| Map `warp_index`/`lane_index`/`is_first` queries | [spec'd] | Warp-specialized reduce support; no IR query node yet (loop_tile_lower.md §7bis). |
+| Map `warp_index`/`lane_index`/`is_first` queries | DELIVERED (flat-index() ruling 2026-10-23) | `ThreadMapping::warp_index()`/`lane_id()`/`is_first_in_warp()`/`is_first_in_cta()`/`warp_count()` on the v0 surface (runtime/tca/mapping.h) — runtime-internal control flow for reducer staging and the R3 single-owner store gate; generated code never inlines threadIdx arithmetic. |
 | Concurrent-LNT portion sharding | [spec'd] | The ONE future place chained/shard maps may return (loop_tile_lower.md §7bis). |
 
 ---
