@@ -13,3 +13,11 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 add_library(tcacomp_runtime INTERFACE)
 target_include_directories(tcacomp_runtime INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# CPU unit layer + golden compile-conformance targets (OFF by default: a plain
+# `cmake -S runtime -B <dir>` configure stays INTERFACE-only).
+option(TCACOMP_RUNTIME_TESTS "Build runtime unit + conformance targets" OFF)
+if(TCACOMP_RUNTIME_TESTS)
+  add_subdirectory(tests)
+endif()
+
