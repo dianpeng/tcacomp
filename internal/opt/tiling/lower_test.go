@@ -511,8 +511,10 @@ func TestRewriteTailSaturatingGuard(t *testing.T) {
 
 // TestRewriteCTADim pins the CTA template: between step LoC×T; the in-body
 // GridMap rank expression feeds offset = rank×T + round; the inside loop
-// strides the coupled thread count; the index expression chains
-// offset + inside + coupled thread rank.
+// strides the coupled thread count; the flat-index ruling (2026-10-23)
+// makes the inside IV's INIT the zero-operand flat thread query and the
+// index expression offset + inside — the tuple-coordinate +index(threadDim)
+// add is DELETED (finding C1).
 func TestRewriteCTADim(t *testing.T) {
 	fx := newChain32("cta", 4096)
 	store := bodyStore(fx)
@@ -532,9 +534,17 @@ func TestRewriteCTADim(t *testing.T) {
 	if got := dimvarStep(t, inside); got != 256 {
 		t.Fatalf("CTA inside step = %v, want coupled threads = 256", got)
 	}
+	// The inside IV's INIT is the FLAT zero-operand thread query
+	// (Index() = flatRank + i*coupledThreads — the single-owner mechanism).
+	iv := ir.OperandsOf(inside)[0]
+	init := ir.OperandsOf(iv)[1]
+	if init == nil || init.KindOf() != ir.KindRuntimeThreadQuery || len(ir.OperandsOf(init)) != 0 {
+		t.Fatalf("CTA inside IV init = %v, want the zero-operand flat thread query", init)
+	}
 	// The store's axis (its only operand tree referencing the loop) must
-	// resolve to offset + inside + thread_rank: chase it down to a
-	// GridMap and a ThreadMap intrinsic.
+	// resolve to offset + insideIV: a GridMap rank query for the offset and
+	// NO one-operand (tuple-coordinate) thread query — the +index(threadDim)
+	// term is deleted.
 	axes := ir.OperandsOf(store)[2:]
 	if len(axes) != 1 {
 		t.Fatalf("store must carry one rewritten axis, got %d", len(axes))
@@ -542,11 +552,11 @@ func TestRewriteCTADim(t *testing.T) {
 	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeGridQuery) {
 		t.Fatal("rewritten index must contain the GridMap rank query")
 	}
-	if !subtreeHasKind(t, fx.g, axes[0], ir.KindRuntimeThreadQuery) {
-		t.Fatal("rewritten index must contain the coupled ThreadMap rank query")
+	for _, x := range flattenSubtree(axes[0]) {
+		if x.KindOf() == ir.KindRuntimeThreadQuery && len(ir.OperandsOf(x)) != 0 {
+			t.Fatalf("rewritten index carries a tuple-coordinate thread query %d — the +index(threadDim) add is deleted", x.BasePtr().ID())
+		}
 	}
-	// dosoc consts: grid dim 0 (GridMap) and thread dim 0 (ThreadMap).
-	assertDosocConst(t, axes[0])
 	assertVerifyAndRootReachable(t, fx.g)
 }
 
@@ -855,15 +865,21 @@ func subtreeHasKind(t *testing.T, g *ir.Graph, n ir.Node, k ir.Kind) bool {
 	return found
 }
 
-// assertDosocConst pins that every intrinsic in the subtree carries a
-// const-u32 DoSoC operand (the PHASE 0 shape in the generated product).
+// assertDosocConst pins that every TUPLE-FORM intrinsic in the subtree
+// carries a const-u32 DoSoC operand (the PHASE 0 shape in the generated
+// product). The zero-operand FLAT index() query (the 2026-10-23 ruling)
+// carries no DoSoC by definition and is skipped.
 func assertDosocConst(t *testing.T, n ir.Node) {
 	t.Helper()
 	for _, x := range flattenSubtree(n) {
 		if x.KindOf() != ir.KindRuntimeGridQuery && x.KindOf() != ir.KindRuntimeThreadQuery {
 			continue
 		}
-		d := ir.OperandsOf(x)[0]
+		ops := ir.OperandsOf(x)
+		if len(ops) == 0 {
+			continue // the flat index() form — no DoSoC operand
+		}
+		d := ops[0]
 		if d == nil || d.KindOf() != ir.KindConst {
 			t.Fatalf("intrinsic node %d carries a non-const DoSoC", x.BasePtr().ID())
 		}
@@ -1622,7 +1638,7 @@ func TestSelfCheckInjections(t *testing.T) {
 		_ = tensor
 	})
 
-	t.Run("frag fully-unroll", func(t *testing.T) {
+	t.Run("frag cta-covered refusal", func(t *testing.T) {
 		fx := newChain32("inj5", 64)
 		ctaIter := fx.iters[0]
 		lr := &lowerRun{
@@ -1633,8 +1649,8 @@ func TestSelfCheckInjections(t *testing.T) {
 			fills: []*siteFill{{siteID: 9, covered: []*dimRewrite{{iter: ctaIter}}}},
 		}
 		rec := &Record{Sites: map[uint64]SiteDecision{9: {Promoted: true, Class: ClassFRAG}}}
-		if err := lr.checkFragSites(rec, nil); err == nil || !strings.Contains(err.Error(), "fully-unroll") {
-			t.Fatalf("a FRAG site over a CTA dim must trip the fully-unroll check, got %v", err)
+		if err := lr.checkFragSites(rec, nil); err == nil || !strings.Contains(err.Error(), "R2 refusal") {
+			t.Fatalf("a FRAG site covering a CTA dim must trip the R2 refusal, got %v", err)
 		}
 	})
 }
@@ -1676,12 +1692,13 @@ func assertReachable(t *testing.T, g *ir.Graph, k ir.Kind, want int) {
 }
 
 // TestDecideLowerComposition pins the plan's headline success criterion:
-// the decide→verify→lower triple composes — tiling (114) → tiling-verify
-// (115) → tile-lower (116) runs clean over the matmul worked example with
-// the REAL searched record (no crafted entries; the F7 stamp is the verify
-// pass's own product), ending verifier-clean and typable. The searched
-// record's own outcome is pinned: the winning schedule promotes lhs through
-// the R2 WINDOW path and declines rhs with its reason.
+// the decide→verify→lower triple composes — tiling → tiling-verify →
+// tile-lower runs clean over the matmul worked example with the REAL
+// searched record (no crafted entries; the F7 stamp is the verify pass's
+// own product), ending verifier-clean and typable. The searched record's
+// own outcome is pinned: under the C1b forced-FRAG precedence
+// (2026-10-23), the winning schedule promotes lhs as a per-thread FRAGMENT
+// and declines rhs with its reason.
 func TestDecideLowerComposition(t *testing.T) {
 	p := DefaultParams()
 	fx, lhs, rhs, store := matmulUsed()
@@ -1696,27 +1713,28 @@ func TestDecideLowerComposition(t *testing.T) {
 	}
 
 	// The REAL searched record over the worked example: the winning schedule
-	// assigns M=CTA/100, K=WARP/8 warps (256 threads), N=SEQ, all at T=64 —
-	// lhs (covered {K}, K WARP-assigned) promotes through the R2 tier rule
-	// as a 64 KB SMEM WINDOW (4 B × 256 threads × 64 — exactly MaxCache)
-	// with per-thread reuse 64 (its n-walk); rhs (covered {N,K}, only reuse
-	// dim M) declines — the owning thread's per-epoch m-count is
-	// ceil(64/256) = 1 < 2, no traffic avoided. The decide pass publishes
-	// the record UNSTAMPED (F7: tiling-verify owns the stamp).
+	// assigns M=CTA/100, N=SEQ/1, K=SEQ/1, all at T=64 — under the C1b
+	// forced-FRAG precedence (2026-10-23) lhs (covered {K}, INS {M,K})
+	// carries a thread-varying NON-covered source coordinate (M is the CTA
+	// dim), so it promotes as a forced FRAGMENT: 256 per-thread bytes
+	// (4 B × T=64) with per-thread reuse 64 (its n-walk); rhs (covered
+	// {N,K}, no thread-varying non-covered INS iter but 16384 per-thread
+	// bytes) declines the F6 gate. The decide pass publishes the record
+	// UNSTAMPED (F7: tiling-verify owns the stamp).
 	sl, ok := rec.SiteDecisionOf(lhs)
 	if !ok {
 		t.Fatal("the searched record must carry lhs's site entry")
 	}
-	if !sl.Promoted || sl.Class != ClassSMEM || sl.Bytes != p.MaxCache || sl.Reuse != 64 {
-		t.Fatalf("searched lhs decision = %+v, want promoted %s window of %d B with per-thread reuse 64",
-			sl, ClassSMEM, p.MaxCache)
+	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4*64 || sl.Reuse != 64 {
+		t.Fatalf("searched lhs decision = %+v, want promoted %s of %d B with per-thread reuse 64",
+			sl, ClassFRAG, 4*64)
 	}
 	sr, ok := rec.SiteDecisionOf(rhs)
 	if !ok {
 		t.Fatal("the searched record must carry rhs's site entry")
 	}
-	if sr.Promoted || sr.Reason != ReasonLowReuse {
-		t.Fatalf("searched rhs decision = %+v, want declined with reason %q", sr, ReasonLowReuse)
+	if sr.Promoted || sr.Reason != ReasonFragBytes {
+		t.Fatalf("searched rhs decision = %+v, want declined with reason %q", sr, ReasonFragBytes)
 	}
 	if rec.Verified {
 		t.Fatal("the decide pass must publish the record unstamped (F7)")
@@ -1734,41 +1752,47 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatalf("tile-lower over the real record: %v", err)
 	}
 
-	// Lowered products: the promoted lhs exercises the R2 WINDOW path end to
-	// end — a 64 KB MemNewSMem window buffer, a cooperative LoadTileCta
-	// fill (variant 1) riding the covered K dim's between-round dimvar (K is
-	// the WARP dim of the winning schedule: between stride (LoC×32)×T =
-	// 16384), and the rank-in-index access (thread_map.index(d)·T + i, R2);
-	// the declined rhs stays GMEM untouched.
+	// Lowered products: the promoted lhs exercises the forced-FRAG path end
+	// to end — a 256 B FragNew buffer, a per-thread LoadTileThread fill
+	// (variant 2) riding K's between-round dimvar (K is SEQ/1 at T=64:
+	// between stride LoC×T = 64), and the plain-inside-IV access (C1b: no
+	// ThreadMap rank query in the FRAGMENT access coordinate — the per-
+	// thread strip origin lives on the FILL's GMEM source coordinate, which
+	// carries the rank query); the declined rhs stays GMEM untouched.
 	if !lhs.BasePtr().Erased() {
 		t.Fatal("the promoted lhs load must be erased")
 	}
 	if rhs.BasePtr().Erased() {
 		t.Fatal("the declined rhs load must stay GMEM (untouched)")
 	}
-	buf := findBuffer(t, fx.g, ir.KindMemNewSMem, 65536)
+	buf := findBuffer(t, fx.g, ir.KindFragNew, 4*64)
 	fill := findFillOf(t, fx.g, buf)
-	if v := loadtileVariantOf(t, fill); v != 1 {
-		t.Fatalf("the real-record window fill variant = %v, want 1 (LoadTileCta)", v)
+	if v := loadtileVariantOf(t, fill); v != 2 {
+		t.Fatalf("the real-record fragment fill variant = %v, want 2 (LoadTileThread)", v)
 	}
 	bases := ir.OperandsOf(fill)[2 : len(ir.OperandsOf(fill))-1]
 	if len(bases) != 1 {
 		t.Fatalf("the lhs fill must ride exactly its covered round base, got %d", len(bases))
 	}
-	if step, ok := ir.ConstValueOf(ir.OperandsOf(bases[0])[2]); !ok || step != 16384 {
-		t.Fatalf("the round base must be K's between dimvar (step (LoC×32)×T = 16384), got step %v", step)
+	if step, ok := ir.ConstValueOf(ir.OperandsOf(bases[0])[2]); !ok || step != 64 {
+		t.Fatalf("the round base must be K's between dimvar (step LoC×T = 64), got step %v", step)
+	}
+	// The per-thread strip origin (ThreadMap rank query) rides the fill's
+	// GMEM source coordinate, NOT the fragment access.
+	if !subtreeHasKind(t, fx.g, ir.OperandsOf(fill)[0], ir.KindRuntimeThreadQuery) {
+		t.Fatal("the fill's GMEM source coordinate must carry the ThreadMap rank query (per-thread strip origin)")
 	}
 	var access ir.Node
 	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() == ir.KindMemLoadSMem {
+		if n.KindOf() == ir.KindFragLoad {
 			access = n
 		}
 	}
 	if access == nil {
-		t.Fatal("the store's value must read the window buffer through a MemLoadSMem access")
+		t.Fatal("the store's value must read the fragment buffer through a FragLoad access")
 	}
-	if !subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindRuntimeThreadQuery) {
-		t.Fatal("the window access's K coordinate must carry the ThreadMap rank query (R2 rank-in-index)")
+	if subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindRuntimeThreadQuery) {
+		t.Fatal("the fragment access coordinate must be the plain inside IV — C1b forbids the rank query there")
 	}
 
 	if vs := ir.Verify(fx.g); len(vs) != 0 {

@@ -97,13 +97,19 @@ func (e *emitter) kernelTop() (string, error) {
 	}
 
 	// The SMEM pool (D5: dynamic — the 64 KB budget exceeds the 48 KB
-	// static ceiling) and its disjoint v0 offset views (D8).
+	// static ceiling) and its disjoint v0 offset views (D8). Reducer
+	// staging rows (R1) participate in the offset accounting but get NO
+	// declared view here — their only textual form is the INLINE SmemView
+	// inside the reducer ctor.
 	if len(e.buffers) > 0 {
 		if e.comments >= cg.CommentSections {
 			write(fmt.Sprintf("// dynamic SMEM pool (%d B): one pool, disjoint v0 offsets — the future RA pass overlaps them", e.smemCap))
 		}
 		write("extern __shared__ __align__(16) char tca_smem[];")
 		for _, buf := range e.buffers {
+			if e.staging[buf] {
+				continue
+			}
 			view, err := e.smemViewDecl(buf, write)
 			if err != nil {
 				return "", err

@@ -60,10 +60,19 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		e.line(fmt.Sprintf("tca::rt::%s %s(%s, %s);", cls, local, ki, strings.Join(ports, ", ")))
 		return nil
 
-	default: // the three reducer specializations
+	default: // the three reducer specializations (R1/R2 ctor faces)
 		ops := ir.OperandsOf(n)
-		if len(ops) != 2 || ops[0] == nil || ops[1] == nil {
-			return fmt.Errorf("cxx: reducer %d malformed (want init, lambda)", n.BasePtr().ID())
+		want := 2
+		if n.KindOf() == ir.KindRuntimeWarpReducer || n.KindOf() == ir.KindRuntimeGlobalReducer {
+			want = 4
+		}
+		if len(ops) != want {
+			return fmt.Errorf("cxx: reducer %d malformed (want %d operands)", n.BasePtr().ID(), want)
+		}
+		for _, op := range ops {
+			if op == nil {
+				return fmt.Errorf("cxx: reducer %d carries an unwired operand", n.BasePtr().ID())
+			}
 		}
 		ts, err := e.initType(ops[0])
 		if err != nil {
@@ -83,7 +92,26 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		case ir.KindRuntimeGlobalReducer:
 			cls = "GlobalReducer"
 		}
-		slots := e.slotCount[n] // the slot tile extent; 0 = slotless (scalar Combine)
+		// R1/R2: warp/global constructions carry (init, combiner, mapping,
+		// staging row). The mapping is the owning LNT's ThreadMapping local;
+		// the staging row renders as the INLINE SmemView over the dynamic
+		// pool at the compiler-assigned disjoint offset (extent = the CTA's
+		// warp count, cross-checked against the byte extent final-lower
+		// allocated).
+		args := []string{init, e.lambdaName(ops[1])}
+		if want == 4 {
+			tm, ok := e.objName[ops[2]]
+			if !ok {
+				return fmt.Errorf("cxx: reducer %d references an unconstructed ThreadMapping", n.BasePtr().ID())
+			}
+			count, err := e.stagingCount(ops[3], ts, n)
+			if err != nil {
+				return err
+			}
+			args = append(args, tm,
+				fmt.Sprintf("tca::rt::SmemView<%s, 1u>(reinterpret_cast<%s*>(tca_smem + %du), %du)",
+					ts, ts, uint(e.smemOff[ops[3]]), count))
+		}
 		local := e.local(fmt.Sprintf("reducer%d", e.redN))
 		e.redN++
 		scope := "sequential"
@@ -93,11 +121,37 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		case "GlobalReducer":
 			scope = "global (CTA)"
 		}
-		e.c("%s reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim", scope)
+		e.c("%s reduction — the combiner is runtime-owned; per-element brackets [Init → reduced-dim walks (Reduce(value)) → Combine]", scope)
 		e.objName[n] = local
-		e.line(fmt.Sprintf("tca::rt::%s<%s, %du> %s(%s, %s);", cls, ts, uint(slots), local, init, e.lambdaName(ops[1])))
+		e.line(fmt.Sprintf("tca::rt::%s<%s> %s(%s);", cls, ts, local, join(args)))
 		return nil
 	}
+}
+
+// stagingCount resolves the staging row's ELEMENT count (R1: #warps = the
+// CTA's warp count): the byte extent final-lower allocated divided by the
+// element size, cross-checked against the launch total's warp count — a
+// disagreement means the provenance and the launch options disagree, which
+// is a named error, never a guess.
+func (e *emitter) stagingCount(staging ir.Node, ts string, owner ir.Node) (uint, error) {
+	ext, err := e.byteExtent(staging)
+	if err != nil {
+		return 0, err
+	}
+	size, err := elemByteSize(ts)
+	if err != nil {
+		return 0, err
+	}
+	if ext%size != 0 {
+		return 0, fmt.Errorf("cxx: reducer %d staging row of %d B is not a whole multiple of %s (%d B)",
+			owner.BasePtr().ID(), ext, ts, size)
+	}
+	count := uint(ext / size)
+	if want := uint(e.opts.MaxThreadsPerCTA / 32); count != want {
+		return 0, fmt.Errorf("cxx: reducer %d staging row holds %d slots, want the launch's warp count %d (provenance/launch disagreement)",
+			owner.BasePtr().ID(), count, want)
+	}
+	return count, nil
 }
 
 // initType resolves a reducer construction's element type T from its init
@@ -119,11 +173,13 @@ func (e *emitter) initType(init ir.Node) (string, error) {
 	return "", fmt.Errorf("cxx: reducer init %d carries no resolvable element type", init.BasePtr().ID())
 }
 
-// stmtCallMethod emits the runtime method calls (final_lower.md's lowered
-// shape): Init argument-free before loop X, Reduce per step inside the home
-// loop (slot IVs outer→inner, then the piped value — LR-13), Combine after
-// loop X. The (prev, cur) combiner application is runtime-internal — the
-// compiler emits no lambda-call node (final_lower.md 2.3).
+// stmtCallMethod emits the runtime method calls (the R3 lowered shape):
+// Init argument-free at the element-loop head, Reduce(value) per step
+// inside the home walk — the scalar protocol, one element per call (R1:
+// the slot dimvars are gone) — and Combine right after the reduced-dim
+// walks, returning T. The (prev, cur) combiner application is
+// runtime-internal — the compiler emits no lambda-call node
+// (final_lower.md 2.3).
 func (e *emitter) stmtCallMethod(n ir.Node) error {
 	ops := ir.OperandsOf(n)
 	if len(ops) == 0 || ops[0] == nil {
@@ -140,50 +196,27 @@ func (e *emitter) stmtCallMethod(n ir.Node) error {
 		if len(args) != 0 {
 			return fmt.Errorf("cxx: reducer Init %d must be argument-free", n.BasePtr().ID())
 		}
-		e.c("reduction bracket opens (argument-free; re-initializes from the construction-time init)")
+		e.c("per-element bracket opens (argument-free; re-initializes from the construction-time init)")
 		e.line(obj + ".Init();")
 		return nil
 
 	case "Reduce":
-		if len(args) == 0 {
-			return fmt.Errorf("cxx: reducer Reduce %d carries no value", n.BasePtr().ID())
+		if len(args) != 1 {
+			return fmt.Errorf("cxx: reducer Reduce %d carries %d args, want exactly the value (R1 scalar protocol)",
+				n.BasePtr().ID(), len(args))
 		}
-		// Leading args are the accumulator-tile slot dimvars (LR-13);
-		// record them for the D7 slot reads at the Combine use sites.
-		var slots []ir.Node
-		for _, a := range args[:len(args)-1] {
-			d := e.bivDim(a)
-			if d == nil {
-				return fmt.Errorf("cxx: reducer Reduce %d slot arg is not a dimvar over a dim", n.BasePtr().ID())
-			}
-			slots = append(slots, d)
+		val, err := e.emitExpr(args[0])
+		if err != nil {
+			return err
 		}
-		if prev, ok := e.slots[ops[0]]; ok && len(prev) != len(slots) {
-			return fmt.Errorf("cxx: reducer %s slot arity changed between Reduce calls (%d → %d)",
-				obj, len(prev), len(slots))
-		}
-		e.slots[ops[0]] = slots
-		var exprs []string
-		for _, a := range args {
-			s, err := e.emitExpr(a)
-			if err != nil {
-				return err
-			}
-			exprs = append(exprs, s)
-		}
-		e.line(obj + ".Reduce(" + join(exprs) + ");")
+		e.line(obj + ".Reduce(" + val + ");")
 		return nil
 
 	case "Combine":
 		if len(args) != 0 {
 			return fmt.Errorf("cxx: reducer Combine %d must be argument-free", n.BasePtr().ID())
 		}
-		// D7: a slotted Combine materializes ONCE; uses inside the
-		// re-iteration read slots via Get(slot ivs...).
-		if slots, ok := e.slots[ops[0]]; ok && len(slots) > 0 {
-			e.slottedVal[n] = slots
-		}
-		e.c("one Combine — every participant receives the final value")
+		e.c("per-element combine — every participant receives the element's final value")
 		name := e.allocVal()
 		e.line("auto " + name + " = " + obj + ".Combine();")
 		e.values[n] = name

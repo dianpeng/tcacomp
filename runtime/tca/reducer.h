@@ -1,12 +1,18 @@
-// tca/reducer.h — the reducers, <T, Slots> (doc/rt.md §4.6).
+// tca/reducer.h — the reducers (doc/rt.md §4.6).
 //
-// Slots = the flat accumulator-tile extent the compiler stamps as the
-// template argument (0 = scalar reduction); the runtime sizes all state from
-// it. v0 slot addressing is FLAT: Reduce(slot, v) takes exactly one index.
-// Construction carries ALL state (init, combiner); the combiner parameter is
-// the CONCRETE function-pointer type T (*)(T, T) — the goldens pass a
-// function-template NAME (RedwarpCombine0), which only binds against a
-// concrete target type. The runtime owns every combiner call.
+// Scalar-only reduction protocol (R1/R2 ruling 2026-10-23): the compiler
+// stamps NO Slots template parameter — Reduce(value) folds one element per
+// call and Combine() always returns T. Warp staging lives in the COMPILER'S
+// dynamic-SMEM pool, not in runtime-static scratch: the ctor receives the
+// reducer's staging row as a SmemView<T, 1u> (extent = the CTA's warp
+// count) and the mapping as a const ThreadMapping&. Warp/lane/count
+// identity is runtime-internal control flow derived from the map
+// (warp_index()/lane_id()/is_first_in_warp()/warp_count()) — generated code
+// stays branch-free and never inlines threadIdx arithmetic. The combiner
+// parameter is the CONCRETE function-pointer type T (*)(T, T) — the
+// goldens pass a function-template NAME (RedwarpCombine0), which only
+// binds against a concrete target type. The runtime owns every combiner
+// call.
 #ifndef TCA_RT_REDUCER_H_
 #define TCA_RT_REDUCER_H_
 
@@ -19,159 +25,108 @@
 
 #include <cassert>
 
+#include "mapping.h"
+#include "view.h"
+
 namespace tca {
 namespace rt {
 
-// SlotValue — the Slots > 0 Combine() return: a thin array wrapper the
-// emitted epilogue reads via .Get(slot_iv).
-template <typename T, unsigned Slots>
-class SlotValue {
- public:
-  static constexpr unsigned kSlots = Slots > 0u ? Slots : 1u;
-
-  __host__ __device__ SlotValue() {
-    for (unsigned s = 0u; s < kSlots; ++s) vals_[s] = T{};
-  }
-
-  __host__ __device__ T Get(unsigned i) const { return vals_[i]; }
-  __host__ __device__ void Set(unsigned i, T v) { vals_[i] = v; }
-
- private:
-  T vals_[kSlots];
-};
-
 // SeqReducer — per-thread accumulators, no synchronization; Combine returns
-// the local accumulators (copy). Fully __host__ __device__ (CPU-testable).
-template <typename T, unsigned Slots>
+// the local accumulator. Fully __host__ __device__ (CPU-testable).
+template <typename T>
 class SeqReducer {
  public:
-  static constexpr unsigned kSlots = Slots > 0u ? Slots : 1u;
-
   __host__ __device__ SeqReducer(T init, T (*fn)(T, T)) : init_(init), fn_(fn) {
     assert(fn != nullptr);
-    for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = init_;
+    acc_ = init_;
   }
 
   // Argument-free; re-initializes from the construction-time init.
-  __host__ __device__ void Init() {
-    for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = init_;
-  }
+  __host__ __device__ void Init() { acc_ = init_; }
 
-  // Scalar form (Slots == 0).
-  __host__ __device__ void Reduce(T v) { acc_[0u] = fn_(acc_[0u], v); }
+  // One element per call (R1: the slot argument is gone).
+  __host__ __device__ void Reduce(T v) { acc_ = fn_(acc_, v); }
 
-  // Flat slot form (Slots > 0).
-  __host__ __device__ void Reduce(unsigned slot, T v) { acc_[slot] = fn_(acc_[slot], v); }
-
-  // Called once per bracket. T when Slots == 0; SlotValue<T, Slots> otherwise.
-  __host__ __device__ auto Combine() {
-    if constexpr (Slots == 0u) {
-      return acc_[0u];
-    } else {
-      SlotValue<T, Slots> out;
-      for (unsigned s = 0u; s < Slots; ++s) out.Set(s, acc_[s]);
-      return out;
-    }
-  }
+  // Called once per output element; always returns T.
+  __host__ __device__ T Combine() { return acc_; }
 
  private:
   T init_;
   T (*fn_)(T, T);
-  T acc_[kSlots];
+  T acc_;
 };
 
-// WarpReducer — the v0 protocol (identity-init simplification):
-//   1. Init/Reduce on the private tile as above;
-//   2. Combine(): per-slot full-warp shuffle down-tree
-//      (__shfl_down_sync(0xffffffff, ...) — valid because inactive lanes hold
-//      the identity init), lane 0 of each warp stages its per-slot partials
-//      into the static scratch; __syncthreads(); every thread then folds ALL
-//      staged partials per slot locally in ascending warp order (tca.md
-//      §5.10's replicated-local-combine broadcast — every participant
-//      receives the final value; the re-iteration reads any slot).
-// Scratch ruling: function-scope static __shared__ inside the template — one
-// allocation per <T, Slots> instantiation, capacity kMaxWarpsPerCTA = 16
-// (512/32 default config). Over-provisioned vs the reduction group by
-// design: warps outside the group hold the identity init and stage it too.
-template <typename T, unsigned Slots>
+// WarpReducer — the v0 protocol (R1/R2 ruling 2026-10-23):
+//   1. Init/Reduce on the private accumulator as above;
+//   2. Combine(): full-warp shuffle down-tree (__shfl_down_sync(0xffffffff,
+//      ...) — valid because every CTA thread participates and out-of-group
+//      lanes hold the identity init), the warp's first lane stages its
+//      partial into the ctor-provided SMEM staging row AT THE WARP'S INDEX,
+//      __syncthreads(), then every thread folds ALL staged warp partials in
+//      ascending warp order from the identity init (tca.md §5.10's
+//      replicated-local-combine broadcast — every participant receives the
+//      final value; the element loop's per-element brackets each read it).
+// Staging ownership (R1): the compiler owns the scratch — one disjoint
+// row of #warps × sizeof(T) bytes in the kernel's dynamic-SMEM pool, handed
+// in as a SmemView<T, 1u>. The runtime keeps NO static __shared__.
+template <typename T>
 class WarpReducer {
  public:
-  static constexpr unsigned kSlots = Slots > 0u ? Slots : 1u;
-  static constexpr unsigned kMaxWarpsPerCTA = 16u;
-
-  __host__ __device__ WarpReducer(T init, T (*fn)(T, T)) : init_(init), fn_(fn) {
+  __host__ __device__ WarpReducer(T init, T (*fn)(T, T), const ThreadMapping& map,
+                                  SmemView<T, 1u> staging)
+      : init_(init), fn_(fn), map_(map), staging_(staging) {
     assert(fn != nullptr);
-    for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = init_;
+    acc_ = init_;
   }
 
-  __host__ __device__ void Init() {
-    for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = init_;
-  }
+  __host__ __device__ void Init() { acc_ = init_; }
 
-  __host__ __device__ void Reduce(T v) { acc_[0u] = fn_(acc_[0u], v); }
-  __host__ __device__ void Reduce(unsigned slot, T v) { acc_[slot] = fn_(acc_[slot], v); }
+  __host__ __device__ void Reduce(T v) { acc_ = fn_(acc_, v); }
 
-  __host__ __device__ auto Combine() {
+  __host__ __device__ T Combine() {
 #if defined(__CUDA_ARCH__)
     // Device passes see only this branch (nvcc eliminates the inactive one).
-    static __shared__ T stage[kSlots][kMaxWarpsPerCTA];
-    const unsigned lane = threadIdx.x & 31u;
-    const unsigned warp = threadIdx.x >> 5;
-    const unsigned cta_warps = blockDim.x >> 5;
-    assert(warp < kMaxWarpsPerCTA);
-
-    T part[kSlots];
-    for (unsigned s = 0u; s < kSlots; ++s) part[s] = acc_[s];
+    T part = acc_;
     for (unsigned off = 16u; off > 0u; off >>= 1u) {
-      for (unsigned s = 0u; s < kSlots; ++s) {
-        part[s] = fn_(part[s], __shfl_down_sync(0xffffffffu, part[s], off));
-      }
+      part = fn_(part, __shfl_down_sync(0xffffffffu, part, off));
     }
-    if (lane == 0u) {
-      for (unsigned s = 0u; s < kSlots; ++s) stage[s][warp] = part[s];
+    if (map_.is_first_in_warp()) {
+      staging_.Set(part, map_.warp_index());
     }
-    __syncthreads();  // legal: the bracket is uniformly called by every CTA thread
+    __syncthreads();  // legal: Combine is uniformly called by every CTA thread
     // Deterministic replicated-local fold over every staged warp (ascending).
-    for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = init_;
-    for (unsigned w = 0u; w < cta_warps; ++w) {
-      for (unsigned s = 0u; s < kSlots; ++s) acc_[s] = fn_(acc_[s], stage[s][w]);
+    T out = init_;
+    for (unsigned w = 0u; w < map_.warp_count(); ++w) {
+      out = fn_(out, staging_.Get(w));
     }
-    if constexpr (Slots == 0u) {
-      return acc_[0u];
-    } else {
-      SlotValue<T, Slots> out;
-      for (unsigned s = 0u; s < Slots; ++s) out.Set(s, acc_[s]);
-      return out;
-    }
+    return out;
 #else
     // Host (CPU unit tests / nvcc host pass): no warps — the seq algebra.
-    if constexpr (Slots == 0u) {
-      return acc_[0u];
-    } else {
-      SlotValue<T, Slots> out;
-      for (unsigned s = 0u; s < Slots; ++s) out.Set(s, acc_[s]);
-      return out;
-    }
+    return acc_;
 #endif
   }
 
  private:
   T init_;
   T (*fn_)(T, T);
-  T acc_[kSlots];
+  const ThreadMapping& map_;
+  SmemView<T, 1u> staging_;
+  T acc_;
 };
 
 // GlobalReducer — registered scaffolding only (no v0 preset assigns CTA
 // parallelism to a reduced dim). Compiling stub, same face; bodies trap at
 // runtime. Enablement needs the multi-CTA scratch/ownership plan (tca.md
 // §5.10(3)) — deliberately no static_assert.
-template <typename T, unsigned Slots>
+template <typename T>
 class GlobalReducer {
  public:
-  static constexpr unsigned kSlots = Slots > 0u ? Slots : 1u;
-
-  __host__ __device__ GlobalReducer(T init, T (*fn)(T, T)) : init_(init), fn_(fn) {
+  __host__ __device__ GlobalReducer(T init, T (*fn)(T, T), const ThreadMapping& map,
+                                    SmemView<T, 1u> staging)
+      : init_(init), fn_(fn), map_(map), staging_(staging) {
     assert(fn != nullptr);
+    (void)map_;
+    (void)staging_;
   }
 
   __host__ __device__ void Init() { assert(!"GlobalReducer: not enabled in v0"); }
@@ -179,23 +134,16 @@ class GlobalReducer {
     (void)v;
     assert(!"GlobalReducer: not enabled in v0");
   }
-  __host__ __device__ void Reduce(unsigned slot, T v) {
-    (void)slot;
-    (void)v;
+  __host__ __device__ T Combine() {
     assert(!"GlobalReducer: not enabled in v0");
-  }
-  __host__ __device__ auto Combine() {
-    assert(!"GlobalReducer: not enabled in v0");
-    if constexpr (Slots == 0u) {
-      return init_;
-    } else {
-      return SlotValue<T, Slots>();
-    }
+    return init_;
   }
 
  private:
   T init_;
   T (*fn_)(T, T);
+  const ThreadMapping& map_;
+  SmemView<T, 1u> staging_;
 };
 
 }  // namespace rt

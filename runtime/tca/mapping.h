@@ -114,6 +114,14 @@ struct Decomposition {
   __host__ __device__ unsigned coord(unsigned d, unsigned id) const {
     return (id / strides[d]) % exposed[d];
   }
+
+  // Sum of the unit extents (CTAs for GridMapping, WARPS for ThreadMapping)
+  // — the total the map decomposes. ThreadMapping::warp_count() is this.
+  __host__ __device__ unsigned unit_sum() const {
+    unsigned n = 0u;
+    for (unsigned d = 0u; d < ndim; ++d) n += unit_extents[d];
+    return n;
+  }
 };
 
 }  // namespace detail
@@ -133,6 +141,9 @@ class GridMapping {
 
   __host__ __device__ unsigned dimension(unsigned d) const { return dec_.exposed[d]; }
   __host__ __device__ unsigned index(unsigned d) const { return dec_.coord(d, linear_id()); }
+  // The FLAT form (ruling 2026-10-23): no-arg index() is this CTA's absolute
+  // 1-D id — the blockIdx.x analog. index(d) (the tuple coordinate) unchanged.
+  __host__ __device__ unsigned index() const { return linear_id(); }
 
 #ifndef __CUDACC__
   // CPU unit-test hook: stand in for blockIdx.x.
@@ -168,6 +179,24 @@ class ThreadMapping {
 
   __host__ __device__ unsigned dimension(unsigned d) const { return dec_.exposed[d]; }
   __host__ __device__ unsigned index(unsigned d) const { return dec_.coord(d, linear_id()); }
+  // The FLAT form (ruling 2026-10-23): no-arg index() is the thread's
+  // absolute flattened 1-D id in the CTA — the threadIdx.x analog. lane/warp
+  // identity DERIVES from it (index()%32, index()/32); the compiler never
+  // inlines threadIdx.x itself — the map stays the opaque seam.
+  __host__ __device__ unsigned index() const { return linear_id(); }
+
+  // Warp/lane identity and count, first-class on the map (ruling addenda
+  // 2026-10-23): pure functions of index(); runtime-internal control flow
+  // (generated code stays branch-free — these never appear as
+  // compiler-emitted conditionals).
+  __host__ __device__ unsigned warp_index() const { return index() / 32u; }
+  __host__ __device__ unsigned lane_id() const { return index() % 32u; }
+  __host__ __device__ bool is_first_in_warp() const { return lane_id() == 0u; }
+  __host__ __device__ bool is_first_in_cta() const { return index() == 0u; }
+  // The CTA's EXISTING warp count (total threads / 32), obtained THROUGH the
+  // map — the fold-existing-warps refinement's bound and the staging-extent
+  // cross-check read it here, never a magic constant.
+  __host__ __device__ unsigned warp_count() const { return dec_.unit_sum(); }
 
 #ifndef __CUDACC__
   // CPU unit-test hook: stand in for threadIdx.x.

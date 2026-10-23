@@ -1,8 +1,8 @@
 package finallower
 
-// reducer.go is final-lower's REDUCER LOWER (LR-1..LR-3, LR-7, LR-8, LR-13,
-// LR-14; doc/optana/final_lower.md "Reducer Lower Integration" as amended —
-// the review 261022-g6i FL-1 fix): per live KindReduce, in allocation order,
+// reducer.go is final-lower's REDUCER LOWER (LR-1..LR-3, LR-7, LR-8 as
+// amended by the R1/R2/R3 ruling of 2026-10-23): per live KindReduce, in
+// allocation order,
 //
 //	(0)  derive @r — Reduce.op0 → (recursing through Reduce chains) →
 //	     producing Map → ir.AsOf → the LAST dim operand of the As order; the
@@ -10,44 +10,55 @@ package finallower
 //	     a HARD diagnostic, never a guess. Runs BEFORE Map Lower (LR-2),
 //	     which rewires Reduce.op0 away.
 //	(1)  resolve X (provenance.Between — the OUTERMOST loop over the reduced
-//	     dim; the single loop at T==1), home (provenance.Inside, else X),
-//	     and the between-set: the Loop blocks strictly nested between X's
-//	     block and home's block on the parent chain (empty at T==1).
-//	(2.1) homogeneity (LR-8): the piped value's ELEMENT type must equal the
-//	     init attribute's type; allocate the specialized construction
-//	     (LR-7: Soc 0→Sequential, 2→Warp, 1→Global) over (%init, %lambda),
-//	     appended after the existing content of the OWNING LNT's prologue
-//	     Group (the owner = the LNT of home's block), stamped SN 0.
-//	(2.2) RuntimeCallMethod(%reducer, "Init") — argument-free — inserted
-//	     immediately BEFORE X's item in X's PARENTAL block (the prologue
-//	     Group when X is its cluster's outermost loop).
-//	(2.3) RuntimeCallMethod(%reducer, "Reduce", betweenIVs..., %piped)
+//	     dim), home (provenance.Inside, else X), and the between chain: the
+//	     Loop blocks strictly nested between X's block and home's block on
+//	     the parent chain (empty at T==1).
+//	(2.1) homogeneity (LR-8) + the specialized construction (LR-7: Soc
+//	     0→Sequential over (init, lambda); 2→Warp / 1→Global over (init,
+//	     lambda, ThreadMapping, staging) per R1/R2): the WARP/GLOBAL
+//	     constructions additionally allocate a staging KindMemNewSMem — one
+//	     #warps × sizeof(T) row in the compiler's dynamic-SMEM pool at a
+//	     disjoint D8 offset — inserted with the construction at the head
+//	     end of the OWNING LNT's prologue Group (before the embedded root
+//	     loop), stamped SN 0. The ThreadMapping operand resolves through
+//	     this pass's own per-LNT objects (Run() inserts them FIRST).
+//	(2.2) R3 — per-output-element brackets. The tiled shape (T>1):
+//	     the between loops DISSOLVE as per-thread walks; a FRESH UNIFORM
+//	     sequential element loop chain (one loop per between dim, init 0,
+//	     step 1, the between loop's own clamped bound) replaces X at X's
+//	     position in X's parental block, and X (with home inside) moves
+//	     INTO the innermost element loop. Per element: Init (first item) →
+//	     the reduced-dim walks with Reduce(value) (slot arguments are GONE
+//	     — R1's scalar protocol) → Combine right after X. Every reference
+//	     to a dissolved between IV — inside the moved walk and inside the
+//	     moved epilogue consumers — is REBUILT onto the fresh element IV
+//	     (cloned spines, shared leaves; the tile-lower rebuildAxis
+//	     discipline). The uniform element loop keeps Combine CTA-uniform
+//	     (its __syncthreads is legally reached by every thread), and the
+//	     per-element epilogue stores become single-owner stores (the
+//	     emitter gates them on is_first_in_cta(), R2/R3).
+//	     The T==1 shape keeps the old flat bracket: Init before X, Combine
+//	     after X, both in X's parental block — one output element per
+//	     bracket, no element loops.
+//	(2.3) RuntimeCallMethod(%reducer, "Reduce", %piped) — VALUE ONLY —
 //	     inserted inside the HOME loop, immediately after the piped value's
-//	     producing item. NOTE on the anchor: the piped Map is a pure
-//	     projection the scheduler lands in the nest EPILOGUE (SN == the
-//	     reduced loop's depth — astcfg.go's documented duality) while the
-//	     VALUE it projects (the Map's lambda body) is the home loop's
-//	     in-body producer; the call therefore anchors at the body-chased
-//	     node's item, which must BE an item of the home block (fail-closed)
-//	     — the only reading consistent with LR-1's law ("the Reduce call
-//	     stays INSIDE the home loop") on the scheduler's actual landing.
-//	     The combiner application itself is RUNTIME-INTERNAL (LR-3): the
-//	     compiler emits NO lambda-call node and never reads
-//	     current_value/init_value — prev is the runtime's member field, the
-//	     lambda's formals are the carriers.
+//	     producing item (the scheduler lands the piped Map's projection in
+//	     the nest EPILOGUE while the value it projects is the home loop's
+//	     in-body producer; the call anchors at the body-chased node's
+//	     item, which must BE an item of the home block — fail-closed).
+//	     The combiner application is RUNTIME-INTERNAL (LR-3): the compiler
+//	     emits no lambda-call node and never reads current_value/init.
 //	(2.4) RuntimeCallMethod(%reducer, "Combine") — RAUW EVERY former use of
-//	     the Reduce onto it, erase the Reduce + its KeyedAttribute
-//	     explicitly (the lambda stays live through the construction's
-//	     operand), insert Combine immediately AFTER X's item, then build
-//	     the fused-consumer RE-ITERATION (LR-14/P-12): fresh sequential
-//	     ForLoops over the between dims, and the qualifying owning-LNT
-//	     epilogue items MOVED into the innermost re-iteration block.
+//	     the Reduce onto it, erase the Reduce + its KeyedAttribute, then
+//	     move the qualifying owning-LNT epilogue consumers into the
+//	     innermost element loop after Combine (rebuilding their between-dim
+//	     coordinates onto the fresh element IVs). Combine returns T (R1) —
+//	     the consumers read the scalar directly; the D7 slot reads are
+//	     gone.
 //
-// One reduction spans ALL tiles of @r: Init/Combine bracket X, NEVER the
-// tile-inside loop — no per-tile partials (doc/tca.md §5.10). Accumulator
-// tiles (LR-13): when non-reduced loops run between X and home, the Reduce
-// call carries the between-loop IVs as slot indices; Init/Combine stay
-// argument-free and cover the whole tile.
+// One reduction spans ALL tiles of @r per bracket: Init → the reduced-dim
+// walks → Combine (doc/tca.md §5.10). The bracket's ITERATION SPACE is the
+// output element (the non-reduced between dims) — R3.
 //
 // Do NOT run a whole-graph DCE sweep here (P-7): the Init/Reduce call
 // statements have no users, and a roots-based sea sweep would erase them —
@@ -115,7 +126,7 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 		return err
 	}
 
-	// (2.1) Homogeneity (LR-8) + the specialized construction (LR-7).
+	// (2.1) Homogeneity (LR-8) + the specialized construction (LR-7 + R1/R2).
 	init := ir.ReduceInitOf(red)
 	if init == nil {
 		return fmt.Errorf("final-lower: reduce node %d carries no init KeyedAttribute", red.BasePtr().ID())
@@ -133,7 +144,7 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 	if lambda == nil {
 		return fmt.Errorf("final-lower: reduce node %d carries no combiner lambda", red.BasePtr().ID())
 	}
-	construction, err := lr.newReducerConstruction(prov.Soc, init, lambda)
+	construction, err := lr.newReducerConstruction(prov.Soc, init, lambda, initTy, ownerLNT)
 	if err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: %w", red.BasePtr().ID(), err)
 	}
@@ -153,32 +164,26 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 			break
 		}
 	}
+	// The staging allocation item (if any) precedes the construction: the
+	// construction's operand references it, and the reader sees the pool row
+	// before its consumer.
+	if st := lr.stagingOf(construction); st != nil {
+		if err := prologue.InsertItemAt(headEnd, ir.ASTItem{Node: st}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting the reducer staging row: %w", red.BasePtr().ID(), err)
+		}
+		st.BasePtr().SetSched(0, prologue)
+		headEnd++
+	}
 	if err := prologue.InsertItemAt(headEnd, ir.ASTItem{Node: construction}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting the reducer construction: %w", red.BasePtr().ID(), err)
 	}
 	construction.BasePtr().SetSched(0, prologue)
 
-	// (2.2) Init: immediately BEFORE X's item, in X's parental block — X
-	// appears as a BLOCK item (its own Loop block), so the parent is the
-	// block holding X's SchedBlock as an item (the prologue Group when X is
-	// its cluster's outermost loop).
-	parentBlk, xIdx := lr.findBlockItem(xBlk)
-	if parentBlk == nil || xIdx < 0 {
-		return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) is not an AST item anywhere",
-			red.BasePtr().ID(), x.BasePtr().ID())
-	}
-	initCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Init", construction)
-	if err := parentBlk.InsertItemAt(xIdx, ir.ASTItem{Node: initCall}); err != nil {
-		return fmt.Errorf("final-lower: reduce node %d: inserting Init before X: %w", red.BasePtr().ID(), err)
-	}
-	scope := lr.scopeDepth(parentBlk)
-	initCall.BasePtr().SetSched(scope, parentBlk)
-
-	// (2.3) The Reduce call: inside the HOME loop, after the piped value's
-	// producing item (see the file comment's anchor note). The projection
-	// chase applies only on the DIRECT piped-Map shape; a reduce-after-reduce
-	// chain keeps the piped node itself as the anchor (its landing is
-	// asserted against the home block either way).
+	// (2.3) The Reduce call's anchor: the piped value's producing item (see
+	// the file comment). The projection chase applies only on the DIRECT
+	// piped-Map shape; a reduce-after-reduce chain keeps the piped node
+	// itself as the anchor (its landing is asserted against the home block
+	// either way).
 	anchor := piped
 	if producingMap != nil && piped != nil && producingMap.BasePtr() == piped.BasePtr() {
 		if bodies := ir.LambdaBodies(producingMap); len(bodies) == 1 && bodies[0] != nil {
@@ -196,21 +201,16 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 		return fmt.Errorf("final-lower: reduce node %d: the piped value's producer (node %d) sits outside the home loop (node %d) — the Reduce call must stay inside the home loop (LR-1)",
 			red.BasePtr().ID(), anchor.BasePtr().ID(), home.BasePtr().ID())
 	}
-	args := make([]ir.Node, 0, len(betweenBlks)+1)
-	for _, b := range betweenBlks {
-		args = append(args, ir.OperandsOf(b.Loop())[0]) // the between-loop IV, outer→inner (LR-13)
-	}
-	args = append(args, piped)
-	reduceCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Reduce", construction, args...)
+	// R1: Reduce(value) — the slot dimvars are gone; the single argument is
+	// the piped value (Map Lower later resolves it at the load).
+	reduceCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Reduce", construction, piped)
 	if err := anchorBlk.InsertItemAt(anchorIdx+1, ir.ASTItem{Node: reduceCall}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting the Reduce call: %w", red.BasePtr().ID(), err)
 	}
 	reduceCall.BasePtr().SetSched(lr.scopeDepth(homeBlk), homeBlk)
 
 	// (2.4) Combine: RAUW every Reduce use onto it, erase the Reduce + its
-	// KeyedAttribute, insert immediately AFTER X's item. X moved to xIdx+1
-	// when Init landed at xIdx, so Combine takes xIdx+2 and the re-iteration
-	// chain xIdx+3.
+	// KeyedAttribute, then place the call per R3.
 	combineCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Combine", construction)
 	if err := lr.mctx.ReplaceAllUsesWith(red, combineCall); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: RAUW onto the Combine call: %w", red.BasePtr().ID(), err)
@@ -224,13 +224,354 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 			return fmt.Errorf("final-lower: reduce node %d: erasing its KeyedAttribute: %w", red.BasePtr().ID(), err)
 		}
 	}
-	if err := parentBlk.InsertItemAt(xIdx+2, ir.ASTItem{Node: combineCall}); err != nil {
-		return fmt.Errorf("final-lower: reduce node %d: inserting Combine after X: %w", red.BasePtr().ID(), err)
-	}
-	combineCall.BasePtr().SetSched(scope, parentBlk)
 
-	// The fused-consumer re-iteration (LR-14/P-12).
-	return lr.buildReiteration(red, dim, xIdx+3, parentBlk, betweenBlks, ownerLNT, combineCall)
+	if len(betweenBlks) == 0 {
+		// T==1: the flat bracket — Init before X's item, Combine after it,
+		// both in X's parental block (one output element per bracket).
+		parentBlk, xIdx := lr.findBlockItem(xBlk)
+		if parentBlk == nil || xIdx < 0 {
+			return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) is not an AST item anywhere",
+				red.BasePtr().ID(), x.BasePtr().ID())
+		}
+		initCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Init", construction)
+		if err := parentBlk.InsertItemAt(xIdx, ir.ASTItem{Node: initCall}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting Init before X: %w", red.BasePtr().ID(), err)
+		}
+		initCall.BasePtr().SetSched(lr.scopeDepth(parentBlk), parentBlk)
+		if err := parentBlk.InsertItemAt(xIdx+2, ir.ASTItem{Node: combineCall}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting Combine after X: %w", red.BasePtr().ID(), err)
+		}
+		combineCall.BasePtr().SetSched(lr.scopeDepth(parentBlk), parentBlk)
+		return nil
+	}
+
+	// (2.2) R3 — the per-output-element restructure.
+	return lr.buildElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall, anchor)
+}
+
+// buildElementLoop implements R3: the between loops dissolve as per-thread
+// walks; a fresh UNIFORM sequential element loop chain (one per between dim,
+// same dim + clamped bound) takes X's position in X's parental block; X
+// (with home inside, the between wrappers stripped) moves into the
+// innermost element loop; per element [Init → the reduced-dim walks →
+// Combine → the moved consumers]. Every between-IV reference in the moved
+// walk and the moved epilogue consumers is rebuilt onto the fresh element
+// IVs (cloned spines, shared leaves). A consumer referencing a reduced-dim
+// dimvar is a hard diagnostic (its value is not defined per element).
+func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTBlock,
+	betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT,
+	construction, combineCall, anchor ir.Node) error {
+
+	parentBlk, xIdx := lr.findBlockItem(xBlk)
+	if parentBlk == nil || xIdx < 0 {
+		return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) is not an AST item anywhere",
+			red.BasePtr().ID(), x.BasePtr().ID())
+	}
+
+	// The between IVs (outer→inner) and their bounds — read BEFORE the
+	// blocks dissolve; the fresh element loops reuse the very same clamped
+	// bound expressions (scheduler-stamped pure SSA values stay available
+	// at the element-loop position, which X's parental block encloses).
+	betweenIVs := make([]ir.Node, len(betweenBlks))
+	boundMaxs := make([]ir.Node, len(betweenBlks))
+	for i, b := range betweenBlks {
+		bops := ir.OperandsOf(b.Loop())
+		if len(bops) < 2 || bops[0] == nil {
+			return fmt.Errorf("final-lower: reduce node %d: between loop %d carries no (iv, bound) header",
+				red.BasePtr().ID(), b.Loop().BasePtr().ID())
+		}
+		betweenIVs[i] = bops[0]
+		bb := ir.OperandsOf(bops[1])
+		if len(bb) != 2 || bb[1] == nil {
+			return fmt.Errorf("final-lower: reduce node %d: between loop %d bound is not a (iv, max) bdimvar",
+				red.BasePtr().ID(), b.Loop().BasePtr().ID())
+		}
+		boundMaxs[i] = bb[1]
+		if err := lr.assertBoundEncloses(bb[1], parentBlk); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: the element loop over dim of loop %d: %w",
+				red.BasePtr().ID(), b.Loop().BasePtr().ID(), err)
+		}
+	}
+
+	// Build the fresh uniform element chain innermost-first (each loop's
+	// body operand is wired at construction — the piped producer anchors the
+	// innermost body, the sea-level reachability anchor; the AST blocks
+	// carry the real statement order). Uniform: init 0, step 1, soc 0
+	// (sequential), loc 1 — every thread walks every element, which is what
+	// keeps Combine's collectives uniformly reached.
+	freshIVs := make([]ir.Node, len(betweenBlks))
+	innermost := anchor
+	var innerBlk *ir.ASTBlock
+	for i := len(betweenBlks) - 1; i >= 0; i-- {
+		dimParam := ir.OperandsOf(betweenIVs[i])[0]
+		freshIV := lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
+		freshWrapper := lr.g.NewBoundedDimVar(lowerOrigin, freshIV, boundMaxs[i])
+		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper, innermost,
+			lr.g.NewKeyedAttribute(lowerOrigin, "soc", lr.u32c(0)),
+			lr.g.NewKeyedAttribute(lowerOrigin, "loc", lr.u32c(1)))
+		blk, err := ir.NewASTLoop(freshLoop)
+		if err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: building an element loop block: %w", red.BasePtr().ID(), err)
+		}
+		depth := lr.scopeDepth(parentBlk) + 1 + i
+		freshLoop.BasePtr().SetSched(depth, blk)
+		freshIV.BasePtr().SetSched(depth, blk)
+		freshWrapper.BasePtr().SetSched(depth, blk)
+		if innerBlk != nil {
+			if err := blk.InsertItemAt(0, ir.ASTItem{Block: innerBlk}); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: nesting the element chain: %w", red.BasePtr().ID(), err)
+			}
+		}
+		innerBlk, innermost = blk, freshLoop
+		freshIVs[i] = freshIV
+	}
+	elemDepth := lr.scopeDepth(parentBlk) + len(betweenBlks)
+
+	// Init: the FIRST item of the innermost element loop — the per-element
+	// bracket opens here, before the reduced-dim walks.
+	initCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Init", construction)
+	if err := innerBlk.InsertItemAt(0, ir.ASTItem{Node: initCall}); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: inserting Init into the element loop: %w", red.BasePtr().ID(), err)
+	}
+	initCall.BasePtr().SetSched(elemDepth, innerBlk)
+
+	// Dissolve the between wrappers: home's block unhooks from the chain
+	// and re-attaches directly inside X's block at the outermost between
+	// block's old position; the between blocks (their loop wrappers and
+	// their pure items) are discarded. A between block carrying a SECOND
+	// Block item is a corrupted schedule — fail closed.
+	outerBetween := betweenBlks[0]
+	xItems := xBlk.Items()
+	detachAt := -1
+	for i, it := range xItems {
+		if it.Block == outerBetween {
+			detachAt = i
+			break
+		}
+	}
+	if detachAt < 0 {
+		return fmt.Errorf("final-lower: reduce node %d: the outermost between block is not an item of X's block (corrupted schedule?)", red.BasePtr().ID())
+	}
+	for _, b := range betweenBlks {
+		nBlocks := 0
+		for _, it := range b.Items() {
+			if it.Block != nil {
+				nBlocks++
+			}
+		}
+		if nBlocks != 1 {
+			return fmt.Errorf("final-lower: reduce node %d: between block (loop %d) carries %d child blocks, want exactly the chain child",
+				red.BasePtr().ID(), b.Loop().BasePtr().ID(), nBlocks)
+		}
+	}
+	xBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == outerBetween })
+	if err := xBlk.InsertItemAt(detachAt, ir.ASTItem{Block: homeBlk}); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: re-homing the home block inside X: %w", red.BasePtr().ID(), err)
+	}
+
+	// Move X's block (now [clamps..., home]) out of its parental block and
+	// into the innermost element loop, right after Init.
+	parentBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == xBlk })
+	innerBlk.AppendItem(ir.ASTItem{Block: xBlk})
+
+	// Combine: right after X's block, still inside the innermost element
+	// loop — the per-element bracket closes; every thread leaves with the
+	// element's fully combined value (R1: the call returns T).
+	innerBlk.AppendItem(ir.ASTItem{Node: combineCall})
+	combineCall.BasePtr().SetSched(elemDepth, innerBlk)
+
+	// The qualifying epilogue consumers: the owning LNT's epilogue Group's
+	// items (in order, the end node excluded) that CONSUME the Combine
+	// value. The between-IV reference alone must NOT qualify (the piped
+	// Map's projection lambda is a PRODUCER for the nest; Map Lower disposes
+	// it where it sits).
+	epilogue, err := lr.epilogueOf(ownerLNT)
+	if err != nil {
+		return err
+	}
+	subs := make(map[ir.Node]ir.Node, len(betweenIVs))
+	for i, oldIV := range betweenIVs {
+		subs[oldIV] = freshIVs[i]
+	}
+	qualifies := func(n ir.Node) bool {
+		if n == nil || n.KindOf() == ir.KindReturn {
+			return false
+		}
+		return operandClosure(n)[combineCall]
+	}
+	var moved []ir.Node
+	for _, it := range epilogue.Items() {
+		if it.Node != nil && qualifies(it.Node) {
+			moved = append(moved, it.Node)
+		}
+	}
+	if len(moved) > 0 {
+		// Reduced-dim dimvars are poison in moved consumers: their walks
+		// re-execute per element inside the bracket — the consumer would
+		// read an iteration variable of the WRONG element's strip.
+		reducedVars := lr.reducedDimVars(dim)
+		for _, m := range moved {
+			if containsAny(operandClosure(m), reducedVars) {
+				return fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined at the element-loop position (doc/tca.md §5.10 point 4)",
+					m.BasePtr().ID(), m.KindOf())
+			}
+		}
+		// Rebuild the moved consumers' between-dim coordinates onto the
+		// fresh element IVs (shared expression spines are cloned; the
+		// in-nest walk already got its own clones above — wait, the walk
+		// rebuild happens after the moves complete; both share this subs
+		// map and the discipline of one clone per shared def per USER).
+		for _, m := range moved {
+			if err := lr.rebuildOperands(m, subs); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: rebuilding a moved consumer's between-dim coordinates: %w", red.BasePtr().ID(), err)
+			}
+		}
+		idx := 0
+		epilogue.RemoveItemsIf(func(it ir.ASTItem) bool {
+			if it.Node != nil && idx < len(moved) && it.Node.BasePtr() == moved[idx].BasePtr() {
+				idx++
+				return true
+			}
+			return false
+		})
+		for _, m := range moved {
+			innerBlk.AppendItem(ir.ASTItem{Node: m})
+			m.BasePtr().SetSched(elemDepth, innerBlk)
+		}
+	}
+
+	// Rebuild the moved WALK's between-IV references (every item of X's
+	// block and home's subtree — the loads' non-reduced coordinates) onto
+	// the fresh element IVs.
+	var rebuildWalk func(blk *ir.ASTBlock) error
+	rebuildWalk = func(blk *ir.ASTBlock) error {
+		for _, it := range blk.Items() {
+			if it.Node != nil {
+				if err := lr.rebuildOperands(it.Node, subs); err != nil {
+					return fmt.Errorf("final-lower: reduce node %d: rebuilding the walk's between-dim coordinates: %w", red.BasePtr().ID(), err)
+				}
+				continue
+			}
+			if it.Block != nil {
+				if err := rebuildWalk(it.Block); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := rebuildWalk(xBlk); err != nil {
+		return err
+	}
+
+	// The orphan guard + disposal. First: X's loop BODY operand pointed at
+	// the outermost between loop (the scheduler's chain wiring) — rewire it
+	// onto home's loop, X's new direct child, so the dissolved loop's last
+	// legitimate use dies. The erasure itself is DEFERRED to
+	// finalizeDissolutions (after Map Lower): the piped Map's projection
+	// machinery — the producing Map, its As, and its epilogue-anchored
+	// lambda — still references the walk's coordinate expressions until
+	// Map Lower disposes them, so the between dimvar's use list only
+	// reaches zero there.
+	homeLoop := homeBlk.Loop()
+	rewired := false
+	for _, u := range ir.UsesOf(betweenBlks[0].Loop()) {
+		if usr := u.User(); usr != nil && usr.BasePtr() == x.BasePtr() {
+			if err := lr.mctx.SetDef(u, homeLoop); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: rewiring X's body operand onto home: %w", red.BasePtr().ID(), err)
+			}
+			rewired = true
+			break
+		}
+	}
+	if !rewired && len(ir.UsesOf(betweenBlks[0].Loop())) > 0 {
+		u := ir.UsesOf(betweenBlks[0].Loop())[0]
+		return fmt.Errorf("final-lower: reduce node %d: node %d (%s) still references the dissolved between loop %d after the element-loop restructure",
+			red.BasePtr().ID(), u.User().BasePtr().ID(), u.User().KindOf(), betweenBlks[0].Loop().BasePtr().ID())
+	}
+	for i := range betweenBlks {
+		loop := betweenBlks[i].Loop()
+		// Capture the loop's operand closure BEFORE any erasure — the
+		// finalize sweep's candidate set (wrapper, annotations, and their
+		// coordinate debris).
+		closure := operandClosure(loop)
+		lr.dissolved = append(lr.dissolved, dissolveJob{loop: loop, iv: betweenIVs[i], red: red, closure: closure})
+	}
+
+	// Insert the element chain at X's old position — the restructure is
+	// complete: [element loops [ Init, X [ home [ ..., Reduce ] ], Combine,
+	// moved consumers... ]].
+	if err := parentBlk.InsertItemAt(xIdx, ir.ASTItem{Block: innerBlk}); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: inserting the element loop chain: %w", red.BasePtr().ID(), err)
+	}
+	return nil
+}
+
+// stagingOf returns the construction's staging MemNewSMem operand (R1: the
+// warp/global specializations carry one; the sequential specialization
+// carries none).
+func (lr *lowering) stagingOf(construction ir.Node) ir.Node {
+	switch construction.KindOf() {
+	case ir.KindRuntimeWarpReducer, ir.KindRuntimeGlobalReducer:
+		ops := ir.OperandsOf(construction)
+		if len(ops) == 4 && ops[3] != nil {
+			return ops[3]
+		}
+	}
+	return nil
+}
+
+// newReducerConstruction allocates the Soc-specialized construction (LR-7)
+// plus, for warp/global, the R1 staging row: one #warps × sizeof(T) bytes in
+// the compiler's dynamic-SMEM pool (extent in bytes — the pool accounting
+// unit; D8 disjointness comes from the emitter's prescan offset assignment).
+func (lr *lowering) newReducerConstruction(soc tiling.SoCType, init, lambda ir.Node, initTy ir.Type, ownerLNT *ir.ASTLNT) (ir.Node, error) {
+	if soc == tiling.SoCSequential {
+		return lr.g.NewRuntimeSequentialReducer(lowerOrigin, init, lambda), nil
+	}
+	// R1/R2: warp and global carry (init, lambda, ThreadMapping, staging).
+	threadMap, ok := lr.threadOf[ownerLNT]
+	if !ok || threadMap == nil {
+		return nil, fmt.Errorf("no RuntimeThreadMapping for the owning LNT (insertRuntimeObjects must run before the reducer lower)")
+	}
+	if lr.prov.MaxThreadsPerCTA <= 0 || lr.prov.MaxThreadsPerCTA%32 != 0 {
+		return nil, fmt.Errorf("the provenance launch total %d is not a positive multiple of 32 (the staging row needs the CTA's warp count)", lr.prov.MaxThreadsPerCTA)
+	}
+	scalar, ok := initTy.(*ir.NumericType)
+	if !ok || scalar == nil || scalar.Rank() != 0 {
+		return nil, fmt.Errorf("the init type %v is not scalar (the staging row sizes by the element type)", initTy)
+	}
+	bytes, err := elemBytes(scalar.Elem())
+	if err != nil {
+		return nil, err
+	}
+	warps := lr.prov.MaxThreadsPerCTA / 32
+	staging := lr.g.NewMemNewSMem(lowerOrigin, lr.u32c(float64(warps*bytes)))
+	switch soc {
+	case tiling.SoCWARP:
+		return lr.g.NewRuntimeWarpReducer(lowerOrigin, init, lambda, threadMap, staging), nil
+	case tiling.SoCTA:
+		// LR-7's rule (cta → Global); v0-unreachable by the scheduling
+		// policy (no CTA-parallel reduced dims) — registered scaffolding.
+		return lr.g.NewRuntimeGlobalReducer(lowerOrigin, init, lambda, threadMap, staging), nil
+	default:
+		return nil, fmt.Errorf("unknown SoC %d for the reducer specialization", int(soc))
+	}
+}
+
+// elemBytes maps a scalar element type to its C++ size in bytes — the
+// staging row's sizing unit (R1).
+func elemBytes(e ir.ElemType) (int, error) {
+	switch e {
+	case ir.TBool, ir.TI8, ir.TU8:
+		return 1, nil
+	case ir.TI16, ir.TU16, ir.TF16, ir.TBF16:
+		return 2, nil
+	case ir.TI32, ir.TU32, ir.TF32:
+		return 4, nil
+	default:
+		return 0, fmt.Errorf("no pinned byte size for element type %v (the staging row cannot size)", e)
+	}
 }
 
 // deriveReducedDim implements LR-2 step 0: Reduce Input #0 → (recursing
@@ -267,8 +608,8 @@ func (lr *lowering) deriveReducedDim(red ir.Node) (dim, producingMap, piped ir.N
 // betweenBlocks returns the Loop blocks strictly nested between xBlk and
 // homeBlk on the parent chain (outer→inner), or nil when homeBlk is not a
 // descendant of xBlk. homeBlk itself is the terminus — never a between
-// block (it is the reduced dim's own home, not a slot-index space, and
-// re-iterating over it would re-walk the reduced dimension).
+// block (it is the reduced dim's own home; re-walking over it would
+// re-walk the reduced dimension).
 func betweenBlocks(xBlk, homeBlk *ir.ASTBlock) []*ir.ASTBlock {
 	var path []*ir.ASTBlock
 	var search func(blk *ir.ASTBlock) bool
@@ -295,156 +636,6 @@ func betweenBlocks(xBlk, homeBlk *ir.ASTBlock) []*ir.ASTBlock {
 		return nil
 	}
 	return append([]*ir.ASTBlock(nil), path...)
-}
-
-// newReducerConstruction allocates the Soc-specialized construction (LR-7).
-func (lr *lowering) newReducerConstruction(soc tiling.SoCType, init, lambda ir.Node) (ir.Node, error) {
-	switch soc {
-	case tiling.SoCSequential:
-		return lr.g.NewRuntimeSequentialReducer(lowerOrigin, init, lambda), nil
-	case tiling.SoCWARP:
-		return lr.g.NewRuntimeWarpReducer(lowerOrigin, init, lambda), nil
-	case tiling.SoCTA:
-		// LR-7's rule (cta → Global); v0-unreachable by the scheduling
-		// policy (no CTA-parallel reduced dims) — registered scaffolding.
-		return lr.g.NewRuntimeGlobalReducer(lowerOrigin, init, lambda), nil
-	default:
-		return nil, fmt.Errorf("unknown SoC %d for the reducer specialization", int(soc))
-	}
-}
-
-// buildReiteration implements LR-14/P-12: fresh sequential ForLoops over the
-// between dims (same dim InputParam, same bound expression — its schedule
-// position must enclose the insertion point, fail-closed), nested as AST
-// Loop blocks right after Combine, with the qualifying owning-LNT epilogue
-// items (in order, the KindReturn end node excluded) moved into the
-// innermost block. Within the moved subtrees each between loop's ORIGINAL
-// dimvar is rewired onto the re-iteration loop's dimvar (scoped RAUW); a
-// moved consumer referencing a REDUCED-dim dimvar is a hard diagnostic. An
-// empty between-set (T==1) leaves the consumers after Combine as-is; no
-// qualifying items means no re-iteration blocks (never empty loops).
-func (lr *lowering) buildReiteration(red, dim ir.Node, insertAt int, parentBlk *ir.ASTBlock, betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT, combine ir.Node) error {
-	if len(betweenBlks) == 0 {
-		return nil // T==1: consumers simply stay after Combine
-	}
-
-	// The qualifying epilogue items: the owning LNT's epilogue Group's
-	// items (in order, the end node excluded) that CONSUME the Combine
-	// value (doc/tca.md §5.10 point 4: "operations that consume %valred
-	// are placed after Combine, inside a re-iteration of the non-reduced
-	// inner dimensions"). The between-IV reference alone must NOT
-	// qualify: the piped Map's projection lambda (anchored in the epilogue
-	// by the scheduler) references the between loops' IVs through its
-	// lowered coordinates, yet it is a PRODUCER for the nest — the Reduce
-	// call inside the home loop pipes it — and Map Lower (running after
-	// this pass, LR-2) disposes it where it sits.
-	epilogue, err := lr.epilogueOf(ownerLNT)
-	if err != nil {
-		return err
-	}
-	betweenIVs := make([]ir.Node, len(betweenBlks))
-	for i, b := range betweenBlks {
-		betweenIVs[i] = ir.OperandsOf(b.Loop())[0]
-	}
-	qualifies := func(n ir.Node) bool {
-		if n == nil || n.KindOf() == ir.KindReturn {
-			return false
-		}
-		return operandClosure(n)[combine]
-	}
-	var moved []ir.Node
-	for _, it := range epilogue.Items() {
-		if it.Node != nil && qualifies(it.Node) {
-			moved = append(moved, it.Node)
-		}
-	}
-	if len(moved) == 0 {
-		return nil
-	}
-	// Reduced-dim dimvars are poison in moved consumers: their values are
-	// not defined at the re-iteration position (the reduced loops are DONE).
-	reducedVars := lr.reducedDimVars(dim)
-	for _, m := range moved {
-		if containsAny(operandClosure(m), reducedVars) {
-			return fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined after the reduction bracket (doc/tca.md §5.10 point 4)",
-				m.BasePtr().ID(), m.KindOf())
-		}
-	}
-
-	// Build the fresh re-iteration chain innermost-first: each loop's body
-	// operand is wired at construction (the first moved item anchors the
-	// innermost body — the sea-level reachability anchor; the AST blocks
-	// carry the real statement order).
-	freshIVs := make([]ir.Node, len(betweenBlks))
-	innermost := moved[0]
-	var innerBlk *ir.ASTBlock
-	for i := len(betweenBlks) - 1; i >= 0; i-- {
-		loop := betweenBlks[i].Loop()
-		iv := ir.OperandsOf(loop)[0]
-		dimParam := ir.OperandsOf(iv)[0]
-		maxExpr := ir.OperandsOf(ir.OperandsOf(loop)[1])[1]
-		if err := lr.assertBoundEncloses(maxExpr, parentBlk); err != nil {
-			return fmt.Errorf("final-lower: reduce node %d: %w", red.BasePtr().ID(), err)
-		}
-		freshIV := lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
-		freshWrapper := lr.g.NewBoundedDimVar(lowerOrigin, freshIV, maxExpr)
-		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper, innermost,
-			lr.g.NewKeyedAttribute(lowerOrigin, "soc", lr.u32c(0)),
-			lr.g.NewKeyedAttribute(lowerOrigin, "loc", lr.u32c(1)))
-		blk, err := ir.NewASTLoop(freshLoop)
-		if err != nil {
-			return fmt.Errorf("final-lower: reduce node %d: building a re-iteration loop block: %w", red.BasePtr().ID(), err)
-		}
-		depth := lr.scopeDepth(parentBlk) + 1
-		freshLoop.BasePtr().SetSched(depth, blk)
-		freshIV.BasePtr().SetSched(depth, blk)
-		freshWrapper.BasePtr().SetSched(depth, blk)
-		if innerBlk != nil {
-			if err := blk.InsertItemAt(0, ir.ASTItem{Block: innerBlk}); err != nil {
-				return fmt.Errorf("final-lower: reduce node %d: nesting the re-iteration chain: %w", red.BasePtr().ID(), err)
-			}
-		}
-		innerBlk, innermost = blk, freshLoop
-		freshIVs[i] = freshIV
-	}
-
-	// Re-iteration coordinates: within the moved consumers, each between
-	// loop's ORIGINAL dimvar becomes the fresh re-iteration dimvar. A bare
-	// scoped RAUW is UNSOUND here — the consumers' coordinate expressions
-	// (the lowered index expressions) are SHARED with the in-nest loads,
-	// and rewiring a shared node's dimvar use would corrupt the loads.
-	// The moved items instead get REBUILT operand subtrees with the
-	// substitution applied (the tile-lower rebuildAxis precedent: clone
-	// the expression spine, share the untouched leaves) — the semantic
-	// equivalent of P-12's "consumer references to those loops' dimvars
-	// are RAUW'd", made sound on shared expressions.
-	subs := make(map[ir.Node]ir.Node, len(betweenIVs))
-	for i, oldIV := range betweenIVs {
-		subs[oldIV] = freshIVs[i]
-	}
-	for _, m := range moved {
-		if err := lr.rebuildOperands(m, subs); err != nil {
-			return fmt.Errorf("final-lower: reduce node %d: rebuilding a moved consumer's between-dim coordinates: %w", red.BasePtr().ID(), err)
-		}
-	}
-
-	// Move the qualifying items out of the epilogue, in order, into the
-	// innermost re-iteration block; nest the chain right after Combine.
-	idx := 0
-	epilogue.RemoveItemsIf(func(it ir.ASTItem) bool {
-		if it.Node != nil && idx < len(moved) && it.Node.BasePtr() == moved[idx].BasePtr() {
-			idx++
-			return true
-		}
-		return false
-	})
-	for _, m := range moved {
-		innerBlk.AppendItem(ir.ASTItem{Node: m})
-	}
-	if err := parentBlk.InsertItemAt(insertAt, ir.ASTItem{Block: innerBlk}); err != nil {
-		return fmt.Errorf("final-lower: reduce node %d: inserting the re-iteration chain: %w", red.BasePtr().ID(), err)
-	}
-	return nil
 }
 
 // closureHitsAny reports whether n's operand closure contains any key of
@@ -574,11 +765,10 @@ func (lr *lowering) reducedDimVars(dim ir.Node) map[ir.Node]bool {
 // assertBoundEncloses fail-closes when the bound expression DEPENDS ON a
 // DimVar (the IR's scoping carrier) whose loop block does not enclose (is
 // not an ancestor-or-self of) the insertion block: such an IV is genuinely
-// not live at the re-iteration position (P-12). Computed sub-expressions
+// not live at the insertion position (P-12). Computed sub-expressions
 // (binops, consts — even the bound node itself) are pure SSA values the
-// scheduler stamps at their innermost USE site (here: inside X); SSA value
-// semantics keep them available after X closes, and the plan pins reusing
-// the m tile-inside loop's very same bound node — so only the IV leaves
+// scheduler stamps at their innermost USE site; SSA value semantics keep
+// them available after their minting loops close — so only the IV leaves
 // are scope-checked.
 func (lr *lowering) assertBoundEncloses(bound ir.Node, insertion *ir.ASTBlock) error {
 	for n := range operandClosure(bound) {
@@ -589,7 +779,7 @@ func (lr *lowering) assertBoundEncloses(bound ir.Node, insertion *ir.ASTBlock) e
 		if bBlk == nil || bBlk == insertion || findSubBlock(bBlk, insertion) != nil {
 			continue // unscheduled, or the insertion sits inside the IV's loop block
 		}
-		return fmt.Errorf("the re-iteration bound depends on the IV node %d, whose loop does not enclose the insertion position — the bound is not defined at the re-iteration position", n.BasePtr().ID())
+		return fmt.Errorf("the element-loop bound depends on the IV node %d, whose loop does not enclose the insertion position — the bound is not defined at the element-loop position", n.BasePtr().ID())
 	}
 	return nil
 }

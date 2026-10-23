@@ -58,13 +58,23 @@ func TestCatalogArityPinsVariadicKinds(t *testing.T) {
 	g := NewGraph("arity")
 	c := g.NewConst("ctor", InternScalar(TF32), 0)
 	for _, k := range AllKinds() {
-		n := g.NewNode(k, "ctor", c, c, c, c)
 		arity := fixedArity(k)
-		if arity >= 0 && n.BasePtr().surplus == 0 {
+		// Fixed kinds get arity+1 operands (one surplus); variadic kinds
+		// get four (all wired).
+		n := 4
+		if arity >= 0 {
+			n = arity + 1
+		}
+		ops := make([]Node, n)
+		for i := range ops {
+			ops[i] = c
+		}
+		built := g.NewNode(k, "ctor", ops...)
+		if arity >= 0 && built.BasePtr().surplus == 0 {
 			t.Errorf("fixed-arity kind %s must record surplus operands (arity %d)", k, arity)
 		}
-		if arity < 0 && n.BasePtr().surplus != 0 {
-			t.Errorf("variadic kind %s must wire every operand, surplus %d", k, n.BasePtr().surplus)
+		if arity < 0 && built.BasePtr().surplus != 0 {
+			t.Errorf("variadic kind %s must wire every operand, surplus %d", k, built.BasePtr().surplus)
 		}
 	}
 }

@@ -281,9 +281,9 @@ type siteJudgment struct {
 
 // judgeSite is the doc's promotion judge ("Judge Criterial"), as amended
 // 2026-10-21 (R2 tier rule + F4 drop-rule gate + F6 frag budget + the
-// per-thread reuse gate). The site is classified by the SoC of its COVERED
-// dims (the cached trailing dimensions; rank >= CacheDims is guaranteed by
-// the admission filter):
+// per-thread reuse gate) and 2026-10-23 (C1b tier precedence). The site is
+// classified by the SoC of its COVERED dims (the cached trailing dimensions;
+// rank >= CacheDims is guaranteed by the admission filter):
 //
 //   - GATE: any covered dim CTA-assigned -> the site is REFUSED (a
 //     CTA-covered tile has no coherent fill variant under the v0
@@ -291,9 +291,16 @@ type siteJudgment struct {
 //   - GATE: any covered dim with tile_size 1 blocks promotion (F4: the
 //     judge's gate matches the lower's drop rule — ANY covered iter at
 //     tile 1, not only all of them).
-//   - TIER: any covered dim WARP-assigned -> ClassSMEM (the window class:
-//     cooperative LoadTileCta, window-sized buffer); all covered dims
-//     sequential -> ClassFRAG (per-thread LoadTileThread).
+//   - TIER PRECEDENCE (C1b, 2026-10-23): a site with a THREAD-VARYING
+//     non-covered source coordinate — any referenced iter (INS) NOT in the
+//     covered set, assigned CTA or WARP — takes ClassFRAG regardless of
+//     the covered dims' SoC. A cooperative SMEM fill is CTA-uniform (R1),
+//     and a fill whose own source coordinates move with the thread (the
+//     worked example's lhs: the row coordinate is the coupled per-thread
+//     walk) has no coherent shared-window variant.
+//   - TIER: otherwise any covered dim WARP-assigned -> ClassSMEM (the
+//     window class: cooperative LoadTileCta, window-sized buffer); all
+//     covered dims sequential -> ClassFRAG (per-thread LoadTileThread).
 //   - GATE: a FRAG site's per-thread bytes must fit MaxFragPerThread (F6).
 //   - GATE: per-thread reuse < 2 -> not promoted (bytes loaded once and
 //     read once avoid no traffic on the owning thread's behalf).
@@ -301,7 +308,9 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx, p Par
 	if len(sf.Covered) == 0 {
 		return siteJudgment{reason: ReasonEmptyCovered}
 	}
+	coveredSet := make(map[ir.Node]bool, len(sf.Covered))
 	for _, c := range sf.Covered {
+		coveredSet[c] = true
 		d, ok := iters[c]
 		if !ok {
 			return siteJudgment{reason: ReasonUnknownIter} // unknown assignment: fail closed
@@ -316,14 +325,30 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx, p Par
 			return siteJudgment{reason: ReasonTileOne} // tiling disabled on a covered dim
 		}
 	}
-	class := ClassFRAG
-	for _, c := range sf.Covered {
-		if iters[c].SoC == SoCWARP {
-			class = ClassSMEM
+	forcedFrag := false
+	for _, it := range sf.INS {
+		if coveredSet[it] {
+			continue
+		}
+		d, ok := iters[it]
+		if !ok {
+			return siteJudgment{reason: ReasonUnknownIter} // unknown assignment: fail closed
+		}
+		if d.SoC == SoCTA || d.SoC == SoCWARP {
+			forcedFrag = true // C1b: a thread-varying non-covered coordinate
 			break
 		}
 	}
-	bytes := siteWindowBytes(sf, iters)
+	class := ClassFRAG
+	if !forcedFrag {
+		for _, c := range sf.Covered {
+			if iters[c].SoC == SoCWARP {
+				class = ClassSMEM
+				break
+			}
+		}
+	}
+	bytes := siteWindowBytes(sf, iters, class)
 	if class == ClassFRAG && bytes > p.MaxFragPerThread {
 		return siteJudgment{class: class, bytes: bytes, reason: ReasonFragBytes}
 	}
@@ -336,17 +361,20 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx, p Par
 
 // siteWindowBytes is the site's post-demotion footprint under the
 // WINDOW-BYTES model (R2, ruled 2026-10-21 — rank-in-index =>
-// window-in-shape): element size x the product over the covered dims of
-// (alloc_d x tile_size_d), where alloc_d is the number of execution
-// slots partitioning that dim's round window in the schedule:
+// window-in-shape), made class-aware by the C1b precedence (2026-10-23).
+// Element size x the product over the covered dims of (alloc_d x
+// tile_size_d), where alloc_d is the number of execution slots partitioning
+// that dim's round window in the schedule:
 //
 //   - SEQ dim: 1 (the tile alone — one thread's sequential chunk),
-//   - WARP dim: LoC_d x 32 threads (the whole group's round window, NOT
-//     the single-thread chunk),
+//   - WARP dim: ClassSMEM — LoC_d x 32 threads (the whole group's round
+//     window, NOT the single-thread chunk); ClassFRAG — 1 (C1b: the
+//     per-thread window: a forced-FRAG site's WARP-covered dim is each
+//     thread's own T_d-chunk, priced and sized per thread),
 //   - CTA dim: LoC_d CTAs (the CTA group's round window; such sites are
-//     refused by the tier rule regardless — the value stays well-defined
-//     for diagnostics).
-func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision) int {
+//     refused by the covered-CTA gate regardless — the value stays
+//     well-defined for diagnostics).
+func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision, class CacheClass) int {
 	e, ok := elemTypeOf(sf.Load)
 	if !ok {
 		return 0 // unavailable element type: contributes no traffic (fail closed)
@@ -360,7 +388,9 @@ func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision) int {
 		alloc := 1
 		switch d.SoC {
 		case SoCWARP:
-			alloc = d.LoC * 32
+			if class == ClassSMEM {
+				alloc = d.LoC * 32
+			}
 		case SoCTA:
 			alloc = d.LoC
 		}

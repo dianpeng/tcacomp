@@ -560,9 +560,22 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
       - Stride = #threads x tile_size, ie tile-chunk granularity
       - Each thread owns a WHOLE tile_size CHUNK of that dimension
       - Its inside loop is SEQUENTIAL over the chunk's elements
-    - (b) CTA dim's coupled inside loop
+    - (b) CTA dim's coupled inside loop — the FLAT-INDEX FORM (ruled
+      2026-10-23)
       - Stride = #threads at ELEMENT granularity
-      - Each thread owns rows/elements of the tile interior
+      - The IV's INIT is the NO-ARG flat thread query thread_map.index()
+        (the absolute flattened 1-D rank); step = the coupled thread
+        count; bound = the tile max. Index() = flatRank + i*#threads; the
+        element address = round_base + Index(); the separate
+        +index(threadDim) tuple add is DELETED (it supplied only the
+        SLOWEST-axis coordinate — never a 0..#threads-1 element rank)
+      - Each thread owns the tile rows/elements at its flat stride: threads
+        with flatRank >= tile_max take ZERO trips (whole-body no-op) —
+        single-owner EXACT while tile_size <= #threads
+      - REGISTERED FUTURE WORK (do NOT implement): for tile_size >
+        #threads a thread takes multiple trips and tid vs tid+coupled
+        overlap — needs group-membership gating (is_first-style) when such
+        tiles are ever searched
   - v0 default searcher POLICY, within the constraints, NOT a model rule
     - At most ONE CTA-assigned dim and at most ONE independent WARP dim per LNT
     - Same-category multi-dim composition, CTA+CTA or independent WARP+WARP,

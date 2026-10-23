@@ -7,14 +7,17 @@ __device__ static __forceinline__ T RedwarpCombine0(T p0, T p1) {
 }
 
 // Redwarp: launch 100 CTAs x 512 threads (tiling Params; the runtime asserts divisibility)
+// dynamic SMEM pool: 64 B (v0: disjoint offsets, zero reuse)
 namespace {
 
 __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out) {
   tca::rt::TensorView<const float, 2u> lhs_v(lhs, d0, d1);
   tca::rt::TensorView<float, 1u> out_v(out, d0);
+  // dynamic SMEM pool (64 B): one pool, disjoint v0 offsets — the future RA pass overlaps them
+  extern __shared__ __align__(16) char tca_smem[];
 
   tca::rt::KernelInfo kinfo;
-  // LNT #0: d0=CTA(T=32,LoC=100) d1=thread/warp(T=64,LoC=256) d0=thread/warp(T=32,LoC=256) d1=sequential(T=64,LoC=1)
+  // LNT #0: d0=CTA(T=32,LoC=100) d1=thread/warp(T=64,LoC=256) dim=thread/warp(LoC=256) d1=sequential(T=64,LoC=1)
   {
     // CTA-space mapping (portions -1 — the launch grammar this nest remaps)
     tca::rt::GridMapping grid_map0(kinfo, -1);
@@ -26,43 +29,43 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
     auto v0 = grid_map0.index(0u);
     auto c3 = 32u;
     auto v1 = (v0 * c3);
-    auto v2 = thread_map1.index(0u);
-    auto v3 = thread_map1.index(1u);
+    auto v2 = thread_map1.index(1u);
     auto c4 = 64u;
-    auto v4 = (v3 * c4);
-    // warp reduction — the combiner is runtime-owned; Init/Combine bracket ALL tiles of the reduced dim
-    tca::rt::WarpReducer<float, 32u> reducer0(c2, RedwarpCombine0);
+    auto v3 = (v2 * c4);
+    auto v4 = thread_map1.index(0u);
+    auto v5 = (v4 * c1);
+    // warp reduction — the combiner is runtime-owned; per-element brackets [Init → reduced-dim walks (Reduce(value)) → Combine]
+    tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0, thread_map1, tca::rt::SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem + 0u), 16u));
     // @d0 tile-between rounds — CTA, T=32, LoC=100 (map dim 0)
     for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 3200u, c0); d0_it0.Has(); d0_it0.Next()) {
-      auto v5 = (v1 + d0_it0.Index());
-      auto v6 = tca::rt::umin(v5, c0);
-      auto v7 = (c0 - v6);
-      auto v8 = tca::rt::umin(c3, v7);
-      // reduction bracket opens (argument-free; re-initializes from the construction-time init)
-      reducer0.Init();
-      // @d1 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 1)
-      for (auto d1_it1 = tca::rt::ThrIterator(thread_map1, 1u, 256u, 0u, 16384u, c1); d1_it1.Has(); d1_it1.Next()) {
-        auto v9 = (v4 + d1_it1.Index());
-        auto v10 = tca::rt::umin(v9, c1);
-        auto v11 = (c1 - v10);
-        auto v12 = tca::rt::umin(c4, v11);
-        // @d0 tile-between rounds — thread/warp, T=32, LoC=256 (map dim 0)
-        for (auto d0_it2 = tca::rt::ThrIterator(thread_map1, 0u, 256u, 0u, 256u, v8); d0_it2.Has(); d0_it2.Next()) {
-          auto v13 = (v5 + d0_it2.Index());
-          auto v14 = (v13 + v2);
+      auto v6 = (v1 + d0_it0.Index());
+      auto v7 = tca::rt::umin(v6, c0);
+      auto v8 = (c0 - v7);
+      auto v9 = tca::rt::umin(c3, v8);
+      // @d0 walk — sequential, LoC=1
+      for (auto d0_it1 = tca::rt::SeqIterator(0u, 1u, v9); d0_it1.Has(); d0_it1.Next()) {
+        // per-element bracket opens (argument-free; re-initializes from the construction-time init)
+        reducer0.Init();
+        // @d1 tile-between rounds — thread/warp, T=64, LoC=256 (map dim 1)
+        for (auto d1_it2 = tca::rt::ThrIterator(thread_map1, 1u, 256u, 0u, 16384u, c1); d1_it2.Has(); d1_it2.Next()) {
+          auto v10 = (v3 + d1_it2.Index());
+          auto v11 = (v10 + v5);
+          auto v12 = tca::rt::umin(v11, c1);
+          auto v13 = (c1 - v12);
+          auto v14 = tca::rt::umin(c4, v13);
           // @d1 inside walk (tile elements) — T=64
-          for (auto d1_it3 = tca::rt::SeqIterator(0u, 1u, v12); d1_it3.Has(); d1_it3.Next()) {
-            auto v15 = (v9 + d1_it3.Index());
-            auto v16 = lhs_v.Get(v14, v15);
-            reducer0.Reduce(d0_it2.Index(), v16);
+          for (auto d1_it3 = tca::rt::SeqIterator(0u, 1u, v14); d1_it3.Has(); d1_it3.Next()) {
+            auto v15 = (v11 + d1_it3.Index());
+            auto v16 = lhs_v.Get((v6 + d0_it1.Index()), v15);
+            reducer0.Reduce(v16);
           }
         }
-      }
-      // one Combine — every participant receives the final value
-      auto v17 = reducer0.Combine();
-      // @d0 walk — sequential, LoC=1
-      for (auto d0_it4 = tca::rt::SeqIterator(0u, 1u, v8); d0_it4.Has(); d0_it4.Next()) {
-        out_v.Set(v17.Get(d0_it4.Index()), ((v5 + d0_it4.Index()) + v2));
+        // per-element combine — every participant receives the element's final value
+        auto v17 = reducer0.Combine();
+        // single-owner store — the element's owner thread writes (R2/R3)
+        if (thread_map1.is_first_in_cta()) {
+          out_v.Set(v17, (v6 + d0_it1.Index()));
+        }
       }
     }
   }
@@ -74,7 +77,7 @@ void RedwarpLaunch(const tca::Tensor<float, 2u>& lhs, tca::Tensor<float, 1u>& ou
   const uint32_t d0 = lhs.Dim(0u);
   const uint32_t d1 = lhs.Dim(1u);
   TCA_REQUIRE(out.Dim(0u) == d0, "out.Dim(0) must equal d0 (dim d0)");
-  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u);
-  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
+  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 64u);
+  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 64u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
   TCA_CUDA_CHECK(cudaGetLastError());
 }

@@ -31,22 +31,21 @@ type emitter struct {
 	smemCap   int                // total pool bytes (v0: Σ extents, zero reuse)
 	fillSrc   map[ir.Node]bool   // MemLoads serving as a fill's source (skipped as items)
 	bufTensor map[ir.Node]string // MemNewSMem/FragNew → source tensor name (semantic view names)
+	staging   map[ir.Node]bool   // MemNewSMem nodes serving as reducer staging rows (R1 — inline ctor views, no kernelTop decl)
+	gated     map[ir.Node]bool   // MemStores of a reduced value (R3 — single-owner gated on is_first_in_cta)
 
 	// symbols.
-	tensorView   map[ir.Node]string    // RoleTensor param → TensorView local
-	smemView     map[ir.Node]string    // MemNewSMem → SmemView local
-	fragLocal    map[ir.Node]string    // FragNew → Frag local
-	iters        map[ir.Node]string    // DimVar node → owning loop's iterator local
-	dimScope     []map[ir.Node]string  // dim InputParam → iterator local, loop-scoped stack
-	objName      map[ir.Node]string    // runtime construction → local
-	slots        map[ir.Node][]ir.Node // reducer construction → slot dim params (D7)
-	slotCount    map[ir.Node]int       // reducer construction → slot TILE EXTENT (the <T, Slots> template arg)
-	slottedVal   map[ir.Node][]ir.Node // slotted Combine node → its slot dim params
-	lambdas      []ir.Node             // surviving KindLambda in first-reference order
-	lambdaOwned  map[ir.Node]bool      // the operand closure of every surviving lambda — skipped in the kernel walk (hoisted file-scope instead)
-	lambdaParams map[ir.Node]string    // the lambda currently being emitted: param → local
-	curGrid      string                // the enclosing LNT's GridMapping local
-	curThread    string                // the enclosing LNT's ThreadMapping local
+	tensorView   map[ir.Node]string   // RoleTensor param → TensorView local
+	smemView     map[ir.Node]string   // MemNewSMem → SmemView local
+	fragLocal    map[ir.Node]string   // FragNew → Frag local
+	iters        map[ir.Node]string   // DimVar node → owning loop's iterator local
+	dimScope     []map[ir.Node]string // dim InputParam → iterator local, loop-scoped stack
+	objName      map[ir.Node]string   // runtime construction → local
+	lambdas      []ir.Node            // surviving KindLambda in first-reference order
+	lambdaOwned  map[ir.Node]bool     // the operand closure of every surviving lambda — skipped in the kernel walk (hoisted file-scope instead)
+	lambdaParams map[ir.Node]string   // the lambda currently being emitted: param → local
+	curGrid      string               // the enclosing LNT's GridMapping local
+	curThread    string               // the enclosing LNT's ThreadMapping local
 
 	// symbol derivation (quick-261023-cgq): the KindKernelMeta payloads or
 	// the Google-style PascalCase fallback; collision-safe local naming.
@@ -93,14 +92,13 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 		smemOff:     map[ir.Node]int{},
 		fillSrc:     map[ir.Node]bool{},
 		bufTensor:   map[ir.Node]string{},
+		staging:     map[ir.Node]bool{},
+		gated:       map[ir.Node]bool{},
 		tensorView:  map[ir.Node]string{},
 		smemView:    map[ir.Node]string{},
 		fragLocal:   map[ir.Node]string{},
 		iters:       map[ir.Node]string{},
 		objName:     map[ir.Node]string{},
-		slots:       map[ir.Node][]ir.Node{},
-		slotCount:   map[ir.Node]int{},
-		slottedVal:  map[ir.Node][]ir.Node{},
 		lambdaOwned: map[ir.Node]bool{},
 		paramNames:  map[string]bool{},
 		usedNames:   map[string]bool{},
@@ -275,7 +273,7 @@ func (e *emitter) prescan() error {
 	if err := walk(e.k.Body); err != nil {
 		return err
 	}
-	e.scanReducerSlots()
+	e.scanReducerFacts()
 	e.buildPureRefs()
 
 	// The lambda-owned closure: the scheduler anchors the surviving
@@ -290,65 +288,70 @@ func (e *emitter) prescan() error {
 	return nil
 }
 
-// scanReducerSlots pre-collects each reducer construction's slot facts
-// from its Reduce calls (quick-261023-rt: the construction emits BEFORE the
-// calls in walk order, so the <T, Slots> template argument needs the
-// reverse lookup). Slots is the slot TILE EXTENT — the product of the slot
-// dims' tile sizes, taken from the owning inside loops' tile annotations
-// (the accumulator tile is one entry per logical output; the runtime's
-// static scratch is stage[Slots][PortionWarp]). Deterministic: the first
-// Reduce call wins; the emission-time consistency check still guards
-// arity drift.
-func (e *emitter) scanReducerSlots() {
-	ivTile := map[ir.Node]int{}
-	var index func(blk *ir.ASTBlock)
-	index = func(blk *ir.ASTBlock) {
-		if blk.Loop() != nil && blk.IV() != nil {
-			if t, ok := e.loopTile(blk.Loop()); ok {
-				ivTile[blk.IV()] = t
-			}
+// scanReducerFacts pre-collects the R1/R3 reducer emission facts (the
+// constructions emit BEFORE the data-flow that uses them in walk order, so
+// the reverse lookups happen up front):
+//
+//   - STAGING: every warp/global construction's staging MemNewSMem operand
+//     (R1). Staging rows participate in the pool offset accounting (the
+//     prescan's disjoint D8 layout) but get NO kernelTop view declaration —
+//     their only textual form is the INLINE SmemView construction inside
+//     the reducer ctor.
+//   - GATED: every GMEM MemStore whose value-operand closure consumes a
+//     Combine call (R3). Such stores are per-element epilogue stores inside
+//     a reducer's element loop — the runtime-owned ownership gate
+//     (is_first_in_cta, R2) wraps them so exactly one CTA thread writes
+//     each output element.
+func (e *emitter) scanReducerFacts() {
+	var combineCalls []ir.Node
+	for _, n := range e.g.AllocatedNodes() {
+		if n == nil || n.BasePtr().Erased() {
+			continue
 		}
-		for _, it := range blk.Items() {
-			if it.Block != nil {
-				index(it.Block)
+		switch n.KindOf() {
+		case ir.KindRuntimeWarpReducer, ir.KindRuntimeGlobalReducer:
+			if ops := ir.OperandsOf(n); len(ops) == 4 && ops[3] != nil {
+				e.staging[ops[3]] = true
+			}
+		case ir.KindRuntimeCallMethod:
+			if ir.RuntimeMethodOf(n) == "Combine" {
+				combineCalls = append(combineCalls, n)
 			}
 		}
 	}
-	index(e.k.Body)
+	if len(combineCalls) == 0 {
+		return
+	}
+	for _, n := range e.g.AllocatedNodes() {
+		if n == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
+			continue
+		}
+		cl := e.closureOf(ir.OperandsOf(n)[0])
+		for _, c := range combineCalls {
+			if cl[c] {
+				e.gated[n] = true
+				break
+			}
+		}
+	}
+}
 
-	var walk func(blk *ir.ASTBlock)
-	walk = func(blk *ir.ASTBlock) {
-		for _, it := range blk.Items() {
-			if it.Node != nil && it.Node.KindOf() == ir.KindRuntimeCallMethod &&
-				ir.RuntimeMethodOf(it.Node) == "Reduce" {
-				ops := ir.OperandsOf(it.Node)
-				if len(ops) > 1 && ops[0] != nil {
-					if _, seen := e.slots[ops[0]]; !seen {
-						count, dims := 1, []ir.Node{}
-						for _, a := range ops[1 : len(ops)-1] {
-							ops2 := ir.OperandsOf(a)
-							if len(ops2) != 3 || ops2[0] == nil {
-								continue
-							}
-							dims = append(dims, ops2[0])
-							t, ok := ivTile[a]
-							if !ok || t < 1 {
-								continue // no tile fact: slots collapse to 1 (slotless scalars)
-							}
-							count *= t
-						}
-						e.slots[ops[0]] = dims
-						e.slotCount[ops[0]] = count
-					}
-				}
-				continue
-			}
-			if it.Block != nil {
-				walk(it.Block)
-			}
+// closureOf collects n's transitive operand closure (self included, live
+// nodes only) — the prescan's expression-reach helper.
+func (e *emitter) closureOf(n ir.Node) map[ir.Node]bool {
+	set := make(map[ir.Node]bool)
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+			return
+		}
+		set[x] = true
+		for _, d := range ir.OperandsOf(x) {
+			visit(d)
 		}
 	}
-	walk(e.k.Body)
+	visit(n)
+	return set
 }
 
 // buildPureRefs computes which scheduler-anchored PURE items are actually
@@ -369,6 +372,14 @@ func (e *emitter) buildPureRefs() {
 			// Header/annotation carriers: their children (iv init/step,
 			// soc/dosoc/loc/tile/loadtile values) emit as inline literals,
 			// never as locals — descending would false-reference them.
+			return
+		case ir.KindMemNewSMem, ir.KindFragNew:
+			// Allocation declarations (F0, 2026-10-23): their byte-extent
+			// consts render as inline literals in the hoisted preamble
+			// declarations (the pool views, the Frag tiles, the reducer
+			// staging slices) — never as locals. Descending would
+			// false-reference the extent const into a dead local (the same
+			// rationale as the DimVar/KeyedAttribute stop).
 			return
 		}
 		for _, op := range ir.OperandsOf(n) {

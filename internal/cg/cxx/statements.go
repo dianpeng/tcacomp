@@ -123,7 +123,12 @@ func (e *emitter) stmtMemLoad(n ir.Node) error {
 }
 
 // stmtMemStore: the epilogue store — one owner per address (structural
-// race-freedom), so a plain Set through the view.
+// race-freedom), so a plain Set through the view. A store of a REDUCED
+// value (R3: the per-element epilogue stores inside a reducer's element
+// loop) is additionally wrapped in the runtime-owned ownership gate —
+// is_first_in_cta() on the enclosing LNT's ThreadMapping (R2) — so exactly
+// one CTA thread writes each output element; the walk itself stays
+// branch-free (every thread computes the element; only the owner stores).
 func (e *emitter) stmtMemStore(n ir.Node) error {
 	ops := ir.OperandsOf(n)
 	if len(ops) < 2 {
@@ -140,6 +145,18 @@ func (e *emitter) stmtMemStore(n ir.Node) error {
 	coords, _, err := e.accessAxes(n, 2)
 	if err != nil {
 		return err
+	}
+	if e.gated[n] {
+		if e.curThread == "" {
+			return fmt.Errorf("cxx: gated store %d sits outside every LNT cluster (no ThreadMapping in scope)", n.BasePtr().ID())
+		}
+		e.c("single-owner store — the element's owner thread writes (R2/R3)")
+		e.line("if (" + e.curThread + ".is_first_in_cta()) {")
+		e.deep++
+		e.line(view + ".Set(" + val + ", " + join(coords) + ");")
+		e.deep--
+		e.line("}")
+		return nil
 	}
 	e.line(view + ".Set(" + val + ", " + join(coords) + ");")
 	return nil

@@ -158,8 +158,10 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 		t.Fatal("the lexical Group must carry the LNT record via Nest()")
 	}
 	// Loop-kind/depth structure — the observed stable dump: the tile-lowered
-	// M→N→K chain materializes as six loops, CTA→Seq→Thr→Thr→Seq→Seq.
-	wantKinds := []ir.BlockKind{ir.BlockCTALoop, ir.BlockSeqLoop, ir.BlockThrLoop,
+	// M→N→K chain materializes as six loops, CTA→Seq→Seq→Thr→Seq→Seq
+	// (the C1b forced-FRAG precedence's optimum assigns both N and K
+	// sequential — the single Thr loop is M's coupled inside walk).
+	wantKinds := []ir.BlockKind{ir.BlockCTALoop, ir.BlockSeqLoop, ir.BlockSeqLoop,
 		ir.BlockThrLoop, ir.BlockSeqLoop, ir.BlockSeqLoop}
 	var gotKinds []ir.BlockKind
 	for b := rootBlockOf(t, blocks[0]); b != nil; {
@@ -188,75 +190,78 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 		t.Fatalf("Params = %d, want 6 (3 dims + 3 tensors)", len(k1.Params))
 	}
 	if len(k1.Gmem) != 0 {
-		t.Fatalf("Gmem = %d allocations, want 0 (the promoted buffers are SMEM)", len(k1.Gmem))
+		t.Fatalf("Gmem = %d allocations, want 0 (the promoted buffers are on-chip: SMEM windows / per-thread fragments)", len(k1.Gmem))
 	}
 }
 
 // TestPipelineFillInsideHost is THE CR-01 regression pin
-// (quick-261022-b2m): with K=32768 (a multi-round fill-key extent) the SMEM
-// fill store lands INSIDE its K-between host loop — SN 3, a Loop-kind block
-// whose loop also sits at SN 3 — re-executing once per round (R1's
-// once-per-round mandate). The old operand-only clamp hoisted it to the
-// once-only prologue at SN 0, leaving rounds 2+ reading a stale SMEM window.
-// The fill's source load reloads per M-round (SN 1) and the SMEM buffer
-// declaration lands at SN 0 in the FIRST prologue (the allocation
-// exemption); the end node lands in the LAST LNT's epilogue.
+// (quick-261022-b2m): with K=32768 (a multi-round fill-key extent) the fill
+// store lands INSIDE its host loop — SN 4, a ThrLoop-kind block whose loop
+// also sits at SN 4 — re-executing once per host trip (R1's once-per-host
+// mandate), never hoisted to the once-only prologue at SN 0 (the old
+// operand-only clamp left later trips reading a stale window). Under the
+// C1b forced-FRAG precedence (2026-10-23) the fill is a per-thread
+// FragStore (LoadTileThread): its host is M's coupled inside walk, so each
+// thread re-fills its K fragment once per row trip. The fill's source load
+// reloads per trip (SN 4), its K-between round base rides SN 3, and the
+// fragment buffer declaration lands at SN 0 in the FIRST prologue (the
+// allocation exemption); the end node lands in the LAST LNT's epilogue.
 func TestPipelineFillInsideHost(t *testing.T) {
 	g := matmulGraphK("mm-k32768", 32768)
 	k := runPipeline(t, g)
 
-	// Exactly one live SMEM fill (lhs promoted, rhs declined by the searched
-	// defaults).
+	// Exactly one live fragment fill (lhs promoted, rhs declined by the
+	// searched defaults).
 	var fill ir.Node
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStoreSMem {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindFragStore {
 			continue
 		}
 		if fill != nil {
-			t.Fatalf("two live SMEM fills (%d and %d), want exactly one", fill.BasePtr().ID(), n.BasePtr().ID())
+			t.Fatalf("two live fragment fills (%d and %d), want exactly one", fill.BasePtr().ID(), n.BasePtr().ID())
 		}
 		fill = n
 	}
 	if fill == nil {
-		t.Fatal("no live SMEM fill found — the searched defaults must promote lhs")
+		t.Fatal("no live fragment fill found — the searched defaults must promote lhs")
 	}
 
-	// The fill sits INSIDE its K-between host loop (SN 3, Loop-kind block,
-	// the host loop also at SN 3) — never in the prologue.
-	if got := fill.BasePtr().SchedSN(); got != 3 {
-		t.Fatalf("fill SN = %d, want 3 (inside the K-between host loop; the old clamp gave 0)", got)
+	// The fill sits INSIDE its host loop (SN 4, ThrLoop-kind block, the host
+	// loop also at SN 4) — never in the prologue.
+	if got := fill.BasePtr().SchedSN(); got != 4 {
+		t.Fatalf("fill SN = %d, want 4 (inside the coupled-walk host loop; the old clamp gave 0)", got)
 	}
 	blk := fill.BasePtr().SchedBlock()
 	if blk == nil || blk.Kind() == ir.BlockGroup {
-		t.Fatalf("fill block kind = %v, want a Loop block", blkKindOf(blk))
+		t.Fatalf("fill block kind = %v, want a ThrLoop block", blkKindOf(blk))
 	}
-	if host := blk.Loop(); host == nil || host.BasePtr().SchedSN() != 3 {
-		t.Fatalf("the fill's host loop must also sit at SN 3 (the K-between host)")
+	if host := blk.Loop(); host == nil || host.BasePtr().SchedSN() != 4 {
+		t.Fatalf("the fill's host loop must also sit at SN 4 (the coupled-walk host)")
 	}
 
-	// Every live data dep of the fill is at SN <= 3 (executed before it).
+	// Every live data dep of the fill is at SN <= 4 (executed before it).
 	for _, d := range ir.DataDeps(fill) {
 		if d == nil || d.BasePtr().Erased() {
 			continue
 		}
-		if got := d.BasePtr().SchedSN(); got > 3 {
-			t.Fatalf("fill dep node %d (%s) at SN %d, want <= 3", d.BasePtr().ID(), d.KindOf(), got)
+		if got := d.BasePtr().SchedSN(); got > 4 {
+			t.Fatalf("fill dep node %d (%s) at SN %d, want <= 4", d.BasePtr().ID(), d.KindOf(), got)
 		}
 	}
 
-	// Source tile load: per-M-round reload at SN 1.
+	// Source tile load: per-trip reload at SN 4.
 	ops := ir.OperandsOf(fill)
 	if len(ops) < 2 || ops[0] == nil || ops[0].KindOf() != ir.KindMemLoad {
 		t.Fatalf("fill ops[0] = %v, want the KindMemLoad source tile load", kindOf(ops[0]))
 	}
-	if got := ops[0].BasePtr().SchedSN(); got != 1 {
-		t.Fatalf("fill source load SN = %d, want 1 (per-M-round reload)", got)
+	if got := ops[0].BasePtr().SchedSN(); got != 4 {
+		t.Fatalf("fill source load SN = %d, want 4 (per-trip reload)", got)
 	}
 
-	// SMEM buffer: the allocation-exemption pin — SN 0 in the FIRST
+	// Fragment buffer: the allocation-exemption pin — SN 0 in the FIRST
 	// prologue Group.
-	if len(ops) < 2 || ops[1] == nil || ops[1].KindOf() != ir.KindMemNewSMem {
-		t.Fatalf("fill ops[1] = %v, want the KindMemNewSMem buffer", kindOf(ops[1]))
+	if len(ops) < 2 || ops[1] == nil || ops[1].KindOf() != ir.KindFragNew {
+		t.Fatalf("fill ops[1] = %v, want the KindFragNew buffer", kindOf(ops[1]))
 	}
 	buf := ops[1]
 	if got := buf.BasePtr().SchedSN(); got != 0 {

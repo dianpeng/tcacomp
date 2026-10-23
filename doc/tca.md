@@ -633,7 +633,7 @@ For the matmul with `as (@m, @k, @n)`, the nest is:
 @m_o -> @k_o -> @n_o -> @m_i -> @k_i -> @n_i
 ```
 
-The compiler never reorders loops in v0. Every later decision derives from this fixed order: reducer placement and accumulator shape ([Section 5.10](#510-reduce-lowering)), and the hoisting level of caches ([Section 5.8](#58-cta-cache-allocation)). For the matmul, `Init`/`Combine` surround `@n_o`, and `@m_i` and `@k_i` lie between `@n_o` and `Reduce`, so the accumulator tile has shape `[T_m][T_k]`.
+The compiler never reorders loops in v0. Every later decision derives from this fixed order: reducer placement and the element-walk brackets ([Section 5.10](#510-reduce-lowering)), and the hoisting level of caches ([Section 5.8](#58-cta-cache-allocation)). Under the R3 element-bracket model the reducer state is a scalar per output element — the non-reduced inside loops between the reduced dim's tile-between loop and `Reduce` become the uniform element walk, and no accumulator tile exists.
 
 The example below uses `as (@m, @k)` with `@k` reduced.
 
@@ -720,40 +720,40 @@ Broadcast does not replace global synchronization. An implementation using `coop
 
 **IR lowering of reduce**
 
-Reduce lowering runs on the already tiled loop structure produced by [Section 5.9](#59-iteration-lowering). For `reduce<@r>`, where `@r` has been split into `@r_o` (tile-between) and `@r_i` (tile-inside):
+Reduce lowering runs on the already tiled loop structure produced by [Section 5.9](#59-iteration-lowering). For `reduce<@r>`, where `@r` has been split into `@r_o` (tile-between) and `@r_i` (tile-inside) — **as amended by the R1/R2/R3 ruling (2026-10-23): per-output-element brackets over a UNIFORM element walk, scalar-only reducer protocol, compiler-owned staging**:
 
-1. **`Init` / `Combine` placement.** Construct the reducer and call `Init` immediately **before the tile-between loop `@r_o`**, and call `Combine` immediately **after** it. They are never placed inside the tiling loops of `@r`. This way one reduction spans all tiles of `@r`, and no per-tile partials are produced.
-2. **`Reduce` placement.** `Reduce` replaces the abstract `reduce` at its original position, inside `@r_i`.
-3. **Reducer state shape.** Every loop of a *non-reduced* dimension that lies between `@r_o` and the `Reduce` call (here `@m_i`) runs once per `@r_o` iteration. Each of its points needs its own accumulator, so the reducer state is a **tile of accumulators** indexed by those variables, with shape `[T_m]` in this example. `Reduce` indexes into the tile, and `Init`/`Combine` cover the whole tile.
-4. **Fused consumers.** Operations that consume `%valred` (the fused `map | store` tail) are placed after `Combine`, inside a re-iteration of the non-reduced inner dimensions.
+1. **Element walk (R3).** Every loop of a *non-reduced* dimension between `@r_o` and the `Reduce` call (here `@m_i`) DISSOLVES as a per-thread walk and is replaced by a fresh **uniform sequential element loop** (init 0, step 1, the dissolved loop's own clamped bound) placed at `@r_o`'s position; `@r_o` and `@r_i` move inside it. The uniform walk is what keeps `Combine`'s CTA barrier uniformly reached ([Section 5.12](#512-code-generation)): every thread executes the same number of element iterations, and threads whose reduced-dim strips saturate to zero trips contribute the identity initializer.
+2. **Bracket placement.** Per element: `Init` is the first statement of the element loop, the reduced-dim walks (`@r_o`, `@r_i`) follow, and `Combine` sits immediately after `@r_o` — one reduction per output element, spanning ALL tiles of `@r`, never per-tile partials.
+3. **Reducer state (R1).** The state is a **scalar accumulator** — `Reduce(value)` folds one element per call and `Combine()` returns `T`. There is no accumulator tile and no slot index: the element is the loop variable of the uniform walk. The warp/global construction carries `(init, combiner, ThreadMapping, staging row)`; the staging row is one `#warps × sizeof(T)` allocation in the compiler's dynamic-SMEM pool at a disjoint offset, handed to the runtime as a `SmemView` — the runtime keeps NO static shared scratch.
+4. **Fused consumers.** Operations that consume the `Combine` value are placed after `Combine` inside the element loop, their non-reduced coordinates rebuilt onto the element dimvar. The per-element output store is **ownership-gated** by the runtime's mapping query `is_first_in_cta()` — one owner per output element ([Section 5.12](#512-code-generation)); every other thread computes the same value and stores nothing.
 
 ```
 thread_for(@m_o(step=T_m)/M, <thread group>) -> {
-  %reducer = <specialized Reducer, state: tensor<f32, [T_m]>>();
-  %reducer.Init();                           // initialize all T_m accumulators
+  %staging = smem<#warps * sizeof(T)>();    // R1: compiler-pool staging row
+  %reducer = <specialized Reducer>(init, combiner, thread_map, %staging);
 
-  seq_for(@k_o(step=T_k)/K) -> {             // tile-between loop of the reduced @k
-    seq_for(@m_i/T_m, offset=@m_o) -> {
-      seq_for(@k_i/T_k, offset=@k_o) -> {
+  seq_for(@m_e/T_m) -> {                    // R3: UNIFORM element walk (dissolves @m_i)
+    %reducer.Init();                        // per-element bracket opens
+    thread_for(@k_o(step=T_k)/K) -> {       // tile-between loop of the reduced @k
+      seq_for(@k_i/T_k, offset=@k_o) -> {   // mirror threads saturate to 0 trips
         %valmap = map(...);
-        %reducer.Reduce(@m_i, %valmap);      // accumulate into slot @m_i
+        %reducer.Reduce(%valmap);           // R1: scalar protocol — value only
       }
     }
-  }
-
-  %valred = %reducer.Combine();              // tensor<f32, [T_m]>: one result per @m_i
-  seq_for(@m_i/T_m, offset=@m_o) -> {
-    map(%valred[@m_i], lambda(v): v * scale) as (@m) | store(%output[...], %0);
+    %valred = %reducer.Combine();           // returns T: every participant receives it
+    if (thread_map.is_first_in_cta())       // R2: single-owner store
+      map(%valred, lambda(v): v * scale) as (@m) | store(%output[...], %0);
   }
 }
 ```
 
 **Consequences**
 
-- `Combine` runs **once per output element**, after every tile of `@r`. For the Thread and CTA specializations, the shuffle tree, `__syncthreads()`, and grid barriers are paid once instead of once per tile.
-- If `@r` is thread-parallel, its tile-between loop is a `thread_for` and its tile-inside loop is a `seq_for` ([Section 5.9](#59-iteration-lowering)). Each thread's private accumulator persists across both loops, and the warp/CTA combine happens once afterwards.
-- When `@r` is untiled (`T = 1`), the rule reduces to the simple form: `Init` before the `@r` loop and `Combine` after it.
-- The accumulator tile is the classic matmul register tile. Its loops are sequential and its indices are compile-time constants after unrolling, so it is a natural **FRAG** candidate. It must be counted against the per-CTA SMEM + FRAG budget in [Section 5.8](#58-cta-cache-allocation).
+- `Combine` runs **once per output element**, after every tile of `@r`. For the Thread and CTA specializations, the shuffle tree and `__syncthreads()` are paid once per element, not once per tile element.
+- If `@r` is thread-parallel, its tile-between loop is a `thread_for` and its tile-inside loop is a `seq_for` ([Section 5.9](#59-iteration-lowering)). Each thread's private scalar accumulator persists across both loops inside the element bracket; the warp/CTA combine happens once per element afterwards.
+- Threads that own no element of a reduced-dim strip see it saturate to zero trips (the arithmetic mirror gate: the strip offset carries `+ index(ctaThreadDim) * extent` of the independent dim, the FULL extent), so their `Reduce` never fires and their accumulator holds the identity initializer.
+- When `@r` is untiled (`T = 1`) the element set is empty and the rule reduces to the simple form: `Init` before the `@r` loop and `Combine` after it, in the bracket loop's parental block.
+- The staging row is counted against the per-CTA SMEM budget in [Section 5.8](#58-cta-cache-allocation) (dynamic pool, disjoint offsets in v0).
 
 ### 5.11 Cache Lowering
 
@@ -814,7 +814,7 @@ The single-tier IR (Section 5.1) is one module, `internal/ir`, organized into su
 | FamilyAbstract | `iter`, `itercluster`, `map`, `reduce`, `store`, `return`, `inputparam`, and the value-level `dimvar`/`bdimvar` | `construct.go`, `dimvar.go` |
 | FamilyTileOp | `loadtile`, `storetile` | `tile.go` |
 | FamilyLoop | the lowered `for` loop | `loop.go` |
-| FamilyCollective | (reserved for reducer collectives; empty until reduce lowering lands) | — |
+| FamilyCollective | the runtime-object constructions (`runtimekernelinfo`, the grid/thread mappings, the three reducer specializations) and their method calls/attribute reads | `node_runtime.go` |
 
 The lowered suite is what iteration lowering (Section 5.9) and cache lowering (Section 5.11) produce into the same node suite:
 

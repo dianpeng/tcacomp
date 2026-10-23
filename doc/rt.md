@@ -34,7 +34,7 @@ runtime/
 │   ├── iterator.h          # device: Seq/Cta/ThrIterator
 │   ├── view.h              # device: Layout, TensorView, SmemView, Frag
 │   ├── loader.h            # device: LoadTileCta / LoadTileThread
-│   └── reducer.h           # device: Seq/Warp/GlobalReducer, SlotValue
+│   └── reducer.h           # device: Seq/Warp/GlobalReducer (scalar protocol)
 ```
 
 - CMake: `project(tcacomp_runtime LANGUAGES CXX CUDA)`; `add_library(
@@ -63,11 +63,10 @@ constraints)
 3. **The layout seam (cg.md D6).** Every memory access goes through a view
    carrying a layout descriptor; v0 ships `Layout::RowMajor` only. The
    future coalescing/swizzle passes change descriptors, never call sites.
-4. **Static-`__shared__` scratch via the scalfold trick.** nvcc forbids
-   `__shared__` members; a function-scope `static __shared__` array inside
-   a template gives each instantiation its own allocation (SMemImpl
-   precedent). The compiler's dynamic pool stays tile-buffers-ONLY; reducer
-   scratch is static per instantiation (§4.6).
+4. **No runtime-static SMEM (R1, 2026-10-23).** The runtime keeps NO
+   `static __shared__` scratch — reducer staging is one row of the
+   COMPILER's dynamic-SMEM pool, handed to the ctor as a `SmemView<T, 1u>`
+   (§4.6). The pool is the only SMEM owner; the launcher sizes it.
 5. **Determinism and totality.** No allocation, no host calls on device
    paths; every accessor is O(1).
 
@@ -82,7 +81,7 @@ constraints)
 | `tca::rt::TensorView<float, 3u> out_v(out, d0, d1, d2);` + `.Get(c...)` `.Set(v, c...)` | §4.4 |
 | `tca::rt::SmemView<float, 1u> lhs_tile(reinterpret_cast<float*>(tca_smem + 0u), 16384u);` + `.Get(i)` | §4.4 |
 | `tca::rt::LoadTileCta(lhs_tile, lhs_v, m_base, k_round);` | §4.5 |
-| `tca::rt::WarpReducer<float, 32u> reducer0(0.0f, RedwarpCombine0);` + `.Init()` `.Reduce(slot, v)` `.Combine()` → `.Get(i)` | §4.6 |
+| `tca::rt::WarpReducer<float> reducer0(0.0f, RedwarpCombine0, thread_map1, tca::rt::SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem + N), 16u));` + `.Init()` `.Reduce(v)` `.Combine()` → `T` | §4.6 |
 | `tca::rt::umin(a, b)` (umax registered, unused yet) | §4.7 |
 | `tca::Tensor<float, 3u>& out` + `.Data()` `.Dim(i)` | §5 |
 | `TCA_REQUIRE(cond, "msg")`, `TCA_CUDA_CHECK(expr)` | §5 |
@@ -123,8 +122,23 @@ struct ThreadMapping { /* same face over threadIdx.x */ };
   row-major over the extents — `coord_d = (id / stride_d) % extent_d`.
   `index(d) = coord_d`; `dimension(d) = extent_d`. Pure arithmetic — no
   `__ballot_sync`, CPU-testable.
-- Future (registered, never emitted in v0): `warp_index()/lane_index()/
-  is_first()` queries on ThreadMapping.
+- **The FLAT index() — ruling 2026-10-23.** `index()` with NO argument
+  returns the map holder's ABSOLUTE FLATTENED 1-D index:
+  `ThreadMapping::index()` is the thread's linear id in the CTA (the
+  `threadIdx.x` analog); `GridMapping::index()` the CTA's linear id (the
+  `blockIdx.x` analog). `index(d)` (the per-dimension tuple coordinate) is
+  UNCHANGED. The compiler NEVER inlines `threadIdx.x`/`blockIdx.x` itself —
+  the maps stay the opaque seam; lane/warp identity derives from the flat
+  form (`index() % 32`, `index() / 32`).
+- **Warp/lane queries — v0 surface (ruling addenda 2026-10-23).**
+  `ThreadMapping` additionally carries, all pure functions of `index()`:
+  `warp_index()` (= `index()/32`), `lane_id()` (= `index()%32`),
+  `is_first_in_warp()`, `is_first_in_cta()` (`index() == 0`), and
+  `warp_count()` (the CTA's EXISTING warp count, `total threads/32`,
+  obtained THROUGH the map — never a magic constant). These are
+  runtime-INTERNAL control flow (reducer staging ownership, fold-existing-
+  warps bounds, the staging-extent cross-check); generated code stays
+  branch-free — the queries never appear as compiler-emitted conditionals.
 
 ### 4.3 Iterators — the uniform round walk
 
@@ -141,9 +155,18 @@ struct ThrIterator { __device__ ThrIterator(ThreadMapping, unsigned dosoc, unsig
   base += step; }`. `Index()` returns the current dimvar value
   (`init + k·step`) — the 0-based round-base identity; the per-thread /
   per-CTA rank (`map.index(d)·T`) enters only as in-body offset terms the
-  compiler already emitted as attribute reads. **`Has()` is deliberately
-  NOT per-thread**: every thread of the CTA agrees on the trip count —
-  this is what makes every collective call uniformly reached.
+  compiler already emitted as attribute reads.
+- **`Has()` is CTA-uniform for the ROUND walks — and PER-THREAD by design
+  for the coupled-inside walk (amended, flat-index() ruling 2026-10-23).**
+  The between-round walks keep every thread of the CTA agreeing on the trip
+  count (this is what makes every collective call uniformly reached). The
+  CTA dim's COUPLED tile-inside walk is a thread iterator whose INIT is the
+  per-thread flat rank (`thread_map.index()`), step the coupled thread
+  count, bound the tile max: threads with `flatRank >= tile_max` take ZERO
+  trips (the whole body no-ops) — per-thread trip counts are the
+  single-ownership mechanism, not a uniformity violation (nothing
+  collective sits inside the coupled walk). Lane/warp identity at such
+  sites derives from the flat form: `index() % 32` / `index() / 32`.
 - v0 Cta/Thr carry the mapping/dosoc/loc for future ownership-guard
   queries; the walk ignores them.
 - The bound expression is the compiler's saturating F1 chain
@@ -205,46 +228,52 @@ __device__ void LoadTileThread(Frag& dst, const TensorView& src, unsigned baseCo
 - **`cp.async`:** optional fast path under `__CUDA_ARCH__ >= 800` with a
   plain-copy fallback — an internal decision, invisible to callers.
 
-### 4.6 The reducers — `<T, Slots>` and the static scratch ruling
+### 4.6 The reducers — the scalar protocol (R1/R2 ruling 2026-10-23)
 
 ```c++
-template <typename T, unsigned Slots> struct SeqReducer  { SeqReducer(T init, F&& fn); void Init(); void Reduce(coords-or-slots..., T v); auto Combine(); };
-template <typename T, unsigned Slots> struct WarpReducer { /* same face */ };
-template <typename T, unsigned Slots> struct GlobalReducer{ /* v0-unreachable scaffolding */ };
+template <typename T> struct SeqReducer { SeqReducer(T init, T (*fn)(T, T));
+                                          void Init(); void Reduce(T v); T Combine(); };
+template <typename T> struct WarpReducer { WarpReducer(T init, T (*fn)(T, T),
+                                           const ThreadMapping&, SmemView<T, 1u> staging);
+                                           /* same method face */ };
+template <typename T> struct GlobalReducer { /* v0-unreachable scaffolding, same ctor face */ };
 ```
 
-- **Slots = the accumulator tile extent** (one entry per logical output —
-  the compiler derives it as the product of the slot dims' tile sizes; 0
-  when the reduction is scalar). The compiler emits the template argument;
-  the runtime sizes all state from it.
-- **Construction carries ALL state** `(init, combiner)`; `Init()` is
-  argument-free and re-initializes; `Reduce(slot indices..., value)` folds
-  the value through the RUNTIME-OWNED combiner (the compiler emits no
-  lambda-call node); `Combine()` finalizes ONCE per bracket.
-- **`Combine()` return:** `T` when `Slots == 0`; otherwise a `SlotValue<T,
-  Slots>` with `Get(i)` (the emitted epilogue reads `v.Get(slot_iv)`).
-- **SeqReducer:** per-thread `T acc[Slots]`; no synchronization;
-  `Combine()` returns the local accumulators directly.
+- **Scalar-only (R1):** NO Slots template parameter, no slot argument.
+  `Reduce(value)` folds ONE element per call; `Combine()` ALWAYS returns
+  `T`. Multi-output reductions re-iterate the whole [Init → Reduce-walk →
+  Combine] bracket per output element (tca.md §5.10 R3) — the bracket is
+  cheap relative to the walk it brackets.
+- **Construction carries ALL state** `(init, combiner)` for SeqReducer;
+  WarpReducer/GlobalReducer additionally take the mapping and the staging
+  view (below). `Init()` is argument-free and re-initializes;
+  `Combine()` finalizes ONCE per bracket.
+- **SeqReducer:** per-thread `T acc`; no synchronization; `Combine()`
+  returns the local accumulator.
 - **WarpReducer (the v0 protocol, identity-init simplification):**
-  1. Per-thread `T acc[Slots]`, `Init()` fills with the declared init.
-  2. `Reduce` folds into the private tile.
-  3. `Combine()`: per-slot full-warp shuffle down-tree (`__shfl_down_sync(
-     0xffffffff, ...)` — valid because inactive lanes hold the identity
-     init, so a full-mask tree is correct; the lane-prefix mask refinement
-     lands when non-identity inits do); each warp's lane 0 stages its
-     Slots partials into the static scratch; `__syncthreads()` (legal:
-     the bracket is uniformly called by every CTA thread); every thread
-     then combines ALL staged partials per slot locally (tca.md §5.10's
-     replicated-local-combine broadcast — every participant receives the
-     final value; the re-iteration reads any slot).
-  4. **Scratch (the ruling):** `__shared__` function-scope static inside
-     the template: `T stage[Slots][kMaxWarpsPerCTA]` with `kMaxWarpsPerCTA
-     = 16` (MaxThreadsPerCTA/32). Over-provisioned vs the group's warps —
-     correct (warps outside the reduction group hold the identity init and
-     stage it too) and bounded; group-scoped staging via the mapping is a
-     future refinement. Static bytes: `Slots × 16 × sizeof(T)` per
-     instantiation, asserted against the device ceiling together with the
-     dynamic pool (§6).
+  1. Per-thread `T acc`, `Init()` fills with the declared init.
+  2. `Reduce` folds into the private accumulator.
+  3. `Combine()`: full-warp shuffle down-tree (`__shfl_down_sync(
+     0xffffffff, ...)` — valid because every CTA thread participates and
+     out-of-group lanes hold the identity init, so a full-mask tree is
+     correct); the warp's FIRST LANE (`map.is_first_in_warp()`) stages its
+     partial into the ctor-provided SMEM row AT THE WARP'S INDEX
+     (`map.warp_index()`); `__syncthreads()` (legal: Combine is uniformly
+     called by every CTA thread); every thread then folds ALL staged warp
+     partials in ascending warp order from the identity init, bounded by
+     `map.warp_count()` (tca.md §5.10's replicated-local-combine
+     broadcast — every participant receives the final value; the
+     per-element brackets each re-read it).
+  4. **Staging ownership (R1):** the scratch is ONE ROW of the COMPILER's
+     dynamic-SMEM pool — `#warps × sizeof(T)` bytes at a disjoint pool
+     offset (D8), passed as `SmemView<T, 1u>(reinterpret_cast<T*>(tca_smem
+     + offset), warp_extent)`. The runtime keeps NO `static __shared__`;
+     `kMaxWarpsPerCTA` is gone. Warp/lane/count identity is runtime-
+     INTERNAL control flow derived from the mapping (§4.2) — generated
+     code stays branch-free.
+  5. **Host branch:** no warps — the sequential algebra (`Combine`
+     returns the private accumulator); CPU unit tests stand the staging
+     row up as a stack array.
 - **Initialization semantics:** v0 requires the declared init to be an
   identity for the combiner over partials (0 for `+`). General
   non-identity inits need validity tags (tca.md §5.10) — future work, and
@@ -294,7 +323,7 @@ void ValidateLaunch(dim3 grid, dim3 block, unsigned smemBytes);
 | Region | Owner | Sizing |
 |---|---|---|
 | Dynamic pool (tile buffers) | compiler | Σ buffer extents, disjoint v0 offsets (D8); passed as the launch's dynamic-smem bytes |
-| Reducer scratch | runtime | static `__shared__` per `<T, Slots>` instantiation: `Slots×16×sizeof(T)` |
+| Reducer staging rows | compiler | one `#warps×sizeof(T)` row per reducer at a disjoint dynamic-pool offset (R1/D8); the pool sum is the launch's dynamic-smem bytes |
 
 Both must fit the queried per-block ceiling; `ValidateLaunch` is the
 assertion point (the static side is compile-time visible in the same TU).
@@ -312,7 +341,8 @@ assertion point (the static side is compile-time visible in the same TU).
 
 1. **CPU-testable units (plain gtest, no GPU):** portion decomposition
    (index/dimension over sample totals), iterator walks, view stride math,
-   the mask/identity reducer algebra over Slots.
+   the scalar reducer algebra (SeqReducer folds; the WarpReducer host
+   branch with a stack-array staging stand-in).
 2. **Golden compile conformance:** build the two committed `.cu` goldens
    against the headers — they must compile cleanly (the linker surface is
    the launcher symbols only).

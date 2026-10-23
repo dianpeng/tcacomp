@@ -33,6 +33,16 @@ func combinerOf(g *Graph) Node {
 	return g.NewLambdaNode("ctor", []Node{acc, now}, body)
 }
 
+// warpReducerOf builds the R1 4-operand warp construction face: a
+// KernelInfo + ThreadMapping pair and a 64-B staging row (16 warps × f32),
+// then the reducer over (init, lambda, mapping, staging).
+func warpReducerOf(g *Graph) Node {
+	ki := g.NewRuntimeKernelInfo("ctor")
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	staging := g.NewMemNewSMem("ctor", u32const(g, 64))
+	return g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g), tm, staging)
+}
+
 // TestRuntimeAttributeOfQueries pins the renamed read face: the query field
 // payload round-trips through the constructors and RuntimeAttributeOf
 // (shared with the GetAttribute payload); foreign nodes report "".
@@ -59,7 +69,7 @@ func TestRuntimeAttributeOfQueries(t *testing.T) {
 // through the constructor; foreign nodes report "".
 func TestRuntimeMethodOf(t *testing.T) {
 	g := NewGraph("methodof")
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	call := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	if got := RuntimeMethodOf(call); got != "Combine" {
 		t.Fatalf("RuntimeMethodOf(call) = %q, want %q", got, "Combine")
@@ -142,7 +152,7 @@ func runtimeFx() (*Graph, Node, Node, Node, Node, Node, Node, Node) {
 	ki := g.NewRuntimeKernelInfo("ctor")
 	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
 	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	init := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combine := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	idx := g.NewRuntimeGetAttribute("ctor", "index", gm, u32const(g, 0))
@@ -228,12 +238,12 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	expect("red-missing", func(g *Graph) {
 		raw := g.NewNode(KindRuntimeWarpReducer, "ctor", f32const(g, 0))
 		g.NewReturn("ctor", raw)
-	}, "exactly (init, lambda)")
+	}, "unwired")
 
 	// CallMethod: unknown payload, non-object operand 0, method on a
 	// non-reducer object.
 	expect("call-badpayload", func(g *Graph) {
-		red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+		red := warpReducerOf(g)
 		call := g.NewRuntimeCallMethod("ctor", "current_value", red)
 		g.NewReturn("ctor", call)
 	}, "\"Init\", \"Reduce\", \"Combine\"")
@@ -266,10 +276,13 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 		ga := g.NewRuntimeGetAttribute("ctor", "index", ki, u32const(g, 0))
 		g.NewReturn("ctor", ga)
 	}, "mapping object")
-	expect("get-index-noargs", func(g *Graph) {
+	// Flat-index() ruling (2026-10-23): the ZERO-ARG index getattr is the
+	// legal flat form — the old "noargs fails" pin is superseded. The
+	// zero-arg DIMENSION getattr still fails wanting exactly 1.
+	expect("get-dimension-noargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
-		ga := g.NewRuntimeGetAttribute("ctor", "index", gm)
+		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm)
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-twoargs", func(g *Graph) {
@@ -341,6 +354,87 @@ func TestRuntimeKindTaxonomy(t *testing.T) {
 	}
 	if !(KindRuntimeThreadQuery < KindRuntimeKernelInfo && KindRuntimeKernelInfo < KindRuntimeGridMapping) {
 		t.Fatal("the queries must precede the constructions in enum order")
+	}
+}
+
+// TestRuntimeFlatQueryVerifyShape pins the flat-index() ruling (2026-10-23):
+// the ZERO-OPERAND query form is verifier-legal ONLY for field "index" (the
+// thread's/Crank's absolute flattened 1-D rank — the threadIdx.x/blockIdx.x
+// analog); field "dimension" still demands exactly one const-u32 DoSoC. The
+// one-operand forms behave exactly as today (TestRuntimeQueryVerifyShape).
+func TestRuntimeFlatQueryVerifyShape(t *testing.T) {
+	wellformed := func() (*Graph, Node, Node) {
+		g := NewGraph("flat")
+		gq := g.NewRuntimeGridQueryFlat("ctor")
+		tq := g.NewRuntimeThreadQueryFlat("ctor")
+		g.NewReturn("ctor", gq, tq)
+		return g, gq, tq
+	}
+	g, gq, tq := wellformed()
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("zero-operand flat queries must verify clean, got %v", vs)
+	}
+	if got := RuntimeAttributeOf(gq); got != "index" {
+		t.Fatalf("flat grid query field = %q, want \"index\"", got)
+	}
+	if got := RuntimeAttributeOf(tq); got != "index" {
+		t.Fatalf("flat thread query field = %q, want \"index\"", got)
+	}
+
+	// A zero-operand "dimension" query: flip the flat ctor's field — the
+	// shape case must reject it, the flat form is index-only.
+	badDim := NewGraph("flatdim")
+	dq := badDim.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	dq.field = "dimension"
+	badDim.NewReturn("ctor", dq)
+	if vs := Verify(badDim); len(vs) != 1 || !strings.Contains(vs[0].Msg, "dimension") {
+		t.Fatalf("zero-operand dimension query must be a shape violation, got %v", vs)
+	}
+
+	// The getattr mirror: attribute "index" with ZERO extra args is legal
+	// (the flat form); "dimension" keeps exactly one.
+	ga1 := NewGraph("flatgetattr")
+	ki1 := ga1.NewRuntimeKernelInfo("ctor")
+	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, -1})
+	ga1.NewReturn("ctor", ga1.NewRuntimeGetAttribute("ctor", "index", tm1))
+	if vs := Verify(ga1); len(vs) != 0 {
+		t.Fatalf("zero-arg index getattr must verify clean, got %v", vs)
+	}
+	g2 := NewGraph("flatgetattrdim")
+	ki2 := g2.NewRuntimeKernelInfo("ctor")
+	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, -1})
+	g2.NewReturn("ctor", g2.NewRuntimeGetAttribute("ctor", "dimension", tm2))
+	if vs := Verify(g2); len(vs) != 1 || !strings.Contains(vs[0].Msg, "exactly 1") {
+		t.Fatalf("zero-arg dimension getattr must fail wanting exactly 1 arg, got %v", vs)
+	}
+}
+
+// TestRuntimeFlatQueryValueNumbering pins the flat form's value contract:
+// two flat queries of the same kind are GVN-equal; a flat query is NOT equal
+// to the dim-0 one-operand query (distinct operand lists hash distinct — the
+// slot count participates in ValueHash).
+func TestRuntimeFlatQueryValueNumbering(t *testing.T) {
+	g := NewGraph("flatvn")
+	se := pureAll{}
+	f1 := asValue(t, g.NewRuntimeThreadQueryFlat("ctor"))
+	f2 := asValue(t, g.NewRuntimeThreadQueryFlat("ctor"))
+	d0 := asValue(t, g.NewRuntimeThreadQuery("ctor", "index", u32const(g, 0)))
+	gf := asValue(t, g.NewRuntimeGridQueryFlat("ctor"))
+
+	if !f1.ValueEqual(f2, se) {
+		t.Fatal("two flat thread queries must be value-equal")
+	}
+	if f1.ValueHash(se) != f2.ValueHash(se) {
+		t.Fatal("equal flat queries must hash identically (the GVN-CSE contract)")
+	}
+	if f1.ValueEqual(d0, se) {
+		t.Fatal("a flat query must not be value-equal to the dim-0 one-operand query")
+	}
+	if f1.ValueHash(se) == d0.ValueHash(se) {
+		t.Fatal("the flat and one-operand forms must hash distinctly (operand-count keying)")
+	}
+	if f1.ValueEqual(gf, se) {
+		t.Fatal("flat grid and thread queries are distinct kinds")
 	}
 }
 
@@ -416,7 +510,7 @@ func TestRuntimeObjectValueNumbering(t *testing.T) {
 	// differing payload — unequal content hash (compared through the
 	// package-private contentHash, since EffectOf excludes calls from the
 	// Value surface under a real analysis).
-	red := g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g))
+	red := warpReducerOf(g)
 	initCall := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combineCall := g.NewRuntimeCallMethod("ctor", "Combine", red)
 	if contentHash(initCall) == contentHash(combineCall) {

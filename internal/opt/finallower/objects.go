@@ -128,7 +128,7 @@ func (lr *lowering) rewriteQueries() error {
 		}
 		field := ir.RuntimeAttributeOf(q)
 		dosoc := ir.OperandsOf(q)
-		if len(dosoc) != 1 || dosoc[0] == nil {
+		if len(dosoc) > 1 || (len(dosoc) == 1 && dosoc[0] == nil) {
 			return fmt.Errorf("final-lower: query node %d carries a malformed DoSoC operand", q.BasePtr().ID())
 		}
 
@@ -150,10 +150,18 @@ func (lr *lowering) rewriteQueries() error {
 				lnt.Root.BasePtr().ID(), kind)
 		}
 
-		// The getattr: same field payload, the mapping object, the query's
-		// DoSoC const as the single arg (LR-12: "DoSoC const preserved,
-		// field payload preserved").
-		getattr := lr.g.NewRuntimeGetAttribute(lowerOrigin, field, obj, dosoc[0])
+		// The getattr: same field payload, the mapping object, and the
+		// query's DoSoC const as the single arg (LR-12: "DoSoC const
+		// preserved, field payload preserved") — EXCEPT the zero-operand
+		// FLAT query (the flat-index() ruling 2026-10-23), which rewrites to
+		// the ZERO-ARG attribute read: NewRuntimeGetAttribute(origin, field,
+		// obj) with no extra args.
+		var getattr ir.Node
+		if len(dosoc) == 0 {
+			getattr = lr.g.NewRuntimeGetAttribute(lowerOrigin, field, obj)
+		} else {
+			getattr = lr.g.NewRuntimeGetAttribute(lowerOrigin, field, obj, dosoc[0])
+		}
 
 		if err := lr.mctx.ReplaceAllUsesWith(q, getattr); err != nil {
 			return fmt.Errorf("final-lower: RAUW of query node %d: %w", q.BasePtr().ID(), err)

@@ -77,10 +77,13 @@ func (Pass) Preserved() []string { return nil }
 // Run lowers a scheduled kernel to codegen-ready IR:
 //
 //	gates (nil graph / no AST / provenance fetch fail-closed)
-//	  → lowerReducers (reducer.go, LR-1..LR-3/LR-7/LR-8/LR-13/LR-14 — FIRST:
-//	     the @r derivation needs the producing Maps alive, LR-2)
+//	  → insertRuntimeObjects (objects.go, LR-11 — FIRST among the lowers:
+//	     the R1/R2 reducer constructions consume the per-LNT
+//	     RuntimeThreadMapping nodes this step creates)
+//	  → lowerReducers (reducer.go, LR-1..LR-3/LR-7/LR-8 + R3 — before Map
+//	     Lower: the @r derivation needs the producing Maps alive, LR-2)
 //	  → lowerMaps (maplower.go, LR-9)
-//	  → insertRuntimeObjects + rewriteQueries (objects.go, LR-11/LR-12)
+//	  → rewriteQueries (objects.go, LR-12)
 //	  → the erased-item sweep (P-6's RemoveItemsIf over every block)
 //	  → ir.Verify
 //
@@ -108,9 +111,17 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		threadOf: make(map[*ir.ASTLNT]ir.Node),
 	}
 
-	// Reducer Lower — FIRST (LR-2: the @r derivation reads Reduce.op0 →
+	// Runtime objects (LR-11) — FIRST: the reducer constructions reference
+	// the per-LNT ThreadMapping objects (R1/R2), so they must exist before
+	// Reducer Lower runs. The query rewrite still runs LAST (after Map
+	// Lower disposed the Maps that anchored query-using projections).
+	if err := lr.insertRuntimeObjects(); err != nil {
+		return err
+	}
+
+	// Reducer Lower (before Map Lower: the @r derivation reads Reduce.op0 →
 	// producing Map → AsOf, so every Reduce must be lowered before Map
-	// Lower rewires those operands away).
+	// Lower rewires those operands away, LR-2).
 	if err := lr.lowerReducers(); err != nil {
 		return err
 	}
@@ -120,10 +131,13 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return err
 	}
 
-	// Runtime objects + query rewrite (LR-11/LR-12).
-	if err := lr.insertRuntimeObjects(); err != nil {
+	// The dissolved between-loop disposal (R3): with the Map debris gone,
+	// no live use of a dissolved between dimvar may remain — erase the
+	// dissolved loop headers, fail-closed on any survivor.
+	if err := lr.finalizeDissolutions(); err != nil {
 		return err
 	}
+
 	if err := lr.rewriteQueries(); err != nil {
 		return err
 	}
@@ -170,18 +184,102 @@ func fetchProvenance(ctx *opt.Context) (*tiling.Provenance, error) {
 
 // lowering carries one Run's shared state: the graph, its attached AST, the
 // provenance, the choke-point context, the block→LNT index (P-11, built
-// lazily — objects.go and reducer.go share it), and the per-LNT mapping
+// lazily — objects.go and reducer.go share it), the per-LNT mapping
 // objects insertRuntimeObjects created (the query rewrite's resolution
-// targets, LR-12).
+// targets, LR-12), and the deferred between-loop dissolutions (R3 —
+// finalized after Map Lower).
 type lowering struct {
-	g        *ir.Graph
-	ast      *ir.ASTKernel
-	prov     *tiling.Provenance
-	mctx     *ir.MutContext
-	byLNT    map[*ir.ASTBlock]*ir.ASTLNT // every block of an LNT's cluster → its LNT
-	lntsIx   bool                        // byLNT built
-	gridOf   map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeGridMapping
-	threadOf map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeThreadMapping
+	g         *ir.Graph
+	ast       *ir.ASTKernel
+	prov      *tiling.Provenance
+	mctx      *ir.MutContext
+	byLNT     map[*ir.ASTBlock]*ir.ASTLNT // every block of an LNT's cluster → its LNT
+	lntsIx    bool                        // byLNT built
+	gridOf    map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeGridMapping
+	threadOf  map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeThreadMapping
+	dissolved []dissolveJob               // R3: between loops dissolved by the element-loop restructure
+}
+
+// dissolveJob is one dissolved between loop awaiting disposal (R3): its
+// loop node, IV, the loop's operand closure (captured BEFORE erasure —
+// Erase unwires the loop's own records), and the originating Reduce for
+// diagnostics.
+type dissolveJob struct {
+	loop    ir.Node
+	iv      ir.Node
+	red     ir.Node
+	closure map[ir.Node]bool // the loop's operand closure (wrapper, attrs, coordinate debris)
+}
+
+// finalizeDissolutions disposes the dissolved between loops after Map
+// Lower. The rebuilds orphan the ORIGINAL coordinate expressions (every
+// consumer now reads a rebuilt clone) and the loop's own header debris
+// (bound wrapper, annotations) — a fixpoint sweep erases the zero-use
+// orphans bottom-up, guarded so a still-shared node (a const another live
+// expression reads) is never touched. What may NEVER remain is a live use
+// of the dissolved IV by a non-orphan: such a survivor reads a dimvar
+// whose loop no longer exists in the AST (the emitter would have no
+// iterator for it) — a named hard error.
+func (lr *lowering) finalizeDissolutions() error {
+	for _, job := range lr.dissolved {
+		cands := make(map[ir.Node]bool, len(job.closure)+8)
+		for n := range job.closure {
+			cands[n] = true
+		}
+		cands[job.iv] = true
+		for _, d := range ir.OperandsOf(job.iv) {
+			for n := range operandClosure(d) {
+				cands[n] = true
+			}
+		}
+		// The IV's transitive USER chain: after the rebuilds every former
+		// consumer reads a clone, so what remains reachable upward from the
+		// IV is exactly the orphaned ORIGINAL coordinate debris (#66-style
+		// expression items of the dissolved blocks).
+		var up func(n ir.Node)
+		up = func(n ir.Node) {
+			for _, u := range ir.UsesOf(n) {
+				usr := u.User()
+				if usr == nil || usr.BasePtr() == nil || usr.BasePtr().Erased() || cands[usr] {
+					continue
+				}
+				cands[usr] = true
+				up(usr)
+			}
+		}
+		up(job.iv)
+		if err := lr.mctx.Erase(job.loop); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: erasing a dissolved between loop: %w", job.red.BasePtr().ID(), err)
+		}
+		// Fixpoint orphan sweep: erase any candidate with zero uses (the
+		// deepest die first, freeing their parents); the IV itself is
+		// excluded until the guard passes.
+		for progress := true; progress; {
+			progress = false
+			for n := range cands {
+				if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.BasePtr() == job.iv.BasePtr() {
+					continue
+				}
+				if len(ir.UsesOf(n)) > 0 {
+					continue // still consumed — a shared leaf or a stranded user
+				}
+				if err := lr.mctx.Erase(n); err != nil {
+					return fmt.Errorf("final-lower: reduce node %d: erasing dissolved-loop debris node %d (%s): %w",
+						job.red.BasePtr().ID(), n.BasePtr().ID(), n.KindOf(), err)
+				}
+				progress = true
+			}
+		}
+		if uses := ir.UsesOf(job.iv); len(uses) > 0 {
+			return fmt.Errorf("final-lower: reduce node %d: node %d still references the dissolved between dimvar of loop %d after Map Lower (its value is not defined at that position)",
+				job.red.BasePtr().ID(), uses[0].User().BasePtr().ID(), job.loop.BasePtr().ID())
+		}
+		if err := lr.mctx.Erase(job.iv); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: erasing a dissolved between dimvar: %w", job.red.BasePtr().ID(), err)
+		}
+	}
+	lr.dissolved = nil
+	return nil
 }
 
 // blockIndex builds the block→LNT index per P-11: for each LNT, its

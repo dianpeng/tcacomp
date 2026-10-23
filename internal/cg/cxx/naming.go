@@ -45,6 +45,21 @@ func elemType(e ir.ElemType) (string, error) {
 	}
 }
 
+// elemByteSize maps a C++ element spelling (elemType's outputs) to its size
+// in bytes — the staging row's sizing unit (R1).
+func elemByteSize(ts string) (int, error) {
+	switch ts {
+	case "bool", "int8_t", "uint8_t":
+		return 1, nil
+	case "int16_t", "uint16_t", "__half", "__nv_bfloat16":
+		return 2, nil
+	case "int32_t", "uint32_t", "float":
+		return 4, nil
+	default:
+		return 0, fmt.Errorf("cxx: no pinned byte size for element spelling %q", ts)
+	}
+}
+
 // scalarType renders a scalar (rank-0) NumericType; tensor types are an
 // error at scalar positions (fail closed, never silently demoted).
 func scalarType(t ir.Type) (string, error) {

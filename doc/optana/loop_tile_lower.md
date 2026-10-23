@@ -272,7 +272,22 @@
   - ANY covered dim CTA-assigned -> site REFUSED (not promoted): a
     CTA-covered tile has no coherent fill variant under the v0
     mechanics
-  - ANY covered dim WARP-assigned -> SMEM WINDOW class: cooperative
+  - PRECEDENCE (ruled 2026-10-23, before the WARP tier below): a site
+    with a thread-varying NON-covered source coordinate at the fill
+    point — ANY referenced iter of a non-covered tensor position
+    carrying SoC CTA or WARP — takes the FRAG class REGARDLESS of the
+    covered dims' SoC (the worked example's own principle: the
+    per-thread coupled/striped walk makes that coordinate vary by
+    thread at the fill point, and R1's CTA-uniform-coordinates-only
+    rule makes the cooperative SMEM fill incoherent for such sites).
+    FRAG over a WARP-covered dim prices and sizes at T_d per thread
+    (the per-thread window — NEVER the LoC x 32 group window), the
+    access is the plain inside coordinate for EVERY covered dim, and
+    the WARP-covered dim's fill coordinate rides the AXES path as its
+    round base (rank x T + round; the biv path cannot carry it — the
+    fill store's biv operands are pinned to between dimvars)
+  - ANY covered dim WARP-assigned (and the precedence above did not
+    fire) -> SMEM WINDOW class: cooperative
     tca::rt::LoadTileCta, window-sized buffer (R2 sizing above)
   - ALL covered dims sequential -> FRAG class: per-thread
     tca::rt::LoadTileThread, fill key per-thread (e.g. matmul lhs)
@@ -357,10 +372,23 @@ introduces a new decision.
     - CTA dim: between for (a = 0; a < A; a += LoC*T) with LoC = MaxCTA
       (portion -1/full); in-body cta_rank =
       IntrinsicGridMap(DoSoC_d, "index"); a_offset = cta_rank*T + a.
-      Inside = the COUPLED warp walk, ELEMENT stride:
-      for (a_i = …; a_i += nThreads_coupled) with
-      a_idx = a_offset + a_i + thread_rank_coupled — the coupled
-      group's thread count = remaining warp portions x quantum x 32
+      Inside = the COUPLED warp walk, ELEMENT stride — the FLAT-INDEX FORM
+      (ruling 2026-10-23, superseding the former
+      "a_idx = a_offset + a_i + thread_rank_coupled"): a thread iterator
+      with INIT = the NO-ARG flat thread query IntrinsicThreadMap("index")
+      (the thread's absolute flattened 1-D rank — never an inlined
+      threadIdx.x), STEP = nThreads_coupled (the coupled group's thread
+      count = remaining warp portions x quantum x 32), BOUND = a_tile_max:
+      for (a_i = flat_index(); a_i < a_tile_max; a_i += nThreads_coupled)
+      with a_idx = a_offset + a_i (Index() = flatRank + i*nThreads_coupled).
+      The separate +thread_rank_coupled add is DELETED. Threads with
+      flatRank >= a_tile_max take ZERO trips — the whole body no-ops via
+      the loop materialization: per-thread trip counts ARE the
+      single-ownership mechanism (each tile element has exactly one owning
+      thread while T <= nThreads_coupled). REGISTERED FUTURE WORK (do NOT
+      implement): for T > nThreads_coupled a thread takes multiple trips
+      and tid vs tid+coupledThreads overlap — needs group-membership gating
+      (is_first-style) when such tiles are ever searched
     - WARP dim: between for (b = 0; b < B; b += nThreads*T) (each
       thread owns a whole T-chunk — the composition-semantics ruling);
       in-body thread_rank = IntrinsicThreadMap(DoSoC_d, "index");
@@ -396,9 +424,12 @@ introduces a new decision.
     inner than the recorded Tie, the CacheDims clamp) with the SAME
     deterministic chase as the decide pass — adjacency makes the
     results identical; the record needs no extension
-  - Tier classification (RULED 2026-10-21, R2): classify the site by
-    the SoC of its COVERED dims
+  - Tier classification (RULED 2026-10-21, R2, + the 2026-10-23
+    precedence): classify the site by the SoC of its COVERED dims
     - ANY covered dim CTA-assigned -> site REFUSED (never rewritten)
+    - ANY NON-covered referenced iter CTA/WARP-assigned -> FRAG class
+      (the thread-varying-coordinate precedence; the re-derivation here
+      must agree with the decide-side judge or the record fails closed)
     - ANY covered dim WARP-assigned -> SMEM window class
     - ALL covered dims sequential -> FRAG class (per-thread)
   - FILL PLACEMENT (RULED 2026-10-21, R1 — VARIANT-DEPENDENT; the
@@ -547,8 +578,15 @@ introduces a new decision.
   - Tuple coordinates
     - cuda_linear_id computed FIRST, linear over the 1-D launch
     - Then reverse stride-shape decomposition per the mapping's shape
-    - warp_index / lane_index / is_first_thread queries provided for
-      warp-specialized reduce
+    - The NO-ARG flat form (ruling 2026-10-23): index() returns the
+      holder's absolute flattened 1-D rank (ThreadMapping: threadIdx.x
+      analog; GridMapping: blockIdx.x analog); index(d) keeps the tuple
+      coordinate. The compiler never inlines threadIdx.x — the map is the
+      seam; the coupled-inside walk's IV init is this query
+    - warp_index / lane_id / is_first_in_warp / is_first_in_cta /
+      warp_count queries PRESENT (2026-10-23 addenda — pure functions of
+      index(); runtime-internal control flow for warp-specialized reduce;
+      generated code never emits them as conditionals)
   - Counting invariant (author-ruled)
     - p = m: CTA assignments = CTA dims
     - q = n: independent warp assignments

@@ -67,6 +67,34 @@ void test_thread_mapping_two_dims() {
   }
 }
 
+// (c, flat) The no-arg index() — the flat-index() ruling (2026-10-23):
+// ThreadMapping::index() is the thread's absolute flattened 1-D id (the
+// threadIdx.x analog); GridMapping::index() the blockIdx.x analog; index(d)
+// (the tuple coordinate) is unchanged. Plus the warp/lane queries derived
+// from it: warp_index = index()/32, lane_id = index()%32,
+// is_first_in_warp = lane_id == 0, is_first_in_cta = index() == 0, and
+// warp_count = total threads / 32 through the map.
+void test_flat_index_and_warp_queries() {
+  auto kinfo = host_info(100u, 512u);
+  tca::rt::GridMapping gm(kinfo, 4, -1);
+  for (unsigned id : {0u, 1u, 42u, 99u}) {
+    gm.set_linear_id(id);
+    CHECK(gm.index() == id);  // the flat CTA id — blockIdx.x
+  }
+  tca::rt::ThreadMapping tm(kinfo, 4, -1);
+  for (unsigned tid : {0u, 1u, 31u, 32u, 255u, 256u, 511u}) {
+    tm.set_linear_id(tid);
+    CHECK(tm.index() == tid);  // the flat thread id — threadIdx.x
+    CHECK(tm.warp_index() == tid / 32u);
+    CHECK(tm.lane_id() == tid % 32u);
+    CHECK(tm.is_first_in_warp() == (tid % 32u == 0u));
+    CHECK(tm.is_first_in_cta() == (tid == 0u));
+  }
+  CHECK(tm.warp_count() == 16u);  // 512 threads / 32
+  tca::rt::ThreadMapping tm256(host_info(100u, 256u), -1);
+  CHECK(tm256.warp_count() == 8u);
+}
+
 // (d) ThreadMapping(-1) @ 256 threads: minimum config (8 warps = 1 portion).
 void test_thread_mapping_min() {
   auto kinfo = host_info(100u, 256u);
@@ -206,49 +234,41 @@ void test_umin_umax() {
 
 float add_f(float a, float b) { return a + b; }
 
-// (h) Reducer algebra over <T, Slots>.
+// (h) Reducer algebra — the R1 scalar-only protocol (ruling 2026-10-23):
+// no Slots template parameter, Reduce folds one element per call, Combine
+// always returns T.
 void test_seq_reducer() {
-  // Scalar (Slots == 0): Init fills the declared init; Reduce folds through
-  // the runtime-owned combiner; Combine returns T. Dyadic values — exact.
-  tca::rt::SeqReducer<float, 0u> r0(0.0f, add_f);
-  r0.Init();
-  CHECK(r0.Combine() == 0.0f);  // identity-init semantics before any Reduce
-  r0.Reduce(1.5f);
-  r0.Reduce(2.25f);
-  CHECK(r0.Combine() == 3.75f);
-  r0.Init();  // argument-free re-initialization from the construction-time init
-  CHECK(r0.Combine() == 0.0f);
-
-  // Slotted (Slots == 32): Init fills the DECLARED init (2.0f here — proves
-  // the fill is the construction-time value, not a hardcoded zero); per-slot
-  // folds are independent; Combine returns SlotValue with Get.
-  tca::rt::SeqReducer<float, 32u> r32(2.0f, add_f);
-  r32.Init();
-  CHECK(r32.Combine().Get(0u) == 2.0f);
-  CHECK(r32.Combine().Get(31u) == 2.0f);
-  r32.Reduce(3u, 0.5f);
-  r32.Reduce(3u, 0.25f);
-  r32.Reduce(31u, 1.0f);
-  auto sv = r32.Combine();
-  CHECK(sv.Get(3u) == 2.75f);   // 2.0 + 0.5 + 0.25
-  CHECK(sv.Get(31u) == 3.0f);   // 2.0 + 1.0
-  CHECK(sv.Get(0u) == 2.0f);    // untouched slot keeps the declared init
+  // Scalar: Init fills the declared init; Reduce folds through the
+  // runtime-owned combiner; Combine returns T. Dyadic values — exact.
+  tca::rt::SeqReducer<float> r(0.0f, add_f);
+  r.Init();
+  CHECK(r.Combine() == 0.0f);  // identity-init semantics before any Reduce
+  r.Reduce(1.5f);
+  r.Reduce(2.25f);
+  CHECK(r.Combine() == 3.75f);
+  r.Init();  // argument-free re-initialization from the construction-time init
+  CHECK(r.Combine() == 0.0f);
 }
 
 // The WarpReducer's HOST branch is the seq algebra (no warps on the host);
-// pin it so the branch is compiled and pinned somewhere.
+// the ctor carries the mapping and the compiler-pool staging row — R1: on
+// the CPU layer a stack array is the stand-in for the dynamic-SMEM pool
+// row. Pin the face so the branch is compiled and exercised somewhere.
 void test_warp_reducer_host_branch() {
-  tca::rt::WarpReducer<float, 0u> w0(0.0f, add_f);
-  w0.Init();
-  w0.Reduce(1.5f);
-  w0.Reduce(0.25f);
-  CHECK(w0.Combine() == 1.75f);
-
-  tca::rt::WarpReducer<float, 32u> w32(0.0f, add_f);
-  w32.Init();
-  w32.Reduce(7u, 0.5f);
-  CHECK(w32.Combine().Get(7u) == 0.5f);
-  CHECK(w32.Combine().Get(8u) == 0.0f);
+  auto kinfo = host_info(100u, 512u);
+  tca::rt::ThreadMapping tm(kinfo, -1);
+  float stage[16] = {};  // 16 warps — the stack-array stand-in for the pool row
+  tca::rt::SmemView<float, 1u> staging(stage, 16u);
+  tca::rt::WarpReducer<float> w(0.0f, add_f, tm, staging);
+  w.Init();
+  w.Reduce(1.5f);
+  w.Reduce(0.25f);
+  CHECK(w.Combine() == 1.75f);
+  w.Init();
+  CHECK(w.Combine() == 0.0f);
+  // The host branch never touches the staging row; the ctor-provided view
+  // addresses the caller's array unchanged.
+  CHECK(staging.Get(0u) == 0.0f);
 }
 
 }  // namespace
@@ -257,6 +277,7 @@ int main() {
   test_grid_mapping_tail();
   test_grid_mapping_two_dims();
   test_thread_mapping_two_dims();
+  test_flat_index_and_warp_queries();
   test_thread_mapping_min();
   test_seq_iterator();
   test_map_iterators();
