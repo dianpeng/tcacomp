@@ -168,8 +168,9 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // quick-261021-jay); an LIR store's trailing KeyedAttribute operands (the
 // fill annotation convention, LO-01/quick-261021-o61 T5) are pinned
 // well-formed — at most one per key, each with a const value; a runtime map
-// query holds exactly one const-u32
-// DoSoC operand and a field in {index, dimension} (§5 companion 3); the
+// query holds either exactly one const-u32 DoSoC operand and a field in
+// {index, dimension}, or the zero-operand FLAT form (field "index" only —
+// the flat-index() ruling 2026-10-23) (§5 companion 3); the
 // runtime-object family's P-3 shape cross-checks (KernelInfo operand-free,
 // mapping portion grammar, reducer (init, lambda) pair, closed method/
 // attribute vocabularies with their object domains); an
@@ -274,23 +275,32 @@ func checkNodeShape(n Node, vs *[]Violation) {
 			}
 		}
 	case *runtimeQueryNode:
-		// §5 companion 3 (quick-261021-jay, renamed LR-6): exactly one
-		// operand — the DoSoC const u32; the field payload must be a known
-		// query selector.
-		if len(OperandsOf(t)) != 1 {
-			*vs = append(*vs, nodeViolation(n, invUseDef,
-				"runtime map query must hold exactly one operand (the DoSoC const)"))
-			break
-		}
-		if d := operandAt(t, 0); d != nil {
-			c, ok := d.(*constNode)
-			if !ok {
+		// §5 companion 3 (quick-261021-jay, renamed LR-6), extended by the
+		// flat-index() ruling (2026-10-23): EITHER exactly one operand — the
+		// DoSoC const u32 — OR the ZERO-OPERAND flat form, legal ONLY for
+		// field "index" (the absolute flattened 1-D rank). The field payload
+		// must be a known query selector.
+		switch {
+		case len(OperandsOf(t)) == 0:
+			// The flat form: index-only ("dimension" demands the DoSoC).
+			if t.field != "index" {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
-					"runtime map query operand 0 must be a const-u32 DoSoC"))
-			} else if typ := c.typ; typ == nil || !typ.Equal(InternScalar(TU32)) {
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					"runtime map query operand 0 must be a const-u32 DoSoC"))
+					fmt.Sprintf("runtime map query field %q carries no DoSoC operand — the zero-operand flat form is legal only for field \"index\"", t.field)))
 			}
+		case len(OperandsOf(t)) == 1:
+			if d := operandAt(t, 0); d != nil {
+				c, ok := d.(*constNode)
+				if !ok {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						"runtime map query operand 0 must be a const-u32 DoSoC"))
+				} else if typ := c.typ; typ == nil || !typ.Equal(InternScalar(TU32)) {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						"runtime map query operand 0 must be a const-u32 DoSoC"))
+				}
+			}
+		default:
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"runtime map query must hold exactly one operand (the DoSoC const) or none (the flat index form)"))
 		}
 		switch t.field {
 		case "index", "dimension":
@@ -370,7 +380,14 @@ func checkNodeShape(n Node, vs *[]Violation) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					fmt.Sprintf("runtimegetattribute %q requires a mapping object, got %s", t.attribute, obj.KindOf())))
 			}
-			if extra := len(OperandsOf(t)) - 1; extra != 1 {
+			extra := len(OperandsOf(t)) - 1
+			// The flat-index() ruling (2026-10-23): attribute "index" admits
+			// the ZERO-ARG form (the flattened 1-D rank); "dimension" keeps
+			// exactly one const-u32 DoSoC.
+			if t.attribute == "index" && extra == 0 {
+				break
+			}
+			if extra != 1 {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					fmt.Sprintf("runtimegetattribute %q carries %d extra args, want exactly 1 (the DoSoC const)", t.attribute, extra)))
 				break

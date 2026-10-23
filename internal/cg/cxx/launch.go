@@ -169,6 +169,10 @@ func (e *emitter) cmake() (string, error) {
 	fmt.Fprintf(&b, "add_library(%s OBJECT %s.cu)\n", e.kernelSym, e.name)
 	fmt.Fprintf(&b, "set_target_properties(%s PROPERTIES CUDA_ARCHITECTURES %d)\n", e.kernelSym, sm)
 	fmt.Fprintf(&b, "target_compile_options(%s PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)\n", e.kernelSym)
+	// C3 (2026-10-23): CMake 4.x does NOT define the CUDA::cudart imported
+	// target from project(... LANGUAGES CUDA) alone — find_package(
+	// CUDAToolkit REQUIRED) must precede the link line or configure fails.
+	b.WriteString("find_package(CUDAToolkit REQUIRED)\n")
 	fmt.Fprintf(&b, "target_link_libraries(%s PRIVATE tcacomp_runtime CUDA::cudart)\n", e.kernelSym)
 	return b.String(), nil
 }

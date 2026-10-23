@@ -440,6 +440,58 @@ func TestQueryRewrite(t *testing.T) {
 	}
 }
 
+// TestFlatQueryRewrite pins the flat-index() ruling's final-lower half: a
+// ZERO-OPERAND thread query (grafted as an LNT-prologue item over the
+// scheduled map-only kernel) rewrites to a RuntimeGetAttribute with attribute
+// "index" over the owning LNT's ThreadMapping carrying NO extra args, and
+// every query kind vanishes from the graph.
+func TestFlatQueryRewrite(t *testing.T) {
+	f, load, mp, out := mapOnlyFx(t)
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+	})
+	k := f.g.AST()
+	var prologue *ir.ASTBlock
+	for _, it := range k.Body.Items() {
+		if it.Block != nil && it.Block.Kind() == ir.BlockGroup && it.Block.Nest() == k.LNTs[0] {
+			prologue = it.Block
+			break
+		}
+	}
+	if prologue == nil {
+		t.Fatal("fixture setup: the LNT prologue Group must exist post-schedule")
+	}
+	flat := f.g.NewRuntimeThreadQueryFlat("ctor")
+	flat.BasePtr().SetSched(0, prologue)
+	prologue.AppendItem(ir.ASTItem{Node: flat})
+
+	if err := runFinalLower(t, f.g, cache); err != nil {
+		t.Fatalf("final-lower over the grafted flat query: %v", err)
+	}
+	for _, kind := range []ir.Kind{ir.KindRuntimeGridQuery, ir.KindRuntimeThreadQuery} {
+		if got := liveOfKind(f.g, kind); len(got) != 0 {
+			t.Fatalf("no live %s may survive the rewrite (flat included), got %d", kind, len(got))
+		}
+	}
+	found := false
+	for _, ga := range liveOfKind(f.g, ir.KindRuntimeGetAttribute) {
+		ops := ir.OperandsOf(ga)
+		if ir.RuntimeAttributeOf(ga) != "index" || len(ops) != 1 || ops[0] == nil {
+			continue
+		}
+		if ops[0].KindOf() == ir.KindRuntimeThreadMapping {
+			found = true // the zero-arg flat form
+		}
+	}
+	if !found {
+		t.Fatal("the flat query must have rewritten to a zero-arg index getattr over the ThreadMapping")
+	}
+	_ = load
+	_ = mp
+	_ = out
+}
+
 // TestMapOnlyEndToEnd pins the map-only kernel's full post-pass shape:
 // zero Map/lambda-debris/query nodes, exactly one KernelInfo as the first
 // statement, one mapping pair per LNT prologue, every former query use

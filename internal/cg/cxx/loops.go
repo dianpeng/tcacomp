@@ -51,12 +51,21 @@ func (e *emitter) walkLoop(blk *ir.ASTBlock) error {
 		return err
 	}
 	// The dimvar identity (init, step) rides the iterator ctor as literals
-	// — header facts, not reused SSA values.
+	// — header facts, not reused SSA values. The flat-index() ruling
+	// (2026-10-23) admits a NON-CONST init (the coupled walk's flat
+	// thread-rank query, by then a zero-arg getattr): such an init renders
+	// as an EXPRESSION inline (e.g. thread_map1.index()); the step stays a
+	// constLiteral (the verifier's positive-const-step pin).
 	ivOps := ir.OperandsOf(iv)
 	if len(ivOps) != 3 {
 		return fmt.Errorf("cxx: loop %d iv is not a (dim, init, step) dimvar", loop.BasePtr().ID())
 	}
-	initLit, err := constLiteral(ivOps[1])
+	var initLit string
+	if _, isConst := ir.ConstValueOf(ivOps[1]); isConst {
+		initLit, err = constLiteral(ivOps[1])
+	} else {
+		initLit, err = e.emitExpr(ivOps[1])
+	}
 	if err != nil {
 		return err
 	}

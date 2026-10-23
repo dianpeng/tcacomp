@@ -123,8 +123,23 @@ struct ThreadMapping { /* same face over threadIdx.x */ };
   row-major over the extents — `coord_d = (id / stride_d) % extent_d`.
   `index(d) = coord_d`; `dimension(d) = extent_d`. Pure arithmetic — no
   `__ballot_sync`, CPU-testable.
-- Future (registered, never emitted in v0): `warp_index()/lane_index()/
-  is_first()` queries on ThreadMapping.
+- **The FLAT index() — ruling 2026-10-23.** `index()` with NO argument
+  returns the map holder's ABSOLUTE FLATTENED 1-D index:
+  `ThreadMapping::index()` is the thread's linear id in the CTA (the
+  `threadIdx.x` analog); `GridMapping::index()` the CTA's linear id (the
+  `blockIdx.x` analog). `index(d)` (the per-dimension tuple coordinate) is
+  UNCHANGED. The compiler NEVER inlines `threadIdx.x`/`blockIdx.x` itself —
+  the maps stay the opaque seam; lane/warp identity derives from the flat
+  form (`index() % 32`, `index() / 32`).
+- **Warp/lane queries — v0 surface (ruling addenda 2026-10-23).**
+  `ThreadMapping` additionally carries, all pure functions of `index()`:
+  `warp_index()` (= `index()/32`), `lane_id()` (= `index()%32`),
+  `is_first_in_warp()`, `is_first_in_cta()` (`index() == 0`), and
+  `warp_count()` (the CTA's EXISTING warp count, `total threads/32`,
+  obtained THROUGH the map — never a magic constant). These are
+  runtime-INTERNAL control flow (reducer staging ownership, fold-existing-
+  warps bounds, the staging-extent cross-check); generated code stays
+  branch-free — the queries never appear as compiler-emitted conditionals.
 
 ### 4.3 Iterators — the uniform round walk
 
@@ -141,9 +156,18 @@ struct ThrIterator { __device__ ThrIterator(ThreadMapping, unsigned dosoc, unsig
   base += step; }`. `Index()` returns the current dimvar value
   (`init + k·step`) — the 0-based round-base identity; the per-thread /
   per-CTA rank (`map.index(d)·T`) enters only as in-body offset terms the
-  compiler already emitted as attribute reads. **`Has()` is deliberately
-  NOT per-thread**: every thread of the CTA agrees on the trip count —
-  this is what makes every collective call uniformly reached.
+  compiler already emitted as attribute reads.
+- **`Has()` is CTA-uniform for the ROUND walks — and PER-THREAD by design
+  for the coupled-inside walk (amended, flat-index() ruling 2026-10-23).**
+  The between-round walks keep every thread of the CTA agreeing on the trip
+  count (this is what makes every collective call uniformly reached). The
+  CTA dim's COUPLED tile-inside walk is a thread iterator whose INIT is the
+  per-thread flat rank (`thread_map.index()`), step the coupled thread
+  count, bound the tile max: threads with `flatRank >= tile_max` take ZERO
+  trips (the whole body no-ops) — per-thread trip counts are the
+  single-ownership mechanism, not a uniformity violation (nothing
+  collective sits inside the coupled walk). Lane/warp identity at such
+  sites derives from the flat form: `index() % 32` / `index() / 32`.
 - v0 Cta/Thr carry the mapping/dosoc/loc for future ownership-guard
   queries; the walk ignores them.
 - The bound expression is the compiler's saturating F1 chain

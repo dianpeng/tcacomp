@@ -67,6 +67,34 @@ void test_thread_mapping_two_dims() {
   }
 }
 
+// (c, flat) The no-arg index() — the flat-index() ruling (2026-10-23):
+// ThreadMapping::index() is the thread's absolute flattened 1-D id (the
+// threadIdx.x analog); GridMapping::index() the blockIdx.x analog; index(d)
+// (the tuple coordinate) is unchanged. Plus the warp/lane queries derived
+// from it: warp_index = index()/32, lane_id = index()%32,
+// is_first_in_warp = lane_id == 0, is_first_in_cta = index() == 0, and
+// warp_count = total threads / 32 through the map.
+void test_flat_index_and_warp_queries() {
+  auto kinfo = host_info(100u, 512u);
+  tca::rt::GridMapping gm(kinfo, 4, -1);
+  for (unsigned id : {0u, 1u, 42u, 99u}) {
+    gm.set_linear_id(id);
+    CHECK(gm.index() == id);  // the flat CTA id — blockIdx.x
+  }
+  tca::rt::ThreadMapping tm(kinfo, 4, -1);
+  for (unsigned tid : {0u, 1u, 31u, 32u, 255u, 256u, 511u}) {
+    tm.set_linear_id(tid);
+    CHECK(tm.index() == tid);  // the flat thread id — threadIdx.x
+    CHECK(tm.warp_index() == tid / 32u);
+    CHECK(tm.lane_id() == tid % 32u);
+    CHECK(tm.is_first_in_warp() == (tid % 32u == 0u));
+    CHECK(tm.is_first_in_cta() == (tid == 0u));
+  }
+  CHECK(tm.warp_count() == 16u);  // 512 threads / 32
+  tca::rt::ThreadMapping tm256(host_info(100u, 256u), -1);
+  CHECK(tm256.warp_count() == 8u);
+}
+
 // (d) ThreadMapping(-1) @ 256 threads: minimum config (8 warps = 1 portion).
 void test_thread_mapping_min() {
   auto kinfo = host_info(100u, 256u);
@@ -257,6 +285,7 @@ int main() {
   test_grid_mapping_tail();
   test_grid_mapping_two_dims();
   test_thread_mapping_two_dims();
+  test_flat_index_and_warp_queries();
   test_thread_mapping_min();
   test_seq_iterator();
   test_map_iterators();

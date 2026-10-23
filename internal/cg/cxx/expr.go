@@ -247,6 +247,11 @@ func (e *emitter) emitGetAttr(n ir.Node) (string, error) {
 		}
 		return obj + "." + attr + "()", nil
 	case "index", "dimension":
+		// The flat-index() ruling (2026-10-23): attribute "index" with NO
+		// extra args renders <obj>.index() — the flattened 1-D rank.
+		if attr == "index" && len(ops) == 1 {
+			return obj + ".index()", nil
+		}
 		if len(ops) != 2 || ops[1] == nil {
 			return "", fmt.Errorf("cxx: getattr %s needs exactly one dim operand", attr)
 		}

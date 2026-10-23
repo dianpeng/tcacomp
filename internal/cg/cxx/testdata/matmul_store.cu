@@ -27,7 +27,6 @@ __global__ void __launch_bounds__(512) Mm(uint32_t d0, uint32_t d1, uint32_t d2,
     auto v2 = thread_map1.index(0u);
     auto v3 = thread_map1.index(1u);
     auto v4 = (v3 * c1);
-    auto c2 = 65536u;
     // @d0 tile-between rounds — CTA, T=64, LoC=100 (map dim 0)
     for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 6400u, c0); d0_it0.Has(); d0_it0.Next()) {
       auto v5 = (v1 + d0_it0.Index());

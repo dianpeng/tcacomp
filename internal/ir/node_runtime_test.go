@@ -266,10 +266,13 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 		ga := g.NewRuntimeGetAttribute("ctor", "index", ki, u32const(g, 0))
 		g.NewReturn("ctor", ga)
 	}, "mapping object")
-	expect("get-index-noargs", func(g *Graph) {
+	// Flat-index() ruling (2026-10-23): the ZERO-ARG index getattr is the
+	// legal flat form — the old "noargs fails" pin is superseded. The
+	// zero-arg DIMENSION getattr still fails wanting exactly 1.
+	expect("get-dimension-noargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
-		ga := g.NewRuntimeGetAttribute("ctor", "index", gm)
+		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm)
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-twoargs", func(g *Graph) {
@@ -341,6 +344,87 @@ func TestRuntimeKindTaxonomy(t *testing.T) {
 	}
 	if !(KindRuntimeThreadQuery < KindRuntimeKernelInfo && KindRuntimeKernelInfo < KindRuntimeGridMapping) {
 		t.Fatal("the queries must precede the constructions in enum order")
+	}
+}
+
+// TestRuntimeFlatQueryVerifyShape pins the flat-index() ruling (2026-10-23):
+// the ZERO-OPERAND query form is verifier-legal ONLY for field "index" (the
+// thread's/Crank's absolute flattened 1-D rank — the threadIdx.x/blockIdx.x
+// analog); field "dimension" still demands exactly one const-u32 DoSoC. The
+// one-operand forms behave exactly as today (TestRuntimeQueryVerifyShape).
+func TestRuntimeFlatQueryVerifyShape(t *testing.T) {
+	wellformed := func() (*Graph, Node, Node) {
+		g := NewGraph("flat")
+		gq := g.NewRuntimeGridQueryFlat("ctor")
+		tq := g.NewRuntimeThreadQueryFlat("ctor")
+		g.NewReturn("ctor", gq, tq)
+		return g, gq, tq
+	}
+	g, gq, tq := wellformed()
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("zero-operand flat queries must verify clean, got %v", vs)
+	}
+	if got := RuntimeAttributeOf(gq); got != "index" {
+		t.Fatalf("flat grid query field = %q, want \"index\"", got)
+	}
+	if got := RuntimeAttributeOf(tq); got != "index" {
+		t.Fatalf("flat thread query field = %q, want \"index\"", got)
+	}
+
+	// A zero-operand "dimension" query: flip the flat ctor's field — the
+	// shape case must reject it, the flat form is index-only.
+	badDim := NewGraph("flatdim")
+	dq := badDim.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	dq.field = "dimension"
+	badDim.NewReturn("ctor", dq)
+	if vs := Verify(badDim); len(vs) != 1 || !strings.Contains(vs[0].Msg, "dimension") {
+		t.Fatalf("zero-operand dimension query must be a shape violation, got %v", vs)
+	}
+
+	// The getattr mirror: attribute "index" with ZERO extra args is legal
+	// (the flat form); "dimension" keeps exactly one.
+	ga1 := NewGraph("flatgetattr")
+	ki1 := ga1.NewRuntimeKernelInfo("ctor")
+	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, -1})
+	ga1.NewReturn("ctor", ga1.NewRuntimeGetAttribute("ctor", "index", tm1))
+	if vs := Verify(ga1); len(vs) != 0 {
+		t.Fatalf("zero-arg index getattr must verify clean, got %v", vs)
+	}
+	g2 := NewGraph("flatgetattrdim")
+	ki2 := g2.NewRuntimeKernelInfo("ctor")
+	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, -1})
+	g2.NewReturn("ctor", g2.NewRuntimeGetAttribute("ctor", "dimension", tm2))
+	if vs := Verify(g2); len(vs) != 1 || !strings.Contains(vs[0].Msg, "exactly 1") {
+		t.Fatalf("zero-arg dimension getattr must fail wanting exactly 1 arg, got %v", vs)
+	}
+}
+
+// TestRuntimeFlatQueryValueNumbering pins the flat form's value contract:
+// two flat queries of the same kind are GVN-equal; a flat query is NOT equal
+// to the dim-0 one-operand query (distinct operand lists hash distinct — the
+// slot count participates in ValueHash).
+func TestRuntimeFlatQueryValueNumbering(t *testing.T) {
+	g := NewGraph("flatvn")
+	se := pureAll{}
+	f1 := asValue(t, g.NewRuntimeThreadQueryFlat("ctor"))
+	f2 := asValue(t, g.NewRuntimeThreadQueryFlat("ctor"))
+	d0 := asValue(t, g.NewRuntimeThreadQuery("ctor", "index", u32const(g, 0)))
+	gf := asValue(t, g.NewRuntimeGridQueryFlat("ctor"))
+
+	if !f1.ValueEqual(f2, se) {
+		t.Fatal("two flat thread queries must be value-equal")
+	}
+	if f1.ValueHash(se) != f2.ValueHash(se) {
+		t.Fatal("equal flat queries must hash identically (the GVN-CSE contract)")
+	}
+	if f1.ValueEqual(d0, se) {
+		t.Fatal("a flat query must not be value-equal to the dim-0 one-operand query")
+	}
+	if f1.ValueHash(se) == d0.ValueHash(se) {
+		t.Fatal("the flat and one-operand forms must hash distinctly (operand-count keying)")
+	}
+	if f1.ValueEqual(gf, se) {
+		t.Fatal("flat grid and thread queries are distinct kinds")
 	}
 }
 

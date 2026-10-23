@@ -370,6 +370,14 @@ func (e *emitter) buildPureRefs() {
 			// soc/dosoc/loc/tile/loadtile values) emit as inline literals,
 			// never as locals — descending would false-reference them.
 			return
+		case ir.KindMemNewSMem, ir.KindFragNew:
+			// Allocation declarations (F0, 2026-10-23): their byte-extent
+			// consts render as inline literals in the hoisted preamble
+			// declarations (the pool views, the Frag tiles, the reducer
+			// staging slices) — never as locals. Descending would
+			// false-reference the extent const into a dead local (the same
+			// rationale as the DimVar/KeyedAttribute stop).
+			return
 		}
 		for _, op := range ir.OperandsOf(n) {
 			add(op)

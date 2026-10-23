@@ -74,6 +74,27 @@ func (g *Graph) NewRuntimeThreadQuery(origin string, field string, dosoc Node) N
 	return n
 }
 
+// NewRuntimeGridQueryFlat creates the ZERO-OPERAND GridMapping query — the
+// flat-index() ruling (2026-10-23): field is pinned "index" (the CTA's
+// absolute flattened 1-D id, the blockIdx.x analog). The verifier's shape
+// case admits the zero-operand form ONLY for field "index"; "dimension"
+// still demands exactly one const-u32 DoSoC.
+func (g *Graph) NewRuntimeGridQueryFlat(origin string) Node {
+	n := g.allocNode(KindRuntimeGridQuery, origin, 0).(*runtimeQueryNode)
+	n.field = "index"
+	return n
+}
+
+// NewRuntimeThreadQueryFlat creates the ZERO-OPERAND ThreadMap query — the
+// flat-index() ruling (2026-10-23): field is pinned "index" (the thread's
+// absolute flattened 1-D id in the CTA, the threadIdx.x analog; lane/warp
+// identity derives from it). Same shape contract as NewRuntimeGridQueryFlat.
+func (g *Graph) NewRuntimeThreadQueryFlat(origin string) Node {
+	n := g.allocNode(KindRuntimeThreadQuery, origin, 0).(*runtimeQueryNode)
+	n.field = "index"
+	return n
+}
+
 // runtimeKernelInfoNode: the one-per-kernel runtime information object —
 // zero operands, zero payload (LR-4: a dedicated construction node, no
 // generic RuntimeConstruct). final-lower prepends it as the FIRST item of
