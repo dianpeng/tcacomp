@@ -12,28 +12,28 @@ package lexer
 type Kind int
 
 const (
-	Illegal Kind = iota // a malformed token (the scan stopped cleanly at it)
-	EOF                 // end of input
-	Ident               // identifier
-	IntLit              // decimal intLit  → i32 (design §2.1)
-	UintLit             // decimal uintLit → u32 ('u'/'U' suffix)
-	FloatLit            // floatLit → f32 ('f'/'F' suffix REQUIRED)
-	StringLit           // string literal (annotations only)
-	Placeholder         // '%' digits — the §7.3 pipe-slot family (v0: %0 only)
+	Illegal     Kind = iota // a malformed token (the scan stopped cleanly at it)
+	EOF                     // end of input
+	Ident                   // identifier
+	IntLit                  // decimal intLit  → i32 (design §2.1)
+	UintLit                 // decimal uintLit → u32 ('u'/'U' suffix)
+	FloatLit                // floatLit → f32 ('f'/'F' suffix REQUIRED)
+	StringLit               // string literal (annotations only)
+	Placeholder             // '%' digits — the §7.3 pipe-slot family (v0: %0 only)
 
 	// Reserved keywords (design §2.1).
-	Kernel  // kernel
-	Let     // let
-	Return  // return
-	DimVar  // dimvar
-	Map     // map
-	On      // on
-	As      // as
-	Reduce  // reduce
-	Init    // init
-	True    // true
-	False   // false
-	InfF32  // inf_f32 — predefined f32 constant (reserved identifier)
+	Kernel // kernel
+	Let    // let
+	Return // return
+	DimVar // dimvar
+	Map    // map
+	On     // on
+	As     // as
+	Reduce // reduce
+	Init   // init
+	True   // true
+	False  // false
+	InfF32 // inf_f32 — predefined f32 constant (reserved identifier)
 
 	// Element-type keywords (reserved; double as cast operators, §2.7).
 	TBool // bool
@@ -89,28 +89,28 @@ const (
 // cxx_path) are CONTEXTUAL identifiers and deliberately absent. The table is
 // a plain lookup map, never iterated.
 var keywords = map[string]Kind{
-	"kernel":   Kernel,
-	"let":      Let,
-	"return":   Return,
-	"dimvar":   DimVar,
-	"map":      Map,
-	"on":       On,
-	"as":       As,
-	"reduce":   Reduce,
-	"init":     Init,
-	"true":     True,
-	"false":    False,
-	"inf_f32":  InfF32,
-	"bool":     TBool,
-	"f32":      TF32,
-	"f16":      TF16,
-	"bf16":     TBF16,
-	"i8":       TI8,
-	"i16":      TI16,
-	"i32":      TI32,
-	"u8":       TU8,
-	"u16":      TU16,
-	"u32":      TU32,
+	"kernel":  Kernel,
+	"let":     Let,
+	"return":  Return,
+	"dimvar":  DimVar,
+	"map":     Map,
+	"on":      On,
+	"as":      As,
+	"reduce":  Reduce,
+	"init":    Init,
+	"true":    True,
+	"false":   False,
+	"inf_f32": InfF32,
+	"bool":    TBool,
+	"f32":     TF32,
+	"f16":     TF16,
+	"bf16":    TBF16,
+	"i8":      TI8,
+	"i16":     TI16,
+	"i32":     TI32,
+	"u8":      TU8,
+	"u16":     TU16,
+	"u32":     TU32,
 }
 
 // keywordText is keywords' inverse: Kind → source spelling, for diagnostics

@@ -51,6 +51,16 @@ func (t ElemType) String() string {
 	}
 }
 
+// CastPairOK reports whether the explicit cast from→to is admitted by the
+// v0 SHARED cast registry (doc/syntax-design.md §4.6 rule 19):
+// arithmetic→arithmetic only — no bool involvement (either direction), no
+// identity casts. This is the single source of truth consulted by the
+// frontend semacheck and pkg.Cast alike (the registry lives in the IR so the
+// frontend never keeps a local table).
+func CastPairOK(from, to ElemType) bool {
+	return from != TBool && to != TBool && from != to
+}
+
 // DimRef is one tensor shape dimension. Extent == 0 means a dynamic /
 // symbolic runtime dim (Name holds the dim parameter name); Extent > 0 is a
 // compile-time constant extent.

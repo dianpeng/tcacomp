@@ -121,8 +121,6 @@ func isFloatType(t ir.Type) bool {
 
 func isArithType(t ir.Type) bool { return isIntType(t) || isFloatType(t) }
 
-func isArithElem(e ir.ElemType) bool { return isIntElem(e) || isFloatElem(e) }
-
 func isBoolType(t ir.Type) bool {
 	nt := numericOf(t)
 	return nt != nil && nt.IsScalar() && nt.Elem() == ir.TBool
@@ -288,21 +286,21 @@ func Select(cond, a, b Expr) Expr {
 }
 
 // Cast is the explicit conversion to a named scalar type (§4.6 rule 19: explicit
-// only, registry-checked pairs). The v0 cast registry lives here in the
-// builder DSL until the shared frontend/IR registry lands with the parser;
-// it admits arithmetic-to-arithmetic pairs only — no bool involvement, no
-// redundant identity casts.
+// only, registry-checked pairs). The v0 cast registry is the SHARED table
+// ir.CastPairOK — the single source of truth the frontend semacheck consults
+// too — admitting arithmetic-to-arithmetic pairs only: no bool involvement,
+// no redundant identity casts.
 func Cast(e Expr, t ir.ElemType) Expr {
 	if err := firstErr(e); err != nil {
 		return e.b.bad(err)
 	}
 	target := ir.InternScalar(t)
-	if !isArithType(e.typ) || !isArithElem(t) {
-		return e.b.bad(fmt.Errorf("cast: pair %s -> %s is not in the v0 cast registry (arithmetic-to-arithmetic only)",
-			typeName(e.typ), t))
-	}
 	if nt := numericOf(e.typ); nt != nil && nt.Elem() == t {
 		return e.b.bad(fmt.Errorf("cast: redundant cast to %s", t))
+	}
+	if nt := numericOf(e.typ); nt == nil || !ir.CastPairOK(nt.Elem(), t) {
+		return e.b.bad(fmt.Errorf("cast: pair %s -> %s is not in the v0 cast registry (arithmetic-to-arithmetic only)",
+			typeName(e.typ), t))
 	}
 	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.materialize()), typ: target}
 }
@@ -310,19 +308,22 @@ func Cast(e Expr, t ir.ElemType) Expr {
 // Call resolves a registered pure builtin against its pinned signature
 // (§4.6 rule 20): the name must be registered (the signature table lives in
 // internal/ir's Builtin registry — the single source of truth shared with
-// the type-inference pass) and every argument must be f32. It is a
-// package-level function because it is self-contained — it adopts the
-// builder shared by its arguments.
+// the type-inference pass) and every argument must match the signature's
+// argument element type; the result carries the signature's result type
+// (the f32 family takes f32; umin/umax take u32). It is a package-level
+// function because it is self-contained — it adopts the builder shared by
+// its arguments.
 func Call(name string, args ...Expr) (Expr, error) {
 	sig, ok := ir.Builtin(name)
 	if !ok {
 		return Expr{}, fmt.Errorf("function %s is not a registered pure scalar builtin", name)
 	}
 	if len(args) != sig.Arity {
-		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s) of type f32, got %d", name, sig.Arity, len(args))
+		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s), got %d", name, sig.Arity, len(args))
 	}
 	b := args[0].b
-	f32 := ir.InternScalar(ir.TF32)
+	argType := ir.InternScalar(sig.Arg)
+	resultType := ir.InternScalar(sig.Result)
 	nodes := make([]ir.Node, len(args))
 	for i, a := range args {
 		if a.err != nil {
@@ -331,10 +332,10 @@ func Call(name string, args ...Expr) (Expr, error) {
 		if a.b != b {
 			return Expr{}, fmt.Errorf("call %s: argument %d comes from a different builder", name, i)
 		}
-		if a.typ != f32 {
-			return Expr{}, fmt.Errorf("call %s: argument %d must be f32, got %s", name, i, typeName(a.typ))
+		if a.typ != argType {
+			return Expr{}, fmt.Errorf("call %s: argument %d must be %s, got %s", name, i, sig.Arg, typeName(a.typ))
 		}
 		nodes[i] = a.materialize()
 	}
-	return Expr{b: b, node: b.g.NewCall(origin, name, nodes...), typ: f32}, nil
+	return Expr{b: b, node: b.g.NewCall(origin, name, nodes...), typ: resultType}, nil
 }
