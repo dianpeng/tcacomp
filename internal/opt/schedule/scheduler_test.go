@@ -247,7 +247,7 @@ func TestSingleNestLICM(t *testing.T) {
 	inv := f.g.NewBinOp("ctor", ir.BinOpMul, f.g.NewConst("ctor", f.f32, 3), f.g.NewConst("ctor", f.f32, 4))
 	varying := f.g.NewBinOp("ctor", ir.BinOpAdd, iv, inv)
 	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, varying)
-	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+	loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 	end := f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 	k := run(t, f.g)
@@ -315,12 +315,16 @@ func TestNestedNestSinglePlacement(t *testing.T) {
 	outerIV := f.g.NewDimVar("ctor", f.m, f.g.NewConst("ctor", f.u32, 0), f.g.NewConst("ctor", f.u32, 4))
 	outerBound := f.g.NewBoundedDimVar("ctor", outerIV, f.g.NewConst("ctor", f.u32, 64))
 	innerIV := f.g.NewDimVar("ctor", f.m, f.g.NewConst("ctor", f.u32, 0), f.g.NewConst("ctor", f.u32, 1))
-	innerBound := f.g.NewBoundedDimVar("ctor", innerIV, f.g.NewConst("ctor", f.u32, 8))
+	// fix1.md D-b nesting: the inner loop's bound references the outer IV in
+	// its data-dep closure (the loopforest forOverNested idiom) — the old
+	// body-operand link is gone.
+	innerBound := f.g.NewBoundedDimVar("ctor", innerIV,
+		f.g.NewBinOp("ctor", ir.BinOpAdd, outerIV, f.g.NewConst("ctor", f.u32, 8)))
 	shared := f.g.NewBinOp("ctor", ir.BinOpAdd, innerIV, f.g.NewConst("ctor", f.f32, 1))
 	use := f.g.NewBinOp("ctor", ir.BinOpMul, shared, outerIV)
 	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, use)
-	inner := f.g.NewForLoop("ctor", innerIV, innerBound, st, f.loopAttrs(2, 1, 32)...)
-	outer := f.g.NewForLoop("ctor", outerIV, outerBound, inner, f.loopAttrs(1, 0, 64)...)
+	inner := f.g.NewForLoop("ctor", innerIV, innerBound, f.loopAttrs(2, 1, 32)...)
+	outer := f.g.NewForLoop("ctor", outerIV, outerBound, f.loopAttrs(1, 0, 64)...)
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, outer)
 
 	k := run(t, f.g)
@@ -386,11 +390,11 @@ func TestMultipleLNTs(t *testing.T) {
 
 	ivA, boundA := f.dimVar()
 	stA := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewBinOp("ctor", ir.BinOpAdd, ivA, inv))
-	loopA := f.g.NewForLoop("ctor", ivA, boundA, stA, f.loopAttrs(2, 0, 32)...)
+	loopA := f.g.NewForLoop("ctor", ivA, boundA, f.loopAttrs(2, 0, 32)...)
 
 	ivB, boundB := f.dimVar()
 	stB := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m}, f.g.NewBinOp("ctor", ir.BinOpAdd, ivB, inv))
-	loopB := f.g.NewForLoop("ctor", ivB, boundB, stB, f.loopAttrs(1, 0, 64)...)
+	loopB := f.g.NewForLoop("ctor", ivB, boundB, f.loopAttrs(1, 0, 64)...)
 
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out, out2}, loopA, loopB)
 
@@ -452,7 +456,7 @@ func TestNoLNTMetadata(t *testing.T) {
 	f := newFx("plain")
 	iv, bound := f.dimVar()
 	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1)))
-	loop := f.g.NewForLoop("ctor", iv, bound, st)
+	loop := f.g.NewForLoop("ctor", iv, bound)
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 	k := run(t, f.g)
@@ -478,8 +482,8 @@ func TestKernelMetadata(t *testing.T) {
 	tmp := f.g.NewMemNew("ctor", extent)
 	iv, bound := f.dimVar()
 	load := f.g.NewMemLoad("ctor", tmp, []ir.Node{iv})
-	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, load)
-	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 1, 32)...)
+	f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, load)
+	loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 1, 32)...)
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 	k := run(t, f.g)
@@ -543,7 +547,7 @@ func TestReductionShapeEpilogue(t *testing.T) {
 	iv, bound := f.dimVar()
 	n := f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1))
 	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, n)
-	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+	loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 	R := f.g.NewBinOp("ctor", ir.BinOpMul, n, f.g.NewConst("ctor", f.f32, 2)) // kernel-level consumer of in-loop n
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop, R)
 
@@ -593,8 +597,8 @@ func TestLambdaParamsExcludedFromPrototype(t *testing.T) {
 	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", f.f32, 0),
 		f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1)),
 		ir.NewLambda([]ir.Node{acc, now}, comb))
-	st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, red)
-	loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+	f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, red)
+	loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 	k := run(t, f.g)
@@ -639,7 +643,7 @@ func TestPostNestStoreEpilogue(t *testing.T) {
 	iv, bound := f.dimVar()
 	st1b := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m},
 		f.g.NewBinOp("ctor", ir.BinOpAdd, iv, f.g.NewConst("ctor", f.f32, 1)))
-	loop := f.g.NewForLoop("ctor", iv, bound, st1b, f.loopAttrs(2, 0, 32)...)
+	loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 	st2 := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 7))
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out, out2}, loop, st2)
 
@@ -657,26 +661,32 @@ func TestPostNestStoreEpilogue(t *testing.T) {
 	}
 }
 
-// TestEffectfulNoHoist pins HI-02 (quick-261022-b2m): a data-INVARIANT
-// effectful memory access floors inside its operand-containing loop, while
-// pure invariants and ALLOCATIONS still hoist to the prologue (the
-// allocation-exemption pin — a buffer is a shared declaration).
+// TestEffectfulNoHoist pins HI-02's content under the fix1.md sea model
+// (quick-261022-b2m, recast quick-261024-sdk): an EPOCH-VARYING effectful
+// access (the fill idiom — its axes reference the loop's IV even though its
+// value is invariant) is an IV member whose SN already meets its loop's
+// depth by construction, so it stays in-loop; a fully invariant access
+// (no IV reference anywhere in its closure) is unordered w.r.t. the loop
+// and legally hoists to the prologue; pure invariants hoist, and GMEM
+// allocations anchor in the Prototype (D-1).
 func TestEffectfulNoHoist(t *testing.T) {
-	t.Run("invariant store stays in loop", func(t *testing.T) {
+	t.Run("epoch store stays in loop", func(t *testing.T) {
 		f := newFx("nohoist-store")
 		iv, bound := f.dimVar()
-		// axes reference the dim param, NOT the iv: the store is data-invariant.
-		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 1))
-		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		// The fill idiom: the axes reference the iv (epoch-varying address),
+		// the value is invariant. Membership via the IV relation keeps the
+		// per-epoch re-execution; there is no separate floor pass post-fix1.
+		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{iv}, f.g.NewConst("ctor", f.f32, 1))
+		loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 		k := run(t, f.g)
 		thr := rootBlockOf(t, bodyBlocks(t, k)[0])
 		if st.BasePtr().SchedSN() != 1 || st.BasePtr().SchedBlock() != thr {
-			t.Fatalf("invariant effectful store SN/block = %d/%p, want 1/ThrLoop (HI-02 floor)", st.BasePtr().SchedSN(), st.BasePtr().SchedBlock())
+			t.Fatalf("epoch effectful store SN/block = %d/%p, want 1/ThrLoop (IV membership)", st.BasePtr().SchedSN(), st.BasePtr().SchedBlock())
 		}
 		if indexOf(itemNodes(thr), st) < 0 {
-			t.Fatal("the invariant store must be an ITEM of the loop block")
+			t.Fatal("the epoch store must be an ITEM of the loop block")
 		}
 	})
 	t.Run("pure hoists, allocation exempt", func(t *testing.T) {
@@ -686,7 +696,7 @@ func TestEffectfulNoHoist(t *testing.T) {
 		buf := f.g.NewMemNew("ctor", f.g.NewConst("ctor", f.u32, 128)) // allocation: exempt from the floor
 		load := f.g.NewMemLoad("ctor", buf, []ir.Node{iv})             // varies with the iv: in-loop
 		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewBinOp("ctor", ir.BinOpMul, load, inv))
-		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 
 		k := run(t, f.g)
@@ -697,8 +707,8 @@ func TestEffectfulNoHoist(t *testing.T) {
 		}
 		// quick-261022-e2u (D-1/D-4): a KindMemNew (GMEM) is a PLACEHOLDER —
 		// anchored at SN -1 into the Prototype block, not scheduled. (The
-		// HI-02 exemption still governs KindMemNewSMem/KindFragNew, pinned by
-		// the pipeline fill test's buffer-at-SN-0 leg.)
+		// allocation non-membership likewise governs KindMemNewSMem/KindFragNew,
+		// pinned by the pipeline fill test's buffer-at-SN-0 leg.)
 		if buf.BasePtr().SchedSN() != ir.PrototypeSN || buf.BasePtr().SchedBlock() != k.Prototype {
 			t.Fatalf("GMEM allocation SN/block = %d/%p, want -1/Prototype (placeholder anchoring)", buf.BasePtr().SchedSN(), buf.BasePtr().SchedBlock())
 		}
@@ -712,22 +722,31 @@ func TestEffectfulNoHoist(t *testing.T) {
 }
 
 // TestBranchedNestRefusal pins HI-01 (quick-261022-b2m): two sibling loops
-// under one parent (both uniform and operand contained in the parent's body)
-// refuse fail-closed — byDepth would silently cross-product the siblings'
+// under one parent (both nested in it by the fix1.md D-b IV data-dep
+// relation — each sibling's bound references the outer IV) refuse
+// fail-closed — byDepth would silently cross-product the siblings'
 // iteration spaces. Mirrors tile-lower's F3 contract.
 func TestBranchedNestRefusal(t *testing.T) {
 	f := newFx("branched")
 	out2 := f.tensor("out2")
-	iv1, bound1 := f.dimVar()
-	st1 := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 1))
-	inner1 := f.g.NewForLoop("ctor", iv1, bound1, st1, f.loopAttrs(0, -1, 1)...)
-	iv2, bound2 := f.dimVar()
-	st2 := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 2))
-	inner2 := f.g.NewForLoop("ctor", iv2, bound2, st2, f.loopAttrs(0, -1, 1)...)
+	u32 := f.u32
 	ivO, boundO := f.dimVar()
-	both := f.g.NewBinOp("ctor", ir.BinOpAdd, inner1, inner2) // both siblings in one body closure
-	outer := f.g.NewForLoop("ctor", ivO, boundO, both, f.loopAttrs(1, -1, 1)...)
+	// Sibling 1: its bound references the outer IV (D-b nesting).
+	iv1 := f.g.NewDimVar("ctor", f.m, f.g.NewConst("ctor", u32, 0), f.g.NewConst("ctor", u32, 1))
+	bound1 := f.g.NewBoundedDimVar("ctor", iv1, f.g.NewBinOp("ctor", ir.BinOpAdd, ivO, f.g.NewConst("ctor", u32, 4)))
+	st1 := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{iv1}, f.g.NewConst("ctor", f.f32, 1))
+	inner1 := f.g.NewForLoop("ctor", iv1, bound1, f.loopAttrs(0, -1, 1)...)
+	// Sibling 2: same shape over a second dimvar (also IV-nested in outer).
+	iv2 := f.g.NewDimVar("ctor", f.m, f.g.NewConst("ctor", u32, 0), f.g.NewConst("ctor", u32, 1))
+	bound2 := f.g.NewBoundedDimVar("ctor", iv2, f.g.NewBinOp("ctor", ir.BinOpAdd, ivO, f.g.NewConst("ctor", u32, 4)))
+	st2 := f.g.NewMemStoreChained("ctor", f.env, out2, []ir.Node{iv2}, f.g.NewConst("ctor", f.f32, 2))
+	inner2 := f.g.NewForLoop("ctor", iv2, bound2, f.loopAttrs(0, -1, 1)...)
+	outer := f.g.NewForLoop("ctor", ivO, boundO, f.loopAttrs(1, -1, 1)...)
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out, out2}, outer)
+	_ = inner1
+	_ = inner2
+	_ = st1
+	_ = st2
 
 	err := (schedule.Scheduler{}).Run(nil, f.g)
 	if err == nil || !strings.Contains(err.Error(), "branched") {
@@ -768,8 +787,8 @@ func TestUnreachableForLoopRefusal(t *testing.T) {
 	f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, st)
 	// Debris: a plain (unchained) store under a ForLoop nothing roots at.
 	iv, bound := f.dimVar()
-	dst := f.g.NewMemStore("ctor", f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 2))
-	f.g.NewForLoop("ctor", iv, bound, dst)
+	f.g.NewMemStore("ctor", f.out, []ir.Node{f.m}, f.g.NewConst("ctor", f.f32, 2))
+	f.g.NewForLoop("ctor", iv, bound)
 
 	err := (schedule.Scheduler{}).Run(nil, f.g)
 	if err == nil || !strings.Contains(err.Error(), "not reachable from the sea roots") {
@@ -819,8 +838,8 @@ func TestSchedStateReset(t *testing.T) {
 		iv, bound := f.dimVar()
 		inv := f.g.NewBinOp("ctor", ir.BinOpMul, f.g.NewConst("ctor", f.f32, 3), f.g.NewConst("ctor", f.f32, 4))
 		varying := f.g.NewBinOp("ctor", ir.BinOpAdd, iv, inv)
-		st := f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, varying)
-		loop := f.g.NewForLoop("ctor", iv, bound, st, f.loopAttrs(2, 0, 32)...)
+		f.g.NewMemStoreChained("ctor", f.env, f.out, []ir.Node{f.m}, varying)
+		loop := f.g.NewForLoop("ctor", iv, bound, f.loopAttrs(2, 0, 32)...)
 		f.g.NewReturnChained("ctor", f.env, []ir.Node{f.out}, loop)
 		return f
 	}

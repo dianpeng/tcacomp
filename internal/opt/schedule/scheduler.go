@@ -17,7 +17,9 @@
 //     carrying its ruling citations. Behavior is byte-identical to the
 //     pre-refactor monolith (the test suites pin it unmodified).
 //   - nest.go — the forest adapter over the shared generic loopforest
-//     analysis + the pass-local body/reach placement derivations.
+//     analysis + the pass-local placement derivations (memberSetOf: the
+//     ONE IV-membership relation; completionCutOf: the C3 completion
+//     cut).
 //   - order.go — per-rank stable topological ordering.
 //   - net.go — the post-placement cross-block ordering net.
 //
@@ -36,19 +38,27 @@
 //     is never in a body node's dependency closure), and the iv is exactly
 //     what loop-varying index math depends on.
 //
-// PLACEMENT MODEL (quick-261022-b2m, replacing the old containment clamp
-// that review 261021-ta3 proved unsound — CR-01/CR-02): the clamp
-// "SN = min(propagated, deepest-enclosing-depth)" hoisted per-epoch SMEM
-// fills into the once-only prologue (fills are loop members via EFFECT
-// chains, which the operand-only containment ignored) and scheduled every
-// unenclosed consumer — reduction shapes, post-nest stores, every kernel's
-// end node — BEFORE its in-loop dependencies. The model is now:
+// PLACEMENT MODEL (quick-261022-b2m's no-clamp model, recast onto the
+// fix1.md sea model by quick-261024-sdk — the body/reach derivations and
+// the HI-02 floor pass are deleted; ONE relation everywhere):
 //
-//   - UNIFORM RELATION (user ruling): ImpactBy is treated IDENTICALLY to
-//     input edges throughout the scheduling model — propagation already
-//     maxes over DataDeps+EffectDeps, and the containment cap AND cluster
-//     ownership now use the same uniform closure (nest.go reachSetOf, the
-//     exact relation tiling's reachableFrom uses, lower_rewrite.go).
+//   - MEMBERSHIP (fix1.md §0): a node is inside loop L's iteration iff its
+//     data-dep closure references L's IV ("a use of L's IV is membership
+//     in L"), with ForLoop nodes OPAQUE to the walk — a reference TO a
+//     loop node is completion order, never a path to its IV. capOp, capUni,
+//     and cluster ownership all read this one relation (nest.go
+//     memberSetOf); propagation maxes over DataDeps+EffectDeps, so the
+//     effect chain is still treated identically to input edges.
+//   - COMPLETION CUT (C3): "def = ForLoop node → after whole loop" — a
+//     node whose data/effect closure TOUCHES a loop node, or that the end
+//     node's completion chain parks after a loop (NewReturnChained's
+//     trailing-operand order; P6 keeps "end.operand = final store"), is
+//     ordered AFTER that loop's whole nest: both caps are cut below the
+//     loop's depth (nest.go completionCutOf). This resolves D-c's
+//     incoherence — uses L's IV yet ordered after L — as AFTER, sending
+//     the end node, repointed post-nest stores, and kernel-level
+//     reduction consumers to the epilogue while their raw IV membership
+//     runs deep.
 //   - TWO-CASE PLACEMENT, NO CLAMP: SN <= capUni places AT SN (earliest
 //     legal point — SN 0 is the first prologue, LICM intact); SN > capUni
 //     places in the epilogue Group of the contributing nest — the deps
@@ -58,16 +68,14 @@
 //     post-nest consumers at the nest ROOT loop because "the ForLoop node
 //     as effect-def" denotes whole-loop completion), so real tile-lower
 //     output lands correctly by the uniform rule alone; hand-built
-//     fixtures with un-repointed in-body effect-defs (the review's hazard
-//     probes) land as epilogue nodes the same way.
-//   - EFFECTFUL FLOOR (HI-02): after the first fixpoint, a live
-//     memory-ACCESS node (EffectOf full, non-allocation) is floored at its
-//     OPERAND containment depth (capOp — data-invariant accesses stay in
-//     their operand-containing loop; pure invariants still hoist), then
-//     propagation re-runs so floors flow to consumers. ALLOCATIONS
-//     (MemNew/MemNewSMem/FragNew) are exempt: a buffer is a shared
-//     declaration consumed at multiple depths, and hoisting a declaration
-//     is semantics-preserving (the pin: the buffer lands at SN 0).
+//     fixtures park their after-nest consumers in the end chain the same
+//     way.
+//   - EFFECTFUL ACCESSES (HI-02, emergent — no separate floor pass): an
+//     epoch-varying access (the fill idiom — its coordinates reference
+//     the host IV) is a member whose SN already equals or exceeds its
+//     loop's depth by construction, so it lands in-loop; a fully
+//     invariant access references no IV, is unordered w.r.t. the loop,
+//     and legally hoists (fix1.md §0: ordering is dependency-only).
 //   - EPILOGUE STAMPING (ruling 6): epilogue nodes KEEP their propagated
 //     SN — the DEPTH REQUIREMENT — while the epilogue Group is the landing
 //     zone; SN and block are complementary, which is what final_lower's
@@ -142,10 +150,9 @@ func (Scheduler) Run(_ *opt.Context, g *ir.Graph) error {
 	if err := run.deriveForest(); err != nil { // SPEC STEP 0: loop-nest forest + shape gates
 		return err
 	}
-	run.anchorSchedule() // SPEC 3.1: loop headers + SN -1 prototype anchors
-	run.computeCaps()    // the operand/uniform containment caps
-	run.propagate()      // SPEC 3.2: SN max-propagation to fixpoint
-	run.applyEffectfulFloor()
+	run.anchorSchedule()                               // SPEC 3.1: loop headers + SN -1 prototype anchors
+	run.computeCaps()                                  // the IV-membership caps + C3 completion cuts
+	run.propagate()                                    // SPEC 3.2: SN max-propagation to fixpoint
 	run.classify()                                     // two-case: in-loop vs epilogue (no clamp)
 	run.assignOwnership()                              // in-loop cluster ownership
 	if err := run.resolveEpilogueHomes(); err != nil { // epilogue cluster homes

@@ -5,12 +5,30 @@
 // category spec. What stays here is what the analysis must NOT own:
 //
 //   - the forNest adapter shape the scheduler consumes (loop/parent/
-//     children/depth + the per-nest .body/.reach sets + the stamped block),
-//   - bodySetOf — the OPERAND-only body closure feeding capOp (the HI-02
-//     effectful floor),
-//   - reachSetOf — the UNIFORM closure (data + impact defs) feeding capUni
-//     and ownership (quick-261022-b2m CR-01: tile-lower makes SMEM fills
-//     loop members through effect chains, so containment must see them).
+//     children/depth + the per-nest .members set + the stamped block),
+//   - memberSetOf — the ONE membership relation (fix1.md §0/D-b/D-g):
+//     the non-loop nodes whose data-dep operand closure references the
+//     loop's IV dimvar ("a use of L's IV is membership in L"), with
+//     ForLoop nodes OPAQUE to the walk. It feeds BOTH containment caps
+//     (capOp, the HI-02 effectful floor's reference; capUni, the CR-01
+//     placement bound/ownership reference) — the old body-operand and
+//     uniform-effect-chain derivations are deleted with the body model
+//     (C4): the fill's epoch membership rides its coordinates' IV
+//     references (fix1.md §1.4), so the old effect-chain inclusion is
+//     subsumed by the IV relation.
+//   - completionCutOf — the C3 completion cut: a node whose data/effect
+//     closure TOUCHES a KindForLoop node ("def = ForLoop node → after
+//     whole loop") is ordered after that loop's whole nest, so its
+//     placement cap is cut below the loop's depth. This is D-c's
+//     incoherence form resolved: a node that references L's IV (a member
+//     by the relation above) yet is completion-ordered after L is AFTER
+//     L, never inside it — the end node and every repointed post-nest
+//     store place through this cut.
+//   - reduceCompletionCutOf — the fold-completion cut (§5.1): consumers
+//     of a KindReduce's whole-domain value order after every walk the
+//     fold reads through, so the piped-projection store family lands in
+//     the reduced nest's epilogue instead of inheriting the walk's
+//     membership depth through the fold (the rejected Option D).
 //
 // See the loopforest package header for the two rulings this file rides
 // on: membership-edges-only linking (D-04 — repointChains completion edges
@@ -20,6 +38,8 @@
 package schedule
 
 import (
+	"math"
+
 	"tcacomp/internal/analysis/loopforest"
 	"tcacomp/internal/ir"
 )
@@ -33,8 +53,7 @@ type forNest struct {
 	parent   *forNest         // nil for roots
 	children []*forNest       // loops nested in this one, allocation order
 	depth    int              // root = 1, child = parent + 1 (spec convention)
-	body     map[ir.Node]bool // body-operand subtree containment set (ops[2] walk over OperandsOf) — the HI-02 effectful floor (capOp)
-	reach    map[ir.Node]bool // UNIFORM containment set (ops[2] walk over DataDeps+ImpactBy defs, quick-261022-b2m CR-01) — placement cap and ownership
+	members  map[ir.Node]bool // IV-membership set (memberSetOf): both containment caps and ownership claims derive from it
 	block    *ir.ASTBlock     // the LBBN Loop block built for this node, stamped during scheduling
 }
 
@@ -46,7 +65,7 @@ type forNest struct {
 // Tree.Iter, parent/children from the tree links (allocation order
 // preserved by the mirror walk), depth = Tree.Depth + 1 (the single
 // adaptation point of the D-02 depth-base ruling), and the pass-local
-// .body/.reach closures computed here per nest. The KindIter gate in the
+// .members closure computed here per nest. The KindIter gate in the
 // scheduler's Run guarantees no HIR iters reach this forest; the analysis
 // would link them coherently regardless.
 //
@@ -58,11 +77,10 @@ func forLoopForest(g *ir.Graph) []*forNest {
 	var mirror func(t *loopforest.Tree, parent *forNest) *forNest
 	mirror = func(t *loopforest.Tree, parent *forNest) *forNest {
 		fn := &forNest{
-			loop:   t.Iter,
-			parent: parent,
-			depth:  t.Depth + 1, // D-02: analysis 0-based → scheduler 1-based
-			body:   bodySetOf(t.Iter),
-			reach:  reachSetOf(t.Iter),
+			loop:    t.Iter,
+			parent:  parent,
+			depth:   t.Depth + 1, // D-02: analysis 0-based → scheduler 1-based
+			members: memberSetOf(g, t.Iter),
 		}
 		for _, c := range t.Children { // allocation order, preserved
 			fn.children = append(fn.children, mirror(c, fn))
@@ -76,84 +94,173 @@ func forLoopForest(g *ir.Graph) []*forNest {
 	return roots
 }
 
-// bodySetOf computes the transitive operand-slot closure starting at n's
-// ops[2] (the loop body), allocation-visit order, cycle-guarded: the set
-// keyed by ir.Node identity answers body-containment questions
-// ("is x inside y's loop body") in O(1). Payload (ImpactBy) edges are not
-// part of the body-subtree relation — this is the OPERAND-only set the
-// HI-02 effectful floor consumes (capOp). Forest LINKING uses the same
-// relation, but that now lives in the shared analysis (its
-// membership-edges discipline, D-04).
-func bodySetOf(n ir.Node) map[ir.Node]bool {
+// memberSetOf computes the ONE membership relation (fix1.md §0/Step 5):
+// every allocated NON-LOOP node whose data-dep operand closure references
+// the loop's IV dimvar (ops[0]) — the same relation loopforest links
+// nesting with (D-b) and tiling's P6 inside-set re-derives (D-g).
+// Sea-of-nodes membership is implicit: "a node is inside a loop's
+// iteration because it uses an InductionVariable that references the
+// loop". Notes:
+//
+//   - KindForLoop nodes are excluded as candidates AND the closure walk
+//     treats them as opaque (referencesDataDep): a reference TO a loop
+//     node is completion ORDER (C3 — "def = ForLoop node → after whole
+//     loop"), never a path to its IV. Without the opacity the end node's
+//     operand (the loop itself) would transitively "reference" the IV and
+//     conflate whole-loop completion order with iteration membership.
+//   - Member sets are chain-nested on real nests: an inner op references
+//     the inner IV, whose index/dimvar operands close over the enclosing
+//     IVs (D-b's probe-verified round-base fact), so cap(n) — the max
+//     member depth — is the deepest loop n belongs to.
+//   - Erased nodes are skipped; the per-node closure test is
+//     cycle-guarded. O(N·E) per nest is documented as fine at v0 kernel
+//     scale (hundreds of nodes).
+func memberSetOf(g *ir.Graph, loop ir.Node) map[ir.Node]bool {
 	set := make(map[ir.Node]bool)
-	if n == nil {
+	if g == nil || loop == nil {
 		return set
 	}
-	ops := ir.OperandsOf(n)
-	if len(ops) < 3 || ops[2] == nil {
+	ops := ir.OperandsOf(loop)
+	if len(ops) == 0 || ops[0] == nil {
 		return set
 	}
-	var visit func(x ir.Node)
-	visit = func(x ir.Node) {
-		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
-			return
+	iv := ops[0]
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() == ir.KindForLoop {
+			continue
 		}
-		set[x] = true
-		for _, d := range ir.OperandsOf(x) {
-			visit(d)
+		if referencesDataDep(n, iv) {
+			set[n] = true
 		}
 	}
-	visit(ops[2])
 	return set
 }
 
-// reachSetOf computes the UNIFORM containment closure starting at n's ops[2]
-// (quick-261022-b2m, CR-01): identical to bodySetOf (cycle-guarded, starts
-// at the body operand, skips nil/erased) except the walk expands ir.DataDeps
-// AND ir.ImpactBy payload defs — the EXACT edge relation of tiling's
-// lowerRun.reachableFrom (lower_rewrite.go). USER PRINCIPLE, locked for this
-// task: the effect chain (ImpactBy) is treated IDENTICALLY to use-def/input
-// edges throughout the scheduling model. Tile-lower's cache insertion
-// (lower_cache.go PHASE 4, F8) places SMEM fills OUTSIDE the body-operand
-// subtree on purpose — the fill becomes a loop member through the
-// pass-built effect chains and re-executes per fill-key epoch — so an
-// operand-only containment set gives every fill cap 0 and the old clamp
-// hoisted multi-round fills into the once-only kernel prologue (stale SMEM
-// windows, wrong numerics). The uniform set makes the fill's cap the depth
-// of the deepest loop whose body reaches it through data OR impact edges:
-// it is an impact-predecessor of the in-body buffer access.
-//
-// NOTE the asymmetry with forest LINKING (D-04): placement containment is
-// UNIFORM (this set — a fill positioned by an effect chain belongs inside
-// its host loop), but nest STRUCTURE is membership-edges-only (a
-// completion edge to a foreign root must never nest two LNTs). The
-// distinction is edge-direction semantics: an impact-PREDECESSOR of an
-// in-body node is a same-iteration member; an impact edge AT a loop ROOT
-// is "after the whole loop".
-func reachSetOf(n ir.Node) map[ir.Node]bool {
-	set := make(map[ir.Node]bool)
-	if n == nil {
-		return set
+// referencesDataDep reports whether target lies in n's transitive
+// data-dep operand closure (cycle-guarded identity test over DataDeps).
+// ForLoop nodes are OPAQUE: the walk matches the loop itself but never
+// descends into its operands — completion-order references must not
+// reach through a loop to its IV (C3; see memberSetOf).
+func referencesDataDep(n, target ir.Node) bool {
+	if n == nil || target == nil {
+		return false
 	}
-	ops := ir.OperandsOf(n)
-	if len(ops) < 3 || ops[2] == nil {
-		return set
+	tid := target.BasePtr()
+	seen := make(map[ir.Node]bool)
+	var visit func(x ir.Node) bool
+	visit = func(x ir.Node) bool {
+		if x == nil || x.BasePtr() == nil || seen[x] {
+			return false
+		}
+		seen[x] = true
+		if x.KindOf() == ir.KindForLoop {
+			return x.BasePtr() == tid
+		}
+		if x.BasePtr() == tid {
+			return true
+		}
+		for _, d := range ir.DataDeps(x) {
+			if visit(d) {
+				return true
+			}
+		}
+		return false
 	}
+	return visit(n)
+}
+
+// completionCutOf returns n's C3 COMPLETION CUT (fix1.md C3/D-c): one
+// less than the depth of the SHALLOWEST loop whose KindForLoop node lies
+// in n's transitive data/effect closure — "def = ForLoop node → after
+// whole loop": a completion edge to L orders n after L's whole nest, so
+// no placement may put n in or under L. The walk treats loops as opaque
+// (the touch is the def itself, never a path through a loop to its IV),
+// making this exactly D-c's incoherence form — a node that references L's
+// IV (a member by memberSetOf) yet is completion-ordered after L —
+// resolved as AFTER, never inside. depthOf maps loop nodes to nest
+// depths; loops absent from it (dead debris) contribute nothing.
+// math.MaxInt means n touches no loop (no cut).
+func completionCutOf(n ir.Node, depthOf map[ir.Node]int) int {
+	cut := math.MaxInt
+	seen := make(map[ir.Node]bool)
 	var visit func(x ir.Node)
 	visit = func(x ir.Node) {
-		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+		if x == nil || x.BasePtr() == nil || seen[x] {
 			return
 		}
-		set[x] = true
+		seen[x] = true
+		if x.KindOf() == ir.KindForLoop {
+			if d, ok := depthOf[x]; ok && d-1 < cut {
+				cut = d - 1
+			}
+			return // opaque: the touch orders, it is never a path
+		}
 		for _, d := range ir.DataDeps(x) {
 			visit(d)
 		}
-		for _, u := range ir.ImpactBy(x) {
-			visit(u.Def())
+		for _, d := range ir.EffectDeps(x) {
+			visit(d)
 		}
 	}
-	visit(ops[2])
-	return set
+	visit(n)
+	return cut
+}
+
+// reduceCompletionCutOf returns n's FOLD-COMPLETION CUT (fix1.md §5.1's
+// "KindReduce inside the tile-inside walk, piped map and store at the
+// reduced nest's epilogue"): a KindReduce's value is a WHOLE-DOMAIN FOLD
+// — it has no per-iteration value, so every node whose data/effect
+// closure CONSUMES one is completion-ordered AFTER every walk the fold's
+// feeding chain reads through. The cut is one less than the SHALLOWEST
+// nest the reduce itself belongs to (reduceFloor maps each KindReduce to
+// that depth, derived in computeCaps from the very member sets the
+// membership relation produced). The REDUCE node itself is exempt — its
+// own closure contains no reduce — so it stays a full member placed at
+// its feeding walk (SN == cap), which is what §5.1's first clause pins;
+// only its consumers drop past every touched nest into the epilogue.
+// Every such consumer carries the folded value among its deps, so its
+// propagated SN already equals the walk depth — the cut can only move it
+// to the epilogue class, never reshuffle in-loop placement. Without this
+// cut the consumers inherit the walk's full membership depth through the
+// fold (SN == cap) and land INSIDE the reduced walk — fix1.md's rejected
+// Option D ("closure-extended store depth ... violating R-A. Recorded so
+// it is never retried"). math.MaxInt means n consumes no reduce.
+//
+// The walk mirrors completionCutOf's shape (ForLoop-opaque, data+effect),
+// descending THROUGH reduce nodes: a reduce-after-reduce chain contributes
+// every fold in the chain. Folds are recognized on the DESENT edges only —
+// the entry node itself is exempt (a reduce is not its own consumer).
+func reduceCompletionCutOf(n ir.Node, reduceFloor map[ir.Node]int) int {
+	cut := math.MaxInt
+	seen := make(map[ir.Node]bool)
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || seen[x] {
+			return
+		}
+		seen[x] = true
+		if x.KindOf() == ir.KindForLoop {
+			return // opaque, as in every ordering walk
+		}
+		for _, d := range ir.DataDeps(x) {
+			if d != nil && d.KindOf() == ir.KindReduce {
+				if fl, ok := reduceFloor[d]; ok && fl-1 < cut {
+					cut = fl - 1
+				}
+			}
+			visit(d)
+		}
+		for _, d := range ir.EffectDeps(x) {
+			if d != nil && d.KindOf() == ir.KindReduce {
+				if fl, ok := reduceFloor[d]; ok && fl-1 < cut {
+					cut = fl - 1
+				}
+			}
+			visit(d)
+		}
+	}
+	visit(n)
+	return cut
 }
 
 // allNests lists every forest tree in allocation order of its loop node —
