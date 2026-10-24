@@ -156,7 +156,7 @@ func (c *chain) checkOperand(op Operand) (ir.Node, ir.Type, error) {
 		return nil, nil, fmt.Errorf("map: tensor %q is not declared in this builder", t.name)
 	}
 	if len(op.axes) != len(t.dims) {
-		return nil, nil, fmt.Errorf("map: operand %s has %d subscripts for rank %d (structural indexing, syntax.md §4.1)",
+		return nil, nil, fmt.Errorf("map: operand %s has %d subscripts for rank %d (structural indexing, syntax-design.md §4.4 rule 9)",
 			t.name, len(op.axes), len(t.dims))
 	}
 	for i, ax := range op.axes {
@@ -177,7 +177,8 @@ func (c *chain) checkOperand(op Operand) (ir.Node, ir.Type, error) {
 
 // buildMapLambda validates the operands and the lambda, then invokes it with
 // fresh typed lambda parameters. piped selects the piped-map convention:
-// the incoming pipe is lambda argument 0 and the operands follow (§5.2).
+// the incoming pipe is lambda argument 0 and the operands follow
+// (syntax-design.md §2.6).
 // The map NODE is not constructed here — its `as` clause only exists at the
 // following As rung; RootAs/AfterMap hold the pieces until then.
 func (c *chain) buildMapLambda(ops []Operand, fn any, piped bool) (opNodes []ir.Node, params []ir.Node, body Expr, err error) {
@@ -293,7 +294,8 @@ func (c *chain) checkAsPermutation(dims []Dim, what string) error {
 	return nil
 }
 
-// checkAsExact validates a piped map's as clause (syntax.md §5.2, tca.md
+// checkAsExact validates a piped map's as clause (syntax-design.md §4.4
+// rule 11, tca.md
 // §2.7 rule 5): exactly the producer's as with the reduced axes removed, in
 // order — no permutation, no new axes, no resurrected reductions.
 func (c *chain) checkAsExact(dims []Dim, what string) error {
@@ -383,7 +385,7 @@ type RootMap struct {
 
 // Map constructs the root map's lambda over the operand accesses. The lambda
 // arity must equal the operand count; each operand supplies one scalar
-// lambda argument in source order (syntax.md §5.1). The map stage node is
+// lambda argument in source order (syntax-design.md §2.6). The map stage node is
 // built at the following As rung, where the mandatory as clause arrives.
 func (rm *RootMap) Map(ops []Operand, fn any) (*RootAs, error) {
 	c := rm.c
@@ -479,7 +481,7 @@ func (ar *AfterReduce) Reduce(init Expr, fn func(acc, v Expr) Expr) (*AfterReduc
 }
 
 // Map constructs a piped map: the previous stage's value is lambda argument
-// 0 and the explicit operands follow it (syntax.md §5.2). The lambda arity
+// 0 and the explicit operands follow it (syntax-design.md §2.6). The lambda arity
 // must be 1 + len(ops). The piped map's as clause arrives at the following
 // As rung.
 func (ar *AfterReduce) Map(ops []Operand, fn any) (*AfterMap, error) {
@@ -514,7 +516,7 @@ type AfterMap struct {
 }
 
 // As pins the piped map's mandatory as clause: exactly the producer's axis
-// order minus the reduced axes (syntax.md §5.2, tca.md §2.7 rule 5). The
+// order minus the reduced axes (syntax-design.md §4.4 rule 11, tca.md §2.7 rule 5). The
 // piped map renders as an empty iteration cluster, iter() -> map(...)
 // (doc/tca.md §5.1).
 func (am *AfterMap) As(dims ...Dim) *Tail {

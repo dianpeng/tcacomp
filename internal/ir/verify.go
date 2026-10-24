@@ -216,9 +216,16 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		}
 	case *paramRefNode:
 		if p := operandAt(t, 0); p != nil {
+			// An InputParam (kernel/dim/tensor/scalar/lambda symbol) or a
+			// MemNew allocation: pkg.Builder.Local backs `let`-locals with
+			// GMEM allocations, and a map operand references the local's
+			// def through a paramRef exactly like a parameter (syntax-
+			// design.md §6 Task 4).
 			if _, ok := p.(*inputParamNode); !ok {
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					"param operand 0 must be an InputParam node"))
+				if _, ok := p.(*memNewNode); !ok {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						"param operand 0 must be an InputParam node or a local MemNew allocation"))
+				}
 			}
 		}
 	case *iterClusterNode:
@@ -620,13 +627,22 @@ func checkAsPlacement(n Node, vs *[]Violation) {
 
 // checkTensorParam pins an HIR GMEM access's tensor operand to a RoleTensor
 // InputParam node (the kernel I/O symbol itself — the access axes are the
-// dim operands that follow).
+// dim operands that follow) or to a MemNew allocation (a pkg.Builder.Local
+// `let`-local — conceptually GMEM, so its allocation is a legitimate access
+// target, syntax-design.md §6 Task 4).
 func checkTensorParam(n Node, tensor Node, vs *[]Violation) {
 	if tensor == nil {
 		return
 	}
 	ip, ok := tensor.(*inputParamNode)
-	if !ok || ip.role != RoleTensor {
+	if !ok {
+		if _, ok := tensor.(*memNewNode); !ok {
+			*vs = append(*vs, nodeViolation(n, invUseDef,
+				"tensor operand must be a RoleTensor InputParam node or a local MemNew allocation"))
+		}
+		return
+	}
+	if ip.role != RoleTensor {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
 			"tensor operand must be a RoleTensor InputParam node"))
 	}

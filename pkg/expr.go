@@ -7,7 +7,7 @@ import (
 )
 
 // This file is the expr-builder DSL (D-09): typed scalar-expression handles
-// composed bottom-up, mirroring doc/syntax.md §6.2 operators 1:1 (same names,
+// composed bottom-up, mirroring doc/syntax-design.md §2.7 operators 1:1 (same names,
 // same operand typing rules) and re-rendering through the canonical printer.
 //
 // Pinned receiver shapes: binary/unary operators and literals are methods on
@@ -107,7 +107,7 @@ func isFloatElem(e ir.ElemType) bool {
 	return false
 }
 
-// Operand type classes per syntax.md §6.2. All Exprs are scalar by
+// Operand type classes per syntax-design.md §4.6 rule 17. All Exprs are scalar by
 // construction; the scalar check is defensive against future handle leaks.
 func isIntType(t ir.Type) bool {
 	nt := numericOf(t)
@@ -120,8 +120,6 @@ func isFloatType(t ir.Type) bool {
 }
 
 func isArithType(t ir.Type) bool { return isIntType(t) || isFloatType(t) }
-
-func isArithElem(e ir.ElemType) bool { return isIntElem(e) || isFloatElem(e) }
 
 func isBoolType(t ir.Type) bool {
 	nt := numericOf(t)
@@ -147,7 +145,7 @@ func (b *Builder) typedBinOp(op ir.BinOpCode, x, y Expr, class string) Expr {
 		return b.bad(fmt.Errorf("%s: operands come from a different builder", op))
 	}
 	if x.typ != y.typ {
-		return b.bad(fmt.Errorf("%s: operand types differ (%s vs %s); implicit promotions are not supported (syntax.md §6.2)",
+		return b.bad(fmt.Errorf("%s: operand types differ (%s vs %s); implicit promotions are not supported (syntax-design.md §4.6 rule 17)",
 			op, typeName(x.typ), typeName(y.typ)))
 	}
 	var result ir.Type
@@ -177,16 +175,16 @@ func (b *Builder) typedBinOp(op ir.BinOpCode, x, y Expr, class string) Expr {
 	return Expr{b: b, node: b.g.NewBinOp(origin, op, x.materialize(), y.materialize()), typ: result}
 }
 
-// Binary arithmetic, same-type operands, result of that type (§6.2).
+// Binary arithmetic, same-type operands, result of that type (§2.7).
 func (b *Builder) Add(x, y Expr) Expr { return b.typedBinOp(ir.BinOpAdd, x, y, classArith) }
 func (b *Builder) Sub(x, y Expr) Expr { return b.typedBinOp(ir.BinOpSub, x, y, classArith) }
 func (b *Builder) Mul(x, y Expr) Expr { return b.typedBinOp(ir.BinOpMul, x, y, classArith) }
 func (b *Builder) Div(x, y Expr) Expr { return b.typedBinOp(ir.BinOpDiv, x, y, classArith) }
 
-// Mod requires integer operands (§6.2: `%` is in the integer group).
+// Mod requires integer operands (§2.7: `%` is in the integer group).
 func (b *Builder) Mod(x, y Expr) Expr { return b.typedBinOp(ir.BinOpMod, x, y, classInt) }
 
-// Comparisons require same-type operands and return bool (§6.2).
+// Comparisons require same-type operands and return bool (§2.7).
 func (b *Builder) Eq(x, y Expr) Expr { return b.typedBinOp(ir.BinOpEq, x, y, classCmp) }
 func (b *Builder) Ne(x, y Expr) Expr { return b.typedBinOp(ir.BinOpNE, x, y, classCmp) }
 func (b *Builder) Lt(x, y Expr) Expr { return b.typedBinOp(ir.BinOpLT, x, y, classCmp) }
@@ -194,11 +192,11 @@ func (b *Builder) Le(x, y Expr) Expr { return b.typedBinOp(ir.BinOpLE, x, y, cla
 func (b *Builder) Gt(x, y Expr) Expr { return b.typedBinOp(ir.BinOpGT, x, y, classCmp) }
 func (b *Builder) Ge(x, y Expr) Expr { return b.typedBinOp(ir.BinOpGE, x, y, classCmp) }
 
-// And/Or require Boolean operands (§6.2).
+// And/Or require Boolean operands (§2.7).
 func (b *Builder) And(x, y Expr) Expr { return b.typedBinOp(ir.BinOpLAnd, x, y, classBool) }
 func (b *Builder) Or(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpLOr, x, y, classBool) }
 
-// Integer bitwise operators and shifts, same integer type (§6.2).
+// Integer bitwise operators and shifts, same integer type (§2.7).
 func (b *Builder) BitAnd(x, y Expr) Expr { return b.typedBinOp(ir.BinOpAnd, x, y, classInt) }
 func (b *Builder) BitOr(x, y Expr) Expr  { return b.typedBinOp(ir.BinOpOr, x, y, classInt) }
 func (b *Builder) BitXor(x, y Expr) Expr { return b.typedBinOp(ir.BinOpXor, x, y, classInt) }
@@ -232,13 +230,13 @@ func (b *Builder) typedUnary(op ir.UnaryOpCode, x Expr, class string) Expr {
 	return Expr{b: b, node: b.g.NewUnaryOp(origin, op, x.materialize()), typ: x.typ}
 }
 
-// Neg/Pos are arithmetic; Not is Boolean; BitsNot is integer (§6.2/§7.6).
+// Neg/Pos are arithmetic; Not is Boolean; BitsNot is integer (§2.7).
 func (b *Builder) Neg(x Expr) Expr     { return b.typedUnary(ir.UnaryOpNeg, x, classArith) }
 func (b *Builder) Pos(x Expr) Expr     { return b.typedUnary(ir.UnaryOpPos, x, classArith) }
 func (b *Builder) Not(x Expr) Expr     { return b.typedUnary(ir.UnaryOpLNot, x, classBool) }
 func (b *Builder) BitsNot(x Expr) Expr { return b.typedUnary(ir.UnaryOpNot, x, classInt) }
 
-// Scalar literals (§6.3): decimal integers are i32, trailing-u integers are
+// Scalar literals (syntax-design.md §4.6 rule 21): decimal integers are i32, trailing-u integers are
 // u32, floating literals are f32, true/false are bool. Unary minus is a
 // separate operator (Neg), never part of a literal.
 func (b *Builder) Float32(v float32) Expr {
@@ -265,11 +263,11 @@ func (b *Builder) Bool(v bool) Expr {
 	return Expr{b: b, node: b.g.NewConst(origin, t, f), typ: t}
 }
 
-// Select is the lazy conditional cond ? a : b (§6.2): the condition must be
+// Select is the lazy conditional cond ? a : b (§4.6 rule 18): the condition must be
 // Boolean and the branches identically typed. It is a package-level function
 // because it is self-contained — it adopts the builder shared by its
 // operands. The lazy select preserves C++-style conditional evaluation: an
-// unselected branch is not semantically evaluated (§6.2).
+// unselected branch is not semantically evaluated (§4.6 rule 18).
 func Select(cond, a, b Expr) Expr {
 	if err := firstErr(cond, a, b); err != nil {
 		return cond.b.bad(err)
@@ -287,42 +285,45 @@ func Select(cond, a, b Expr) Expr {
 	return Expr{b: a.b, node: a.b.g.NewSelect(origin, cond.materialize(), a.materialize(), b.materialize()), typ: a.typ}
 }
 
-// Cast is the explicit conversion to a named scalar type (§6.2: explicit
-// only, registry-checked pairs). The v0 cast registry lives here in the
-// builder DSL until the shared frontend/IR registry lands with the parser;
-// it admits arithmetic-to-arithmetic pairs only — no bool involvement, no
-// redundant identity casts.
+// Cast is the explicit conversion to a named scalar type (§4.6 rule 19: explicit
+// only, registry-checked pairs). The v0 cast registry is the SHARED table
+// ir.CastPairOK — the single source of truth the frontend semacheck consults
+// too — admitting arithmetic-to-arithmetic pairs only: no bool involvement,
+// no redundant identity casts.
 func Cast(e Expr, t ir.ElemType) Expr {
 	if err := firstErr(e); err != nil {
 		return e.b.bad(err)
 	}
 	target := ir.InternScalar(t)
-	if !isArithType(e.typ) || !isArithElem(t) {
-		return e.b.bad(fmt.Errorf("cast: pair %s -> %s is not in the v0 cast registry (arithmetic-to-arithmetic only)",
-			typeName(e.typ), t))
-	}
 	if nt := numericOf(e.typ); nt != nil && nt.Elem() == t {
 		return e.b.bad(fmt.Errorf("cast: redundant cast to %s", t))
+	}
+	if nt := numericOf(e.typ); nt == nil || !ir.CastPairOK(nt.Elem(), t) {
+		return e.b.bad(fmt.Errorf("cast: pair %s -> %s is not in the v0 cast registry (arithmetic-to-arithmetic only)",
+			typeName(e.typ), t))
 	}
 	return Expr{b: e.b, node: e.b.g.NewCast(origin, target, e.materialize()), typ: target}
 }
 
 // Call resolves a registered pure builtin against its pinned signature
-// (§6.4): the name must be registered (the signature table lives in
+// (§4.6 rule 20): the name must be registered (the signature table lives in
 // internal/ir's Builtin registry — the single source of truth shared with
-// the type-inference pass) and every argument must be f32. It is a
-// package-level function because it is self-contained — it adopts the
-// builder shared by its arguments.
+// the type-inference pass) and every argument must match the signature's
+// argument element type; the result carries the signature's result type
+// (the f32 family takes f32; umin/umax take u32). It is a package-level
+// function because it is self-contained — it adopts the builder shared by
+// its arguments.
 func Call(name string, args ...Expr) (Expr, error) {
 	sig, ok := ir.Builtin(name)
 	if !ok {
 		return Expr{}, fmt.Errorf("function %s is not a registered pure scalar builtin", name)
 	}
 	if len(args) != sig.Arity {
-		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s) of type f32, got %d", name, sig.Arity, len(args))
+		return Expr{}, fmt.Errorf("builtin %s expects %d argument(s), got %d", name, sig.Arity, len(args))
 	}
 	b := args[0].b
-	f32 := ir.InternScalar(ir.TF32)
+	argType := ir.InternScalar(sig.Arg)
+	resultType := ir.InternScalar(sig.Result)
 	nodes := make([]ir.Node, len(args))
 	for i, a := range args {
 		if a.err != nil {
@@ -331,10 +332,10 @@ func Call(name string, args ...Expr) (Expr, error) {
 		if a.b != b {
 			return Expr{}, fmt.Errorf("call %s: argument %d comes from a different builder", name, i)
 		}
-		if a.typ != f32 {
-			return Expr{}, fmt.Errorf("call %s: argument %d must be f32, got %s", name, i, typeName(a.typ))
+		if a.typ != argType {
+			return Expr{}, fmt.Errorf("call %s: argument %d must be %s, got %s", name, i, sig.Arg, typeName(a.typ))
 		}
 		nodes[i] = a.materialize()
 	}
-	return Expr{b: b, node: b.g.NewCall(origin, name, nodes...), typ: f32}, nil
+	return Expr{b: b, node: b.g.NewCall(origin, name, nodes...), typ: resultType}, nil
 }

@@ -1,0 +1,17 @@
+module
+  include "tca-common.tca"
+  runtime (cxx_path="runtime/tca_runtime.h")
+  annotation @name (cxx="MatMulScale")
+  kernel matmul_scale
+    param lhs tensor<f32,[M,N]>
+    param rhs tensor<f32,[N,Q]>
+    param scale f32
+    ret tensor<f32,[M,Q]>
+    dimvar a b c
+    let output
+      map on(lhs[a][b], rhs[b][c]) as(a,b,c)
+        (l:f32, r:f32) -> f32: (* name(l) name(r))
+      reduce(init=0.0f) on(acc:f32, %0:f32) as(a,c) -> f32: (+ name(acc) %0)
+      map on()
+        [scale] (v:f32) -> f32: (* name(v) name(scale))
+    return output
