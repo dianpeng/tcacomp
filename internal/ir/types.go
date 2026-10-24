@@ -6,8 +6,8 @@ import (
 	"slices"
 )
 
-// ElemType is the IR scalar element type set, mirroring doc/syntax.md §3.3
-// (f8 is intentionally absent: its concrete formats are unspecified).
+// ElemType is the IR scalar element type set, mirroring doc/syntax-design.md
+// §2.4 (f8 is intentionally absent: its concrete formats are unspecified).
 type ElemType int
 
 const (

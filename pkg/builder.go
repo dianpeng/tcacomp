@@ -111,7 +111,7 @@ func (o Operand) Axes() []Dim { return append([]Dim(nil), o.axes...) }
 // At binds axes to a tensor as one structural access (D-08). The binding is
 // validated eagerly by the consuming rung: subscript count must equal the
 // tensor rank and subscript i must bind the tensor's dim i (structural
-// indexing, syntax.md §4.1).
+// indexing, syntax-design.md §4.4 rule 9).
 func At(t Tensor, axes ...Dim) Operand {
 	return Operand{t: t, axes: append([]Dim(nil), axes...)}
 }
@@ -206,7 +206,7 @@ func (b *Builder) Tensor(name string, elem ir.ElemType, dims ...Dim) Tensor {
 }
 
 // ScalarParam declares an explicit scalar dependency and returns its typed
-// expression handle. The [scale] capture of syntax.md §6.1 becomes an SSA
+// expression handle. The [scale] capture of syntax-design.md §4.5 rule 14 becomes an SSA
 // operand of the expression graph through this reference. The handle is
 // lazy: its paramRef node materializes on first use (see Expr.materialize)
 // so scalar declarations never consume graph IDs ahead of the

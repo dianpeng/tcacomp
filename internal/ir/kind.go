@@ -47,7 +47,7 @@ const (
 	KindIterCluster // loop: compound iter(@m, @k, @n) header (dims payload, inputs...)
 	KindConst       // scalar-expr: typed constant
 	KindParam       // scalar-expr: lambda parameter reference
-	KindBinOp       // scalar-expr: binary op (opcode table mirrors syntax.md §7.6)
+	KindBinOp       // scalar-expr: binary op (opcode table mirrors syntax-design.md §2.7)
 	KindUnaryOp     // scalar-expr: unary op
 	KindSelect      // scalar-expr: typed conditional ?:
 	KindCast        // scalar-expr: explicit cast to named type

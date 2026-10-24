@@ -6,7 +6,7 @@ import "testing"
 // (quick-261019-tu3 Task 1): the single source of truth moved from
 // pkg/expr.go's pureBuiltins table, consulted by pkg.Call and the
 // typeinfer pass alike. Every entry is (f32, ...f32) -> f32 per
-// syntax.md §6.4, EXCEPT the u32 min/max pair quick-261021-jay added for
+// syntax-design.md §4.6 rule 20, EXCEPT the u32 min/max pair quick-261021-jay added for
 // the tile-lower pass's materialized bounds (doc/optana/loop_tile_lower.md
 // §3's integer-bounds recipe).
 

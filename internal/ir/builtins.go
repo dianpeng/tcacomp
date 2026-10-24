@@ -5,7 +5,7 @@ package ir
 // inference pass (internal/opt/typeinfer), moved here from pkg/expr.go's
 // local pureBuiltins table (quick-261019-tu3 Task 1) so the pass layer never
 // duplicates the table. Almost every entry is (f32, ...f32) -> f32 with the
-// exact arity syntax.md §6.4 pins; the ONE exception is the u32 min/max
+// exact arity syntax-design.md §4.6 rule 20 pins; the ONE exception is the u32 min/max
 // pair (quick-261021-jay, doc/optana/loop_tile_lower.md §3's integer-bounds
 // recipe — the tile-lower pass's materialized tile_max = umin(T, extent −
 // offset) needs it); anything else — memory access, synchronization,
@@ -20,7 +20,8 @@ type BuiltinSignature struct {
 	Arg, Result ElemType // argument and result element types
 }
 
-// builtins is the registry proper (syntax.md §6.4 + the u32 min/max pair).
+// builtins is the registry proper (syntax-design.md §4.6 rule 20 + the u32
+// min/max pair).
 var builtins = map[string]BuiltinSignature{
 	"expf": {1, TF32, TF32}, "logf": {1, TF32, TF32},
 	"sqrtf": {1, TF32, TF32}, "rsqrtf": {1, TF32, TF32},
