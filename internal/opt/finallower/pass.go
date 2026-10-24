@@ -198,6 +198,14 @@ type lowering struct {
 	gridOf    map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeGridMapping
 	threadOf  map[*ir.ASTLNT]ir.Node      // per-LNT RuntimeThreadMapping
 	dissolved []dissolveJob               // R3: between loops dissolved by the element-loop restructure
+	// rebuildMemo is the CURRENT reduce's between-IV rebuild session (reset
+	// per lowerReduce): original def → rebuilt clone. One clone per shared
+	// def per SESSION — the in-nest walk (the load) and the moved epilogue
+	// consumers (the store) read the SAME rebuilt spine, keeping the spine
+	// inside the defining loops' operand closures (the loop-scope
+	// invariant's containment notion); per-user clones would mint a
+	// store-private spine outside every closure.
+	rebuildMemo map[ir.Node]ir.Node
 }
 
 // dissolveJob is one dissolved between loop awaiting disposal (R3): its

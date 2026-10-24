@@ -232,6 +232,9 @@ func TestFeasibilityBounds(t *testing.T) {
 	t.Run("minimal warp budget", func(t *testing.T) {
 		p := DefaultParams()
 		p.MaxThreadsPerCTA = PortionWarp * 32 // eight warps: the assert-and-trap minimum
+		// HI-03 gate 1: at 256 threads the auto coupled walk is 128 threads,
+		// so the tile set must stay <= 128 to remain a legal Params surface.
+		p.TileSizes = []int{32, 64, 128}
 		rec := runPass(t, fx.g, p)
 		f := feasibilityOf(rec)
 		if f.warpSum*32 > PortionWarp*32 {
@@ -545,6 +548,10 @@ func TestCoupledPortionFloor(t *testing.T) {
 	t.Run("verify rejects starved record", func(t *testing.T) {
 		q := p
 		q.WarpPortion = 7 // floor-legal: 8-7 = 1 coupled portion
+		// HI-03 gate 1: at WarpPortion 7 the coupled walk is (8-7)x2x32 = 64
+		// threads, so the tile set must stay <= 64 to reach the record-level
+		// F2 check this subtest pins.
+		q.TileSizes = []int{32, 64}
 		cache, rec := runDecide(t, fx.g, q)
 		// Corrupt the record into a starved warp allocation: flip one
 		// non-CTA iter to WARP at the full 8 portions — the coupled walk

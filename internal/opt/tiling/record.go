@@ -404,7 +404,10 @@ func DefaultParams() Params {
 // 256-thread minimum). WarpPortion must be a legal portion ([0,
 // PortionWarp], 0 = auto); the remaining bounds must be positive; the tile
 // list must be non-empty with positive entries (a non-positive tile would
-// poison the arithmetic).
+// poison the arithmetic) and, when the auto warp portion leaves a coupled
+// inside walk, no entry may exceed that walk's thread count (HI-03 gate 1:
+// tile > coupledThreads turns the single-owner flat-init walk into a
+// double-writer race).
 func (p Params) Validate() error {
 	if p.MaxCTA <= 0 || p.MaxCTA%PortionCTA != 0 {
 		return fmt.Errorf("tiling: MaxCTA %d must be a positive multiple of PortionCTA %d (the runtime assert-and-trap pre-condition)", p.MaxCTA, PortionCTA)
@@ -439,6 +442,30 @@ func (p Params) Validate() error {
 	for _, v := range p.TileSizes {
 		if v < 1 {
 			return fmt.Errorf("tiling: TileSizes contains non-positive entry %d", v)
+		}
+	}
+	// HI-03 gate 1 (2026-10-24 ruling): a CTA dim's tile must not exceed the
+	// coupled inside walk's thread count — the flat-init coupled walk
+	// (init = the flat thread rank, step = coupledThreads) is single-owner
+	// exact only while tile <= coupled; any larger tile makes every element
+	// at rank >= coupled walked by TWO threads (a write-write race, not a
+	// perf bug). The resolution mirrors lower_rewrite.go coupledThreads():
+	// warpPortion auto = AutoWarpPortion, the binding case per the searcher's
+	// CTA-carrying fallback. When coupled == 0 (WarpPortion == PortionWarp)
+	// the tile comparison is skipped — the F2 floor owns that configuration's
+	// error with its clearer message. DefaultParams' max tile 256 == coupled
+	// 256 stays valid.
+	warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
+	warpPortion := p.WarpPortion
+	if warpPortion == 0 {
+		warpPortion = AutoWarpPortion
+	}
+	if coupled := (PortionWarp - warpPortion) * warpsPerPortion * 32; coupled > 0 {
+		for _, v := range p.TileSizes {
+			if v > coupled {
+				return fmt.Errorf("tiling: TileSizes entry %d exceeds the CTA-coupled inside walk's thread count %d — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (the assert-and-trap family; tiling-verify and the tile-lower rewrite re-check this)",
+					v, coupled)
+			}
 		}
 	}
 	return nil
