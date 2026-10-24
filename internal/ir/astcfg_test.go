@@ -23,7 +23,7 @@ func forLoopWithAttrs(t *testing.T, g *Graph, soc, dosoc, loc float64) Node {
 	socA := g.NewKeyedAttribute("ctor", "soc", g.NewConst("ctor", u32, soc))
 	dosocA := g.NewKeyedAttribute("ctor", "dosoc", g.NewConst("ctor", u32, dosoc))
 	locA := g.NewKeyedAttribute("ctor", "loc", g.NewConst("ctor", u32, loc))
-	return g.NewForLoop("ctor", iv, bound, g.NewConst("ctor", u32, 0), socA, dosocA, locA)
+	return g.NewForLoop("ctor", iv, bound, socA, dosocA, locA)
 }
 
 func TestASTGroupKind(t *testing.T) {
@@ -102,8 +102,7 @@ func TestASTLoopNoAttrsDefault(t *testing.T) {
 	u32 := InternScalar(TU32)
 	dim := g.NewInputParam("ctor", RoleDim, "d", nil)
 	iv := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
-	loop := g.NewForLoop("ctor", iv, g.NewBoundedDimVar("ctor", iv, g.NewConst("ctor", u32, 8)),
-		g.NewConst("ctor", u32, 0))
+	loop := g.NewForLoop("ctor", iv, g.NewBoundedDimVar("ctor", iv, g.NewConst("ctor", u32, 8)))
 	blk, err := NewASTLoop(loop)
 	if err != nil {
 		t.Fatalf("NewASTLoop on an attrs-less loop = %v", err)
@@ -135,7 +134,7 @@ func forLoopWithNonConstAttr(t *testing.T, g *Graph, key string) Node {
 	bound := g.NewBoundedDimVar("ctor", iv, g.NewConst("ctor", u32, 8))
 	socA := g.NewKeyedAttribute("ctor", "soc", g.NewConst("ctor", u32, 1))
 	nc := g.NewBinOp("ctor", BinOpAdd, g.NewConst("ctor", u32, 1), g.NewConst("ctor", u32, 2))
-	return g.NewForLoop("ctor", iv, bound, g.NewConst("ctor", u32, 0), socA,
+	return g.NewForLoop("ctor", iv, bound, socA,
 		g.NewKeyedAttribute("ctor", key, nc))
 }
 

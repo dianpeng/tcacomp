@@ -30,15 +30,14 @@ const (
 	invUseDef = "use-def" // every operand handle resolves to a live def of a known kind
 	invDefUse = "def-use" // every def's ref list matches the operand slots that own its records
 
-	// invLoopScope is the loop-IV scoping invariant: a live ForLoop's dimvar
-	// may be used only by the loop's own operand structure (its iv/bound/body
-	// edges) or by nodes reachable from its body operand subtree — the
-	// CR-02/HI-01/HI-02/ME-03 leakage class of the 261021-mlx review.
-	invLoopScope = "loop-scope"
 	// invLoopStep is the positive-step invariant: a live ForLoop's dimvar
 	// step must be a positive constant (HI-04's IR-level backstop —
 	// tiling-verify checks the tiling records; this is the graph itself).
 	invLoopStep = "loop-step"
+	// (invLoopScope deleted — fix1.md D-c ruling: with no body operand,
+	// the containment-based scoping check is vacuous. The tiling §8 SCOPE
+	// check (coordinates reference only enclosing loops) guards the
+	// placement-level hazard; membership is via IV references.)
 )
 
 // Verify runs both chain-consistency checkers plus the loop-structure
@@ -268,11 +267,12 @@ func checkNodeShape(n Node, vs *[]Violation) {
 					"for-loop operand 0 must be a dimvar"))
 			}
 		}
-		// M1 (quick-261021-jay): trailing operands beyond (iv, bound, body)
+		// M1 (quick-261021-jay): trailing operands beyond (iv, bound)
 		// are KeyedAttribute annotations — the tile-lower pass's soc/dosoc/
 		// loc materialization metadata. Anything else is a shape violation.
+		// (No body operand: sea-of-nodes ruling, fix1.md §0.)
 		for i, op := range OperandsOf(t) {
-			if i < 3 || op == nil {
+			if i < 2 || op == nil {
 				continue // the generic slot check owns nil operands
 			}
 			if _, ok := op.(*keyedAttributeNode); !ok {
@@ -781,37 +781,24 @@ func varNode(v *SSAVar) Node {
 	return v.node
 }
 
-// checkLoopInvariants enforces the two LIR loop invariants over every live
+// checkLoopInvariants enforces the LIR loop invariants over every live
 // ForLoop the walk visited, in walk order (deterministic):
 //
-//   - loop-scope (the CR-02/HI-01/HI-02/ME-03 leakage class, quick-261021-o61
-//     T4): every use of a live ForLoop's IV dimvar must belong to the loop's
-//     own operand structure — the loop node itself plus everything reachable
-//     from its operand and payload edges (the iv/bound/body slots: the
-//     bound's BoundedDimVar wrapper, the body operand subtree with nested
-//     loops AND their bounds, and the construction-time effect chains hanging
-//     off body nodes — the same operand+payload reachability tile-lower's §8
-//     fill-placement check computes). A use from a sibling subtree, from
-//     outside every loop, or from a branch that does not sit under the
-//     defining loop reads an induction value that is not defined at the
-//     use's position. Containment is the Level-1 sea's STRUCTURAL notion
-//     (the child-edge walk), never materialized statement order.
 //   - loop-step (HI-04's IR-level half): the dimvar's step operand must be a
 //     constant > 0 — a zero or negative stride is an infinite or backwards
 //     loop, and a non-constant step has no materializable round stride.
 //
+// (loop-scope deleted by fix1.md D-c ruling: with no body operand, the
+// containment-based scoping check is vacuous. The tiling §8 SCOPE check
+// guards the placement-level hazard; membership is via IV references.)
+//
 // Users the walk never reached are skipped (dead-subgraph bookkeeping, the
 // checkDefUse precedent), as are erased/detached users.
 func checkLoopInvariants(nodes []Node, vs *[]Violation) {
-	walked := make(map[Node]bool, len(nodes))
-	for _, n := range nodes {
-		walked[n] = true
-	}
 	for _, n := range nodes {
 		if n.KindOf() != KindForLoop {
 			continue
 		}
-		checkLoopScope(n, walked, vs)
 		checkLoopStep(n, vs)
 	}
 }
@@ -827,29 +814,9 @@ func forLoopIV(loop Node) *dimVarNode {
 	return dv
 }
 
-// checkLoopScope enforces loop-scope for one live ForLoop: every live use of
-// its IV dimvar must be held by the loop itself or by a node inside its
-// operand/payload closure. The diagnostic names the loop, the dimvar, the
-// offending user node, and the offending use's slot.
-func checkLoopScope(loop Node, walked map[Node]bool, vs *[]Violation) {
-	dv := forLoopIV(loop)
-	if dv == nil {
-		return
-	}
-	allowed := childClosure(loop)
-	for _, u := range UsesOf(dv) {
-		user := u.User()
-		if user == nil || user.BasePtr() == nil || user.BasePtr().Erased() || !walked[user] {
-			continue // erased/detached, or dead-subgraph bookkeeping
-		}
-		if allowed[user] {
-			continue
-		}
-		*vs = append(*vs, nodeViolation(user, invLoopScope,
-			fmt.Sprintf("for-loop node %d's dimvar node %d is used by node %d (%s) at its %s, outside the loop's body operand subtree — a loop's induction variable may only be used by the loop's own structure or by nodes inside its body",
-				loop.BasePtr().id, dv.BasePtr().id, user.BasePtr().id, user.KindOf(), useSlotOf(user, dv))))
-	}
-}
+// (checkLoopScope deleted — fix1.md D-c ruling: with no body operand, the
+// containment-based scoping check is vacuous. The tiling §8 SCOPE check
+// guards the placement-level hazard; membership is via IV references.)
 
 // checkLoopStep enforces loop-step for one live ForLoop: its dimvar's step
 // operand must be a positive constant.

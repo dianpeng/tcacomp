@@ -69,7 +69,7 @@ const (
 
 	// --- LIR tier (D-3): the lowered suite introduced by optimization passes ---
 
-	KindForLoop           // lowered loop nest over a bounded dimvar (iv, bound, body)
+	KindForLoop           // lowered loop nest over a bounded dimvar (iv, bound, attrs...) — no body operand (sea-of-nodes: loops are control-flow, no direct link to expressions)
 	KindDimVar            // lowered induction variable, an (init, step) value object
 	KindBoundedDimVar     // lowered dimvar bound to a max — ((iv tuple), Max)
 	KindMemLoadSMem       // lowered SMEM load (src smem buffer, bivs...)

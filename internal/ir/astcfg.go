@@ -288,8 +288,8 @@ func NewASTLoop(loop Node) (*ASTBlock, error) {
 			loop.KindOf(), loop.BasePtr().ID())
 	}
 	ops := OperandsOf(loop)
-	if len(ops) < 3 {
-		return nil, fmt.Errorf("ir: for-loop node %d carries %d operands, want >= 3 (iv, bound, body)",
+	if len(ops) < 2 {
+		return nil, fmt.Errorf("ir: for-loop node %d carries %d operands, want >= 2 (iv, bound)",
 			loop.BasePtr().ID(), len(ops))
 	}
 	blk := &ASTBlock{
@@ -300,7 +300,9 @@ func NewASTLoop(loop Node) (*ASTBlock, error) {
 		dosoc: -1,
 		loc:   1,
 	}
-	for _, attr := range ops[3:] {
+	// Sea-of-nodes (fix1.md §0): ForLoop has no body operand. Trailing
+	// operands after (iv, bound) are all KeyedAttribute annotations.
+	for _, attr := range ops[2:] {
 		if attr == nil || attr.KindOf() != KindKeyedAttribute {
 			continue
 		}

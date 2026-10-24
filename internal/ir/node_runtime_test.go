@@ -521,9 +521,10 @@ func TestRuntimeObjectValueNumbering(t *testing.T) {
 	}
 }
 
-// TestForLoopAnnotations pins P3/M1: trailing KeyedAttribute annotations
-// verify clean, a trailing non-annotation operand is a shape violation, and
-// the legacy three-operand shape still verifies.
+// TestForLoopAnnotations pins M1: trailing KeyedAttribute annotations
+// verify clean (sea-of-nodes: no body operand — fix1.md §0), a trailing
+// non-annotation operand is a shape violation, and the bare two-operand
+// shape (iv, bound, no attrs) still verifies.
 func TestForLoopAnnotations(t *testing.T) {
 	annotated := func() *Graph {
 		g := NewGraph("annot")
@@ -532,7 +533,7 @@ func TestForLoopAnnotations(t *testing.T) {
 		bdv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", InternScalar(TF32), 8))
 		soc := g.NewKeyedAttribute("ctor", "soc", u32const(g, 1))
 		loc := g.NewKeyedAttribute("ctor", "loc", u32const(g, 100))
-		fl := g.NewForLoop("ctor", dv, bdv, u32const(g, 0), soc, loc)
+		fl := g.NewForLoop("ctor", dv, bdv, soc, loc)
 		g.NewReturn("ctor", fl) // anchor
 		return g
 	}
@@ -540,17 +541,17 @@ func TestForLoopAnnotations(t *testing.T) {
 		t.Fatalf("annotated for-loop must verify clean, got %v", vs)
 	}
 
-	legacy := func() *Graph {
-		g := NewGraph("legacy")
+	bare := func() *Graph {
+		g := NewGraph("bare")
 		m := g.NewInputParam("ctor", RoleDim, "m", nil)
 		dv := g.NewDimVar("ctor", m, g.NewConst("ctor", InternScalar(TF32), 0), g.NewConst("ctor", InternScalar(TF32), 1))
 		bdv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", InternScalar(TF32), 8))
-		fl := g.NewForLoop("ctor", dv, bdv, u32const(g, 0))
+		fl := g.NewForLoop("ctor", dv, bdv)
 		g.NewReturn("ctor", fl) // anchor
 		return g
 	}
-	if vs := Verify(legacy()); len(vs) != 0 {
-		t.Fatalf("legacy three-operand for-loop must verify clean, got %v", vs)
+	if vs := Verify(bare()); len(vs) != 0 {
+		t.Fatalf("bare two-operand for-loop must verify clean, got %v", vs)
 	}
 
 	badTrailing := func() *Graph {
@@ -558,7 +559,7 @@ func TestForLoopAnnotations(t *testing.T) {
 		m := g.NewInputParam("ctor", RoleDim, "m", nil)
 		dv := g.NewDimVar("ctor", m, g.NewConst("ctor", InternScalar(TF32), 0), g.NewConst("ctor", InternScalar(TF32), 1))
 		bdv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", InternScalar(TF32), 8))
-		fl := g.NewForLoop("ctor", dv, bdv, u32const(g, 0), g.NewConst("ctor", InternScalar(TU32), 0))
+		fl := g.NewForLoop("ctor", dv, bdv, g.NewConst("ctor", InternScalar(TU32), 0))
 		g.NewReturn("ctor", fl) // anchor
 		return g
 	}

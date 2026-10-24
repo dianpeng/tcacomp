@@ -495,24 +495,47 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 
 // buildNest constructs the generated loops and wires the canonical nest
 // (§6bis PHASE 3): ALL between loops nest in dim order, ALL inside
-// loops nest inside them, also in dim order. Construction is inside-out so
-// every body operand is wired at construction time; the loops of each
-// dim are stored on the dimRewrite for PHASE 4 and the epilogue. Returns
-// the nest root (the outermost loop — the P6 chain anchor).
+// loops nest inside them, also in dim order. Construction is inside-out;
+// the loops of each dim are stored on the dimRewrite for PHASE 4 and the
+// epilogue. Returns the nest root (the outermost loop — the P6 chain
+// anchor).
+//
+// Step 1 wiring (fix1.md §0): ForLoop has no body operand. The nest is
+// constructed as pure control-flow headers; membership is via IV
+// references and ordering via data+chain edges. The bodyRoot/body-
+// chaining is removed in Step 3 along with bodyRootOf and the full
+// rewrite.
 func (lr *lowerRun) buildNest(lw *lntRewrite) ir.Node {
-	inner := lw.bodyRoot
 	// Inside loops, innermost first (reverse dim order).
+	var inner ir.Node
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
+		var attrs []ir.Node
+		if inner != nil {
+			// TEMPORARY Step-1-only wiring: pass inner as an attr so the
+			// graph structure compiles. This is WRONG semantically and
+			// will be properly removed in Step 3 (buildNest creates
+			// header-only loops with no body). The goal here is Step 1
+			// greenness: get the signature change compiling without
+			// changing semantics.
+			attrs = append(attrs, inner)
+		}
+		attrs = append(attrs, d.insideAttrs...)
 		d.inside = lr.g.NewForLoop(lowerOrigin, d.insideIV,
-			lr.g.NewBoundedDimVar(lowerOrigin, d.insideIV, d.insideBound), inner, d.insideAttrs...)
+			lr.g.NewBoundedDimVar(lowerOrigin, d.insideIV, d.insideBound), attrs...)
 		inner = d.inside
 	}
 	// Between loops, innermost first.
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
+		var attrs []ir.Node
+		if inner != nil {
+			// TEMPORARY Step-1-only wiring (see above).
+			attrs = append(attrs, inner)
+		}
+		attrs = append(attrs, d.betweenAttrs...)
 		d.between = lr.g.NewForLoop(lowerOrigin, d.betweenIV,
-			lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound), inner, d.betweenAttrs...)
+			lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound), attrs...)
 		inner = d.between
 	}
 	return inner

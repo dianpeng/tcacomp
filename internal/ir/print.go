@@ -318,7 +318,9 @@ func pipeInput(n Node) Node {
 	case KindMemStoreSMem, KindFragStore:
 		next = opAt(n, 0) // the stored value
 	case KindForLoop:
-		next = opAt(n, 2) // the body
+		// no body operand (sea-of-nodes ruling, fix1.md §0): forloops
+		// are control-flow nodes, never a chain stage themselves.
+		next = nil
 	}
 	if isStage(next) {
 		return next
@@ -557,12 +559,12 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(r.value(opAt(t, 0)))
 		b.WriteString(" in ")
 		b.WriteString(r.value(opAt(t, 1)))
-		b.WriteString(") ")
-		b.WriteString(r.value(opAt(t, 2)))
+		b.WriteString(")")
 		// M1 trailing annotations (quick-261021-jay): the tile-lower
 		// pass's soc/dosoc/loc KeyedAttribute inputs render after the
-		// body, each through the keyedattribute value rendering.
-		for i := 3; i < len(OperandsOf(t)); i++ {
+		// loop header, each through the keyedattribute value rendering.
+		// No body operand (sea-of-nodes ruling, fix1.md §0).
+		for i := 2; i < len(OperandsOf(t)); i++ {
 			b.WriteString(" ")
 			b.WriteString(r.value(operandAt(t, i)))
 		}

@@ -124,7 +124,7 @@ func TestDimvarVerifyShapes(t *testing.T) {
 	t.Run("forloop rejects non-dimvar iv", func(t *testing.T) {
 		g := NewGraph("s4")
 		loop := g.NewForLoop("ctor", g.NewConst("ctor", f32, 0),
-			g.NewConst("ctor", f32, 64), g.NewConst("ctor", f32, 0))
+			g.NewConst("ctor", f32, 64))
 		g.NewReturn("ctor", loop)
 		assertViolation(t, g, "for-loop operand 0 must be a dimvar")
 	})

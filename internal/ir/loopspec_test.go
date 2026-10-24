@@ -2,9 +2,10 @@ package ir
 
 // loopspec_test.go pins the FamilyLoop category spec (quick-261022-f5o,
 // D-01): loop-header membership (KindIter and KindForLoop only —
-// IterCluster/DimVar/BoundedDimVar are never loops), the iter dialect's
-// ParentEdge (first loop-kind operand in DataDeps slot order), and the
-// forloop dialect's BodyRoot (ops[2]).
+// IterCluster/DimVar/BoundedDimVar are never loops), and the iter
+// dialect's ParentEdge (first loop-kind operand in DataDeps slot order).
+// ForLoop has no body operand (sea-of-nodes ruling, fix1.md §0); LIR
+// nesting is derived from IV data-dep references (fix1.md D-b).
 
 import "testing"
 
@@ -26,7 +27,7 @@ func specFixture(name string) (g *Graph, dim, out, dv, biv Node) {
 func TestLoopSpecIsLoop(t *testing.T) {
 	g, dim, out, dv, biv := specFixture("isloop")
 	iter := g.NewIter("ctor", biv, nil)
-	loop := g.NewForLoop("ctor", dv, biv, g.NewConst("ctor", InternScalar(TF32), 0))
+	loop := g.NewForLoop("ctor", dv, biv)
 	cluster := g.NewIterCluster("ctor", []Node{dim}, g.NewConst("ctor", InternScalar(TF32), 0))
 	c := g.NewConst("ctor", InternScalar(TF32), 1)
 
@@ -64,9 +65,9 @@ func TestLoopSpecParentEdge(t *testing.T) {
 	if p := LoopNesting.ParentEdge(outer); p != nil {
 		t.Fatalf("root iter ParentEdge = %v, want nil", p)
 	}
-	loop := g.NewForLoop("ctor", dv0, biv0, g.NewConst("ctor", InternScalar(TF32), 0))
+	loop := g.NewForLoop("ctor", dv0, biv0)
 	if p := LoopNesting.ParentEdge(loop); p != nil {
-		t.Fatalf("forloop ParentEdge = %v, want nil (containment dialect)", p)
+		t.Fatalf("forloop ParentEdge = %v, want nil (nesting via IV data-dep derivation, fix1.md D-b)", p)
 	}
 	if p := LoopNesting.ParentEdge(nil); p != nil {
 		t.Fatal("nil ParentEdge must answer nil")
@@ -76,10 +77,17 @@ func TestLoopSpecParentEdge(t *testing.T) {
 // TestLoopSpecBodyRoot pins the forloop dialect's body operand: ops[2] of
 // a KindForLoop; nil for iters (no body operand), nil for a corrupted
 // short-operand forloop, nil for non-loop nodes.
+//
+// DEPRECATED: this test and BodyRoot will be removed in Step 2 of the
+// fix1.md body-operand removal (the method only exists for Step 1 →
+// Step 2 transition greenness).
 func TestLoopSpecBodyRoot(t *testing.T) {
 	g, _, _, dv, biv := specFixture("bodyroot")
 	body := g.NewConst("ctor", InternScalar(TF32), 0)
-	loop := g.NewForLoop("ctor", dv, biv, body)
+	// Build a forloop manually with 3+ operands so BodyRoot still works
+	// during the Step 1 transition (NewForLoop no longer takes a body).
+	loop := g.allocNode(KindForLoop, "ctor", 3).(*forLoopNode)
+	wireOperands(loop, dv, biv, body)
 	if b := LoopNesting.BodyRoot(loop); b == nil || b.BasePtr() != body.BasePtr() {
 		t.Fatalf("forloop BodyRoot = %v, want ops[2] (the body subtree root)", b)
 	}
