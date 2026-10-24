@@ -37,9 +37,12 @@ package finallower
 //	     (its __syncthreads is legally reached by every thread), and the
 //	     per-element epilogue stores become single-owner stores (the
 //	     emitter gates them on is_first_in_cta(), R2/R3).
-//	     The T==1 shape keeps the old flat bracket: Init before X, Combine
-//	     after X, both in X's parental block — one output element per
-//	     bracket, no element loops.
+//	     The T==1 shape keeps the flat bracket (R-A's T==1 law): Init
+//	     immediately before X, Combine immediately after, both in X's
+//	     parental block — one output element per bracket, no element loops
+//	     — and the qualifying epilogue consumers move in after Combine so
+//	     the emitted Combine local and its consumers share one C++ scope
+//	     (HI-02).
 //	(2.3) RuntimeCallMethod(%reducer, "Reduce", %piped) — VALUE ONLY —
 //	     inserted inside the HOME loop, immediately after the piped value's
 //	     producing item (the scheduler lands the piped Map's projection in
@@ -85,6 +88,10 @@ func (lr *lowering) lowerReducers() error {
 
 // lowerReduce performs one Reduce's full lowering (steps 0-2.4).
 func (lr *lowering) lowerReduce(red ir.Node) error {
+	// A fresh rebuild session per reduce: the between-IV substitution clones
+	// are shared across every rebuilt user of this reduce (the walk AND the
+	// moved consumers) — see the rebuildMemo field note.
+	lr.rebuildMemo = make(map[ir.Node]ir.Node)
 	// (0) @r derivation (LR-2), fail-closed.
 	dim, producingMap, piped, err := lr.deriveReducedDim(red)
 	if err != nil {
@@ -226,8 +233,9 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 	}
 
 	if len(betweenBlks) == 0 {
-		// T==1: the flat bracket — Init before X's item, Combine after it,
-		// both in X's parental block (one output element per bracket).
+		// T==1: R-A's flat bracket — Init immediately before X's block,
+		// Combine immediately after it, both in X's parental block (one
+		// output element per bracket; X is the reduced dim's single loop).
 		parentBlk, xIdx := lr.findBlockItem(xBlk)
 		if parentBlk == nil || xIdx < 0 {
 			return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) is not an AST item anywhere",
@@ -242,22 +250,30 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 			return fmt.Errorf("final-lower: reduce node %d: inserting Combine after X: %w", red.BasePtr().ID(), err)
 		}
 		combineCall.BasePtr().SetSched(lr.scopeDepth(parentBlk), parentBlk)
-		return nil
+		// HI-02 (R-A's consumer half at T==1): the epilogue consumers of the
+		// Combine value move in with it — the emitted `auto vN =
+		// reducer.Combine();` local and the consuming store must share ONE
+		// lexical C++ scope (the flat bracket's parent block), else the
+		// store reads a local declared inside a loop that already closed.
+		return lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, parentBlk, lr.scopeDepth(parentBlk), nil)
 	}
 
 	// (2.2) R3 — the per-output-element restructure.
 	return lr.buildElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall, anchor)
 }
 
-// buildElementLoop implements R3: the between loops dissolve as per-thread
-// walks; a fresh UNIFORM sequential element loop chain (one per between dim,
-// same dim + clamped bound) takes X's position in X's parental block; X
-// (with home inside, the between wrappers stripped) moves into the
-// innermost element loop; per element [Init → the reduced-dim walks →
-// Combine → the moved consumers]. Every between-IV reference in the moved
-// walk and the moved epilogue consumers is rebuilt onto the fresh element
-// IVs (cloned spines, shared leaves). A consumer referencing a reduced-dim
-// dimvar is a hard diagnostic (its value is not defined per element).
+// buildElementLoop implements R3 under the R-A bracket law (2026-10-24
+// ruling): the between loops dissolve as per-thread walks; a fresh UNIFORM
+// sequential element loop chain (one per between dim, same dim + clamped
+// bound) takes X's position in X's parental block; X (with home inside, the
+// between wrappers stripped) moves into the INNERMOST element loop — X's
+// parent under R-A — carrying the bracket [Init immediately before X →
+// X{home{...Reduce}} → Combine immediately after → the moved consumers]:
+// one bracket per INNERMOST output-element tuple, never per X-round. Every
+// between-IV reference in the moved walk and the moved epilogue consumers
+// is rebuilt onto the fresh element IVs (cloned spines, shared leaves). A
+// consumer referencing a reduced-dim dimvar is a hard diagnostic (its value
+// is not defined per element).
 func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTBlock,
 	betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT,
 	construction, combineCall, anchor ir.Node) error {
@@ -299,9 +315,17 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// carry the real statement order). Uniform: init 0, step 1, soc 0
 	// (sequential), loc 1 — every thread walks every element, which is what
 	// keeps Combine's collectives uniformly reached.
+	//
+	// R-A (HI-01, 2026-10-24 ruling): X's parent must be the INNERMOST
+	// output-element loop — the construction runs innermost-first, so the
+	// FIRST block built (i == len-1) is the innermost (elemBlk) while the
+	// running chain head ends as the OUTERMOST (outermostBlk, the block
+	// inserted into X's old parental position at the end). At
+	// len(betweenBlks)==1 elemBlk == outermostBlk — the committed
+	// 1-between-dim golden shape is bit-identical.
 	freshIVs := make([]ir.Node, len(betweenBlks))
 	innermost := anchor
-	var innerBlk *ir.ASTBlock
+	var outermostBlk, elemBlk *ir.ASTBlock
 	for i := len(betweenBlks) - 1; i >= 0; i-- {
 		dimParam := ir.OperandsOf(betweenIVs[i])[0]
 		freshIV := lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
@@ -317,23 +341,30 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		freshLoop.BasePtr().SetSched(depth, blk)
 		freshIV.BasePtr().SetSched(depth, blk)
 		freshWrapper.BasePtr().SetSched(depth, blk)
-		if innerBlk != nil {
-			if err := blk.InsertItemAt(0, ir.ASTItem{Block: innerBlk}); err != nil {
+		if outermostBlk != nil {
+			if err := blk.InsertItemAt(0, ir.ASTItem{Block: outermostBlk}); err != nil {
 				return fmt.Errorf("final-lower: reduce node %d: nesting the element chain: %w", red.BasePtr().ID(), err)
 			}
 		}
-		innerBlk, innermost = blk, freshLoop
+		if i == len(betweenBlks)-1 {
+			elemBlk = blk // the FIRST built is the INNERMOST element loop
+		}
+		outermostBlk, innermost = blk, freshLoop
 		freshIVs[i] = freshIV
 	}
+	// elemDepth is the INNERMOST element loop's depth (one level per between
+	// dim below X's original parental scope) — the depth the bracket items
+	// are stamped at.
 	elemDepth := lr.scopeDepth(parentBlk) + len(betweenBlks)
 
 	// Init: the FIRST item of the innermost element loop — the per-element
-	// bracket opens here, before the reduced-dim walks.
+	// bracket opens here, immediately before X's block (R-A: X is appended
+	// right after, nothing sits between).
 	initCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Init", construction)
-	if err := innerBlk.InsertItemAt(0, ir.ASTItem{Node: initCall}); err != nil {
+	if err := elemBlk.InsertItemAt(0, ir.ASTItem{Node: initCall}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting Init into the element loop: %w", red.BasePtr().ID(), err)
 	}
-	initCall.BasePtr().SetSched(elemDepth, innerBlk)
+	initCall.BasePtr().SetSched(elemDepth, elemBlk)
 
 	// Dissolve the between wrappers: home's block unhooks from the chain
 	// and re-attaches directly inside X's block at the outermost between
@@ -370,74 +401,22 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	}
 
 	// Move X's block (now [clamps..., home]) out of its parental block and
-	// into the innermost element loop, right after Init.
+	// into the innermost element loop, right after Init (R-A: elemBlk is X's
+	// parent — the innermost output-element loop).
 	parentBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == xBlk })
-	innerBlk.AppendItem(ir.ASTItem{Block: xBlk})
+	elemBlk.AppendItem(ir.ASTItem{Block: xBlk})
 
 	// Combine: right after X's block, still inside the innermost element
 	// loop — the per-element bracket closes; every thread leaves with the
 	// element's fully combined value (R1: the call returns T).
-	innerBlk.AppendItem(ir.ASTItem{Node: combineCall})
-	combineCall.BasePtr().SetSched(elemDepth, innerBlk)
+	elemBlk.AppendItem(ir.ASTItem{Node: combineCall})
+	combineCall.BasePtr().SetSched(elemDepth, elemBlk)
 
-	// The qualifying epilogue consumers: the owning LNT's epilogue Group's
-	// items (in order, the end node excluded) that CONSUME the Combine
-	// value. The between-IV reference alone must NOT qualify (the piped
-	// Map's projection lambda is a PRODUCER for the nest; Map Lower disposes
-	// it where it sits).
-	epilogue, err := lr.epilogueOf(ownerLNT)
-	if err != nil {
-		return err
-	}
+	// The between-IV -> fresh-IV substitution the consumer rebuild and the
+	// walk rebuild below share.
 	subs := make(map[ir.Node]ir.Node, len(betweenIVs))
 	for i, oldIV := range betweenIVs {
 		subs[oldIV] = freshIVs[i]
-	}
-	qualifies := func(n ir.Node) bool {
-		if n == nil || n.KindOf() == ir.KindReturn {
-			return false
-		}
-		return operandClosure(n)[combineCall]
-	}
-	var moved []ir.Node
-	for _, it := range epilogue.Items() {
-		if it.Node != nil && qualifies(it.Node) {
-			moved = append(moved, it.Node)
-		}
-	}
-	if len(moved) > 0 {
-		// Reduced-dim dimvars are poison in moved consumers: their walks
-		// re-execute per element inside the bracket — the consumer would
-		// read an iteration variable of the WRONG element's strip.
-		reducedVars := lr.reducedDimVars(dim)
-		for _, m := range moved {
-			if containsAny(operandClosure(m), reducedVars) {
-				return fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined at the element-loop position (doc/tca.md §5.10 point 4)",
-					m.BasePtr().ID(), m.KindOf())
-			}
-		}
-		// Rebuild the moved consumers' between-dim coordinates onto the
-		// fresh element IVs (shared expression spines are cloned; the
-		// in-nest walk already got its own clones above — wait, the walk
-		// rebuild happens after the moves complete; both share this subs
-		// map and the discipline of one clone per shared def per USER).
-		for _, m := range moved {
-			if err := lr.rebuildOperands(m, subs); err != nil {
-				return fmt.Errorf("final-lower: reduce node %d: rebuilding a moved consumer's between-dim coordinates: %w", red.BasePtr().ID(), err)
-			}
-		}
-		idx := 0
-		epilogue.RemoveItemsIf(func(it ir.ASTItem) bool {
-			if it.Node != nil && idx < len(moved) && it.Node.BasePtr() == moved[idx].BasePtr() {
-				idx++
-				return true
-			}
-			return false
-		})
-		for _, m := range moved {
-			innerBlk.AppendItem(ir.ASTItem{Node: m})
-			m.BasePtr().SetSched(elemDepth, innerBlk)
-		}
 	}
 
 	// Rebuild the moved WALK's between-IV references (every item of X's
@@ -498,13 +477,195 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		lr.dissolved = append(lr.dissolved, dissolveJob{loop: loop, iv: betweenIVs[i], red: red, closure: closure})
 	}
 
-	// Insert the element chain at X's old position — the restructure is
-	// complete: [element loops [ Init, X [ home [ ..., Reduce ] ], Combine,
-	// moved consumers... ]].
-	if err := parentBlk.InsertItemAt(xIdx, ir.ASTItem{Block: innerBlk}); err != nil {
+	// Insert the element chain at X's old position (the OUTERMOST element
+	// loop takes X's slot) — the restructure is complete: [element loops
+	// outer→inner [ ... [ Init, X [ home [ ..., Reduce ] ], Combine, moved
+	// consumers... ] ...]] with the bracket at the INNERMOST level (R-A).
+	// This runs BEFORE the consumer move so the enclosure assertion sees
+	// elemBlk's final ancestor chain (the detached subtree would defeat the
+	// ancestor-or-self test).
+	if err := parentBlk.InsertItemAt(xIdx, ir.ASTItem{Block: outermostBlk}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting the element loop chain: %w", red.BasePtr().ID(), err)
 	}
+
+	// The qualifying epilogue consumers, relocated after Combine inside the
+	// innermost element loop (shared gates with the T==1 flat bracket).
+	if err := lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, elemBlk, elemDepth, subs); err != nil {
+		return err
+	}
 	return nil
+}
+
+// moveCombineConsumers implements R3's consumer half (and HI-02's T==1 flat
+// twin, 2026-10-24): the owning LNT's epilogue items whose operand closure
+// reaches combineCall relocate into dst, inserted IMMEDIATELY AFTER the
+// Combine call's item — the Combine local and its consumers must share one
+// lexical C++ scope (the emitter materializes the call as a local at its
+// item position; a consumer outside that scope reads a dead local). Shared
+// gates, in order:
+//
+//	(a) reduced-dim poison — a consumer referencing the reduced dim's loop
+//	    dimvars would read an iteration variable of the WRONG element's
+//	    strip (doc/tca.md §5.10 point 4);
+//	(b) thread-partitioned refusal — a consumer referencing the single IV
+//	    of a WARP-SoC dim (a thread-partitioned walk) would leave a
+//	    coverage hole under the is_first_in_cta store gate (single-owner
+//	    stores hold only over CTA-replicated element walks) — a defensive
+//	    fail-closed for an unruled v0 shape, unreachable when the reduced
+//	    dim is WARP (the one-WARP-dim policy leaves no second WARP dim);
+//	(c) the between-IV coordinate rebuild onto the fresh element IVs when
+//	    subs != nil (the T==1 flat bracket passes nil — its coordinates are
+//	    defined at scopes enclosing the bracket already);
+//	(d) the generalized enclosure assertion (assertBoundEncloses over
+//	    whole closures, P-12): every DimVar in a moved consumer's closure
+//	    must be defined at a block enclosing dst — a coordinate not live at
+//	    the bracket position is a named error, never an emitted out-of-scope
+//	    reference.
+func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
+	combineCall ir.Node, dst *ir.ASTBlock, depth int, subs map[ir.Node]ir.Node) error {
+	epilogue, err := lr.epilogueOf(ownerLNT)
+	if err != nil {
+		return err
+	}
+	// The qualifying epilogue consumers: the Group's items (in order, the
+	// end node excluded) that CONSUME the Combine value. The between-IV
+	// reference alone must NOT qualify (the piped Map's projection lambda is
+	// a PRODUCER for the nest; Map Lower disposes it where it sits).
+	qualifies := func(n ir.Node) bool {
+		if n == nil || n.KindOf() == ir.KindReturn {
+			return false
+		}
+		return operandClosure(n)[combineCall]
+	}
+	var moved []ir.Node
+	for _, it := range epilogue.Items() {
+		if it.Node != nil && qualifies(it.Node) {
+			moved = append(moved, it.Node)
+		}
+	}
+	if len(moved) == 0 {
+		return nil
+	}
+	// (a) Reduced-dim dimvars are poison in moved consumers: their walks
+	// re-execute per element inside the bracket — the consumer would read
+	// an iteration variable of the WRONG element's strip.
+	reducedVars := lr.reducedDimVars(dim)
+	for _, m := range moved {
+		if containsAny(operandClosure(m), reducedVars) {
+			return fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined at the element-loop position (doc/tca.md §5.10 point 4)",
+				m.BasePtr().ID(), m.KindOf())
+		}
+	}
+	// (b) The thread-partitioned-consumer refusal.
+	if err := lr.refuseThreadPartitionedConsumers(moved); err != nil {
+		return err
+	}
+	// (c) The moved consumers' between-dim coordinates rebuild onto the
+	// fresh element IVs (shared expression spines are cloned; the in-nest
+	// walk's rebuild below shares this subs map and the discipline of one
+	// clone per shared def per USER).
+	if subs != nil {
+		for _, m := range moved {
+			if err := lr.rebuildOperands(m, subs); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: rebuilding a moved consumer's between-dim coordinates: %w", red.BasePtr().ID(), err)
+			}
+		}
+	}
+	// (d) The generalized enclosure assertion: every DimVar still in a
+	// moved consumer's closure must be defined at dst or an enclosing
+	// block.
+	for _, m := range moved {
+		for n := range operandClosure(m) {
+			if n.KindOf() != ir.KindDimVar {
+				continue
+			}
+			bBlk := n.BasePtr().SchedBlock()
+			if bBlk == nil || bBlk == dst || findSubBlock(bBlk, dst) != nil {
+				continue // unscheduled, or the bracket sits inside the IV's loop
+			}
+			return fmt.Errorf("final-lower: reduce node %d: moved consumer node %d (%s) references dimvar node %d whose loop does not enclose the bracket block — the coordinate is not defined at the bracket position (P-12)",
+				red.BasePtr().ID(), m.BasePtr().ID(), m.KindOf(), n.BasePtr().ID())
+		}
+	}
+	// Relocate: detach from the epilogue, then insert immediately after the
+	// Combine call's item in dst.
+	idx := 0
+	epilogue.RemoveItemsIf(func(it ir.ASTItem) bool {
+		if it.Node != nil && idx < len(moved) && it.Node.BasePtr() == moved[idx].BasePtr() {
+			idx++
+			return true
+		}
+		return false
+	})
+	after, ok := itemIndexOf(dst, combineCall)
+	if !ok {
+		return fmt.Errorf("final-lower: reduce node %d: the Combine call is not an item of the bracket block (corrupted bracket?)",
+			red.BasePtr().ID())
+	}
+	for i, m := range moved {
+		if err := dst.InsertItemAt(after+1+i, ir.ASTItem{Node: m}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting a moved epilogue consumer: %w", red.BasePtr().ID(), err)
+		}
+		m.BasePtr().SetSched(depth, dst)
+	}
+	return nil
+}
+
+// refuseThreadPartitionedConsumers fail-closes when a moved consumer's
+// operand closure references the single IV of a WARP-SoC dim: that single
+// loop is a THREAD-PARTITIONED walk (each element of the dim is owned by
+// exactly one thread of the dim's warp group), so the is_first_in_cta store
+// gate would leave the non-owner threads' partitioned elements unwritten —
+// a coverage hole, never a silent pass. Defensive for an unruled adjacent
+// v0 shape: unreachable when the reduced dim is WARP (the one-WARP-dim
+// policy), and the reduced dim's own single IV is caught earlier by the
+// reduced-dim poison check.
+func (lr *lowering) refuseThreadPartitionedConsumers(moved []ir.Node) error {
+	singles := lr.warpSingleIVs()
+	for _, m := range moved {
+		cl := operandClosure(m)
+		var worst ir.Node
+		for iv := range singles {
+			if cl[iv] && (worst == nil || iv.BasePtr().ID() < worst.BasePtr().ID()) {
+				worst = iv // deterministic diagnostic: the lowest-ID offender
+			}
+		}
+		if worst == nil {
+			continue
+		}
+		wdim := singles[worst]
+		return fmt.Errorf("final-lower: moved consumer node %d (%s) references the single IV of WARP dim %q (node %d) — a thread-partitioned walk: the is_first_in_cta store gate yields single-owner stores only over CTA-replicated element walks, so a WARP-partitioned non-reduced output dim would leave a coverage hole (defensive fail-closed for an unruled v0 shape)",
+			m.BasePtr().ID(), m.KindOf(), ir.InputParamNameOf(wdim), wdim.BasePtr().ID())
+	}
+	return nil
+}
+
+// warpSingleIVs maps every WARP-SoC dim's single-loop IV to its dim param —
+// the thread-partitioned walks of the provenance (Tile == 1, no inside
+// split; Between IS the single loop).
+func (lr *lowering) warpSingleIVs() map[ir.Node]ir.Node {
+	out := make(map[ir.Node]ir.Node)
+	for dim, prov := range lr.prov.Dims {
+		if prov.Soc != tiling.SoCWARP || prov.Tile != 1 || prov.Between == nil {
+			continue
+		}
+		ops := ir.OperandsOf(prov.Between)
+		if len(ops) == 0 || ops[0] == nil || ops[0].KindOf() != ir.KindDimVar {
+			continue
+		}
+		out[ops[0]] = dim
+	}
+	return out
+}
+
+// itemIndexOf reports node's item index within blk (node identity).
+func itemIndexOf(blk *ir.ASTBlock, node ir.Node) (int, bool) {
+	for i, it := range blk.Items() {
+		if it.Node != nil && it.Node.BasePtr() == node.BasePtr() {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 // stagingOf returns the construction's staging MemNewSMem operand (R1: the
@@ -635,7 +796,13 @@ func betweenBlocks(xBlk, homeBlk *ir.ASTBlock) []*ir.ASTBlock {
 	if !search(xBlk) {
 		return nil
 	}
-	return append([]*ir.ASTBlock(nil), path...)
+	// Always a NON-nil slice on success: the EMPTY between set (home == X,
+	// the T==1 flat-bracket shape) must stay distinguishable from the
+	// not-found nil — `append(nil-slice)` with zero elements would return
+	// nil and make the T==1 branch forever unreachable (the HI-02 latent
+	// bug: every T==1 reduce died here as a "corrupted schedule").
+	out := make([]*ir.ASTBlock, 0, len(path))
+	return append(out, path...)
 }
 
 // closureHitsAny reports whether n's operand closure contains any key of
@@ -654,13 +821,23 @@ func closureHitsAny(n ir.Node, subs map[ir.Node]ir.Node) bool {
 // with its substitution, sharing every untouched subtree (the leaves stay
 // the original defs — the tile-lower rebuildAxis discipline). Only the
 // scalar-expression kinds that can appear in a coordinate position clone;
-// anything else returns as-is (an unmapped leaf).
+// anything else returns as-is (an unmapped leaf). Clones are MEMOIZED per
+// original def within the current reduce's rebuild session: every rebuilt
+// user of a shared spine reads the SAME clone — the loop-scope invariant's
+// operand-closure containment then holds through the in-nest users (the
+// load), and per-user clones would mint store-private spines outside every
+// defining loop's closure.
 func (lr *lowering) rebuildWithSubs(n ir.Node, subs map[ir.Node]ir.Node) ir.Node {
 	if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 		return n
 	}
 	if sub, ok := subs[n]; ok {
 		return sub
+	}
+	if lr.rebuildMemo != nil {
+		if clone, ok := lr.rebuildMemo[n]; ok {
+			return clone
+		}
 	}
 	ops := ir.OperandsOf(n)
 	newOps := make([]ir.Node, len(ops))
@@ -678,22 +855,27 @@ func (lr *lowering) rebuildWithSubs(n ir.Node, subs map[ir.Node]ir.Node) ir.Node
 	}
 	// Clone the node with rebuilt operands (construction-exempt — the same
 	// freedom the constructors exercise; only NEW nodes result).
+	var clone ir.Node
 	switch n.KindOf() {
 	case ir.KindBinOp:
 		op, _ := ir.BinOpCodeOf(n)
-		return lr.g.NewBinOp(lowerOrigin, op, newOps[0], newOps[1])
+		clone = lr.g.NewBinOp(lowerOrigin, op, newOps[0], newOps[1])
 	case ir.KindUnaryOp:
 		op, _ := ir.UnaryOpCodeOf(n)
-		return lr.g.NewUnaryOp(lowerOrigin, op, newOps[0])
+		clone = lr.g.NewUnaryOp(lowerOrigin, op, newOps[0])
 	case ir.KindSelect:
-		return lr.g.NewSelect(lowerOrigin, newOps[0], newOps[1], newOps[2])
+		clone = lr.g.NewSelect(lowerOrigin, newOps[0], newOps[1], newOps[2])
 	case ir.KindCast:
-		return lr.g.NewCast(lowerOrigin, ir.CastTypeOf(n), newOps[0])
+		clone = lr.g.NewCast(lowerOrigin, ir.CastTypeOf(n), newOps[0])
 	case ir.KindCall:
-		return lr.g.NewCall(lowerOrigin, ir.CallNameOf(n), newOps...)
+		clone = lr.g.NewCall(lowerOrigin, ir.CallNameOf(n), newOps...)
 	default:
 		return n // leaves (consts, params, dimvars, runtime reads) clone as themselves
 	}
+	if lr.rebuildMemo != nil {
+		lr.rebuildMemo[n] = clone
+	}
+	return clone
 }
 
 // rebuildOperands rewrites user's direct operand slots whose operand-edge

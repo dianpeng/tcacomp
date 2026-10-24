@@ -343,9 +343,19 @@ func hasCTADim(dims []*dimRewrite) bool {
 // guarding stays the runtime loop primitive's whole-body no-op (§4), never
 // an IR branch.
 func (lr *lowerRun) tileMax(tile int, extent, offset ir.Node) ir.Node {
-	clamped := lr.g.NewCall(lowerOrigin, "umin", offset, extent)
-	rem := lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, extent, clamped)
+	rem := lr.saturatingRemainder(extent, offset)
 	return lr.g.NewCall(lowerOrigin, "umin", lr.u32c(float64(tile)), rem)
+}
+
+// saturatingRemainder materializes the F1 core extent − umin(offset,
+// extent): the exact number of in-bounds rounds/elements remaining at
+// offset, wrapping nowhere in u32. Shared by every tileMax bound and the
+// T==1 WARP single-form mirror gate, whose fused round-enumerating loop
+// wants the remainder under an UNBOUNDED cap (the extent itself), not a
+// tile-bounded one.
+func (lr *lowerRun) saturatingRemainder(extent, offset ir.Node) ir.Node {
+	clamped := lr.g.NewCall(lowerOrigin, "umin", offset, extent)
+	return lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, extent, clamped)
 }
 
 // generateDimExprs builds every dim's dimvars, bounds, ranks, offsets, and
@@ -404,9 +414,38 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			case SoCWARP:
 				// Single thread-parallel loop at stride LoC×32.
 				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*32)))
-				d.singleIVNode, d.singleBound = d.singleIV, extent
 				d.singleAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32)), lr.attr("tile", float64(d.tile))}
 				rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
+				if ctaThreadDim >= 0 {
+					// MIRROR GATE, single form (2026-10-24 ruling): the SAME
+					// CTA-coupled duplication the T>1 WARP path gates — the
+					// coupled group duplicates this dim's ThreadMap
+					// coordinates, so the mirrored half (gate >= 1) would
+					// re-walk the owning half's elements: a double-writer
+					// walk for stores and a double-counted partial under a
+					// uniform reduce bracket. The bound becomes the
+					// F1-saturating expression over offset = rank +
+					// index(ctaThreadDim)·extent: the mirrored half
+					// saturates to ZERO trips, the owning half keeps its
+					// exact in-bounds round count (extent − rank — strictly
+					// tighter than the raw extent, which admitted OOB
+					// phantom rounds). The cap operand is the EXTENT (an
+					// unbounded clamp), NOT the constant 1: the fused single
+					// loop enumerates whole rounds at stride LoC·32, so a
+					// 1-trip cap would under-cover every extent > LoC·32 —
+					// exactly the T==1 reduce sweep point (a 512-element
+					// last axis at a 256-thread warp group) the gate exists
+					// to make numerically correct.
+					gate := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(ctaThreadDim)))
+					offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, rank,
+						lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, gate, extent))
+					d.singleBound = lr.g.NewCall(lowerOrigin, "umin", extent, lr.saturatingRemainder(extent, offset))
+					d.singleIVNode = d.singleIV
+					d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, offset)
+					d.roundBase = d.indexExpr
+					continue
+				}
+				d.singleIVNode, d.singleBound = d.singleIV, extent
 				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
 				d.roundBase = d.indexExpr
 			}
@@ -454,6 +493,17 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 				// inside ForLoop — an infinite loop.
 				return fmt.Errorf("tile-lower: CTA dim (iter node %d) coupled inside walk computes %d threads — the coupled-portion floor (F2) demands >= 1",
 					d.iter.BasePtr().ID(), coupled)
+			}
+			if d.tile > coupled {
+				// HI-03 gate 3 (2026-10-24 ruling): the flat-init coupled
+				// walk is single-owner exact only while tile <= coupled —
+				// a larger tile makes every element at rank >= coupled
+				// walked by two threads (a write-write race). Params.Validate
+				// (gate 1) and tiling-verify (gate 2) reject this first; a
+				// crafted record that bypasses them fails HERE, never as a
+				// racy kernel.
+				return fmt.Errorf("tile-lower: CTA dim (iter node %d) carries TileSize %d over the coupled inside walk's %d threads — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (HI-03 gate 3; Params.Validate and tiling-verify are gates 1-2)",
+					d.iter.BasePtr().ID(), d.tile, coupled)
 			}
 			d.coupledThreads = coupled
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim,

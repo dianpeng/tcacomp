@@ -2,6 +2,7 @@ package tiling
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"tcacomp/internal/analysis/loopforest"
@@ -429,5 +430,42 @@ func TestParamsValidate(t *testing.T) {
 				t.Fatalf("%s must fail Validate", tc.name)
 			}
 		})
+	}
+}
+
+// TestParamsValidateCoupledTileGate pins HI-03 gate 1: a TileSizes entry
+// over the auto-resolved coupled inside-walk thread count is a named error
+// (the flat-init coupled walk is single-owner exact only while
+// tile <= coupled — a larger tile is a double-writer race); DefaultParams
+// (max tile 256 == coupled 256) stays valid; the coupled == 0 configuration
+// (WarpPortion == PortionWarp) skips the tile comparison and stays the F2
+// floor's error to raise.
+func TestParamsValidateCoupledTileGate(t *testing.T) {
+	p := DefaultParams()
+	p.TileSizes = []int{32, 512}
+	err := p.Validate()
+	if err == nil || !strings.Contains(err.Error(), "coupled") {
+		t.Fatalf("a tile over the coupled thread count must fail closed naming the coupled walk, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("the error must name the tile and the coupled count, got %q", err.Error())
+	}
+	if err := DefaultParams().Validate(); err != nil {
+		t.Fatalf("DefaultParams must stay valid under the coupled tile gate, got %v", err)
+	}
+	// coupled == 0 (WarpPortion == PortionWarp): the comparison is skipped.
+	legal := DefaultParams()
+	legal.WarpPortion = PortionWarp
+	legal.TileSizes = []int{512}
+	if err := legal.Validate(); err != nil {
+		t.Fatalf("the WarpPortion == PortionWarp configuration must skip the tile gate (the F2 floor owns it), got %v", err)
+	}
+	// The coupled count follows the thread budget: 256 threads -> 128.
+	small := DefaultParams()
+	small.MaxThreadsPerCTA = 256
+	small.TileSizes = []int{256}
+	err = small.Validate()
+	if err == nil || !strings.Contains(err.Error(), "128") {
+		t.Fatalf("the coupled count must follow the thread budget (256 threads -> 128), got %v", err)
 	}
 }

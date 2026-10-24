@@ -312,6 +312,38 @@ func TestVerifyKernelWideFragGate(t *testing.T) {
 	}
 }
 
+// TestVerifyCoupledTileGate pins HI-03 gate 2: a record whose CTA dim
+// carries a TileSize over the coupled inside-walk thread count (resolved
+// from Params exactly as the rewrite's coupledThreads does — never the
+// record's warp LoC) fails the per-LNT feasibility sweep with a named
+// error; a tile exactly at the bound verifies green.
+func TestVerifyCoupledTileGate(t *testing.T) {
+	fx := newChain32("ctagate", 4096)
+	bodyStore(fx)
+	mk := func(tile int) *Record {
+		return recordOf(t, fx, map[int]IterDecision{
+			0: {SoC: SoCTA, LoC: 100, TileSize: tile},
+		}, nil)
+	}
+	cache := opt.NewCache()
+	cache.Put(mk(512))
+	err := verifyWith(fx.g, cache, DefaultParams())
+	if err == nil {
+		t.Fatal("a CTA TileSize over the coupled thread count must fail the feasibility sweep")
+	}
+	if !strings.Contains(err.Error(), "coupled") {
+		t.Fatalf("the gate-2 error must name the coupled walk, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("the gate-2 error must name the tile and the coupled count, got %q", err.Error())
+	}
+	cacheOK := opt.NewCache()
+	cacheOK.Put(mk(256))
+	if err := verifyWith(fx.g, cacheOK, DefaultParams()); err != nil {
+		t.Fatalf("a CTA TileSize exactly at the coupled count must verify green, got %v", err)
+	}
+}
+
 // TestVerifyRequiresTiling pins the Requires enforcement: a pipeline of
 // just [tiling-verify] is rejected by the manager's precondition check.
 func TestVerifyRequiresTiling(t *testing.T) {

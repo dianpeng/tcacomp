@@ -629,6 +629,143 @@ func TestRewriteTileOne(t *testing.T) {
 	assertVerifyAndRootReachable(t, fx.g)
 }
 
+// TestLowerCoupledTileBackstop pins HI-03 gate 3: a Verified crafted record
+// whose CTA dim carries TileSize 512 (over the default coupled 256) reaches
+// the rewrite and trips the backstop beside the F2 floor — never a
+// double-writer coupled walk. (Params.Validate and tiling-verify, gates 1-2,
+// would reject it first in the real pipeline; the crafted record bypasses
+// both.)
+func TestLowerCoupledTileBackstop(t *testing.T) {
+	fx := newChain32("ctaback", 4096)
+	bodyStore(fx)
+	rec := recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 100, TileSize: 512},
+	}, nil)
+	cache := opt.NewCache()
+	cache.Put(rec)
+	err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
+	if err == nil || !strings.Contains(err.Error(), "coupled") {
+		t.Fatalf("a CTA TileSize over the coupled thread count must trip the rewrite backstop naming the coupled walk, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("the backstop error must name the tile and the coupled count, got %q", err.Error())
+	}
+}
+
+// TestRewriteWarpSingleMirrorGate pins the T==1 WARP single-form mirror
+// gate (2026-10-24 ruling): in a CTA-carrying LNT the single loop's bound
+// becomes the F1-saturating expression over offset = index(threadDim) +
+// index(ctaThreadDim)·extent — umin(extent, extent − umin(offset,
+// extent)), the EXTENT itself as the cap operand (the fused single loop
+// enumerates whole rounds at stride LoC·32, so a 1-trip cap would
+// under-cover every extent > LoC·32) — zeroing the mirrored coupled half's
+// trips; the IV keeps init 0 / step LoC·32 and the index expression rides
+// the gated offset.
+func TestRewriteWarpSingleMirrorGate(t *testing.T) {
+	fx := newChain32("warpsg", 1024, 512)
+	biv1 := ir.DataDeps(fx.iters[1])[0]
+	extent := ir.DataDeps(biv1)[1] // captured pre-erasure
+	store := bodyStore(fx)
+	rec := recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
+		1: {SoC: SoCWARP, LoC: 8, TileSize: 1},
+	}, nil)
+	runLower(t, fx.g, rec)
+
+	loops := nestOf(t, fx.g) // [d0.between, d1.single, d0.inside]
+	if len(loops) != 3 {
+		t.Fatalf("CTA T>1 + WARP T==1 must yield three loops, got %d", len(loops))
+	}
+	single := loops[1]
+	if got := dimvarStep(t, single); got != 256 {
+		t.Fatalf("the WARP-single IV keeps step LoC×32 = 256, got %v", got)
+	}
+	iv := ir.OperandsOf(single)[0]
+	if v, ok := ir.ConstValueOf(ir.OperandsOf(iv)[1]); !ok || v != 0 {
+		t.Fatal("the WARP-single IV keeps init 0")
+	}
+	// The bound: umin(extent, extent − umin(offset, extent)) with the
+	// extent itself as the cap operand.
+	bound := boundOf(t, single)
+	if bound.KindOf() != ir.KindCall || ir.CallNameOf(bound) != "umin" {
+		t.Fatalf("the gated single bound must be a umin call, got %v", bound.KindOf())
+	}
+	outerOps := ir.OperandsOf(bound)
+	if len(outerOps) != 2 || outerOps[0].BasePtr() != extent.BasePtr() {
+		t.Fatalf("the gated bound's cap operand must be the raw extent (the unbounded clamp), got %v", outerOps[0])
+	}
+	sub, ok := ir.BinOpCodeOf(outerOps[1])
+	if !ok || sub != ir.BinOpSub {
+		t.Fatalf("the gated bound's operand 1 must be the saturating sub, got %v", outerOps[1])
+	}
+	subOps := ir.OperandsOf(outerOps[1])
+	if subOps[0].BasePtr() != extent.BasePtr() {
+		t.Fatal("the sub's minuend must be the raw extent")
+	}
+	clamp := subOps[1]
+	if clamp.KindOf() != ir.KindCall || ir.CallNameOf(clamp) != "umin" {
+		t.Fatalf("the sub's subtrahend must be the clamp umin(offset, extent), got %v", clamp.KindOf())
+	}
+	clampOps := ir.OperandsOf(clamp)
+	if clampOps[1].BasePtr() != extent.BasePtr() {
+		t.Fatal("the clamp's operand 1 must be the raw extent")
+	}
+	// The offset: rank query (threadDim 1) + the mirror term
+	// index(ctaThreadDim=0)·extent.
+	var sawRank, sawGate, sawGateMul bool
+	for _, x := range flattenSubtree(clampOps[0]) {
+		if x.KindOf() != ir.KindRuntimeThreadQuery {
+			continue
+		}
+		qops := ir.OperandsOf(x)
+		if len(qops) != 1 {
+			t.Fatalf("the gate/rank queries are the tuple form, got %d operands", len(qops))
+		}
+		v, ok := ir.ConstValueOf(qops[0])
+		if !ok {
+			t.Fatalf("query DoSoC must be a const, got %v", qops[0])
+		}
+		switch int(v) {
+		case 1:
+			sawRank = true
+		case 0:
+			sawGate = true
+		}
+		if code, _ := ir.BinOpCodeOf(x); code == ir.BinOpMul {
+			sawGateMul = true
+		}
+	}
+	_ = sawGateMul
+	if !sawRank || !sawGate {
+		t.Fatalf("the gated offset must carry the warp rank query (DoSoC 1) and the CTA-coupled mirror query (DoSoC 0)")
+	}
+	var mulOverExtent bool
+	for _, x := range flattenSubtree(clampOps[0]) {
+		if x.KindOf() != ir.KindBinOp {
+			continue
+		}
+		if code, _ := ir.BinOpCodeOf(x); code != ir.BinOpMul {
+			continue
+		}
+		mops := ir.OperandsOf(x)
+		for _, mo := range mops {
+			if mo.BasePtr() == extent.BasePtr() {
+				mulOverExtent = true
+			}
+		}
+	}
+	if !mulOverExtent {
+		t.Fatal("the mirror term must multiply the coupled-group query by the extent")
+	}
+	// The store's d1 axis rides the gated offset: singleIV + offset.
+	axes := ir.OperandsOf(store)[2:]
+	foundIV := subtreeContains(axes[1], iv)
+	if !foundIV {
+		t.Fatal("the rewritten d1 axis must reference the single IV over the gated offset")
+	}
+	assertVerifyAndRootReachable(t, fx.g)
+}
+
 // TestRewriteBranchedLNTRejected pins F3/HI-05: a branched LNT (sibling
 // iters under one parent) is REJECTED fail-closed — never silently
 // linearized into one nested chain (the siblings' spaces would execute as

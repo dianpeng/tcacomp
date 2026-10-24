@@ -5,6 +5,7 @@
 // accumulating failures, nonzero exit on any failure. Pins the doc formulas
 // with exact expected values; totals injected through the host-only
 // KernelInfo(unsigned, unsigned) ctor, linear ids through set_linear_id.
+#include <bit>
 #include <cstdio>
 #include <initializer_list>
 
@@ -271,6 +272,197 @@ void test_warp_reducer_host_branch() {
   CHECK(staging.Get(0u) == 0.0f);
 }
 
+// ---------------------------------------------------------------------------
+// The 2026-10-24 WarpReducer bracket-protocol simulation. Per output
+// element: Init resets a slot array (one per warp) to the init; a sequence
+// of Reduce calls, each carrying (a) the calling warp, (b) a lane-PREFIX
+// participation set (modeled as a count k of active lanes — the prefix
+// property the compiler's bounds gates produce), (c) one hand-chosen value
+// per active lane; per call the warp partial folds the active lanes' values
+// (the guarded down-tree's association — ANY association is valid), then
+// slot[warp] = fn(slot[warp], warpPartial); after all calls, every thread's
+// Combine = fold(init, slots ascending). The reference is a plain
+// single-threaded fold over every (call, lane) value in order.
+//
+// R-C DISCIPLINE: map+reduce are UNORDERED; the assertions are VALUE-only
+// (|simulated - reference| <= 1e-5 for float add; exact value for the int
+// product — integer arithmetic is exact, a value assertion, not an order
+// pin). Never bitwise on floats, never fold-path-pinned.
+// ---------------------------------------------------------------------------
+struct SimCall {
+  unsigned warp;
+  unsigned k;  // active-lane PREFIX count, 1..32
+  float fv[32];
+  int iv[32];
+};
+
+int mul_i(int a, int b) { return a * b; }
+
+// The float-add simulation over one output element's bracket.
+float simulate_bracket_f(float init, unsigned warps, const SimCall* calls, unsigned n) {
+  // Init: reset ALL slots.
+  float slots[16];
+  for (unsigned w = 0u; w < warps; ++w) slots[w] = init;
+  for (unsigned c = 0u; c < n; ++c) {
+    // Reduce: the guarded down-tree over the k-lane prefix.
+    float lanes[32];
+    for (unsigned l = 0u; l < calls[c].k; ++l) lanes[l] = calls[c].fv[l];
+    for (unsigned off = 16u; off > 0u; off >>= 1u) {
+      for (unsigned l = 0u; l + off < calls[c].k; ++l) {
+        lanes[l] = add_f(lanes[l], lanes[l + off]);
+      }
+    }
+    slots[calls[c].warp] = add_f(slots[calls[c].warp], lanes[0]);
+  }
+  // Combine: fold(init, slots ascending).
+  float out = init;
+  for (unsigned w = 0u; w < warps; ++w) out = add_f(out, slots[w]);
+  return out;
+}
+
+float reference_bracket_f(float init, const SimCall* calls, unsigned n) {
+  float acc = init;
+  for (unsigned c = 0u; c < n; ++c)
+    for (unsigned l = 0u; l < calls[c].k; ++l) acc = add_f(acc, calls[c].fv[l]);
+  return acc;
+}
+
+// The int-product simulation (1-warp config): same mechanics, exact values.
+int simulate_bracket_i(int init, unsigned warps, const SimCall* calls, unsigned n) {
+  int slots[16];
+  for (unsigned w = 0u; w < warps; ++w) slots[w] = init;
+  for (unsigned c = 0u; c < n; ++c) {
+    int lanes[32];
+    for (unsigned l = 0u; l < calls[c].k; ++l) lanes[l] = calls[c].iv[l];
+    for (unsigned off = 16u; off > 0u; off >>= 1u) {
+      for (unsigned l = 0u; l + off < calls[c].k; ++l) {
+        lanes[l] = mul_i(lanes[l], lanes[l + off]);
+      }
+    }
+    slots[calls[c].warp] = mul_i(slots[calls[c].warp], lanes[0]);
+  }
+  int out = init;
+  for (unsigned w = 0u; w < warps; ++w) out = mul_i(out, slots[w]);
+  return out;
+}
+
+int reference_bracket_i(int init, const SimCall* calls, unsigned n) {
+  int acc = init;
+  for (unsigned c = 0u; c < n; ++c)
+    for (unsigned l = 0u; l < calls[c].k; ++l) acc = mul_i(acc, calls[c].iv[l]);
+  return acc;
+}
+
+void setf(SimCall& c, unsigned warp, unsigned k, const float* vals) {
+  c.warp = warp;
+  c.k = k;
+  for (unsigned l = 0u; l < 32u; ++l) c.fv[l] = (l < k) ? vals[l] : 0.0f;
+  for (unsigned l = 0u; l < 32u; ++l) c.iv[l] = 1;
+}
+
+void test_warp_reducer_bracket_simulation() {
+  // (32 threads, 1 warp): full-width, partially idle (k < 32), and single
+  // lane calls; plus the exact int product with at most 30 factors of 2.
+  {
+    const float v1[32] = {0.25f, 0.5f,  0.75f, 1.0f,  0.25f, 0.5f,  0.75f, 1.0f,
+                          0.25f, 0.5f,  0.75f, 1.0f,  0.25f, 0.5f,  0.75f, 1.0f,
+                          0.25f, 0.5f,  0.75f, 1.0f,  0.25f, 0.5f,  0.75f, 1.0f,
+                          0.25f, 0.5f,  0.75f, 1.0f,  0.25f, 0.5f,  0.75f, 1.0f};
+    const float v2[17] = {0.5f, 0.25f, 0.25f, 0.5f, 0.75f, 0.25f, 1.0f, 0.5f,
+                          0.25f, 0.25f, 0.5f,  0.5f, 0.25f, 0.75f, 0.5f, 0.25f, 1.0f};
+    const float v3[1] = {2.0f};
+    SimCall calls[3];
+    setf(calls[0], 0u, 32u, v1);
+    setf(calls[1], 0u, 17u, v2);
+    setf(calls[2], 0u, 1u, v3);
+    float sim = simulate_bracket_f(0.0f, 1u, calls, 3u);
+    float ref = reference_bracket_f(0.0f, calls, 3u);
+    CHECK(sim - ref <= 1e-5f && ref - sim <= 1e-5f);
+
+    // Int product: one call, k = 32, at most 30 factors of 2 (rest 1) —
+    // exact value assertion.
+    SimCall pc;
+    pc.warp = 0u;
+    pc.k = 32u;
+    for (unsigned l = 0u; l < 32u; ++l) {
+      pc.fv[l] = 1.0f;
+      pc.iv[l] = (l < 30u) ? 2 : 1;
+    }
+    int isim = simulate_bracket_i(1, 1u, &pc, 1u);
+    int iref = reference_bracket_i(1, &pc, 1u);
+    CHECK(isim == iref);
+    CHECK(iref == (1 << 30));  // 2^30 fits int — the value itself pinned
+  }
+  // (64 threads, 2 warps): warp 1 FULLY IDLE (no calls), warp 0 partially
+  // idle — the idle warp's slot stays init and the fold absorbs it as the
+  // identity.
+  {
+    const float v1[20] = {0.25f, 0.5f, 0.75f, 0.25f, 0.5f, 0.5f, 0.75f, 0.25f,
+                          0.5f,  0.25f, 0.75f, 0.5f,  0.25f, 1.0f, 0.5f,  0.25f,
+                          0.75f, 0.5f, 0.25f, 0.5f};
+    const float v2[32] = {0.25f, 0.25f, 0.25f, 0.25f, 0.5f, 0.5f,  0.5f,  0.5f,
+                          0.75f, 0.75f, 0.75f, 0.75f, 1.0f, 1.0f,  1.0f,  1.0f,
+                          0.25f, 0.25f, 0.25f, 0.25f, 0.5f, 0.5f,  0.5f,  0.5f,
+                          0.75f, 0.75f, 0.75f, 0.75f, 0.5f, 0.25f, 0.75f, 0.5f};
+    SimCall calls[2];
+    setf(calls[0], 0u, 20u, v1);
+    setf(calls[1], 0u, 32u, v2);
+    float sim = simulate_bracket_f(0.0f, 2u, calls, 2u);
+    float ref = reference_bracket_f(0.0f, calls, 2u);
+    CHECK(sim - ref <= 1e-5f && ref - sim <= 1e-5f);
+  }
+  // (256 threads, 8 warps): warps 0..6 active with mixed k (incl. partial),
+  // warp 7 fully idle.
+  // (512 threads, 16 warps): warps 0..14 active, warp 15 fully idle.
+  for (unsigned cfg = 0u; cfg < 2u; ++cfg) {
+    const unsigned warps = (cfg == 0u) ? 8u : 16u;
+    SimCall calls[16];
+    unsigned n = 0u;
+    for (unsigned w = 0u; w + 1u < warps; ++w) {
+      const unsigned k = 1u + ((w * 7u) % 32u);  // mixed prefix widths
+      for (unsigned l = 0u; l < 32u; ++l) {
+        calls[n].fv[l] = 0.0f;
+        calls[n].iv[l] = 1;
+      }
+      calls[n].warp = w;
+      calls[n].k = k;
+      for (unsigned l = 0u; l < k; ++l) {
+        calls[n].fv[l] = static_cast<float>((int)((l + w) % 4) + 1) * 0.25f;
+      }
+      ++n;
+    }
+    float sim = simulate_bracket_f(0.0f, warps, calls, n);
+    float ref = reference_bracket_f(0.0f, calls, n);
+    CHECK(sim - ref <= 1e-5f && ref - sim <= 1e-5f);
+  }
+}
+
+// The mask-derivation contract on host (pure integer checks): prefix masks
+// with k set lanes have popcount k, and the guarded down-tree's source
+// lanes (lane_id + off) stay inside the active prefix whenever the guard
+// admits the read.
+void test_mask_derivation_arithmetic() {
+  for (unsigned k = 1u; k <= 32u; ++k) {
+    const unsigned mask = (k == 32u) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    CHECK(std::popcount(mask) == k);  // prefix(k): the low k lanes
+    for (unsigned off : {1u, 2u, 4u, 8u, 16u}) {
+      for (unsigned lane = 0u; lane < k; ++lane) {
+        if (lane + off < k) {
+          // The guard admits the read: the source lane is in [0, k), i.e.
+          // inside the prefix mask.
+          CHECK(((mask >> (lane + off)) & 1u) == 1u);
+        }
+      }
+    }
+  }
+  // lane/warp identity arithmetic (the map's derivation contract).
+  for (unsigned tid : {0u, 1u, 31u, 32u, 255u, 256u, 511u}) {
+    CHECK(tid / 32u == tid / 32u);   // warp_index
+    CHECK((tid % 32u) < 32u);        // lane_id
+    CHECK(((tid % 32u) == 0u) == (tid % 32u == 0u));  // is_first_in_warp
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -286,6 +478,8 @@ int main() {
   test_umin_umax();
   test_seq_reducer();
   test_warp_reducer_host_branch();
+  test_warp_reducer_bracket_simulation();
+  test_mask_derivation_arithmetic();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

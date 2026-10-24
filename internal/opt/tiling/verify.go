@@ -81,8 +81,11 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //     entry); the CTA LoC == MaxCTA (portion -1/full); the warp LoC is a
 //     warp-portion multiple (LoC/quantum in [1, PortionWarp]); the
 //     COUPLED-PORTION FLOOR (F2): an LNT carrying a CTA dim and a WARP dim
-//     must leave >= 1 warp portion for the coupled inside walk; sequential
-//     entries carry LoC 1; every LoC and TileSize >= 1; every SoC known.
+//     must leave >= 1 warp portion for the coupled inside walk; the CTA
+//     dim's TileSize must not exceed the coupled inside-walk thread count
+//     (HI-03 gate 2 — tile > coupledThreads is a double-writer race);
+//     sequential entries carry LoC 1; every LoC and TileSize >= 1; every
+//     SoC known.
 //   - SITE well-formedness: a promoted site's Tie is a live iter of the
 //     site's LNT or nil; its class is SMEM or FRAG; and the site decision
 //     MATCHES the promotion judge re-run over the record's own schedule
@@ -176,6 +179,8 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	warpsPerPortion := (v.Params.MaxThreadsPerCTA / 32) / PortionWarp
 	for _, root := range f.Roots() {
 		ctaCount, warpCount, warpPortion := 0, 0, 0
+		var ctaIter ir.Node
+		ctaTile := 0
 		for _, it := range treeItersOf(root) {
 			biv, err := bivOf(it)
 			if err != nil {
@@ -194,6 +199,7 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				}
 			case SoCTA:
 				ctaCount++
+				ctaIter, ctaTile = it, d.TileSize
 				if d.LoC != v.Params.MaxCTA {
 					return fmt.Errorf("tiling-verify: iter node %d carries CTA LoC %d, want MaxCTA %d (portion -1/full exhausts the CTA space)",
 						it.BasePtr().ID(), d.LoC, v.Params.MaxCTA)
@@ -230,6 +236,26 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		if warpCount == 1 && warpPortion > PortionWarp-1 {
 			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries a CTA dim and warp portion %d — the coupled-portion floor (F2) demands WarpPortion <= PortionWarp-1 = %d so the coupled inside walk keeps >= 1 portion",
 				root.Iter.BasePtr().ID(), warpPortion, PortionWarp-1)
+		}
+		// HI-03 gate 2 (2026-10-24 ruling): the CTA dim's TileSize must not
+		// exceed the coupled inside walk's thread count — the flat-init
+		// walk is single-owner exact only while tile <= coupled, and a
+		// larger tile is a double-writer race, not a perf bug. The
+		// warpPortion resolution mirrors lower_rewrite.go coupledThreads()
+		// exactly (Params.WarpPortion first, else AutoWarpPortion — the LNT
+		// carries a CTA dim here by ctaCount == 1); the record's warp LoC
+		// is deliberately NOT used — the lower's provenance CoupledThreads
+		// derives from Params, and the three gates must agree. coupled == 0
+		// skips the comparison (the F2 machinery owns that configuration).
+		if ctaCount == 1 {
+			resolved := v.Params.WarpPortion
+			if resolved == 0 {
+				resolved = AutoWarpPortion
+			}
+			if coupled := (PortionWarp - resolved) * warpsPerPortion * 32; coupled > 0 && ctaTile > coupled {
+				return fmt.Errorf("tiling-verify: CTA iter node %d carries TileSize %d over the coupled inside walk's %d threads — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (HI-03 gate 2; Params.Validate is gate 1, the tile-lower rewrite backstop is gate 3)",
+					ctaIter.BasePtr().ID(), ctaTile, coupled)
+			}
 		}
 	}
 

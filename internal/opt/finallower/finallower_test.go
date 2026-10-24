@@ -807,6 +807,26 @@ func TestReducerBracketPlacement(t *testing.T) {
 	if !blockNested(X.BasePtr().SchedBlock(), elemBlk) {
 		t.Fatal("X must be nested inside the element loop")
 	}
+
+	// R-A mechanical pins (the 2026-10-24 bracket law, 1-between audit):
+	// Init's containing block IS X's parental block (the element loop), Init
+	// is the item IMMEDIATELY before X's block, Combine is the item
+	// IMMEDIATELY after it in that same block, and Reduce's innermost
+	// containing block is Y (home).
+	xParent, xIdxRA := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if xParent == nil || xParent != elemBlk {
+		t.Fatalf("X's parental block must be the element loop hosting Init (R-A: the innermost output-element loop IS X's parent), got %v", xParent)
+	}
+	if xIdxRA != initIdx+1 {
+		t.Fatalf("Init must sit IMMEDIATELY before X's block (R-A): Init at %d, X at %d", initIdx, xIdxRA)
+	}
+	afterX := elemBlk.Items()[xIdxRA+1]
+	if afterX.Node == nil || afterX.Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatalf("Combine must sit IMMEDIATELY after X's block (R-A), got %v", afterX.Node)
+	}
+	if rBlk, _ := findItemIn(k, reduceCall); rBlk == nil || rBlk != homeBlk {
+		t.Fatalf("Reduce's innermost containing block must be Y (home), got %v", rBlk)
+	}
 }
 
 // blockNested reports whether inner is outer or nested inside it.
@@ -1171,4 +1191,263 @@ func subtreeOf(n ir.Node) map[ir.Node]bool {
 	}
 	visit(n)
 	return set
+}
+
+// ---------------------------------------------------------------------------
+// R-A bracket-law pins (2026-10-24): >=2-between-dims, T==1, the
+// thread-partitioned-consumer refusal
+// ---------------------------------------------------------------------------
+
+// newRed2Fx builds the 2-dim last-axis reduce fixture (the golden redFx
+// shape, decisions supplied by the caller): lhs[d0,d1] loaded over both
+// IVs, piped through an INLINED Map as=[d0,d1], Reduce(0, +), stored into
+// out[d0]. The T==1 sweep endpoint (both decisions at tile 1) and the
+// refusal probe (d0 WARP-single at tile 1, reduced dim sequential) ride
+// this builder. NOTE: a rank-3 T==1 variant with a SEQUENTIAL non-reduced
+// dim is NOT buildable today — the SEQ T==1 single form's index expression
+// IS the raw dimvar, so an epilogue-positioned consumer of it violates the
+// loop-scope invariant at tile-lower time (a latent defect recorded in the
+// task SUMMARY, independent of this task's rulings).
+func newRed2Fx(t *testing.T, name string) (*fx, ir.Node) {
+	t.Helper()
+	f := newChain(name, 1024, 512)
+	lhs := f.tensor("lhs", 0, 1)
+	out := f.tensor("out", 0)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1)})
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0)}, red)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	return f, store
+}
+
+// newRed3Fx builds the rank-3 last-axis reduce fixture: lhs[d0,d1,d2]
+// loaded over all three IVs (chained), piped through an INLINED-shape Map
+// as=[d0,d1,d2], Reduce(0, +), stored into out[d0,d1] (the two-axis output
+// tail the scheduler lands in the epilogue). typeinfer runs for the
+// homogeneity types.
+func newRed3Fx(t *testing.T, name string) (*fx, ir.Node) {
+	t.Helper()
+	f := newChain(name, 512, 256, 512)
+	lhs := f.tensor("lhs", 0, 1, 2)
+	out := f.tensor("out", 0, 1)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1), f.iv(2)})
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0), f.iv(1)}, red)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	return f, store
+}
+
+// TestReducerBracketMultiBetween pins the R-A bracket law on the
+// >=2-between-dims shape (the HI-01 proof): with TWO non-reduced between
+// dims the fresh element loops nest outer->inner in dim order and the whole
+// bracket [Init immediately before X -> X{home{Reduce}} -> Combine
+// immediately after -> the moved store] sits in the INNERMOST element loop
+// (X's parent under R-A) — never in the outer element loop, never per
+// X-round. The store's d0/d1 coordinates reference the two FRESH element
+// dimvars, and no reduced-dim dimvar leaks into its closure.
+func TestReducerBracketMultiBetween(t *testing.T) {
+	f, store := newRed3Fx(t, "red3")
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	prov := provenanceOf(t, cache)
+	X, home := prov.Dims[f.dims[2]].Between, prov.Dims[f.dims[2]].Inside
+	if X == nil || home == nil {
+		t.Fatal("fixture setup: the reduced d2 must be tiled (Between+Inside)")
+	}
+	if err := runFinalLower(t, f.g, cache); err != nil {
+		t.Fatalf("final-lower over the rank-3 reduce: %v", err)
+	}
+	g, k := f.g, f.g.AST()
+
+	// Exactly one of each bracket call.
+	initCall, combineCall, reduceCall := callOf(g, "Init"), callOf(g, "Combine"), callOf(g, "Reduce")
+	if initCall == nil || combineCall == nil || reduceCall == nil {
+		t.Fatal("exactly one Init, one Reduce, and one Combine call must exist")
+	}
+
+	// The innermost element block: Init's containing block under R-A.
+	elemBlk, initIdx := findItemIn(k, initCall)
+	if elemBlk == nil || initIdx != 0 {
+		t.Fatalf("Init must be item 0 of the INNERMOST element loop, got index %d", initIdx)
+	}
+	if elemBlk.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
+	}
+	// X's parent is the innermost element block; adjacency per R-A.
+	xParent, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if xParent != elemBlk {
+		t.Fatalf("X's parental block must be the INNERMOST element loop (R-A), got %v", xParent)
+	}
+	if xIdx != initIdx+1 {
+		t.Fatalf("Init must sit IMMEDIATELY before X's block: Init at %d, X at %d", initIdx, xIdx)
+	}
+	items := elemBlk.Items()
+	if items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatal("Combine must sit IMMEDIATELY after X's block (R-A)")
+	}
+	if len(items) < xIdx+2 || items[xIdx+2].Node == nil || items[xIdx+2].Node.BasePtr() != store.BasePtr() {
+		t.Fatal("the moved store must follow Combine in the innermost element loop")
+	}
+	// Reduce's innermost containing block is Y (home).
+	if rBlk, _ := findItemIn(k, reduceCall); rBlk != home.BasePtr().SchedBlock() {
+		t.Fatalf("Reduce's innermost containing block must be Y (home), got %v", rBlk)
+	}
+
+	// The innermost element block nests TWO element loops deep: its parent
+	// is the OUTER element loop (the outer's only Block item is the inner),
+	// and Init is NOT an item of the outer.
+	outer, outerIdx := findParentOfBlock(k, elemBlk)
+	if outer == nil || outer.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("the innermost element loop must nest inside an outer element SeqLoop, got %v", outer)
+	}
+	nBlocks := 0
+	for _, it := range outer.Items() {
+		if it.Block != nil {
+			nBlocks++
+		}
+	}
+	if nBlocks != 1 || outer.Items()[outerIdx].Block != elemBlk {
+		t.Fatal("the outer element loop's only Block item must be the inner element loop")
+	}
+	if ob, oi := findItemIn(k, initCall); ob == outer {
+		t.Fatalf("Init must not be an item of the OUTER element loop (HI-01), found at %d", oi)
+	}
+	// The loops walk their own dims: inner over d1, outer over d0.
+	if d := ir.OperandsOf(ir.OperandsOf(elemBlk.Loop())[0])[0]; d.BasePtr() != f.dims[1].BasePtr() {
+		t.Fatal("the innermost element loop must walk d1 (dim order)")
+	}
+	if d := ir.OperandsOf(ir.OperandsOf(outer.Loop())[0])[0]; d.BasePtr() != f.dims[0].BasePtr() {
+		t.Fatal("the outer element loop must walk d0 (dim order)")
+	}
+
+	// The store's d0/d1 coordinates reference the two FRESH element
+	// dimvars; no reduced-dim dimvar leaks into the closure.
+	freshOuter := ir.OperandsOf(outer.Loop())[0]
+	freshInner := ir.OperandsOf(elemBlk.Loop())[0]
+	axes := ir.OperandsOf(store)[2:]
+	if len(axes) != 2 {
+		t.Fatalf("the store must carry two axes, got %d", len(axes))
+	}
+	cl0, cl1 := subtreeOf(axes[0]), subtreeOf(axes[1])
+	if !cl0[freshOuter] || cl0[freshInner] {
+		t.Fatal("the store's d0 coordinate must reference the OUTER fresh element dimvar")
+	}
+	if !cl1[freshInner] || cl1[freshOuter] {
+		t.Fatal("the store's d1 coordinate must reference the INNER fresh element dimvar")
+	}
+	for _, loop := range []ir.Node{X, home} {
+		iv := ir.OperandsOf(loop)[0]
+		if cl0[iv] || cl1[iv] {
+			t.Fatal("the moved store must not reference a reduced-dim dimvar")
+		}
+	}
+
+	// Twin-run determinism.
+	f2, _ := newRed3Fx(t, "red3")
+	cache2 := runTileLowerSchedule(t, f2, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	if err := runFinalLower(t, f2.g, cache2); err != nil {
+		t.Fatalf("twin final-lower: %v", err)
+	}
+	if a, b := astShape(k), astShape(f2.g.AST()); a != b {
+		t.Fatalf("twin rank-3 runs differ:\n--- 1 ---\n%s\n--- 2 ---\n%s", a, b)
+	}
+}
+
+// TestReducerBracketT1 pins R-A's T==1 law (the HI-02 proof): with every
+// dim at tile 1, X is the reduced dim's single loop; Init sits IMMEDIATELY
+// before X's block, Combine IMMEDIATELY after it, and the moved store
+// IMMEDIATELY after Combine — all in X's parental block, with
+// SchedBlock(combineCall) == SchedBlock(store) (the same-lexical-scope
+// contract the emitted C++ needs: the Combine local and its consumer must
+// share one C++ scope).
+func TestReducerBracketT1(t *testing.T) {
+	f, store := newRed2Fx(t, "redt1")
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+	})
+	prov := provenanceOf(t, cache)
+	X := prov.Dims[f.dims[1]].Between
+	if X == nil {
+		t.Fatal("fixture setup: the reduced d1 must carry its single loop as Between")
+	}
+	if err := runFinalLower(t, f.g, cache); err != nil {
+		t.Fatalf("final-lower over the T==1 reduce (the HI-02 consumer move): %v", err)
+	}
+	g, k := f.g, f.g.AST()
+
+	initCall, combineCall := callOf(g, "Init"), callOf(g, "Combine")
+	if initCall == nil || combineCall == nil {
+		t.Fatal("exactly one Init and one Combine call must exist")
+	}
+	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if parentBlk == nil {
+		t.Fatal("X's single-loop block must have a parental block")
+	}
+	items := parentBlk.Items()
+	if items[xIdx-1].Node == nil || items[xIdx-1].Node.BasePtr() != initCall.BasePtr() {
+		t.Fatal("Init must sit IMMEDIATELY before X's block (R-A T==1)")
+	}
+	if items[xIdx].Block == nil || items[xIdx].Block.Loop().BasePtr() != X.BasePtr() {
+		t.Fatal("X's block must be at the bracket center (R-A T==1)")
+	}
+	if items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
+		t.Fatal("Combine must sit IMMEDIATELY after X's block (R-A T==1)")
+	}
+	if items[xIdx+2].Node == nil || items[xIdx+2].Node.BasePtr() != store.BasePtr() {
+		t.Fatal("the store must sit IMMEDIATELY after Combine (the HI-02 same-scope move)")
+	}
+	if combineCall.BasePtr().SchedBlock() != parentBlk || store.BasePtr().SchedBlock() != parentBlk {
+		t.Fatal("SchedBlock(combineCall) and SchedBlock(store) must both be X's parental block")
+	}
+	if ops := ir.OperandsOf(store); ops[0] == nil || ops[0].BasePtr() != combineCall.BasePtr() {
+		t.Fatal("the store's value must resolve at the Combine call")
+	}
+}
+
+// TestReducerWarpSingleConsumerRefusal pins the thread-partitioned-consumer
+// refusal: a moved consumer referencing the single IV of a WARP-SoC
+// NON-reduced dim (here d0, WARP T==1, while the reduced dim is the
+// sequential d1) fails closed naming the thread-partitioned walk — the
+// is_first_in_cta store gate is single-owner only over CTA-replicated
+// element walks, so a WARP-partitioned output dim would leave a coverage
+// hole.
+func TestReducerWarpSingleConsumerRefusal(t *testing.T) {
+	f, _ := newRed2Fx(t, "wref")
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+	})
+	err := runFinalLower(t, f.g, cache)
+	if err == nil || !strings.Contains(err.Error(), "thread-partitioned") {
+		t.Fatalf("a moved consumer referencing a WARP-single non-reduced dim's IV must fail closed naming the thread-partitioned walk, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "d0") {
+		t.Fatalf("the refusal must name the offending dim, got %v", err)
+	}
 }

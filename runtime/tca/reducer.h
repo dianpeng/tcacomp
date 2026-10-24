@@ -56,19 +56,28 @@ class SeqReducer {
   T acc_;
 };
 
-// WarpReducer — the v0 protocol (R1/R2 ruling 2026-10-23):
-//   1. Init/Reduce on the private accumulator as above;
-//   2. Combine(): full-warp shuffle down-tree (__shfl_down_sync(0xffffffff,
-//      ...) — valid because every CTA thread participates and out-of-group
-//      lanes hold the identity init), the warp's first lane stages its
-//      partial into the ctor-provided SMEM staging row AT THE WARP'S INDEX,
-//      __syncthreads(), then every thread folds ALL staged warp partials in
-//      ascending warp order from the identity init (tca.md §5.10's
-//      replicated-local-combine broadcast — every participant receives the
-//      final value; the element loop's per-element brackets each read it).
-// Staging ownership (R1): the compiler owns the scratch — one disjoint
-// row of #warps × sizeof(T) bytes in the kernel's dynamic-SMEM pool, handed
-// in as a SmemView<T, 1u>. The runtime keeps NO static __shared__.
+// WarpReducer — the 2026-10-24 protocol ruling (supersedes the R1/R2-era
+// per-thread-accumulator + Combine-internal shuffle):
+//   1. Init() resets ALL SMEM slots single-writer: each warp's first lane
+//      rewrites its OWN slot; Init is uniformly called by every CTA thread
+//      (the bracket law), so every slot resets, and warps that never
+//      Reduce hold the identity init.
+//   2. Reduce(v) does NOT accumulate per-thread: per call, an
+//      __activemask()-derived down-tree combines fn across the
+//      PARTICIPATING lanes INSIDE Reduce; the warp partial lands in the
+//      first active lane, which folds it into its warp's SMEM slot
+//      (slot[warp] = fn(slot[warp], warpPartial) — single writer per
+//      address).
+//   3. Combine(): __syncthreads() FIRST (the slot writes must be visible),
+//      then EVERY thread folds all warp_count() slots in ascending warp
+//      order from the identity init — the replicated-local-combine
+//      broadcast (tca.md §5.10) — and a TRAILING barrier (the T-bz9-05
+//      contingency, applied on measured racecheck evidence) closes the
+//      fold-reads vs next-bracket-Init-writes window.
+// Staging ownership (R1, unchanged): the compiler owns the scratch — one
+// disjoint row of #warps × sizeof(T) bytes in the kernel's dynamic-SMEM
+// pool, handed in as a SmemView<T, 1u>. The runtime keeps NO static
+// __shared__. No per-thread accumulator exists in device code.
 template <typename T>
 class WarpReducer {
  public:
@@ -76,33 +85,84 @@ class WarpReducer {
                                   SmemView<T, 1u> staging)
       : init_(init), fn_(fn), map_(map), staging_(staging) {
     assert(fn != nullptr);
-    acc_ = init_;
+#ifndef __CUDACC__
+    host_acc_ = init_;
+#endif
   }
 
-  __host__ __device__ void Init() { acc_ = init_; }
+  // Single-writer reset of ALL slots (see the class comment): each warp's
+  // first lane rewrites its own slot; the uniform bracket call guarantees
+  // every warp's first lane is present.
+  __host__ __device__ void Init() {
+#if defined(__CUDA_ARCH__)
+    if (map_.is_first_in_warp()) {
+      staging_.Set(init_, map_.warp_index());
+    }
+#elif !defined(__CUDACC__)
+    host_acc_ = init_;
+#endif
+  }
 
-  __host__ __device__ void Reduce(T v) { acc_ = fn_(acc_, v); }
+  // One element per call (R1): the activemask-derived guarded down-tree
+  // folds the participating lanes' values into the warp partial, and the
+  // first active lane folds it into its warp's slot.
+  __host__ __device__ void Reduce(T v) {
+#if defined(__CUDA_ARCH__)
+    // PREFIX-ALIGNMENT CONTRACT (the correctness argument, per the
+    // 2026-10-24 ruling): the compiler's bounds gates produce
+    // PREFIX-aligned active sets — the F1 tileMax kills lanes from the top
+    // within a warp (a lane's per-thread offset grows with its lane id, so
+    // higher lanes exhaust earlier) and the mirror gate kills whole warps
+    // at the 256-thread/8-warp alignment — so the first active lane is
+    // lane 0 and the guarded tree below folds EXACTLY the active lanes'
+    // values into it. Non-prefix masks are out of scope for v0.
+    const unsigned mask = __activemask();
+    T part = v;
+    for (unsigned off = 16u; off > 0u; off >>= 1u) {
+      // Every lane in the mask executes the shuffle uniformly (the sync
+      // flag names the mask); a lane whose source lane falls outside the
+      // active prefix DISCARDS the read.
+      const T got = __shfl_down_sync(mask, part, off);
+      if (map_.lane_id() + off < __popc(mask)) {
+        part = fn_(part, got);
+      }
+    }
+    // The first active lane under prefix alignment is lane 0 (see the
+    // contract above); it alone folds the warp partial into its warp's
+    // slot — single writer per address.
+    if (map_.lane_id() == 0u) {
+      staging_.Set(fn_(staging_.Get(map_.warp_index()), part), map_.warp_index());
+    }
+#elif !defined(__CUDACC__)
+    host_acc_ = fn_(host_acc_, v);
+#else
+    (void)v;  // nvcc host pass: the reducer is device-only
+#endif
+  }
 
+  // Barrier FIRST, then the all-threads ascending slot fold.
   __host__ __device__ T Combine() {
 #if defined(__CUDA_ARCH__)
-    // Device passes see only this branch (nvcc eliminates the inactive one).
-    T part = acc_;
-    for (unsigned off = 16u; off > 0u; off >>= 1u) {
-      part = fn_(part, __shfl_down_sync(0xffffffffu, part, off));
-    }
-    if (map_.is_first_in_warp()) {
-      staging_.Set(part, map_.warp_index());
-    }
     __syncthreads();  // legal: Combine is uniformly called by every CTA thread
     // Deterministic replicated-local fold over every staged warp (ascending).
     T out = init_;
     for (unsigned w = 0u; w < map_.warp_count(); ++w) {
       out = fn_(out, staging_.Get(w));
     }
+    // Trailing barrier — the T-bz9-05 contingency, applied on MEASURED
+    // evidence per the 2026-10-24 ruling's racecheck-decides disposition:
+    // compute-sanitizer racecheck flagged the slot WAR between a straggler
+    // thread's fold READS here and the next element bracket's Init/Reduce
+    // slot WRITES (the fold reads are not otherwise ordered against the
+    // next bracket — the ruling anticipated exactly this hazard). One
+    // barrier after the fold closes the window: every thread finishes
+    // reading the slots before any thread proceeds to the next bracket.
+    __syncthreads();
     return out;
+#elif !defined(__CUDACC__)
+    return host_acc_;
 #else
-    // Host (CPU unit tests / nvcc host pass): no warps — the seq algebra.
-    return acc_;
+    return init_;  // nvcc host pass: never called (the kernel is device-only)
 #endif
   }
 
@@ -111,7 +171,13 @@ class WarpReducer {
   T (*fn_)(T, T);
   const ThreadMapping& map_;
   SmemView<T, 1u> staging_;
-  T acc_;
+#ifndef __CUDACC__
+  // Host-only stand-in (plain CPU compilation): no warps exist on the CPU
+  // layer, so the host branch runs the sequential algebra. Under nvcc this
+  // member exists in NEITHER pass — device code carries no accumulator
+  // register.
+  T host_acc_;
+#endif
 };
 
 // GlobalReducer — registered scaffolding only (no v0 preset assigns CTA
