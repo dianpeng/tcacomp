@@ -27,6 +27,16 @@
 //     axes make ValueEqual maximally effective post-GVN), erase/rewire
 //     only — no new nodes, no new kinds.
 //
+// quick-261024-sdk (fix1.md D-f) adds ONE LIR-scoped rule beside the
+// region rules — FILL LIVENESS: an unconsumed buffer store (a
+// KindFragStore/KindMemStoreSMem whose buffer has no live buffer load)
+// is dead code removed together with its unread source GMEM load. The
+// author's correction is explicit: this is memory optimization's domain,
+// never DCE's — the fill's source load is chain-reachable (so DCE keeps
+// it) but produces a value nobody reads, which is exactly the
+// ordering-only dead-load class the 2026-10-20 audit named as memopt's
+// open gap.
+//
 // Expectation note (review): today's builder graphs rarely fire the rules —
 // tensor reads are paramRefs, not GMEM loads — so the pass's own tests
 // construct chain-carrying graphs directly through the ir constructors. The
@@ -92,9 +102,10 @@ func (Pass) Preserved() []string { return nil }
 //     the bound is belt-and-braces) over the eligible regions, all
 //     mutations through the one MutContext{Pass: "memopt"} (INV-E):
 //     forward loads (rule a), eliminate shadowed stores (rule b), sweep
-//     zero-use stores (rule c). Determinism (INV-G): regions in
-//     first-access allocation order, accesses in chain order — maps group,
-//     they never steer iteration.
+//     zero-use stores (rule c), and the LIR-scoped fill-liveness sweep
+//     (rule d, D-f) over every live buffer store. Determinism (INV-G):
+//     regions in first-access allocation order, accesses in chain order —
+//     maps group, they never steer iteration.
 //
 // The side-effect analysis is computed once on entry: only stores and
 // loads are ever erased, never the pure axes nodes the proven-path
@@ -113,7 +124,7 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 
 	total := 0
 	for _, n := range g.AllocatedNodes() {
-		if isGMEMAccess(n.KindOf()) {
+		if isGMEMAccess(n.KindOf()) || isBufferStore(n.KindOf()) {
 			total++
 		}
 	}
@@ -158,6 +169,14 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 				progress = progress || fired
 			}
 		}
+		// (d) FILL LIVENESS (D-f, LIR-scoped — outside the regions): a
+		// buffer store whose buffer has no live reads is unconsumed dead
+		// code, removed together with its unread source load.
+		fired, err := sweepUnconsumedBufferStores(mctx, g)
+		if err != nil {
+			return err
+		}
+		progress = progress || fired
 		if !progress {
 			return nil
 		}
@@ -443,12 +462,173 @@ func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node) (bool
 }
 
 // ---------------------------------------------------------------------------
+// Rule (d) — fill liveness (D-f, quick-261024-sdk). LIR-scoped, outside the
+// regions: the fill families carry no per-tensor GMEM chains of their own
+// (the fill store holds no ImpactBy; its readers chain TO it), so the rule
+// keys on buffer-operand identity and the live-readership predicate alone.
+// ---------------------------------------------------------------------------
+
+// sweepUnconsumedBufferStores implements rule (d) — fill liveness (D-f,
+// fix1.md): "a buffer store whose buffer has zero live loads is dead
+// together with its source load". An LIR buffer store (KindFragStore /
+// KindMemStoreSMem — tile-lower's fill spill and its SMEM-window sibling)
+// whose buffer operand has NO live buffer load is unconsumed: the store is
+// erased and, when the stored value is a GMEM load nobody reads, the load
+// dies with it (ordering-only dead-load removal — its chain successors
+// splice past it, C3). DCE stays untouched; this is memory-optimization
+// domain per the author correction (§0: "a fill is a normal memory load —
+// it must have a memory read consuming it, otherwise it is dead code").
+func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error) {
+	progress := false
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferStore(n.KindOf()) {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) < 2 || ops[1] == nil {
+			continue
+		}
+		if bufferHasLiveReads(g, ops[1]) {
+			continue
+		}
+		fired, err := removeUnconsumedFill(mctx, n)
+		if err != nil {
+			return progress, err
+		}
+		progress = progress || fired
+	}
+	return progress, nil
+}
+
+// bufferHasLiveReads reports whether any live buffer load reads buffer —
+// the liveness predicate of rule (d) ("zero live loads", D-f). The load
+// families are the only readers a buffer can have: a buffer name is
+// consumed through its loads, never through a raw operand (construction
+// data edges terminate at the store).
+func bufferHasLiveReads(g *ir.Graph, buffer ir.Node) bool {
+	bb := buffer.BasePtr()
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferLoad(n.KindOf()) {
+			continue
+		}
+		if ops := ir.OperandsOf(n); len(ops) > 0 && ops[0] != nil && ops[0].BasePtr() == bb {
+			return true
+		}
+	}
+	return false
+}
+
+// removeUnconsumedFill erases the buffer store s and, when its value is an
+// unread GMEM load, the load with it (D-f: "dead together with its source
+// load"). The store is value-RAUW'd first (the store families return
+// input#0 — the sweepDeadStore discipline) and erased; the source load —
+// its data uses gone with the store — splices its chain successors past
+// itself and erases. A load that still has a data use is left alone
+// (fail-closed: not this rule's case).
+func removeUnconsumedFill(mctx *ir.MutContext, s ir.Node) (bool, error) {
+	value := storeValue(s)
+	if value == nil {
+		return false, fmt.Errorf("memopt: buffer store node %d (%s) carries no value operand",
+			s.BasePtr().ID(), s.KindOf())
+	}
+	if err := mctx.ReplaceAllUsesWith(s, value); err != nil {
+		return false, fmt.Errorf("memopt: RAUW unconsumed buffer store %d: %w", s.BasePtr().ID(), err)
+	}
+	if err := mctx.Erase(s); err != nil {
+		return false, fmt.Errorf("memopt: erase unconsumed buffer store %d: %w", s.BasePtr().ID(), err)
+	}
+	if value.KindOf() == ir.KindMemLoad && !hasDataUse(value) {
+		if err := splicePast(mctx, value); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+// splicePast removes an ordering-only node n (no data uses — the caller
+// checks): its at-most-one effect successor re-points at n's own
+// predecessor (SetDef), or drops the edge when n was chain-first
+// (RemoveImpactBy) — the C3 splice — and n is erased. A forked ordering
+// (several effect successors or several predecessors) fails closed, the
+// same discipline forwardLoad applies to region loads: the splice would
+// not know which single order to preserve.
+func splicePast(mctx *ir.MutContext, n ir.Node) error {
+	var pred ir.Node
+	if edges := ir.ImpactBy(n); len(edges) == 1 {
+		pred = edges[0].Def()
+	} else if len(edges) > 1 {
+		return fmt.Errorf("memopt: node %d (%s) holds %d ImpactBy edges (an orderable chain is linear)",
+			n.BasePtr().ID(), n.KindOf(), len(edges))
+	}
+	var succEdges []ir.SSAUse
+	for _, u := range ir.UsesOf(n) { // snapshot before any SetDef mutates the list
+		user := u.User()
+		if user == nil {
+			continue
+		}
+		for _, e := range ir.ImpactBy(user) {
+			if e == u { // this use record IS one of user's ImpactBy edges
+				succEdges = append(succEdges, u)
+				break
+			}
+		}
+	}
+	if len(succEdges) > 1 {
+		return fmt.Errorf("memopt: node %d (%s) has %d effect successors (at most one in an orderable chain)",
+			n.BasePtr().ID(), n.KindOf(), len(succEdges))
+	}
+	for _, e := range succEdges {
+		if pred != nil {
+			if err := mctx.SetDef(e, pred); err != nil {
+				return fmt.Errorf("memopt: splice successor of node %d: %w", n.BasePtr().ID(), err)
+			}
+		} else if err := mctx.RemoveImpactBy(e); err != nil {
+			return fmt.Errorf("memopt: drop head edge of node %d: %w", n.BasePtr().ID(), err)
+		}
+	}
+	return mctx.Erase(n)
+}
+
+// hasDataUse reports whether any live use of n is a DATA use (an operand
+// slot, not an ImpactBy ordering edge) — the fill source load's liveness
+// test: ordering edges are spliced away by the removal, a data use means
+// the value is still read.
+func hasDataUse(n ir.Node) bool {
+	for _, u := range ir.UsesOf(n) {
+		user := u.User()
+		if user == nil {
+			continue
+		}
+		effect := false
+		for _, e := range ir.ImpactBy(user) {
+			if e == u {
+				effect = true
+				break
+			}
+		}
+		if !effect {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // Shared access predicates.
 // ---------------------------------------------------------------------------
 
 // isGMEMAccess reports whether k is a HIR GMEM access (C4: the LIR SMEM/
-// FRAG families carry no effect chains and never reach the rules).
+// FRAG families carry no effect chains and never reach the region rules;
+// rule (d) reaches the buffer-store pair directly, D-f).
 func isGMEMAccess(k ir.Kind) bool { return k == ir.KindMemLoad || k == ir.KindMemStore }
+
+// isBufferStore reports whether k is an LIR buffer store of the fill
+// families — rule (d)'s subject (D-f).
+func isBufferStore(k ir.Kind) bool { return k == ir.KindFragStore || k == ir.KindMemStoreSMem }
+
+// isBufferLoad reports whether k is an LIR buffer load of the fill
+// families — the readership side of rule (d)'s liveness predicate.
+func isBufferLoad(k ir.Kind) bool { return k == ir.KindFragLoad || k == ir.KindMemLoadSMem }
 
 // tensorOf returns n's tensor operand node — operand 0 of a load, operand 1
 // of a store (the region key, C2c) — or nil.
@@ -485,13 +665,14 @@ func axesOf(n ir.Node) []ir.Node {
 }
 
 // storeValue returns the stored value — a store's operand 0 (the store
-// returns input#0, doc §2.5) — or nil.
+// returns input#0, doc §2.5; the LIR buffer store families share the
+// [value, dst, bivs...] layout) — or nil.
 func storeValue(n ir.Node) ir.Node {
-	if n.KindOf() != ir.KindMemStore {
-		return nil
-	}
-	if ops := ir.OperandsOf(n); len(ops) > 0 {
-		return ops[0]
+	switch n.KindOf() {
+	case ir.KindMemStore, ir.KindFragStore, ir.KindMemStoreSMem:
+		if ops := ir.OperandsOf(n); len(ops) > 0 {
+			return ops[0]
+		}
 	}
 	return nil
 }
