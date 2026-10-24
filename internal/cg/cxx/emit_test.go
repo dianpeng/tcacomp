@@ -208,13 +208,12 @@ func reduce3Graph(t *testing.T) *ir.Graph {
 	return f.g
 }
 
-// reduceT1Graph builds the T==1 sweep endpoint (the HI-02 proof shape):
-// the redwarp graph at {CTA,100,1}/{WARP,8,1} — X is the reduced dim's
-// single (mirror-gated) K loop; the Combine local and the moved store
-// must share its parent's lexical scope. (A rank-3 T==1 variant with a
-// SEQUENTIAL non-reduced dim is not buildable today — the SEQ T==1 single
-// form's raw-dimvar index expression cannot serve an epilogue consumer
-// under the loop-scope invariant; recorded in the task SUMMARY.)
+// reduceT1Graph builds the minimal-legal-tile endpoint (the HI-02 proof
+// shape, retargeted by the 2026-10-24 tile-disable ruling; the identifier
+// is historical): the redwarp graph at {CTA,100,2}/{WARP,8,2} — the floor
+// tile 2 everywhere, the compiler's flat endpoint — X is the reduced dim's
+// tile-between loop; the Combine local and the moved store must share the
+// element loop's lexical scope.
 func reduceT1Graph(t *testing.T) *ir.Graph {
 	t.Helper()
 	f := newChain("redt1", 1024, 512)
@@ -234,8 +233,8 @@ func reduceT1Graph(t *testing.T) *ir.Graph {
 		t.Fatalf("fixture typeinfer: %v", err)
 	}
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
-		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
 	})
 	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("final-lower: %v", err)
@@ -305,15 +304,15 @@ func TestReduceShapesEmit(t *testing.T) {
 			t.Fatalf("the rank-3 reduce text must satisfy R-A: %v", err)
 		}
 	})
-	t.Run("t1 sweep endpoint", func(t *testing.T) {
+	t.Run("minimal-legal-tile endpoint", func(t *testing.T) {
 		res, err := Emit(reduceT1Graph(t), emitOptions())
 		if err != nil {
-			t.Fatalf("Emit over the T==1 reduce (the HI-02 oracle): %v", err)
+			t.Fatalf("Emit over the minimal-tile reduce (the HI-02 oracle): %v", err)
 		}
 		cu := string(res.Files["redt1.cu"])
 		assertReducerSurface(t, cu)
 		if err := ScanBracketLaw(cu); err != nil {
-			t.Fatalf("the T==1 reduce text must satisfy R-A (incl. the Combine-local/gated-store same-scope pin): %v", err)
+			t.Fatalf("the minimal-tile reduce text must satisfy R-A (incl. the Combine-local/gated-store same-scope pin): %v", err)
 		}
 	})
 }

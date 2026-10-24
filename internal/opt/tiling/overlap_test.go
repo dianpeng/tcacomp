@@ -413,6 +413,7 @@ func TestParamsValidate(t *testing.T) {
 		{"warp portion negative", func(p *Params) { p.WarpPortion = -1 }},
 		{"warp portion above cap", func(p *Params) { p.WarpPortion = PortionWarp + 1 }},
 		{"zero tile size", func(p *Params) { p.TileSizes = []int{32, 0} }},
+		{"one tile size", func(p *Params) { p.TileSizes = []int{32, 1} }},
 		{"empty tile list", func(p *Params) { p.TileSizes = nil }},
 		{"windowk zero", func(p *Params) { p.WindowK = 0 }},
 		{"cachedims zero", func(p *Params) { p.CacheDims = 0 }},
@@ -430,6 +431,24 @@ func TestParamsValidate(t *testing.T) {
 				t.Fatalf("%s must fail Validate", tc.name)
 			}
 		})
+	}
+
+	// The 2026-10-24 tile-disable ruling's gate 1 contract: a below-2 entry
+	// is rejected naming "not a legal schedule" (tile 1 is not a legal
+	// schedule — the compiler never generates a non-tiling schedule), and
+	// the minimal legal set {2,...} validates.
+	p := DefaultParams()
+	p.TileSizes = []int{2, 32, 64}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("the minimal legal set {2,...} must validate: %v", err)
+	}
+	p.TileSizes = []int{1, 32, 64}
+	err := p.Validate()
+	if err == nil {
+		t.Fatal("a TileSizes entry of 1 must fail Validate — tile size 1 is not a legal schedule (2026-10-24 ruling)")
+	}
+	if !strings.Contains(err.Error(), "not a legal schedule") {
+		t.Fatalf("the rejection must name the ruling's contract, got: %v", err)
 	}
 }
 

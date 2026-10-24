@@ -6,10 +6,10 @@
 //	Shape A (HI-01): the rank-3 last-axis reduce out[i,j] = sum_k
 //	a[i,j,k] with TWO T>1 non-reduced dims — the >=2-between-dims R-A
 //	bracket shape (decisions {CTA,100,32}/{SEQ,1,64}/{WARP,8,64}).
-//	Shape B (HI-02): the T==1 sweep endpoint (the redwarp graph at
-//	{CTA,100,1}/{WARP,8,1}) — the T==1 flat bracket's Combine local and
-//	the moved store share one C++ lexical scope, and the WARP-single
-//	reduced dim rides the single-form mirror gate.
+//	Shape B (HI-02): the minimal-legal-tile endpoint (the redwarp graph at
+//	{CTA,100,2}/{WARP,8,2} — the 2026-10-24 tile-disable ruling's floor; the
+//	identifier stays historical) — the flat bracket's Combine local and the
+//	moved store share one C++ lexical scope at the smallest legal schedule.
 //
 // R-C discipline: reduce comparisons are tolerance-based ONLY (canary 0,
 // max abs diff <= 2e-3); the fold order is irrelevant to correctness and
@@ -260,8 +260,8 @@ func buildReduce3Fixture(t *testing.T) string {
 func buildReduceT1Fixture(t *testing.T) string {
 	t.Helper()
 	cu := runReduce3Pipeline(t, "redt1", []float64{1024, 512}, []tiling.IterDecision{
-		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
 	}, "ReduceT1", "ReduceT1Launch")
 	files := map[string][]byte{
 		"redt1.cu":       cu,
@@ -323,8 +323,10 @@ func TestReduce3E2E(t *testing.T) {
 	}
 }
 
-// TestReduceT1E2E is the HI-02 proof: the T==1 sweep endpoint compiles
-// under nvcc (the same-scope Combine local/store) and matches the
+// TestReduceT1E2E is the HI-02 proof at the minimal-legal-tile endpoint
+// ({CTA,100,2}/{WARP,8,2}, the 2026-10-24 tile-disable ruling's floor —
+// the T==1 endpoint it replaced is not a legal schedule): the kernel
+// compiles under nvcc (the same-scope Combine local/store) and matches the
 // sequential reference within tolerance.
 func TestReduceT1E2E(t *testing.T) {
 	skipUnlessE2E(t)

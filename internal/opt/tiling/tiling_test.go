@@ -329,18 +329,20 @@ func TestV0PolicyFilter(t *testing.T) {
 }
 
 // TestSearchWindow pins the innermost-K window: a 7-deep chain under
-// WindowK 5 records the 2 outermost iters as SoCSequential / LoC 1 /
-// TileSize 1.
+// WindowK 5 records the 2 outermost iters as SoCSequential / LoC 1 riding
+// the swept uniform tile (R1, 2026-10-24 tile-disable ruling — the
+// non-window dims take the winning window tile; tile 1 no longer exists).
 func TestSearchWindow(t *testing.T) {
 	maxes := []float64{64, 64, 64, 64, 64, 64, 64}
 	fx := newChain("window7", maxes...)
 	scaffoldStore(fx, fx.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
 	rec := runPass(t, fx.g, DefaultParams())
+	want := decisionOf(t, rec, fx.iters[2]).TileSize // the uniform window tile
 	for i, it := range fx.iters[:2] {
 		d := decisionOf(t, rec, it)
-		if d.SoC != SoCSequential || d.LoC != 1 || d.TileSize != 1 {
-			t.Fatalf("outside-window iter %d (index %d) must be sequential/1/1, got %s/%d/%d",
-				it.BasePtr().ID(), i, d.SoC, d.LoC, d.TileSize)
+		if d.SoC != SoCSequential || d.LoC != 1 || d.TileSize != want {
+			t.Fatalf("outside-window iter %d (index %d) must be sequential/1/uniform-tile %d, got %s/%d/%d",
+				it.BasePtr().ID(), i, want, d.SoC, d.LoC, d.TileSize)
 		}
 	}
 	if feasibilityOf(rec).ctaCount < 1 {
@@ -355,8 +357,9 @@ func TestSearchWindow(t *testing.T) {
 // covered set) forces ClassFRAG regardless of the covered dims' SoC; else
 // ANY WARP-covered dim yields the SMEM window class and all-SEQ covered
 // dims yield FRAG (subject to the per-thread byte and reuse gates); ANY
-// covered dim at tile 1 blocks promotion (the judge-side F4 gate, matching
-// the lower's drop rule).
+// covered dim at tile < 2 fails closed (tile 1 is not a legal schedule —
+// the 2026-10-24 tile-disable ruling — the judge rejects the input with
+// ReasonUnknownIter rather than scoring it).
 func TestPromotionJudge(t *testing.T) {
 	fx, lhs, rhs := matmul()
 	facts := overlapOf(fx, DefaultParams())
@@ -415,13 +418,15 @@ func TestPromotionJudge(t *testing.T) {
 			wantBytes, j.promoted, j.class, j.bytes)
 	}
 
-	// Any covered dim at tile 1 (lhs covers K): not promoted (F4 gate —
-	// ANY covered iter, not only all of them).
+	// A covered dim at an illegal tile (lhs covers K at TileSize 1): the
+	// judge fails closed with ReasonUnknownIter — tile 1 is not a legal
+	// schedule (2026-10-24 tile-disable ruling), so the input is rejected,
+	// not scored (ANY covered iter, not only all of them).
 	iters, ctx = soc(
 		IterDecision{SoCTA, 100, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 1})
 	j = judgeSite(sl, iters, ctx, p)
-	if j.promoted || j.reason != ReasonTileOne {
-		t.Fatalf("a covered iter at tile 1 must block promotion, got (%v, %q)", j.promoted, j.reason)
+	if j.promoted || j.reason != ReasonUnknownIter {
+		t.Fatalf("a covered iter at tile 1 must fail closed with ReasonUnknownIter, got (%v, %q)", j.promoted, j.reason)
 	}
 
 	// Per-thread reuse < 2 declines the site: rhs's only reuse dim is M;
@@ -701,17 +706,17 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 // returns the maximum score — the optimality cross-check. The judge's
 // gates and arithmetic are re-derived here INDEPENDENTLY (no judgeSite
 // call): window bytes, per-thread inside-walk trips, the tier rule, the
-// F4 tile-1 gate, the F6 per-site frag gate, the reuse gate, and the
-// kernel-wide budget feasibility.
+// F6 per-site frag gate, the reuse gate, and the kernel-wide budget
+// feasibility. The sweep is Params.TileSizes only, every entry >= 2
+// (2026-10-24 tile-disable ruling — the old injected tile 1 is gone: the
+// compiler never generates a non-tiling schedule), and non-window dims
+// ride the swept uniform tile (R1) exactly as evalSchedule now does.
 func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	t.Helper()
 	facts := overlapOf(fx, p)
 	window := windowOf(facts, p)
 
-	tiles := []int{1}
-	for _, ts := range p.TileSizes {
-		tiles = append(tiles, ts)
-	}
+	tiles := append([]int(nil), p.TileSizes...)
 	sort.Ints(tiles)
 	quantum := (p.MaxThreadsPerCTA / 32) / PortionWarp
 
@@ -736,7 +741,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 			for _, tile := range tiles {
 				iters := make(map[ir.Node]IterDecision, len(facts.Levels))
 				for _, it := range treeItersOf(facts.Tree) {
-					iters[it] = IterDecision{SoCSequential, 1, 1}
+					iters[it] = IterDecision{SoCSequential, 1, tile} // R1: the swept uniform tile
 				}
 				for i := range window { // portion completion
 					d := IterDecision{SoC: soc[i], LoC: 1, TileSize: tile}
@@ -758,14 +763,14 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 					for _, c := range sf.Covered {
 						coveredSet[c] = true
 					}
-					promoted, ctaCovered, tileOne := true, false, false
+					promoted, ctaCovered := true, false
 					forcedFrag := false
 					for _, c := range sf.Covered {
 						if iters[c].SoC == SoCTA {
 							ctaCovered = true
 						}
-						if iters[c].TileSize == 1 {
-							tileOne = true
+						if iters[c].TileSize < 2 { // the sweep only carries >= 2 — mirror of the judge's fail-closed input gate
+							promoted = false
 						}
 					}
 					for _, it := range sf.INS {
@@ -785,7 +790,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 							}
 						}
 					}
-					if ctaCovered || tileOne || len(sf.Covered) == 0 {
+					if ctaCovered || len(sf.Covered) == 0 {
 						promoted = false
 					}
 					bytes := 0
@@ -1010,6 +1015,42 @@ func TestFragBudgetGate(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("tile-64 FRAG with a 128-byte floor must be infeasible (128+256 > MaxFragPerThread)")
+	}
+}
+
+// TestSearcherNeverDisabledError pins the searcher's gate 4 of the
+// 2026-10-24 tile-disable ruling: when NO tile >= 2 vector is budget-
+// feasible, searchSchedule returns an ERROR — the deleted t=1 fallback is
+// gone, tiling is never disabled. Reachability note: with validated Params
+// and floors a chosen schedule produced, the all-declined corner (score 0,
+// SMEM/FRAG sums 0) is always feasible, so this error is DEFENSIVE — the
+// same reachability the deleted fallback had (its own comment called it
+// unreachable). The pin synthesizes the corner the only way it can exist:
+// floors already beyond the kernel-wide budgets.
+func TestSearcherNeverDisabledError(t *testing.T) {
+	fx, _, _ := matmul()
+	p := DefaultParams()
+	lf := overlapOf(fx, p)
+
+	for _, tc := range []struct {
+		name      string
+		smemFloor int
+		fragFloor int
+	}{
+		{"smem floor beyond MaxCache", p.MaxCache + 1, 0},
+		{"frag floor beyond MaxFragPerThread", 0, p.MaxFragPerThread + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := searchSchedule(lf, p, tc.smemFloor, tc.fragFloor)
+			if err == nil {
+				t.Fatal("no-feasible-schedule must ERROR (the t=1 fallback is deleted; tiling is never disabled)")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "no feasible schedule at any tile >= 2") ||
+				!strings.Contains(msg, "never disabled") {
+				t.Fatalf("error must pin the never-disabled ruling, got: %v", err)
+			}
+		})
 	}
 }
 
