@@ -175,6 +175,74 @@ func reduceWarpGraph(t *testing.T) *ir.Graph {
 	return f.g
 }
 
+// reduce3Graph builds the rank-3 last-axis reduce (the HI-01 proof shape):
+// u32 extents 64/32/512, lhs[d0,d1,d2] load → map (as=[d0,d1,d2]) →
+// reduce(0.0f, +) → out[d0,d1] store, decisions {CTA,100,32}/{SEQ,1,64}/
+// {WARP,8,64} — TWO between dims (the >=2-between-dims R-A case).
+func reduce3Graph(t *testing.T) *ir.Graph {
+	t.Helper()
+	f := newChain("red3", 64, 32, 512)
+	lhs := f.tensor("lhs", 0, 1, 2)
+	out := f.tensor("out", 0, 1)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1), f.iv(2)})
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0), f.iv(1)}, red)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
+		t.Fatalf("final-lower: %v", err)
+	}
+	return f.g
+}
+
+// reduceT1Graph builds the T==1 sweep endpoint (the HI-02 proof shape):
+// the redwarp graph at {CTA,100,1}/{WARP,8,1} — X is the reduced dim's
+// single (mirror-gated) K loop; the Combine local and the moved store
+// must share its parent's lexical scope. (A rank-3 T==1 variant with a
+// SEQUENTIAL non-reduced dim is not buildable today — the SEQ T==1 single
+// form's raw-dimvar index expression cannot serve an epilogue consumer
+// under the loop-scope invariant; recorded in the task SUMMARY.)
+func reduceT1Graph(t *testing.T) *ir.Graph {
+	t.Helper()
+	f := newChain("redt1", 1024, 512)
+	lhs := f.tensor("lhs", 0, 1)
+	out := f.tensor("out", 0)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1)})
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0)}, red)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+	})
+	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
+		t.Fatalf("final-lower: %v", err)
+	}
+	return f.g
+}
+
 // emitOptions mirrors tiling.DefaultParams — the same totals the pipeline
 // ran under (doc/cg.md §1.3: the driver passes them explicitly).
 func emitOptions() cg.Options {
@@ -202,7 +270,10 @@ func TestGoldenMatmulStore(t *testing.T) {
 // TestGoldenReduceWarp pins the reducer surface: the hoisted combiner
 // lambda, the WarpReducer construction carrying (init, lambda), the
 // Init/Reduce/Combine bracket over k's tile-between loop with slot IVs,
-// and the D7 slot reads inside the epilogue re-iteration.
+// and the D7 slot reads inside the epilogue re-iteration. The R-A audit
+// (R-B, 2026-10-24): the byte-identical regeneration proves the committed
+// golden conformant, and ScanBracketLaw re-proves the bracket law
+// mechanically over the emitted text (== the golden bytes).
 func TestGoldenReduceWarp(t *testing.T) {
 	g := reduceWarpGraph(t)
 	res, err := Emit(g, emitOptions())
@@ -210,6 +281,60 @@ func TestGoldenReduceWarp(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 	golden.Assert(t, "testdata/reduce_warp.cu", res.Files["redwarp.cu"])
+	if err := ScanBracketLaw(string(res.Files["redwarp.cu"])); err != nil {
+		t.Fatalf("the committed reduce golden must satisfy the R-A bracket law mechanically: %v", err)
+	}
+}
+
+// TestReduceShapesEmit pins the two new reduce shapes at the emitted-text
+// level (the compile-level oracle: pre-fix, the >=2-between shape failed
+// emission at the dimvar-scope gate): both EMIT successfully, each .cu
+// carries the WarpReducer ctor with the 4-operand face, exactly one Init
+// call site, exactly one Combine local, and the mechanical R-A bracket-law
+// scan is green (for shape B including the same-lexical-scope pin: no
+// scope closes between the Combine local and the gated store).
+func TestReduceShapesEmit(t *testing.T) {
+	t.Run("rank3 multi-between", func(t *testing.T) {
+		res, err := Emit(reduce3Graph(t), emitOptions())
+		if err != nil {
+			t.Fatalf("Emit over the rank-3 reduce (the HI-01 oracle — pre-fix this failed the dimvar-scope gate): %v", err)
+		}
+		cu := string(res.Files["red3.cu"])
+		assertReducerSurface(t, cu)
+		if err := ScanBracketLaw(cu); err != nil {
+			t.Fatalf("the rank-3 reduce text must satisfy R-A: %v", err)
+		}
+	})
+	t.Run("t1 sweep endpoint", func(t *testing.T) {
+		res, err := Emit(reduceT1Graph(t), emitOptions())
+		if err != nil {
+			t.Fatalf("Emit over the T==1 reduce (the HI-02 oracle): %v", err)
+		}
+		cu := string(res.Files["redt1.cu"])
+		assertReducerSurface(t, cu)
+		if err := ScanBracketLaw(cu); err != nil {
+			t.Fatalf("the T==1 reduce text must satisfy R-A (incl. the Combine-local/gated-store same-scope pin): %v", err)
+		}
+	})
+}
+
+// assertReducerSurface pins the common reducer emission facts: the
+// WarpReducer ctor with the 4-operand face, exactly one Init call site,
+// and exactly one Combine local.
+func assertReducerSurface(t *testing.T, cu string) {
+	t.Helper()
+	if !strings.Contains(cu, "tca::rt::WarpReducer<float> reducer0(") {
+		t.Fatal("the .cu must construct the WarpReducer")
+	}
+	if !strings.Contains(cu, "SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem") {
+		t.Fatal("the ctor face must carry the staging SmemView operand")
+	}
+	if got := strings.Count(cu, "reducer0.Init();"); got != 1 {
+		t.Fatalf("exactly one Init call site expected, got %d", got)
+	}
+	if got := strings.Count(cu, "reducer0.Combine();"); got != 1 {
+		t.Fatalf("exactly one Combine local expected, got %d", got)
+	}
 }
 
 // TestDeterminism pins twin-graph byte identity (the repo's standing

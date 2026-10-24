@@ -272,10 +272,13 @@ template <typename T> struct GlobalReducer { /* v0-unreachable scaffolding, same
      lanes' values. Non-prefix masks are out of scope for v0.
   3. `Combine()`: `__syncthreads()` FIRST (the slot writes must be
      visible), then EVERY thread folds all `map.warp_count()` slots in
-     ascending warp order from the identity init — the barrier is the
-     protocol's ONLY synchronization (tca.md §5.10's
-     replicated-local-combine broadcast; the per-element brackets each
-     re-read it).
+     ascending warp order from the identity init — the
+     replicated-local-combine broadcast (tca.md §5.10; the per-element
+     brackets each re-read it) — and a TRAILING `__syncthreads()` (the
+     T-bz9-05 contingency, applied on measured racecheck evidence:
+     compute-sanitizer flagged the fold-read vs next-bracket-Init-write
+     slot WAR on the multi-element-bracket reduce shapes) closes the
+     reuse window.
   4. **Staging ownership (R1):** the scratch is ONE ROW of the COMPILER's
      dynamic-SMEM pool — `#warps × sizeof(T)` bytes at a disjoint pool
      offset (D8), passed as `SmemView<T, 1u>(reinterpret_cast<T*>(tca_smem

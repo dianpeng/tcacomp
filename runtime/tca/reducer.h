@@ -71,8 +71,9 @@ class SeqReducer {
 //   3. Combine(): __syncthreads() FIRST (the slot writes must be visible),
 //      then EVERY thread folds all warp_count() slots in ascending warp
 //      order from the identity init — the replicated-local-combine
-//      broadcast (tca.md §5.10). That barrier is the protocol's ONLY
-//      synchronization.
+//      broadcast (tca.md §5.10) — and a TRAILING barrier (the T-bz9-05
+//      contingency, applied on measured racecheck evidence) closes the
+//      fold-reads vs next-bracket-Init-writes window.
 // Staging ownership (R1, unchanged): the compiler owns the scratch — one
 // disjoint row of #warps × sizeof(T) bytes in the kernel's dynamic-SMEM
 // pool, handed in as a SmemView<T, 1u>. The runtime keeps NO static
@@ -139,8 +140,7 @@ class WarpReducer {
 #endif
   }
 
-  // Barrier FIRST, then the all-threads ascending slot fold — the
-  // protocol's ONLY synchronization.
+  // Barrier FIRST, then the all-threads ascending slot fold.
   __host__ __device__ T Combine() {
 #if defined(__CUDA_ARCH__)
     __syncthreads();  // legal: Combine is uniformly called by every CTA thread
@@ -149,6 +149,15 @@ class WarpReducer {
     for (unsigned w = 0u; w < map_.warp_count(); ++w) {
       out = fn_(out, staging_.Get(w));
     }
+    // Trailing barrier — the T-bz9-05 contingency, applied on MEASURED
+    // evidence per the 2026-10-24 ruling's racecheck-decides disposition:
+    // compute-sanitizer racecheck flagged the slot WAR between a straggler
+    // thread's fold READS here and the next element bracket's Init/Reduce
+    // slot WRITES (the fold reads are not otherwise ordered against the
+    // next bracket — the ruling anticipated exactly this hazard). One
+    // barrier after the fold closes the window: every thread finishes
+    // reading the slots before any thread proceeds to the next bracket.
+    __syncthreads();
     return out;
 #elif !defined(__CUDACC__)
     return host_acc_;
