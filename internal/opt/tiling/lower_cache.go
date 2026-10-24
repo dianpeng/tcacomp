@@ -35,22 +35,14 @@ package tiling
 //     CTA-rank offsets); never a per-thread (ThreadMap) term. A WARP dim
 //     above the tie has NO uniform coordinate and fails closed.
 //
-// Structural realization (the F8 splice, 261021-o61 T3): the fill is placed
-// INSIDE the mandated host loop's body-operand subtree and is ordered
-// before its readers. Loop membership in this IR is "inside the ForLoop
-// body operand subtree"; the fill becomes a member through the pass-built
+// Structural realization (the F8 splice, 261021-o61 T3, sea-of-nodes
+// recast fix1.md D-e): the fill is ordered before its readers through the
 // per-buffer effect chain — every buffer access (which replaced the load's
-// uses, i.e. sits where the readers sat) chains after the fill via its
-// ImpactBy edge, so walking the host's body operand over data+payload
-// edges reaches the fill, and the fill re-executes per fill-key epoch
-// because its coordinates read that epoch's induction variable. The old
-// `bodyRoot == load` re-point (HI-02's incoherent path: a cooperative fill
-// INSIDE an innermost element loop with the buffer access outside the
-// nest) is DELETED; when the erased load WAS a loop's body operand the
-// RAUW moves that slot onto the buffer access — the coherent shape. The
-// §8 self-checks (lower.go) enforce the placement structurally: reachable
-// from the mandated host, never an operand-descendant of a position the
-// variant forbids, coordinates in scope, uniform where required.
+// uses) chains after the fill via its ImpactBy edge, and the §8 ORDERING
+// check (lower.go) verifies the fill is a chain predecessor of every buffer
+// access of the site. The fill re-executes per fill-key epoch because its
+// coordinates read that epoch's induction variable. Membership is via IV
+// references (fix1.md §0), never a body operand.
 //
 // WINDOW SIZING + ACCESS (R2, ruled 2026-10-21 — rank-in-index =>
 // window-in-shape): a covered WARP dim's buffer extent is #threads_d x T_d
@@ -540,11 +532,10 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		access = lr.g.NewMemLoadSMemChained(lowerOrigin, bufEnv, buffer, coords...)
 	}
 
-	// Access rewrite: RAUW every data use, then retire the load. There is
-	// NO bodyRoot == load special case (the HI-02 path is deleted): when
-	// the erased load WAS a loop's body operand, the RAUW itself moves that
-	// body slot onto the buffer access — the coherent shape (the fill stays
-	// at its variant-mandated position).
+	// Access rewrite: RAUW every data use, then retire the load. Sea-of-
+	// nodes (fix1.md §0): there is no body operand — the RAUW simply moves
+	// every data use of the erased load onto the buffer access; placement
+	// rides the per-buffer effect chain, not a body slot.
 	if err := lr.mctx.ReplaceAllUsesWith(sf.Load, access); err != nil {
 		return fmt.Errorf("tile-lower: RAUW of site %d load: %w", id, err)
 	}

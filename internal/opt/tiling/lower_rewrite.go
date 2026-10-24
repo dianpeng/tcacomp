@@ -62,15 +62,17 @@ type dimRewrite struct {
 }
 
 // lntRewrite records one rewritten loop-nest tree: its dims in original
-// (outer→inner) order, the generated nest root (the P6 chain anchor), the
-// effectful op that became the innermost body, and the inside-set for the
-// chain re-pointing.
+// (outer→inner) order, the generated nest root (the P6 chain anchor), and
+// the inside-set for the chain re-pointing.
+//
+// Sea-of-nodes (fix1.md §0): no body operand, no bodyRoot. The inside-set
+// is derived from IV data-dep closure membership (D-g), not from a body
+// reachability walk.
 type lntRewrite struct {
-	root     *loopforest.Tree
-	dims     []*dimRewrite // treeItersOf order: outer→inner
-	lntRoot  ir.Node       // the outermost generated loop
-	bodyRoot ir.Node       // the innermost body operand
-	inside   map[*ir.Base]bool
+	root    *loopforest.Tree
+	dims    []*dimRewrite // treeItersOf order: outer→inner
+	lntRoot ir.Node       // the outermost generated loop
+	inside  map[*ir.Base]bool
 }
 
 // u32c allocates a u32 const node (the pass's integer vocabulary).
@@ -84,8 +86,8 @@ func (lr *lowerRun) attr(key string, v float64) ir.Node {
 }
 
 // rewriteLNT performs PHASE 2-3 for one forest root: numbering, per-dim
-// expression generation, inside-out loop construction, body placement, IV
-// RAUW, original retirement, and the P6 chain re-pointing.
+// expression generation, inside-out loop construction, IV RAUW, original
+// retirement, and the P6 chain re-pointing.
 //
 // F3 (ruled 2026-10-21): a BRANCHED LNT — any tree node with > 1 child — is
 // REJECTED fail-closed before anything is built. treeItersOf's DFS preorder
@@ -94,6 +96,12 @@ func (lr *lowerRun) attr(key string, v float64) ir.Node {
 // execute the siblings' CROSS PRODUCT, and B2's body ops would end up
 // outside the nest while their IVs were RAUW'd to loops they are not inside
 // (HI-05). Per-branch sub-nests are future work.
+//
+// Sea-of-nodes (fix1.md §0, D-g): there is no body operand and no
+// bodyRootOf. The P6 inside-set is derived from IV data-dep closure
+// membership: a node is inside the LNT iff its data-dep closure references
+// any of the LNT's generated loops' IVs — the same relation loopforest
+// uses (D-b).
 func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 	iters := treeItersOf(root)
 	if len(iters) == 0 {
@@ -125,23 +133,16 @@ func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 	}
 	lw := &lntRewrite{root: root, dims: dims}
 
-	// Body BEFORE generation: the deepest effectful op owned by the LNT
-	// becomes the innermost inside loop's body operand.
-	body, err := lr.bodyRootOf(lw)
-	if err != nil {
-		return err
-	}
-	lw.bodyRoot = body
-
 	if err := lr.generateDimExprs(lw); err != nil {
 		return err
 	}
 	lw.lntRoot = lr.buildNest(lw)
 
-	// The inside-set for P6: everything reachable from the body root over
-	// data + payload edges AFTER the nest is wired (the old IV/iter chain
-	// is included — edges from outside into it re-point outward below).
-	lw.inside = lr.reachableFrom(body)
+	// The inside-set for P6 (D-g): every node whose data-dep closure
+	// references any of this LNT's loops' IVs — IV-membership, the same
+	// relation loopforest uses. Effect/chain edges are NOT linking input
+	// (C3); the old body-reachability derivation is deleted with bodyRootOf.
+	lw.inside = lr.ivMembers(lw)
 	if err := lr.repointChains(lw); err != nil {
 		return err
 	}
@@ -495,112 +496,152 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 
 // buildNest constructs the generated loops and wires the canonical nest
 // (§6bis PHASE 3): ALL between loops nest in dim order, ALL inside
-// loops nest inside them, also in dim order. Construction is inside-out;
-// the loops of each dim are stored on the dimRewrite for PHASE 4 and the
-// epilogue. Returns the nest root (the outermost loop — the P6 chain
+// loops nest inside them, also in dim order — the chain
+//
+//	dims[0].between → … → dims[N-1].between → dims[0].inside → … → dims[N-1].inside
+//
+// Construction is inside-out (the pass has consumed dims inner-first since
+// PHASE 2); the loops of each dim are stored on the dimRewrite for PHASE 4
+// and the epilogue. Returns the nest root (the outermost loop — the P6 chain
 // anchor).
 //
-// Step 1 wiring (fix1.md §0): ForLoop has no body operand. The nest is
-// constructed as pure control-flow headers; membership is via IV
-// references and ordering via data+chain edges. The bodyRoot/body-
-// chaining is removed in Step 3 along with bodyRootOf and the full
-// rewrite.
+// Sea-of-nodes (fix1.md §0, D-b, D-g): ForLoop has no body operand, so the
+// canonical chain is carried by an explicit LOOP-TO-LOOP annotation — the
+// "nest" KeyedAttribute on every non-root loop, whose value is the loop's
+// canonical parent. §0 permits explicit loop-to-loop structure ("HIR iters
+// already carry a parent-iter operand — loop-to-loop, permitted"); the attr
+// keeps D-a's [iv, bound, attrs...] layout, never touches codegen (emit.go
+// treats KeyedAttribute as a terminal), and lands the parent loop's IV in
+// the child's operand closure — the exact membership edge loopforest's D-b
+// derivation consumes. Because construction allocates inner loops before
+// their enclosing loops, D-b's first-container-in-allocation-order rule
+// resolves each loop's parent to the lexically CLOSEST ancestor: the
+// candidate scan meets the wired parent before any transitive outer one.
 func (lr *lowerRun) buildNest(lw *lntRewrite) ir.Node {
-	// Inside loops, innermost first (reverse dim order).
-	var inner ir.Node
+	// Inside loops, innermost first (reverse dim order). Header-only: each
+	// loop carries [iv, bound, attrs...] — no body operand.
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
-		var attrs []ir.Node
-		if inner != nil {
-			// TEMPORARY Step-1-only wiring: pass inner as an attr so the
-			// graph structure compiles. This is WRONG semantically and
-			// will be properly removed in Step 3 (buildNest creates
-			// header-only loops with no body). The goal here is Step 1
-			// greenness: get the signature change compiling without
-			// changing semantics.
-			attrs = append(attrs, inner)
-		}
-		attrs = append(attrs, d.insideAttrs...)
 		d.inside = lr.g.NewForLoop(lowerOrigin, d.insideIV,
-			lr.g.NewBoundedDimVar(lowerOrigin, d.insideIV, d.insideBound), attrs...)
-		inner = d.inside
+			lr.g.NewBoundedDimVar(lowerOrigin, d.insideIV, d.insideBound),
+			d.insideAttrs...)
 	}
 	// Between loops, innermost first.
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
-		var attrs []ir.Node
-		if inner != nil {
-			// TEMPORARY Step-1-only wiring (see above).
-			attrs = append(attrs, inner)
-		}
-		attrs = append(attrs, d.betweenAttrs...)
 		d.between = lr.g.NewForLoop(lowerOrigin, d.betweenIV,
-			lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound), attrs...)
-		inner = d.between
+			lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound),
+			d.betweenAttrs...)
 	}
-	return inner
+	// Wire the canonical chain front-to-back via the "nest" annotation: the
+	// chain is betweens in dim order, then insides in dim order.
+	chain := make([]ir.Node, 0, 2*len(lw.dims))
+	for _, d := range lw.dims {
+		chain = append(chain, d.between)
+	}
+	for _, d := range lw.dims {
+		chain = append(chain, d.inside)
+	}
+	for k := 1; k < len(chain); k++ {
+		nest := lr.g.NewKeyedAttribute(lowerOrigin, "nest", chain[k-1])
+		lr.mctx.AddUse(chain[k], nest)
+	}
+	// The nest root is the outermost loop (dims[0] is outermost).
+	return lw.dims[0].between
 }
 
-// bodyRootOf picks the LNT's innermost effectful op: every live GMEM
-// load/store referencing the LNT's iters (via its axis chase), owned by
-// the DEEPEST referenced level; ties break to the latest allocation (the
-// chain-last position). An LNT with no effectful body fails closed — the
-// rewritten nest needs a body operand.
-func (lr *lowerRun) bodyRootOf(lw *lntRewrite) (ir.Node, error) {
-	member := make(map[ir.Node]bool, len(lw.dims))
-	depth := make(map[ir.Node]int, len(lw.dims))
-	var walk func(t *loopforest.Tree)
-	walk = func(t *loopforest.Tree) {
-		depth[t.Iter] = t.Depth
-		for _, c := range t.Children {
-			walk(c)
+// ivMembers derives the P6 inside-set per fix1.md D-g: the D-g referential
+// set (every node whose data-dep operand closure references any of the
+// LNT's loops' IVs — the same IV-membership relation loopforest uses, D-b),
+// minus the kernel's return node, closed backward over data + payload edges.
+//
+// The return exclusion is what keeps P6 non-vacuous, and it is D-c's own
+// case: a node that uses the loop's IVs yet is ordered after the loop's
+// completion — the end node's data-dep closure reaches the IVs through the
+// final store, so bare membership would class it as body and its chain edge
+// would keep local order, leaving the generated nest unreachable from the
+// roots. The epilogue (return, and anything ordered after it — nothing, in
+// the v0 single-block kernels) anchors the edges that re-point at the nest
+// root; body-internal edges keep their local order.
+//
+// Both IV generations are linking input: body nodes still reference the
+// original InductionVariable uses at this pipeline point (the RAUW onto the
+// dim's index expression, which references the generated IVs, happens after
+// repointing, in rauwAndRetire), while the generated loops' IVs are already
+// referenced by the dims' index expressions.
+func (lr *lowerRun) ivMembers(lw *lntRewrite) map[*ir.Base]bool {
+	ivs := make(map[*ir.Base]bool)
+	for _, d := range lw.dims {
+		if d.betweenIV != nil {
+			ivs[d.betweenIV.BasePtr()] = true
+		}
+		if d.insideIV != nil {
+			ivs[d.insideIV.BasePtr()] = true
 		}
 	}
-	walk(lw.root)
-	for _, d := range lw.dims {
-		member[d.iter] = true
+	iters := make(map[*ir.Base]bool)
+	for _, it := range treeItersOf(lw.root) {
+		if it != nil && it.BasePtr() != nil {
+			iters[it.BasePtr()] = true
+		}
 	}
-	var best ir.Node
-	bestDepth := -1
 	for _, n := range lr.g.AllocatedNodes() {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 			continue
 		}
-		k := n.KindOf()
-		if k != ir.KindMemLoad && k != ir.KindMemStore {
+		if n.KindOf() != ir.KindInductionVariable {
 			continue
 		}
-		ops := ir.OperandsOf(n)
-		axesFrom := 1 // loads: axes after the tensor
-		if k == ir.KindMemStore {
-			axesFrom = 2 // stores: value, tensor, then axes
+		if deps := ir.DataDeps(n); len(deps) > 0 && deps[0] != nil && iters[deps[0].BasePtr()] {
+			ivs[n.BasePtr()] = true
 		}
-		d := -1
-		for _, ax := range ops[axesFrom:] {
-			for _, it := range findAxisIters(ax) {
-				if !member[it] {
-					continue
-				}
-				if depth[it] > d {
-					d = depth[it]
-				}
+	}
+	// E: the D-g members that are not the kernel epilogue.
+	seeds := make([]ir.Node, 0, 16)
+	for _, n := range lr.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+			continue
+		}
+		if n.KindOf() == ir.KindReturn {
+			continue // D-c: ordered after the loop's completion
+		}
+		if referencesAnyIV(n, ivs) {
+			seeds = append(seeds, n)
+		}
+	}
+	// inside = the backward (data + payload) cone of E: the chain position
+	// the loop body occupies — the same extent bodyRootOf produced, restated
+	// in sea vocabulary without a body operand.
+	inside := make(map[*ir.Base]bool)
+	for _, s := range seeds {
+		for b := range lr.reachableFrom(s) {
+			inside[b] = true
+		}
+	}
+	return inside
+}
+
+// referencesAnyIV reports whether n's data-dep operand closure (transitive
+// operand-slot walk, no effect edges) contains any of the given IVs.
+func referencesAnyIV(n ir.Node, ivs map[*ir.Base]bool) bool {
+	seen := make(map[*ir.Base]bool)
+	var visit func(x ir.Node) bool
+	visit = func(x ir.Node) bool {
+		if x == nil || x.BasePtr() == nil || seen[x.BasePtr()] || x.BasePtr().Erased() {
+			return false
+		}
+		if ivs[x.BasePtr()] {
+			return true
+		}
+		seen[x.BasePtr()] = true
+		for _, dep := range ir.DataDeps(x) {
+			if visit(dep) {
+				return true
 			}
 		}
-		if d < 0 {
-			continue // references no iter of this LNT
-		}
-		if lr.claimed[n.BasePtr()] {
-			return nil, fmt.Errorf("tile-lower: effectful node %d is owned by two LNTs (cross-tree body)", n.BasePtr().ID())
-		}
-		if d > bestDepth || (d == bestDepth && best != nil && n.BasePtr().ID() > best.BasePtr().ID()) {
-			best, bestDepth = n, d
-		}
+		return false
 	}
-	if best == nil {
-		return nil, fmt.Errorf("tile-lower: LNT rooted at iter node %d owns no effectful body op", lw.root.Iter.BasePtr().ID())
-	}
-	lr.claimed[best.BasePtr()] = true
-	return best, nil
+	return visit(n)
 }
 
 // reachableFrom returns the set of nodes reachable from start over data

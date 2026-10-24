@@ -176,7 +176,6 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		decisions: decisions,
 		overrides: overrides,
 		byIter:    make(map[ir.Node]*dimRewrite),
-		claimed:   make(map[*ir.Base]bool),
 		prov: &Provenance{
 			Dims: make(map[ir.Node]DimProvenance),
 			LNTs: make(map[ir.Node]MappingPlan),
@@ -216,10 +215,9 @@ type lowerRun struct {
 	decisions map[ir.Node]IterDecision
 	overrides map[ir.Node]int // budget tile overrides, keyed by iter
 	byIter    map[ir.Node]*dimRewrite
-	claimed   map[*ir.Base]bool // effectful body ops already owned by an LNT
-	rewrites  []*lntRewrite     // per-root products, Roots() order
-	fills     []*siteFill       // PHASE 4 products, for the §8 placement/scope checks
-	prov      *Provenance       // the P-5 provenance under construction
+	rewrites  []*lntRewrite // per-root products, Roots() order
+	fills     []*siteFill   // PHASE 4 products, for the §8 placement/scope checks
+	prov      *Provenance   // the P-5 provenance under construction
 }
 
 // effectiveTile returns the iter's tile size after budget overrides.
@@ -308,11 +306,12 @@ func (lr *lowerRun) checkLoopAnnotations() error {
 
 // loopAnnotations collects a generated for-loop's KeyedAttribute inputs by
 // key (u32-const values). The pass constructs at most one attribute per
-// key per loop.
+// key per loop. Operand layout is [iv, bound, attrs...] (sea-of-nodes,
+// fix1.md §0 — no body operand); attrs start at index 2.
 func loopAnnotations(loop ir.Node) map[string]float64 {
 	out := make(map[string]float64)
 	ops := ir.OperandsOf(loop)
-	for i := 3; i < len(ops); i++ {
+	for i := 2; i < len(ops); i++ {
 		op := ops[i]
 		if op == nil || op.KindOf() != ir.KindKeyedAttribute {
 			continue
@@ -328,37 +327,78 @@ func loopAnnotations(loop ir.Node) map[string]float64 {
 	return out
 }
 
-// checkFillPlacement pins the §8 FILL PLACEMENT + FILL SCOPE + layering
-// exit conditions STRUCTURALLY (F5, ruled 2026-10-21: every check is
-// computed from the emitted graph and must be able to fail on a
-// plausibly-emitted graph). Per emitted fill:
+// checkFillPlacement pins the §8 fill exit conditions STRUCTURALLY (F5,
+// ruled 2026-10-21: every check is computed from the emitted graph and must
+// be able to fail on a plausibly-emitted graph). Post-fix1.md (D-e), the
+// checks are recast around the sea-of-nodes model: no body operand, no
+// body-reachability. Per emitted fill:
 //
-//   - PLACEMENT: the fill is data-reachable from its mandated host loop's
-//     BODY OPERAND (operand + ImpactBy walk — loop membership in this IR is
-//     "inside the ForLoop body operand subtree", and the fill reaches it
-//     through the per-buffer chain of its readers; a fill wired nowhere
-//     trips). LoadTileThread fills host at the element loop defining the
-//     fill key; LoadTileCta fills host at the innermost covered dim's
-//     between-round loop.
-//   - LAYERING: a cooperative LoadTileCta fill is NEVER an operand-
-//     descendant of an element (tile-inside) loop's body — the HI-02 class:
-//     a cooperative loader must be callable by every thread of the CTA the
-//     same number of times, which an element-loop body position breaks
-//     (§4). Per-thread LoadTileThread fills are exempt (R1: they ARE
-//     element-level ops).
+//   - ORDERING: every live buffer access of the site has the fill among
+//     its chain predecessors (ImpactBy walk). The fill dominates its reads
+//     in the sea's explicit effect order — this is THE structural
+//     placement fact (the F8 splice wires it). A fill whose buffer has NO
+//     live reads passes vacuously: it is unconsumed dead code (§0),
+//     memopt's fill-liveness domain (D-f), not a placement violation.
+//   - LAYERING: a cooperative LoadTileCta fill's operand-closure
+//     references NO inside-loop IV — the HI-02 class: a cooperative loader
+//     must be callable by every thread of the CTA the same number of
+//     times, which an element-loop (inside-walk) position breaks (§4).
+//     Per-thread LoadTileThread fills are exempt (R1: they ARE element-
+//     level ops).
 //   - SCOPE: every loop dimvar reachable from the fill's coordinates (the
 //     source load's axes and the fill store's round bases) is defined by a
-//     loop that encloses the fill's host — no fill reads a loop dimvar from
-//     outside that loop (the CR-02/HI-01 leakage class). A host's own
-//     dimvar is in scope (the fill sits inside its body).
+//     loop that encloses the fill's host — no fill reads a loop dimvar
+//     from outside that loop (the CR-02/HI-01 leakage class). Enclosure
+//     reads the pass-authored canonical chain (the "nest" annotations):
+//     a host's own dimvar is in scope (the fill re-executes per the host's
+//     epoch).
 //   - UNIFORMITY: a LoadTileCta fill's coordinates carry NO ThreadMap
 //     query — a per-thread term in a cooperative fill's source base is
 //     incoherent (each participating thread would compute a different
 //     source region into the same buffer, HI-03). GridMap queries are
 //     CTA-uniform and allowed.
+//
+// EPOCH is no longer a separate check — the fill's coordinates are the
+// promoted load's own axes by construction, so epoch membership is
+// inherent (D-e).
 func (lr *lowerRun) checkFillPlacement() error {
 	// dimvar -> defining loop, over every rewritten dim.
 	ivLoop := make(map[*ir.Base]ir.Node)
+	// insideIVs collects every inside (tile-walk) dimvar — the LAYERING set.
+	insideIVs := make(map[*ir.Base]bool)
+	// nestPos stamps every generated loop with its position in the pass-
+	// authored canonical chain (betweens in dim order, then insides in dim
+	// order) and the chain's identity — the sea-of-nodes "encloses" relation
+	// for the SCOPE check. The pass built the nest, so it need not re-derive
+	// enclosure from closures: loop L encloses host iff both ride the same
+	// chain and L's position is at or above the host's. A foreign chain's
+	// loops never enclose (fail-closed: a fill references only its own
+	// nest's loops by the F8 construction).
+	type nestPos struct {
+		chain *lntRewrite
+		pos   int
+	}
+	positions := make(map[*ir.Base]nestPos)
+	for _, lw := range lr.rewrites {
+		pos := 0
+		// The canonical chain order buildNest wires: ALL betweens in dim
+		// order, then ALL insides in dim order.
+		for _, d := range lw.dims {
+			if d.between != nil {
+				positions[d.between.BasePtr()] = nestPos{lw, pos}
+				pos++
+			}
+		}
+		for _, d := range lw.dims {
+			// Skip collapsed dims (between == inside, one shared node —
+			// already stamped in the between pass above).
+			if d.inside == nil || (d.between != nil && d.inside.BasePtr() == d.between.BasePtr()) {
+				continue
+			}
+			positions[d.inside.BasePtr()] = nestPos{lw, pos}
+			pos++
+		}
+	}
 	for _, lw := range lr.rewrites {
 		for _, d := range lw.dims {
 			if d.betweenIV != nil {
@@ -366,47 +406,42 @@ func (lr *lowerRun) checkFillPlacement() error {
 			}
 			if d.insideIV != nil {
 				ivLoop[d.insideIV.BasePtr()] = d.inside
+				insideIVs[d.insideIV.BasePtr()] = true
 			}
 		}
 	}
-	// encloses reports whether loop's body-operand subtree contains host
-	// (host == loop: the fill sits inside the loop's own body, whose IV is
-	// in scope there). Loops nest purely through body operand slots, so an
-	// operand-only walk is exact for loop containment.
+	// encloses reports whether loop encloses host per the pass-authored
+	// chain positions. A loop always encloses itself (same position).
 	encloses := func(loop, host ir.Node) bool {
-		if loop == nil || host == nil {
+		if loop == nil || host == nil || loop.BasePtr() == nil || host.BasePtr() == nil {
 			return false
 		}
-		if loop.BasePtr() == host.BasePtr() {
-			return true
-		}
-		return lr.operandSubtreeOf(ir.OperandsOf(loop)[2])[host.BasePtr()]
+		lp, okL := positions[loop.BasePtr()]
+		hp, okH := positions[host.BasePtr()]
+		return okL && okH && lp.chain == hp.chain && lp.pos <= hp.pos
 	}
 	for _, fill := range lr.fills {
-		// PLACEMENT: reachable from the host's body operand.
-		hostBody := ir.OperandsOf(fill.host)[2]
-		if !lr.reachableFrom(hostBody)[fill.store.BasePtr()] {
-			return fmt.Errorf("tile-lower: fill for site %d is not reachable from its fill-position loop %d's body operand (the F8 splice must place the fill inside the mandated host, R1)",
-				fill.siteID, fill.host.BasePtr().ID())
+		// ORDERING: every live buffer access of the site has the fill
+		// among its chain predecessors (ImpactBy walk). The buffer access
+		// was RAUW'd into every data use of the promoted load; each such
+		// access chains after the fill via its ImpactBy edge.
+		if err := lr.checkFillOrdering(fill); err != nil {
+			return err
 		}
-		// LAYERING: cooperative fills never inside an element loop's body
-		// operand subtree (operand edges — the dedicated body-slot carrier;
-		// the per-buffer ordering chain is placement-neutral by design).
+		// LAYERING: cooperative fills reference no inside-loop IV in their
+		// operand closure (D-e recast — the old body-subtree check is
+		// deleted with the body operand).
 		if fill.variant == loadTileCta {
-			for _, lw := range lr.rewrites {
-				for _, d := range lw.dims {
-					if d.inside == nil {
-						continue
-					}
-					if lr.operandSubtreeOf(ir.OperandsOf(d.inside)[2])[fill.store.BasePtr()] {
-						return fmt.Errorf("tile-lower: cooperative fill for site %d sits inside element loop %d's body (§4 layering: a LoadTileCta op must be callable uniformly by the whole CTA)",
-							fill.siteID, d.inside.BasePtr().ID())
-					}
+			fillClosure := flattenSubtree(fill.store)
+			for _, n := range fillClosure {
+				if insideIVs[n.BasePtr()] {
+					return fmt.Errorf("tile-lower: cooperative fill for site %d references inside-loop dimvar node %d (§4 layering: a LoadTileCta op must be callable uniformly by the whole CTA — its coordinates must not reference an element-loop IV)",
+						fill.siteID, n.BasePtr().ID())
 				}
 			}
 		}
-		// SCOPE + UNIFORMITY over the fill's coordinates: the source load's
-		// axes and the fill store's trailing round bases.
+		// SCOPE + UNIFORMITY over the fill's coordinates: the source
+		// load's axes and the fill store's trailing round bases.
 		coords := append(append([]ir.Node(nil), ir.OperandsOf(fill.src)[1:]...), ir.OperandsOf(fill.store)[2:]...)
 		for _, coord := range coords {
 			for _, n := range flattenSubtree(coord) {
@@ -424,10 +459,61 @@ func (lr *lowerRun) checkFillPlacement() error {
 	return nil
 }
 
+// checkFillOrdering verifies the §8 ORDERING fact (fix1.md D-e): every
+// live buffer access of the site has the fill among its chain predecessors.
+// The access set is derived from the fill's buffer: every FragLoad/
+// MemLoadSMem that reads the fill's buffer must chain back to the fill's
+// store through ImpactBy edges. Vacuous when the buffer has no live reads —
+// an unconsumed fill is ordinary dead code (§0), removed by memopt's
+// fill-liveness elimination (D-f), not an §8 placement violation.
+func (lr *lowerRun) checkFillOrdering(fill *siteFill) error {
+	// chainPreds collects every chain predecessor of n via ImpactBy walk.
+	chainPreds := func(n ir.Node) map[*ir.Base]bool {
+		seen := make(map[*ir.Base]bool)
+		var visit func(x ir.Node)
+		visit = func(x ir.Node) {
+			if x == nil || x.BasePtr() == nil || seen[x.BasePtr()] || x.BasePtr().Erased() {
+				return
+			}
+			seen[x.BasePtr()] = true
+			for _, u := range ir.ImpactBy(x) {
+				visit(u.Def())
+			}
+		}
+		visit(n)
+		return seen
+	}
+	// Every live buffer access (FragLoad / MemLoadSMem) on the fill's
+	// buffer must have fill.store among its chain predecessors. No live
+	// access at all: vacuous pass (the fill is unconsumed dead code —
+	// memopt's fill-liveness removal (D-f), not an §8 violation).
+	for _, n := range lr.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+			continue
+		}
+		k := n.KindOf()
+		if k != ir.KindFragLoad && k != ir.KindMemLoadSMem {
+			continue
+		}
+		// Confirm this access reads the fill's buffer.
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 || ops[0] == nil || ops[0].BasePtr() == nil ||
+			fill.buffer == nil || fill.buffer.BasePtr() == nil ||
+			ops[0].BasePtr() != fill.buffer.BasePtr() {
+			continue
+		}
+		if !chainPreds(n)[fill.store.BasePtr()] {
+			return fmt.Errorf("tile-lower: fill for site %d is not a chain predecessor of buffer access node %d (ORDERING: the F8 splice must wire the fill before every buffer access of the site via ImpactBy edges)",
+				fill.siteID, n.BasePtr().ID())
+		}
+	}
+	return nil
+}
+
 // operandSubtreeOf returns the operand-only descendant set of n (DataDeps
 // walk, no payload/effect edges): the nodes n's operand slots reference,
-// transitively. This is the dedicated body-slot containment carrier — a
-// loop's body operand subtree in the strict sense.
+// transitively. Post-fix1.md this is a generic operand-closure helper (no
+// body-slot semantics); tests use it to confirm placement facts.
 func (lr *lowerRun) operandSubtreeOf(n ir.Node) map[*ir.Base]bool {
 	seen := make(map[*ir.Base]bool)
 	var visit func(x ir.Node)
