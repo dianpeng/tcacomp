@@ -41,12 +41,12 @@ func writeFixtures(t *testing.T, dir string, files map[string]string) string {
 	return dir
 }
 
-// loadFixtures runs ParseModule on dir/root.tca and returns the module and
+// loadFixtures runs the loader on dir/root.tca and returns the module and
 // all diagnostics.
 func loadFixtures(t *testing.T, dir string) (*ast.Module, []diagnostic.Diagnostic) {
 	t.Helper()
 	fset := lexer.NewFileSet()
-	m, diags := ParseModule(fset, filepath.Join(dir, "root.tca"))
+	m, diags := loadModule(fset, filepath.Join(dir, "root.tca"))
 	return m, diags
 }
 

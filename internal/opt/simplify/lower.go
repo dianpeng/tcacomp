@@ -47,8 +47,11 @@ func init() {
 //	def directly;
 //	projects and processed clusters erased.
 //
-// Legacy builder output — a cluster wrapping a Map, no projects — is a
-// documented no-op (D11): the pass touches nothing.
+// Legacy builder output — a cluster wrapping a Map, no projects — lowers
+// in the legacy sweep (lower_legacy.go, amending the D11 no-op): the
+// frontend driver (quick-261024-k2i) builds chains through the pkg rungs,
+// which speak this dialect, so the pass lowers it into the Iter format the
+// tiling and schedule passes consume.
 //
 // All mutations ride one MutContext{Pass: "simplify-lower"} through the
 // choke points (SetDef for rewiring, Erase for removal); Erase refusals
@@ -122,7 +125,8 @@ type clusterLowering struct {
 //
 // Clusters with ZERO projecting maps: MemLoad inputs are a live uncovered
 // iteration space (error); non-MemLoad inputs only (the legacy wrapper)
-// skip the cluster entirely — the documented no-op.
+// skip the projecting sweep — the legacy sweep (lower_legacy.go) lowers
+// them once every cluster's nest state is collectible.
 func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 	if g == nil {
 		return errors.New("simplify-lower: nil graph")
@@ -216,7 +220,7 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 		if len(stages) == 0 {
 			// No projecting map. A MemLoad input is a live uncovered
 			// iteration space (fail closed); the legacy wrapper (non-load
-			// inputs only) skips the cluster entirely.
+			// inputs only) skips to the legacy sweep below.
 			if len(memLoadInputs(cl)) > 0 {
 				return fmt.Errorf("simplify-lower: cluster node %d carries MemLoad inputs but no projecting map (live uncovered iteration space)",
 					cl.BasePtr().ID())
@@ -355,6 +359,15 @@ func (LowerPass) Run(_ *opt.Context, g *ir.Graph) error {
 				return fmt.Errorf("simplify-lower: rewire project %d: %w", p.BasePtr().ID(), err)
 			}
 		}
+	}
+
+	// Legacy sweep: clusters without projecting stages are the pkg
+	// builder's dialect (a wrapped map over paramRef operands, the chain
+	// dims as leading operands — see lower_legacy.go). Lower them into the
+	// Iter format with the same interned nest machinery; the store-axis
+	// rewire runs inside, after every chain's nest exists.
+	if err := lowerLegacyClusters(g, mctx, clusters, projectingStages, lowerDim); err != nil {
+		return err
 	}
 
 	// Sweep 3: erase the projects (use-free after 2b), then the processed

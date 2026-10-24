@@ -19,19 +19,20 @@ import (
 	"tcacomp/internal/syntax/semacheck"
 )
 
-// ParseModule loads the module rooted at path (read via os, so path may be
+// loadModule loads the module rooted at path (read via os, so path may be
 // absolute or relative to the process working directory): the root file's
 // include graph is resolved relative to each including file — include paths
 // must be relative and must not escape the including file's directory
 // (threat T-k2i-01) — and the merged module is module-checked (rules 1, 3,
 // 4) and per-kernel semachecked (rules 5-26 + §5.1 resolution, whose filled
-// cells the build driver consumes).
+// cells the build driver consumes). The exported entry point is ParseModule
+// (api.go), which wraps this loader and fails fast on diagnostics.
 //
 // The returned module holds every parsed kernel in merge order (include
 // files depth-first, then the root's own kernels); diagnostics are returned
 // separately, and any Error-severity diagnostic means the corresponding
 // declaration must be treated as absent (fail-fast at kernel granularity).
-func ParseModule(fset *lexer.FileSet, path string) (*ast.Module, []diagnostic.Diagnostic) {
+func loadModule(fset *lexer.FileSet, path string) (*ast.Module, []diagnostic.Diagnostic) {
 	ld := &loader{
 		fset:      fset,
 		processed: map[string]bool{},

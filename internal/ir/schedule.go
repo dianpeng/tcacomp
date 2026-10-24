@@ -58,3 +58,25 @@ func (g *Graph) Materialize() error {
 	g.materialized = true
 	return nil
 }
+
+// Dematerialize reverts g from its Level-2 scheduled CFG form back to the
+// Level-1 sea-of-nodes form: the CFG (and its statements) is dropped and the
+// materialized flag is cleared, so a full pass-manager pipeline — including
+// the scheduling/tiling passes, which refuse materialized graphs (their
+// gates expect the Level-1 sea) — can run over the graph. Frontends that
+// build through pkg.Build (which Materializes as its final construction
+// step) use this to hand the verified graph to opt.BuildPipeline before
+// codegen (quick-261024-k2i). It returns an error when the graph is not
+// materialized; Dematerialize/Run-pipeline/Materialize cycles are not
+// supported (passes mutate the sea in place).
+func (g *Graph) Dematerialize() error {
+	if g == nil {
+		return errors.New("ir: Dematerialize on nil graph")
+	}
+	if !g.materialized {
+		return errors.New("ir: graph is not materialized")
+	}
+	g.cfg = nil
+	g.materialized = false
+	return nil
+}
