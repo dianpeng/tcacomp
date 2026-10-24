@@ -1,14 +1,16 @@
 // bracket.go is the R-A bracket-law structural verifier (2026-10-24 ruling,
-// R-B golden-audit protocol): a mechanical brace-depth scanner over an
-// EMITTED kernel text asserting the reduce bracket's statement order —
+// R-B golden-audit protocol; tightened with the tile-disable removal of the
+// same date): a mechanical brace-depth scanner over an EMITTED kernel text
+// asserting the reduce bracket's statement order —
 //
 //	Init's enclosing loop is a for-loop (the output-element loop — X's
-//	parent; the innermost element loop for multi-dim outputs, the enclosing
-//	single loop at T==1) AND Init is the last statement before X opens;
-//	X (the reduced dim's tile-between loop, or the single K loop at T==1)
-//	opens immediately after Init; the Reduce call sits inside the
-//	INNERMOST loop nested in X (the tile-inside walk Y at T>1) or directly
-//	inside X when X carries no nested loop (the T==1 form); the Combine
+//	parent; the innermost element loop for multi-dim outputs, X's own
+//	parent in the zero-between degenerate) AND Init is the last statement
+//	before X opens;
+//	X (the reduced dim's tile-between loop) opens immediately after Init
+//	and ALWAYS carries exactly one directly nested loop (Y, the tile-inside
+//	walk — every dim is tiled, T >= 2, so the no-Y form is gone); the
+//	Reduce call sits inside Y at the governed depth; the Combine
 //	local is the first statement after X's closing brace, at the parent's
 //	depth; the gated single-owner store follows with no scope closing
 //	below the parent between Combine and the store.
@@ -123,17 +125,21 @@ func ScanBracketLaw(cu string) error {
 		return fmt.Errorf("bracket-law: X never closes back to depth %d", d)
 	}
 
-	// Loops nested directly in X's body (headers at depth d+2): the T>1
-	// form carries exactly one (Y, the tile-inside walk); the T==1 form
-	// carries none (X IS the single K loop).
+	// Loops nested directly in X's body (headers at depth d+2): X ALWAYS
+	// carries exactly one (Y, the tile-inside walk) — every dim is tiled
+	// (T >= 2, the 2026-10-24 tile-disable ruling), so a form with none is
+	// a placement regression, not an accepted degenerate.
 	nested := 0
 	for i := initIdx + 2; i < xClose; i++ {
 		if strings.Contains(codes[i].text, "for (") && codes[i].depth == d+2 {
 			nested++
 		}
 	}
+	if nested != 1 {
+		return fmt.Errorf("bracket-law: X carries %d directly nested loops, want exactly Y (1, the tile-inside walk — every dim is tiled, T >= 2)", nested)
+	}
 
-	// (c) Reduce sits inside the innermost reduced-dim loop.
+	// (c) Reduce sits inside Y, the innermost reduced-dim loop.
 	redIdx := -1
 	for i := initIdx + 2; i < xClose; i++ {
 		m := bracketReduceLine.FindStringSubmatch(codes[i].text)
@@ -145,17 +151,8 @@ func ScanBracketLaw(cu string) error {
 	if redIdx < 0 {
 		return fmt.Errorf("bracket-law: no reducer%s.Reduce( inside X", reducer)
 	}
-	switch {
-	case nested == 0:
-		if codes[redIdx].depth != d+1 {
-			return fmt.Errorf("bracket-law: the T==1 form puts Reduce directly inside X (depth %d), got depth %d", d+1, codes[redIdx].depth)
-		}
-	case nested == 1:
-		if codes[redIdx].depth < d+2 {
-			return fmt.Errorf("bracket-law: Reduce must sit inside Y (depth >= %d), got depth %d", d+2, codes[redIdx].depth)
-		}
-	default:
-		return fmt.Errorf("bracket-law: X carries %d directly nested loops, want exactly Y (1) or the T==1 single form (0)", nested)
+	if codes[redIdx].depth < d+2 {
+		return fmt.Errorf("bracket-law: Reduce must sit inside Y (depth >= %d), got depth %d", d+2, codes[redIdx].depth)
 	}
 
 	// (d) Combine is the first statement after X's close, at the parent's

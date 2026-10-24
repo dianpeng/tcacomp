@@ -367,9 +367,6 @@ func (lr *lowerRun) checkFillPlacement() error {
 			if d.insideIV != nil {
 				ivLoop[d.insideIV.BasePtr()] = d.inside
 			}
-			if d.singleIV != nil {
-				ivLoop[d.singleIV.BasePtr()] = d.between
-			}
 		}
 	}
 	// encloses reports whether loop's body-operand subtree contains host

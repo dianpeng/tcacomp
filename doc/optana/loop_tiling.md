@@ -428,10 +428,13 @@ for (auto j = 0; j < J; j += j_tile_size * <# of threads in WARP assignment, nTh
                   see the window-bytes model in 3)
               - Else, xn-1 and xn both sequential => ALL in FRAGs
                 - Since xn-1 and xn access are in a single thread, hence using FRAGMENTS
-              - NOTES: additionally, if tile_size == 1 for a specific iteration, cache is NOT promoted
-                - The budget fallback uses the matching drop rule: a
-                  site is dropped when ANY covered iter's tile reaches
-                  1 (F4, ruled 2026-10-21), not only when all do
+              - NOTES (2026-10-24 tile-disable ruling): tile_size 1 no
+                longer exists — every tile is >= 2 (the compiler never
+                generates a non-tiling schedule), so the only demotion is
+                the budget fallback's drop rule: a site whose halved
+                covered dim would fall below the floor of 2 is DROPPED to
+                GMEM (F4, floor amended 2026-10-24), never demoted to an
+                un-tiled schedule
             - 3) For MemLoad that can be promoted to cache
               - WINDOW-BYTES feasibility model (amended 2026-10-21, R2 —
                 rank-in-index => window-in-shape): SMEM bytes per site =
@@ -596,7 +599,8 @@ for (auto each_sched in psched) { // an incremental permutation iterator that du
 ### Loop Tiling Rewrite
 
 - Rewrite the loop with the resolved **tile_size** per loop to standard loop structure
-  - NOTES, if corresponding iteration's tile_size == 1, it means loop tiling is disabled for that
+  - NOTES (2026-10-24 tile-disable ruling): every tile_size is >= 2 —
+    loop tiling is never disabled
 
 - Preparation of assignment result
   - After the above optimization, we need to run a **SoC numbering** pass

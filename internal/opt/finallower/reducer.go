@@ -10,9 +10,11 @@ package finallower
 //	     a HARD diagnostic, never a guess. Runs BEFORE Map Lower (LR-2),
 //	     which rewires Reduce.op0 away.
 //	(1)  resolve X (provenance.Between — the OUTERMOST loop over the reduced
-//	     dim), home (provenance.Inside, else X), and the between chain: the
-//	     Loop blocks strictly nested between X's block and home's block on
-//	     the parent chain (empty at T==1).
+//	     dim), home (provenance.Inside — always populated, every dim is
+//	     tiled T >= 2), and the between chain: the Loop blocks strictly
+//	     nested between X's block and home's block on the parent chain
+//	     (empty when the reduced dim is the LNT's only dim — the
+//	     zero-between-dims degenerate).
 //	(2.1) homogeneity (LR-8) + the specialized construction (LR-7: Soc
 //	     0→Sequential over (init, lambda); 2→Warp / 1→Global over (init,
 //	     lambda, ThreadMapping, staging) per R1/R2): the WARP/GLOBAL
@@ -22,7 +24,8 @@ package finallower
 //	     end of the OWNING LNT's prologue Group (before the embedded root
 //	     loop), stamped SN 0. The ThreadMapping operand resolves through
 //	     this pass's own per-LNT objects (Run() inserts them FIRST).
-//	(2.2) R3 — per-output-element brackets. The tiled shape (T>1):
+//	(2.2) R3 — per-output-element brackets. The tiled shape (every dim
+//	     T >= 2):
 //	     the between loops DISSOLVE as per-thread walks; a FRESH UNIFORM
 //	     sequential element loop chain (one loop per between dim, init 0,
 //	     step 1, the between loop's own clamped bound) replaces X at X's
@@ -37,12 +40,14 @@ package finallower
 //	     (its __syncthreads is legally reached by every thread), and the
 //	     per-element epilogue stores become single-owner stores (the
 //	     emitter gates them on is_first_in_cta(), R2/R3).
-//	     The T==1 shape keeps the flat bracket (R-A's T==1 law): Init
+//	     The ZERO-BETWEEN-DIMS DEGENERATE (the reduced dim is the LNT's
+//	     only dim; home is a direct child of X, so X's parent is trivially
+//	     the innermost output-element scope) keeps the flat bracket: Init
 //	     immediately before X, Combine immediately after, both in X's
 //	     parental block — one output element per bracket, no element loops
 //	     — and the qualifying epilogue consumers move in after Combine so
 //	     the emitted Combine local and its consumers share one C++ scope
-//	     (HI-02).
+//	     (the lexical-scope law).
 //	(2.3) RuntimeCallMethod(%reducer, "Reduce", %piped) — VALUE ONLY —
 //	     inserted inside the HOME loop, immediately after the piped value's
 //	     producing item (the scheduler lands the piped Map's projection in
@@ -114,9 +119,14 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 		return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) carries no SchedBlock linkage",
 			red.BasePtr().ID(), x.BasePtr().ID())
 	}
-	home := x
-	if prov.Inside != nil && !prov.Inside.BasePtr().Erased() {
-		home = prov.Inside
+	// The home loop is prov.Inside ALWAYS: every dim is tiled (T >= 2, the
+	// 2026-10-24 tile-disable ruling), so Inside is populated on every
+	// provenance entry — a nil or erased Inside is record corruption, fail
+	// closed (never fall back to X).
+	home := prov.Inside
+	if home == nil || home.BasePtr().Erased() {
+		return fmt.Errorf("final-lower: reduce node %d: the provenance Inside loop of dim %d is dead — every dim is tiled (T >= 2), so a missing Inside is record corruption",
+			red.BasePtr().ID(), dim.BasePtr().ID())
 	}
 	homeBlk := home.BasePtr().SchedBlock()
 	if homeBlk == nil {
@@ -203,7 +213,7 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 			red.BasePtr().ID(), anchor.BasePtr().ID())
 	}
 	// Inside the home loop = the home block itself or any descendant (the
-	// T==1 shape nests the producer deeper than the single k loop).
+	// zero-between degenerate nests the producer deeper than home itself).
 	if anchorBlk != homeBlk && findSubBlock(homeBlk, anchorBlk) == nil {
 		return fmt.Errorf("final-lower: reduce node %d: the piped value's producer (node %d) sits outside the home loop (node %d) — the Reduce call must stay inside the home loop (LR-1)",
 			red.BasePtr().ID(), anchor.BasePtr().ID(), home.BasePtr().ID())
@@ -233,9 +243,13 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 	}
 
 	if len(betweenBlks) == 0 {
-		// T==1: R-A's flat bracket — Init immediately before X's block,
-		// Combine immediately after it, both in X's parental block (one
-		// output element per bracket; X is the reduced dim's single loop).
+		// ZERO-BETWEEN-DIMS DEGENERATE of R-A (the 2026-10-24 tile-disable
+		// reframing): the reduced dim is the LNT's ONLY dim — home (the
+		// tile-inside walk) is a DIRECT child of X (the tile-between
+		// loop), so X's parent is trivially the innermost output-element
+		// scope and the flat bracket applies: Init immediately before X's
+		// block, Combine immediately after it, both in X's parental block
+		// (one output element per bracket).
 		parentBlk, xIdx := lr.findBlockItem(xBlk)
 		if parentBlk == nil || xIdx < 0 {
 			return fmt.Errorf("final-lower: reduce node %d: the bracket loop X (node %d) is not an AST item anywhere",
@@ -250,11 +264,12 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 			return fmt.Errorf("final-lower: reduce node %d: inserting Combine after X: %w", red.BasePtr().ID(), err)
 		}
 		combineCall.BasePtr().SetSched(lr.scopeDepth(parentBlk), parentBlk)
-		// HI-02 (R-A's consumer half at T==1): the epilogue consumers of the
-		// Combine value move in with it — the emitted `auto vN =
-		// reducer.Combine();` local and the consuming store must share ONE
-		// lexical C++ scope (the flat bracket's parent block), else the
-		// store reads a local declared inside a loop that already closed.
+		// The lexical-scope law (the historical HI-02 bug is why it exists):
+		// the epilogue consumers of the Combine value move in with it — the
+		// emitted `auto vN = reducer.Combine();` local and the consuming
+		// store must share ONE lexical C++ scope (the flat bracket's parent
+		// block), else the store reads a local declared inside a loop that
+		// already closed.
 		return lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, parentBlk, lr.scopeDepth(parentBlk), nil)
 	}
 
@@ -489,34 +504,29 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	}
 
 	// The qualifying epilogue consumers, relocated after Combine inside the
-	// innermost element loop (shared gates with the T==1 flat bracket).
+	// innermost element loop (shared gates with the flat bracket of the
+	// zero-between degenerate).
 	if err := lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, elemBlk, elemDepth, subs); err != nil {
 		return err
 	}
 	return nil
 }
 
-// moveCombineConsumers implements R3's consumer half (and HI-02's T==1 flat
-// twin, 2026-10-24): the owning LNT's epilogue items whose operand closure
-// reaches combineCall relocate into dst, inserted IMMEDIATELY AFTER the
-// Combine call's item — the Combine local and its consumers must share one
-// lexical C++ scope (the emitter materializes the call as a local at its
-// item position; a consumer outside that scope reads a dead local). Shared
-// gates, in order:
+// moveCombineConsumers implements R3's consumer half (and the flat-bracket
+// twin of the zero-between degenerate, 2026-10-24): the owning LNT's
+// epilogue items whose operand closure reaches combineCall relocate into
+// dst, inserted IMMEDIATELY AFTER the Combine call's item — the Combine
+// local and its consumers must share one lexical C++ scope (the emitter
+// materializes the call as a local at its item position; a consumer
+// outside that scope reads a dead local). Shared gates, in order:
 //
 //	(a) reduced-dim poison — a consumer referencing the reduced dim's loop
 //	    dimvars would read an iteration variable of the WRONG element's
 //	    strip (doc/tca.md §5.10 point 4);
-//	(b) thread-partitioned refusal — a consumer referencing the single IV
-//	    of a WARP-SoC dim (a thread-partitioned walk) would leave a
-//	    coverage hole under the is_first_in_cta store gate (single-owner
-//	    stores hold only over CTA-replicated element walks) — a defensive
-//	    fail-closed for an unruled v0 shape, unreachable when the reduced
-//	    dim is WARP (the one-WARP-dim policy leaves no second WARP dim);
-//	(c) the between-IV coordinate rebuild onto the fresh element IVs when
-//	    subs != nil (the T==1 flat bracket passes nil — its coordinates are
-//	    defined at scopes enclosing the bracket already);
-//	(d) the generalized enclosure assertion (assertBoundEncloses over
+//	(b) the between-IV coordinate rebuild onto the fresh element IVs when
+//	    subs != nil (the zero-between degenerate passes nil — its
+//	    coordinates are defined at scopes enclosing the bracket already);
+//	(c) the generalized enclosure assertion (assertBoundEncloses over
 //	    whole closures, P-12): every DimVar in a moved consumer's closure
 //	    must be defined at a block enclosing dst — a coordinate not live at
 //	    the bracket position is a named error, never an emitted out-of-scope
@@ -556,11 +566,7 @@ func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 				m.BasePtr().ID(), m.KindOf())
 		}
 	}
-	// (b) The thread-partitioned-consumer refusal.
-	if err := lr.refuseThreadPartitionedConsumers(moved); err != nil {
-		return err
-	}
-	// (c) The moved consumers' between-dim coordinates rebuild onto the
+	// (b) The moved consumers' between-dim coordinates rebuild onto the
 	// fresh element IVs (shared expression spines are cloned; the in-nest
 	// walk's rebuild below shares this subs map and the discipline of one
 	// clone per shared def per USER).
@@ -571,7 +577,7 @@ func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 			}
 		}
 	}
-	// (d) The generalized enclosure assertion: every DimVar still in a
+	// (c) The generalized enclosure assertion: every DimVar still in a
 	// moved consumer's closure must be defined at dst or an enclosing
 	// block.
 	for _, m := range moved {
@@ -609,53 +615,6 @@ func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 		m.BasePtr().SetSched(depth, dst)
 	}
 	return nil
-}
-
-// refuseThreadPartitionedConsumers fail-closes when a moved consumer's
-// operand closure references the single IV of a WARP-SoC dim: that single
-// loop is a THREAD-PARTITIONED walk (each element of the dim is owned by
-// exactly one thread of the dim's warp group), so the is_first_in_cta store
-// gate would leave the non-owner threads' partitioned elements unwritten —
-// a coverage hole, never a silent pass. Defensive for an unruled adjacent
-// v0 shape: unreachable when the reduced dim is WARP (the one-WARP-dim
-// policy), and the reduced dim's own single IV is caught earlier by the
-// reduced-dim poison check.
-func (lr *lowering) refuseThreadPartitionedConsumers(moved []ir.Node) error {
-	singles := lr.warpSingleIVs()
-	for _, m := range moved {
-		cl := operandClosure(m)
-		var worst ir.Node
-		for iv := range singles {
-			if cl[iv] && (worst == nil || iv.BasePtr().ID() < worst.BasePtr().ID()) {
-				worst = iv // deterministic diagnostic: the lowest-ID offender
-			}
-		}
-		if worst == nil {
-			continue
-		}
-		wdim := singles[worst]
-		return fmt.Errorf("final-lower: moved consumer node %d (%s) references the single IV of WARP dim %q (node %d) — a thread-partitioned walk: the is_first_in_cta store gate yields single-owner stores only over CTA-replicated element walks, so a WARP-partitioned non-reduced output dim would leave a coverage hole (defensive fail-closed for an unruled v0 shape)",
-			m.BasePtr().ID(), m.KindOf(), ir.InputParamNameOf(wdim), wdim.BasePtr().ID())
-	}
-	return nil
-}
-
-// warpSingleIVs maps every WARP-SoC dim's single-loop IV to its dim param —
-// the thread-partitioned walks of the provenance (Tile == 1, no inside
-// split; Between IS the single loop).
-func (lr *lowering) warpSingleIVs() map[ir.Node]ir.Node {
-	out := make(map[ir.Node]ir.Node)
-	for dim, prov := range lr.prov.Dims {
-		if prov.Soc != tiling.SoCWARP || prov.Tile != 1 || prov.Between == nil {
-			continue
-		}
-		ops := ir.OperandsOf(prov.Between)
-		if len(ops) == 0 || ops[0] == nil || ops[0].KindOf() != ir.KindDimVar {
-			continue
-		}
-		out[ops[0]] = dim
-	}
-	return out
 }
 
 // itemIndexOf reports node's item index within blk (node identity).
@@ -796,11 +755,14 @@ func betweenBlocks(xBlk, homeBlk *ir.ASTBlock) []*ir.ASTBlock {
 	if !search(xBlk) {
 		return nil
 	}
-	// Always a NON-nil slice on success: the EMPTY between set (home == X,
-	// the T==1 flat-bracket shape) must stay distinguishable from the
+	// Always a NON-nil slice on success: the EMPTY between set (the
+	// zero-between-dims degenerate — the reduced dim is the LNT's only
+	// dim, home a direct child of X) must stay distinguishable from the
 	// not-found nil — `append(nil-slice)` with zero elements would return
-	// nil and make the T==1 branch forever unreachable (the HI-02 latent
-	// bug: every T==1 reduce died here as a "corrupted schedule").
+	// nil and make the flat-bracket branch forever unreachable (the
+	// historical HI-02 latent bug, the reason this non-nil guarantee
+	// exists: every flat-bracket reduce died here as a "corrupted
+	// schedule").
 	out := make([]*ir.ASTBlock, 0, len(path))
 	return append(out, path...)
 }

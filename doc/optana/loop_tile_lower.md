@@ -311,12 +311,12 @@
       the SMEM budget
 - Fallback (selection never fails)
   - Halve the reuse tile sizes; if still over budget, drop sites back to GMEM
-  - DROP RULE (F4, ruled 2026-10-21): a site is dropped when ANY of its
-    covered iters reaches tile 1 — NOT only when all of them do
-    (matches the judge's promotion gate; the all-1 variant can strand a
-    promoted site at a covered tile of 1 and make the site lowering
-    fail closed on feasible input)
-  - Terminates: halving reaches 1, dropping empties the set
+  - DROP RULE (F4, ruled 2026-10-21, floor amended 2026-10-24): the
+    halving floor is 2 — a picked site whose halved covered dim would
+    fall below 2 is DROPPED to GMEM (a site that cannot fit at
+    tile >= 2 is dropped, never demoted to a non-tiling schedule — the
+    2026-10-24 tile-disable ruling: tile 1 is not a legal schedule)
+  - Terminates: halving reaches the floor, dropping empties the set
 - Post-pass epilogue
   - Relies on the pipeline's typeinfer re-run for newly inserted lowered nodes
     (doc/opt.md "type inference — for newly inserted lowered node"; the pass
@@ -361,11 +361,12 @@ introduces a new decision.
   - Per tree, walk outer -> inner; two counters (CTA dims, warp dims),
     both restarting per LNT; sequential iters get no dimension
 - PHASE 3 — loop rewrite (per dim, original order)
-  - TileSize == 1 -> NO tiling for that dim: it keeps a single loop
-    and its IV maps directly to the global index
-  - Otherwise the dim becomes between-round + inside loops; ALL between
+  - Every dim becomes between-round + inside loops; ALL between
     loops nest in dim order, ALL inside loops nest inside them, also in
-    dim order (the loop_tiling.md template layout):
+    dim order (the loop_tiling.md template layout). The former
+    TileSize == 1 no-tiling rule is DELETED (2026-10-24 tile-disable
+    ruling: every effective tile is >= 2 — an effective tile below 2
+    fails closed at the rewrite backstop, gate 3):
     - SEQ dim: between for (a = 0; a < A; a += T) (element stride,
       LoC = 1); inside sequential, bounded by the materialized
       a_tile_max

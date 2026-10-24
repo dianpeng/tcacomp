@@ -142,9 +142,6 @@ const (
 	// ReasonCTACovered: a covered dim is CTA-assigned — no coherent fill
 	// variant exists under the v0 mechanics (R2 tier rule, refusal).
 	ReasonCTACovered = "covered dim CTA-assigned: no coherent fill variant (R2 tier rule)"
-	// ReasonTileOne: a covered dim sits at tile 1 — no reuse to cache
-	// (the judge's promotion gate = the lower's F4 drop rule).
-	ReasonTileOne = "covered dim at tile 1: no reuse to cache (F4)"
 	// ReasonFragBytes: the per-thread FRAG footprint exceeds
 	// MaxFragPerThread (F6).
 	ReasonFragBytes = "FRAG bytes exceed MaxFragPerThread (F6)"
@@ -243,17 +240,18 @@ func (r Record) SiteDecisionOf(load ir.Node) (SiteDecision, bool) {
 const ProvenanceName = "tiling-provenance"
 
 // DimProvenance is one rewritten dim's loop relationship (final_lower.md
-// "per-dim provenance entry"): the tile-BETWEEN forloop (== the single loop
-// when T==1), the tile-INSIDE forloop (nil when T==1), the effective SoC
-// (mirrors ASTLoopMeta — LR-7's specialization input), and the effective
-// tile size (1 = untiled). For SoCTA dims the entry additionally carries
+// "per-dim provenance entry"): the tile-BETWEEN forloop, the tile-INSIDE
+// forloop (every dim is tiled, T >= 2, so BOTH always exist — the 2026-10-24
+// tile-disable ruling), the effective SoC (mirrors ASTLoopMeta — LR-7's
+// specialization input), and the effective tile size. For SoCTA dims the
+// entry additionally carries
 // the COUPLED tile-inside walk's materialization facts (its ThreadMap slot
 // and thread count) — final-lower's per-element ownership-gate walk over a
 // reduce's output dims mirrors exactly this form (the 2026-10-23 reducer
 // redirect).
 type DimProvenance struct {
 	Between ir.Node
-	Inside  ir.Node // nil at T==1
+	Inside  ir.Node // always populated (every dim is tiled, T >= 2)
 	Soc     SoCType
 	Tile    int
 	// CoupledDoSoC is the CTA dim's coupled inside-walk ThreadMap slot
@@ -362,8 +360,9 @@ type Params struct {
 	MaxCS int
 	// WindowK is the innermost-K search window depth (K default 5).
 	WindowK int
-	// TileSizes is the common tile-size search set; the uniform sweep also
-	// includes t=1 (tiling disabled).
+	// TileSizes is the common tile-size search set. Every entry must be
+	// >= 2: the compiler never generates a non-tiling schedule (the
+	// 2026-10-24 tile-disable ruling), so tile 1 is not a legal schedule.
 	TileSizes []int
 	// NominalExtent is the documented stand-in extent for a reuse
 	// dimension whose BIV max operand is NOT a constant. NOTE (2026-10-21
@@ -403,7 +402,9 @@ func DefaultParams() Params {
 // (32) whose warp count is a multiple of PortionWarp (8 warps, i.e. the
 // 256-thread minimum). WarpPortion must be a legal portion ([0,
 // PortionWarp], 0 = auto); the remaining bounds must be positive; the tile
-// list must be non-empty with positive entries (a non-positive tile would
+// list must be non-empty with entries >= 2 (tile size 1 is not a legal
+// schedule — the compiler never generates a non-tiling schedule, the
+// 2026-10-24 ruling; a tile below 2 would
 // poison the arithmetic) and, when the auto warp portion leaves a coupled
 // inside walk, no entry may exceed that walk's thread count (HI-03 gate 1:
 // tile > coupledThreads turns the single-owner flat-init walk into a
@@ -440,8 +441,8 @@ func (p Params) Validate() error {
 		return fmt.Errorf("tiling: TileSizes must not be empty")
 	}
 	for _, v := range p.TileSizes {
-		if v < 1 {
-			return fmt.Errorf("tiling: TileSizes contains non-positive entry %d", v)
+		if v < 2 {
+			return fmt.Errorf("tiling: TileSizes entry %d is below 2 — tile size 1 is not a legal schedule: the compiler never generates a non-tiling schedule (2026-10-24 ruling); every entry must be >= 2", v)
 		}
 	}
 	// HI-03 gate 1 (2026-10-24 ruling): a CTA dim's tile must not exceed the

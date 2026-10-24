@@ -101,13 +101,14 @@ type siteFill struct {
 // While the recomputed KERNEL-WIDE sums exceed their budgets (R3: Σ SMEM
 // window bytes over ALL LNTs' promoted SMEM sites ≤ MaxCache; F6: Σ
 // per-thread FRAG bytes ≤ MaxFragPerThread): halve the offending site's
-// covered dims' tile sizes; when ANY covered iter of a site reaches tile 1,
-// drop the site back to GMEM (F4, ruled 2026-10-21 — the judge's promotion
-// gate; the former all-covered-at-1 rule could strand a promoted site at a
-// covered tile of 1 and make lowerSite fail closed on feasible input).
-// Terminates by construction — halving reaches 1, dropping empties the
-// set. With Params mirroring the decide pass's this is a NO-OP:
-// tiling-verify already asserted both sums within budget.
+// covered dims' tile sizes — with the F4 halving FLOOR at 2 (the
+// 2026-10-24 tile-disable ruling): a picked site whose halved covered dim
+// would land below 2 is DROPPED to GMEM instead (a site that cannot fit
+// at tile >= 2 is dropped, never demoted to a non-tiling schedule — tile
+// 1 is not a legal schedule). Terminates by construction — halving
+// reaches the floor, dropping empties the set. With Params mirroring the
+// decide pass's this is a NO-OP: tiling-verify already asserted both sums
+// within budget.
 func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir.Node]IterDecision) (map[ir.Node]int, map[uint64]bool, error) {
 	overrides := make(map[ir.Node]int)
 	dropped := make(map[uint64]bool)
@@ -149,7 +150,11 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 		return smem, frag
 	}
 	// anyTileOne reports whether ANY covered iter of the site sits at tile
-	// 1 under the effective decisions (F4: the drop predicate).
+	// <= 1 under the effective decisions. Belt-and-braces only (2026-10-24
+	// tile-disable ruling): the F4 halving floor above owns the drop — the
+	// floor never writes an override below 2 and record decisions are >= 2
+	// (tiling-verify), so this predicate can no longer fire; it stays as
+	// the defensive sweep over shared covered iters.
 	anyTileOne := func(sf SiteFacts) bool {
 		for _, it := range sf.Covered {
 			if dec(it).TileSize <= 1 {
@@ -183,17 +188,28 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 		if !found {
 			break // nothing left to halve or drop
 		}
+		// F4 halving floor (2026-10-24 tile-disable ruling): the halving
+		// NEVER writes an override below 2 — when the picked site's halved
+		// covered dim would compute next < 2, the SITE IS DROPPED to GMEM
+		// (never demoted to a non-tiling schedule) and the outer loop
+		// continues.
+		floorHit := false
 		for _, it := range pick.Covered {
-			next := dec(it).TileSize / 2
-			if next < 1 {
-				next = 1
+			if dec(it).TileSize/2 < 2 {
+				floorHit = true
+				break
 			}
-			overrides[it] = next
 		}
-		// F4 sweep: ANY covered iter at tile 1 drops the site — shared
-		// covered iters can drive a non-picked site to 1 while its other
-		// covered dim stays > 1, and the pass must never strand a promoted
-		// site into a lowerSite error. Facts order, deterministic.
+		if floorHit {
+			dropped[pick.Load.BasePtr().ID()] = true
+			continue
+		}
+		for _, it := range pick.Covered {
+			overrides[it] = dec(it).TileSize / 2
+		}
+		// F4 sweep: ANY covered iter at tile <= 1 drops the site. The
+		// halving floor above owns this drop now (belt-and-braces over
+		// shared covered iters); facts order, deterministic.
 		for _, lf := range facts {
 			for _, sf := range lf.CS {
 				id := sf.Load.BasePtr().ID()
@@ -322,11 +338,12 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 			id, sd.Class, class)
 	}
 
-	// Covered dims keep T > 1 (the judge's promotion gate = the F4 drop
-	// rule; a tile-1 covered dim reaching surgery is corruption).
+	// Covered dims keep T >= 2 (the judge's promotion gate + the F4 halving
+	// floor; an inside-less covered dim reaching surgery is corruption —
+	// every dim builds an inside loop post-ruling).
 	for _, d := range covered {
-		if d.single || d.insideIV == nil {
-			return fmt.Errorf("tile-lower: site %d covers iter node %d at tile size %d (covered dims must keep T > 1)", id, d.iter.BasePtr().ID(), d.tile)
+		if d.insideIV == nil {
+			return fmt.Errorf("tile-lower: site %d covers iter node %d at tile size %d (covered dims must keep T >= 2; a missing inside walk is rewrite corruption)", id, d.iter.BasePtr().ID(), d.tile)
 		}
 	}
 
@@ -571,9 +588,9 @@ func (lr *lowerRun) owningRewrite(iter ir.Node) (*lntRewrite, error) {
 //   - ClassFRAG (per-thread LoadTileThread): the INSIDE loop of the
 //     INNERMOST above-tie INS dim (the fill key — the dim whose element
 //     change invalidates the fragment, e.g. the worked example's lhs
-//     refills per m-element inside M.inside); a T==1 fill-key dim uses its
-//     single loop; with no above-tie INS dim the position degenerates to
-//     the SMEM rule (the innermost covered dim's between loop).
+//     refills per m-element inside M.inside); with no above-tie INS dim
+//     the position degenerates to the SMEM rule (the innermost covered
+//     dim's between loop).
 //
 // The returned loop anchors the §8 structural placement checks.
 func (lr *lowerRun) fillHost(lw *lntRewrite, sf SiteFacts, covered []*dimRewrite, class CacheClass) (ir.Node, error) {
@@ -598,7 +615,7 @@ func (lr *lowerRun) fillHost(lw *lntRewrite, sf SiteFacts, covered []*dimRewrite
 		return nil, fmt.Errorf("no covered dim of the owning LNT found for the fill position")
 	}
 	if class == ClassSMEM {
-		return hostDim.between, nil // T > 1 precondition ⇒ between exists
+		return hostDim.between, nil // every dim is tiled: between always exists
 	}
 	// FRAG path: the innermost above-tie INS dim — the fill key.
 	insSet := make(map[ir.Node]bool, len(sf.INS))
@@ -609,10 +626,13 @@ func (lr *lowerRun) fillHost(lw *lntRewrite, sf SiteFacts, covered []*dimRewrite
 	if keyDim == nil {
 		return hostDim.between, nil // degenerate: no above-tie INS dim
 	}
-	if keyDim.inside != nil {
-		return keyDim.inside, nil
+	// Post-ruling every dim builds an inside loop — a nil one is rewrite
+	// corruption: fail closed (never fall back to the between loop).
+	if keyDim.inside == nil {
+		return nil, fmt.Errorf("fill-key dim (iter node %d) carries no inside loop (rewrite corruption; every dim is tiled, T >= 2)",
+			keyDim.iter.BasePtr().ID())
 	}
-	return keyDim.between, nil // T==1 fill-key dim: its single loop
+	return keyDim.inside, nil
 }
 
 // coveredBaseSubs maps every covered dim's rewritten index expression to
@@ -627,15 +647,15 @@ func (lr *lowerRun) coveredBaseSubs(covered []*dimRewrite) map[*ir.Base]ir.Node 
 }
 
 // uniformBaseSubs maps EVERY dim of the LNT — covered and above-tie alike —
-// to its CTA-UNIFORM base (R1): SEQ dims ride their between-round dimvar
-// (T>1) or their single-loop IV; a CTA dim rides its rank-offset round base
-// (cta_rank·T + round — uniform across the CTA: the cooperative loader is
-// called by every thread of the CTA, and they all read the same grid
-// rank); a WARP dim rides its between dimvar when it has one — its
-// rank-offset round base carries the per-thread ThreadMap term, which a
-// cooperative fill must never see. The caller fails closed on above-tie
-// WARP dims before substituting; a covered WARP dim always has T > 1 (the
-// surgery precondition), hence a between dimvar.
+// to its CTA-UNIFORM base (R1): SEQ dims ride their between-round dimvar,
+// full stop; a CTA dim rides its rank-offset round base (cta_rank·T + round
+// — uniform across the CTA: the cooperative loader is called by every
+// thread of the CTA, and they all read the same grid rank); a WARP dim
+// rides its between dimvar when it has one — its rank-offset round base
+// carries the per-thread ThreadMap term, which a cooperative fill must
+// never see. The caller fails closed on above-tie WARP dims before
+// substituting; a covered WARP dim always has T >= 2 (the surgery
+// precondition), hence a between dimvar.
 func (lr *lowerRun) uniformBaseSubs(lw *lntRewrite) map[*ir.Base]ir.Node {
 	subs := make(map[*ir.Base]ir.Node, len(lw.dims))
 	for _, d := range lw.dims {
@@ -643,7 +663,7 @@ func (lr *lowerRun) uniformBaseSubs(lw *lntRewrite) map[*ir.Base]ir.Node {
 		switch d.soc {
 		case SoCWARP:
 			base = d.betweenIV
-		default: // SEQ: between dimvar or the T==1 single IV; CTA: rank offset
+		default: // SEQ: between dimvar; CTA: rank offset
 			base = d.roundBase
 		}
 		if base != nil {

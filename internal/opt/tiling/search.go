@@ -12,11 +12,12 @@
 //     conservative and deterministic.
 //   - Uniform tile sweep: the doc's "common searching size for tile_size"
 //     is read as ONE uniform knob t applied to every window level, swept
-//     over {1} ∪ TileSizes (t=1 = tiling disabled). Per-cache-count
-//     heuristic tile sets are future work. This keeps the doc's 3^K
-//     tractability claim literally true: total <= 3^K * (|TileSizes|+1)
-//     <= 1215 schedules per LNT at defaults (the v0 policy filter only
-//     skips more of them).
+//     over TileSizes only — every entry >= 2 (tile size 1 is not a legal
+//     schedule: the compiler never generates a non-tiling schedule, the
+//     2026-10-24 ruling). Per-cache-count heuristic tile sets are future
+//     work. This keeps the doc's 3^K tractability claim literally true:
+//     total <= 3^K * |TileSizes| <= 972 schedules per LNT at defaults (the
+//     v0 policy filter only skips more of them).
 //   - Portion completion replaces the legacy greedy LoC presets: under the
 //     v0 policy there is at most one CTA dim (portion -1/full, LoC =
 //     MaxCTA) and at most one independent warp dim (LoC = warp portion x
@@ -145,23 +146,15 @@ func searchSchedule(lf lntFacts, p Params, smemFloor, fragFloor int) (schedResul
 		}
 	}
 	if !found {
-		// Defensive: the t=1 point of any CTA-carrying vector is always
-		// budget-feasible (nothing promotes at tile 1, so both sums are 0),
-		// so this is unreachable for validated Params — but a search that
-		// found nothing still owes every LNT a schedule. The legacy
-		// all-sequential fallback is INVALID under the >= 1-CTA ruling (an
-		// LNT without a CTA dim cannot execute under the CUDA thread
-		// model), so the fallback CARRIES a CTA dim: the outermost window
-		// level is SoCTA, the rest sequential, t=1.
-		fb := make([]SoCType, len(window))
-		if len(fb) > 0 {
-			fb[0] = SoCTA
-		}
-		res, _, err := evalSchedule(lf, window, fb, 1, p, smemFloor, fragFloor)
-		if err != nil {
-			return schedResult{}, err
-		}
-		return res, nil
+		// The 2026-10-24 tile-disable ruling deleted the t=1 fallback: an
+		// LNT with no feasible tile >= 2 schedule under the kernel-wide
+		// budgets is a configuration/schedule ERROR, never an un-tiled
+		// schedule. (The former t=1 fallback point — a CTA-carrying vector
+		// at tile 1, budget-feasible because nothing promotes — is gone:
+		// tiling is never disabled.)
+		return schedResult{}, fmt.Errorf(
+			"tiling: LNT rooted at iter node %d has no feasible schedule at any tile >= 2 under the kernel-wide budgets (SMEM floor %d + candidate / FRAG floor %d + candidate vs MaxCache %d / MaxFragPerThread %d) — tiling is never disabled (2026-10-24 ruling); widen the budgets or the TileSizes set",
+			lf.Tree.Iter.BasePtr().ID(), smemFloor, fragFloor, p.MaxCache, p.MaxFragPerThread)
 	}
 	return best, nil
 }
@@ -178,7 +171,12 @@ func evalSchedule(lf lntFacts, window []ir.Node, soc []SoCType, tile int, p Para
 	treeIters := treeItersOf(lf.Tree)
 	iters := make(map[ir.Node]IterDecision, len(treeIters))
 	for _, it := range treeIters {
-		iters[it] = IterDecision{SoC: SoCSequential, LoC: 1, TileSize: 1}
+		// R1 (2026-10-24 tile-disable ruling): the non-window sequential
+		// default carries the SWEPT UNIFORM TILE — every LNT dim is tiled
+		// (tile >= 2 everywhere; there is no untiled default). A sequential
+		// dim tiled at T is still exhaustive: between rounds step T, the
+		// inside walk is bounded by the saturating tileMax.
+		iters[it] = IterDecision{SoC: SoCSequential, LoC: 1, TileSize: tile}
 	}
 	// PORTION COMPLETION (the final model, replacing the legacy greedy
 	// preset loops; loop_tiling.md "Portion grammar"). With the v0 policy
@@ -288,9 +286,6 @@ type siteJudgment struct {
 //   - GATE: any covered dim CTA-assigned -> the site is REFUSED (a
 //     CTA-covered tile has no coherent fill variant under the v0
 //     mechanics). An iter with NO decision fails closed the same way.
-//   - GATE: any covered dim with tile_size 1 blocks promotion (F4: the
-//     judge's gate matches the lower's drop rule — ANY covered iter at
-//     tile 1, not only all of them).
 //   - TIER PRECEDENCE (C1b, 2026-10-23): a site with a THREAD-VARYING
 //     non-covered source coordinate — any referenced iter (INS) NOT in the
 //     covered set, assigned CTA or WARP — takes ClassFRAG regardless of
@@ -318,11 +313,8 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx schedCtx, p Par
 		if d.SoC == SoCTA {
 			return siteJudgment{reason: ReasonCTACovered} // R2 tier refusal
 		}
-		if d.TileSize < 1 {
-			return siteJudgment{reason: ReasonUnknownIter} // invalid tile: fail closed
-		}
-		if d.TileSize == 1 {
-			return siteJudgment{reason: ReasonTileOne} // tiling disabled on a covered dim
+		if d.TileSize < 2 {
+			return siteJudgment{reason: ReasonUnknownIter} // invalid tile (tile 1 is not a legal schedule): fail closed
 		}
 	}
 	forcedFrag := false
@@ -482,12 +474,13 @@ func spineOf(root *loopforest.Tree) []*loopforest.Tree {
 	return chain
 }
 
-// tileCandidates returns the uniform tile sweep {1} ∪ TileSizes, ascending
-// and deduped.
+// tileCandidates returns the uniform tile sweep — Params.TileSizes only,
+// ascending and deduped (every entry >= 2 by Params.Validate; tile 1 is not
+// a legal schedule, so nothing injects it).
 func tileCandidates(p Params) []int {
-	seen := make(map[int]bool, len(p.TileSizes)+1)
-	out := make([]int, 0, len(p.TileSizes)+1)
-	for _, t := range append([]int{1}, p.TileSizes...) {
+	seen := make(map[int]bool, len(p.TileSizes))
+	out := make([]int, 0, len(p.TileSizes))
+	for _, t := range p.TileSizes {
 		if !seen[t] {
 			seen[t] = true
 			out = append(out, t)
