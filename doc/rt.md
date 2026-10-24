@@ -250,20 +250,32 @@ template <typename T> struct GlobalReducer { /* v0-unreachable scaffolding, same
   `Combine()` finalizes ONCE per bracket.
 - **SeqReducer:** per-thread `T acc`; no synchronization; `Combine()`
   returns the local accumulator.
-- **WarpReducer (the v0 protocol, identity-init simplification):**
-  1. Per-thread `T acc`, `Init()` fills with the declared init.
-  2. `Reduce` folds into the private accumulator.
-  3. `Combine()`: full-warp shuffle down-tree (`__shfl_down_sync(
-     0xffffffff, ...)` — valid because every CTA thread participates and
-     out-of-group lanes hold the identity init, so a full-mask tree is
-     correct); the warp's FIRST LANE (`map.is_first_in_warp()`) stages its
-     partial into the ctor-provided SMEM row AT THE WARP'S INDEX
-     (`map.warp_index()`); `__syncthreads()` (legal: Combine is uniformly
-     called by every CTA thread); every thread then folds ALL staged warp
-     partials in ascending warp order from the identity init, bounded by
-     `map.warp_count()` (tca.md §5.10's replicated-local-combine
-     broadcast — every participant receives the final value; the
-     per-element brackets each re-read it).
+- **WarpReducer (the 2026-10-24 protocol, identity-init simplification):**
+  1. NO per-thread accumulator in device code. `Init()` resets ALL SMEM
+     slots to the declared init single-writer: each warp's first lane
+     (`map.is_first_in_warp()`) rewrites its OWN slot
+     (`map.warp_index()`); Init is uniformly called by every CTA thread
+     (the bracket law), so every slot resets and warps that never Reduce
+     hold the identity init.
+  2. `Reduce(v)` captures `unsigned mask = __activemask()` at entry and
+     runs the `fn` down-tree over the PARTICIPATING lanes INSIDE Reduce:
+     every lane in the mask executes each `__shfl_down_sync(mask, part,
+     off)` uniformly, discarding the read when its source lane falls
+     outside the active prefix (`lane_id() + off < __popc(mask)`). The
+     warp partial lands in the first active lane, which folds it into
+     its warp's slot: `slot[warp] = fn(slot[warp], warpPartial)` — the
+     per-call slot fold, single writer per address. PREFIX ALIGNMENT:
+     the compiler's bounds gates produce prefix-aligned active sets (the
+     F1 tileMax kills lanes from the top within a warp; the mirror gate
+     kills whole warps at the 256-thread/8-warp alignment), so the first
+     active lane is lane 0 and the guarded tree folds exactly the active
+     lanes' values. Non-prefix masks are out of scope for v0.
+  3. `Combine()`: `__syncthreads()` FIRST (the slot writes must be
+     visible), then EVERY thread folds all `map.warp_count()` slots in
+     ascending warp order from the identity init — the barrier is the
+     protocol's ONLY synchronization (tca.md §5.10's
+     replicated-local-combine broadcast; the per-element brackets each
+     re-read it).
   4. **Staging ownership (R1):** the scratch is ONE ROW of the COMPILER's
      dynamic-SMEM pool — `#warps × sizeof(T)` bytes at a disjoint pool
      offset (D8), passed as `SmemView<T, 1u>(reinterpret_cast<T*>(tca_smem
@@ -271,9 +283,10 @@ template <typename T> struct GlobalReducer { /* v0-unreachable scaffolding, same
      `kMaxWarpsPerCTA` is gone. Warp/lane/count identity is runtime-
      INTERNAL control flow derived from the mapping (§4.2) — generated
      code stays branch-free.
-  5. **Host branch:** no warps — the sequential algebra (`Combine`
-     returns the private accumulator); CPU unit tests stand the staging
-     row up as a stack array.
+  5. **Host branch:** no warps — the sequential algebra through a
+     HOST-ONLY accumulator member (absent from nvcc compilation: neither
+     the device nor the host pass carries it); CPU unit tests stand the
+     staging row up as a stack array.
 - **Initialization semantics:** v0 requires the declared init to be an
   identity for the combiner over partials (0 for `+`). General
   non-identity inits need validity tags (tca.md §5.10) — future work, and
