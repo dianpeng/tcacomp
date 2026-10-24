@@ -205,6 +205,77 @@ func (b *Builder) Tensor(name string, elem ir.ElemType, dims ...Dim) Tensor {
 	return t
 }
 
+// Local declares a `let`-local tensor (syntax-design.md §6 Task 4): a
+// KindMemNew-backed handle — locals are conceptually GMEM (doc/syntax.md), so
+// the handle's node is a GMEM allocation rather than a RoleTensor InputParam.
+// Registration in the builder's tensor table IS the checkOperand relaxation:
+// a local passes the same declared-tensor check an input parameter does; the
+// verifier separately admits the MemNew def as an operand paramRef target
+// and a store target (ir/verify.go). The local's axes REUSE the declared dim
+// handles matching the type's dim names, so structural indexing and stores
+// bind positionally exactly as they do for parameters.
+//
+// v0 boundaries: a rank-1 local may carry a dynamic extent (the MemNew
+// extent rides the dim's InputParam node — inert until codegen grows a GMEM
+// local story). A rank ≥ 2 local must be fully static: a multiplicative
+// extent expression is a GMEM-size computation the v0 builder does not
+// construct. Static unnamed dims use the driver's canonical "e<extent>"
+// spelling and must already be declared (b.Dim).
+func (b *Builder) Local(name string, t ir.Type) Tensor {
+	if b.final {
+		b.noteDeclErr(fmt.Errorf("local %s: builder already finalized by Build", name))
+	}
+	if _, taken := b.tensors[name]; taken {
+		b.noteDeclErr(fmt.Errorf("local %s: already declared", name))
+	}
+	nt, ok := t.(*ir.NumericType)
+	if !ok || nt.IsScalar() {
+		b.noteDeclErr(fmt.Errorf("local %s: must be a tensor type", name))
+	}
+	var dims []ir.DimRef
+	elem := ir.TF32
+	if nt != nil {
+		dims = nt.Dims()
+		elem = nt.Elem()
+	}
+	tdims := make([]Dim, len(dims))
+	product := uint64(1)
+	var dynDim Dim
+	for i, d := range dims {
+		dname := d.Name
+		if dname == "" {
+			if d.Extent == 0 {
+				b.noteDeclErr(fmt.Errorf("local %s: an unnamed dim needs a static extent", name))
+				d.Extent = 1
+			}
+			dname = fmt.Sprintf("e%d", d.Extent)
+		}
+		h, ok := b.dims[dname]
+		if !ok {
+			b.noteDeclErr(fmt.Errorf("local %s: dim @%s is not declared in this builder", name, dname))
+			continue
+		}
+		if d.Extent == 0 {
+			if len(dims) > 1 {
+				b.noteDeclErr(fmt.Errorf("local %s: rank %d with dynamic extents is not v0 (a multiplicative GMEM size is not constructed)", name, len(dims)))
+			}
+			dynDim = h
+		} else {
+			product *= d.Extent
+		}
+		tdims[i] = h
+	}
+	// The extent rides a const product for static shapes, the dynamic dim's
+	// InputParam node for rank-1 dynamic shapes (see doc comment).
+	extent := b.g.NewConst(origin, ir.InternScalar(ir.TU32), float64(product))
+	if dynDim.node != nil {
+		extent = dynDim.node
+	}
+	t2 := Tensor{b: b, node: b.g.NewMemNew(origin, extent), name: name, dims: tdims, elem: elem}
+	b.tensors[name] = t2
+	return t2
+}
+
 // ScalarParam declares an explicit scalar dependency and returns its typed
 // expression handle. The [scale] capture of syntax-design.md §4.5 rule 14 becomes an SSA
 // operand of the expression graph through this reference. The handle is

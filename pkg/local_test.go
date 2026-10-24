@@ -21,8 +21,8 @@ func TestBuilderLocal(t *testing.T) {
 	lhs := b.Tensor("lhs", ir.TF32, m, n)
 	out := b.Tensor("out", ir.TF32, m)
 
-	// tmp[m] is a local tensor with a fully static shape (v0: dynamic local
-	// extents are rejected at declaration).
+	// tmp[m] is a rank-1 local with a dynamic extent (allowed: the MemNew
+	// extent rides the dim's InputParam node).
 	tmp := b.Local("tmp", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
 
 	// Chain 1: row sums of lhs land in the local: tmp[m] = Σ_n lhs[m][n].
@@ -67,24 +67,23 @@ func TestBuilderLocal(t *testing.T) {
 	}
 }
 
-// TestBuilderLocalRejectsDynamicExtents: a local whose shape carries a
-// dynamic dim has no constexpr GMEM extent in v0 — declaration records the
-// violation, surfaced by the next error-returning call or Build.
-func TestBuilderLocalRejectsDynamicExtents(t *testing.T) {
+// TestBuilderLocalRejectsRank2DynamicExtents: a rank ≥ 2 local with dynamic
+// extents needs a multiplicative GMEM size the v0 builder does not
+// construct — declaration records the violation, surfaced by the next
+// error-returning call or Build.
+func TestBuilderLocalRejectsRank2DynamicExtents(t *testing.T) {
 	b := pkg.NewBuilder("local-dyn")
 	m := b.Dim("m", 0)
 	n := b.Dim("n", 0)
 	lhs := b.Tensor("lhs", ir.TF32, m, n)
 	tmp := b.Local("tmp", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}, {Name: "n"}}))
+	// The recorded declaration violation surfaces at the next
+	// error-returning rung — the root map here.
 	root, err := b.Stmt().Iter(m, n).
 		Map([]pkg.Operand{pkg.At(lhs, m, n)}, func(v pkg.Expr) pkg.Expr { return v })
-	if err != nil {
-		t.Fatalf("root map: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "dynamic extents") {
+		t.Fatalf("rank-2 dynamic local: err = %v, want dynamic-extents error", err)
 	}
-	mid := root.As(m, n)
-	if _, err := mid.Reduce(b.Float32(0), func(acc, v pkg.Expr) pkg.Expr { return b.Add(acc, v) }); err == nil ||
-		!strings.Contains(err.Error(), "dynamic") {
-		t.Fatalf("dynamic-extent local: err = %v, want dynamic error", err)
-	}
+	_ = root
 	_ = tmp
 }
