@@ -1,2 +1,3 @@
 .claude/*
 *.swp
+runtime/tests/build/
