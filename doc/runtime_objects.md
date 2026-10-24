@@ -242,7 +242,6 @@ The lowered index expressions consume the maps under these fixed shapes
 | `threadmap(d,"index")·T + round` | WARP-dim chunk offset (in-body local) | lower_rewrite.go:386-388 |
 | `gridmap(d,"index")·T + round + threadmap(d′,"index") + i·stride` | CTA dim's coupled inside walk (i at element stride) | lower_rewrite.go:371-376 |
 | `threadmap(d,"index")·T_d + i` | R2 SMEM buffer access index on WARP dim d | lower_cache.go:458-467 |
-| `threadmap(d,"index")` bare | WARP-dim single-loop (T==1) rank addend | lower_rewrite.go:330-331 |
 
 No map query appears in any induction variable; ranks enter ONLY as in-body
 offset locals.
@@ -393,14 +392,14 @@ nodes; the materialization templates land with codegen.
 
 | Dim kind | Loop | soc | dosoc | loc |
 |----------|------|-----|-------|-----|
-| SEQ, T==1 | single | 0 | — | 1 |
-| SEQ, T>1 | between + inside | 0 | — | 1 (both) |
-| CTA, T==1 | single | 1 | gridDim | LoC |
-| CTA, T>1 | between | 1 | gridDim | LoC |
-| CTA, T>1 | inside (coupled warp walk) | 2 | threadDim | coupled threads |
-| WARP, T==1 | single | 2 | threadDim | LoC×32 |
-| WARP, T>1 | between | 2 | threadDim | LoC×32 |
-| WARP, T>1 | inside (owned-chunk walk) | 0 | — | 1 |
+| SEQ | between + inside | 0 | — | 1 (both) |
+| CTA | between | 1 | gridDim | LoC |
+| CTA | inside (coupled warp walk) | 2 | threadDim | coupled threads |
+| WARP | between | 2 | threadDim | LoC×32 |
+| WARP | inside (owned-chunk walk) | 0 | — | 1 |
+
+(All dims are tiled, T >= 2 — the 2026-10-24 tile-disable ruling; the
+untiled single-loop forms are gone.)
 
 - **Coupled warp walk (CTA dim's inside):** element stride, coupled
   threads = `(PORTION_WARP − warpPortion) × quantum × 32`, where quantum =
@@ -550,8 +549,9 @@ is plain row-major, NO padding/swizzle in v0.
   bytes over ALL LNTs' promoted sites ≤ MaxCache; F6: Σ per-thread FRAG
   bytes ≤ MaxFragPerThread) by decide feasibility, tiling-verify, and the
   lower's budget resolution (lower_cache.go:98-209). Fallback: halve the
-  offending site's covered tiles; drop a site when ANY covered iter reaches
-  tile 1 (F4).
+  offending site's covered tiles with a floor of 2 — a site whose halved
+  covered dim would fall below 2 is DROPPED to GMEM (F4, floor amended
+  2026-10-24: tile 1 is not a legal schedule).
 - **Runtime implementation notes:** assert the device SMEM ceiling (via
   device attributes, NEVER hardcode sm_86's 101,376 B) ≥ the compiled
   kernel's budget.

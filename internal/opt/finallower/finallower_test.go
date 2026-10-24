@@ -195,7 +195,7 @@ func TestGates(t *testing.T) {
 	f2 := newChain("gates", 1024)
 	f2.bodyStore(f2.tensor("out", 0), f2.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
 	_ = runTileLowerSchedule(t, f2, []tiling.IterDecision{
-		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
 	})
 
 	// nil context.
@@ -227,7 +227,7 @@ func TestGates(t *testing.T) {
 		ir.NewLambda([]ir.Node{acc, now}, comb))
 	f3.bodyStore(f3.tensor("out", 0), red)
 	cache3 := runTileLowerSchedule(t, f3, []tiling.IterDecision{
-		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	})
 	if err := runFinalLower(t, f3.g, cache3); err == nil ||
 		!strings.Contains(err.Error(), "no producing Map/As chain") {
@@ -240,7 +240,8 @@ func TestGates(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // mapOnlyFx builds the map-only kernel: a 2-dim chain (CTA tiled + SEQ
-// untiled), a GMEM load over both IVs, an INLINED-shape Map over it with
+// tiled at the floor 2), a GMEM load over both IVs, an INLINED-shape Map
+// over it with
 // as=[d0,d1] (zero declared params — the post-simplify-inline shape), and a
 // chained store of the map into out[d0,d1]. The CTA dim makes tile-lower
 // emit launch-map queries in the rewritten index expressions.
@@ -261,7 +262,7 @@ func runMapOnly(t *testing.T) (*fx, *ir.ASTKernel, ir.Node, ir.Node, ir.Node) {
 	f, load, mp, out := mapOnlyFx(t)
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
-		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	})
 	if err := runFinalLower(t, f.g, cache); err != nil {
 		t.Fatalf("final-lower over the map-only kernel: %v", err)
@@ -455,7 +456,7 @@ func TestFlatQueryRewrite(t *testing.T) {
 	f, load, mp, out := mapOnlyFx(t)
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
-		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	})
 	k := f.g.AST()
 	var prologue *ir.ASTBlock
@@ -1010,7 +1011,7 @@ func TestQueryOutsideLNT(t *testing.T) {
 	f, _, _, _ := mapOnlyFx(t)
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
-		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	})
 	stray := f.g.NewRuntimeGridQuery("test", "index", f.g.NewConst("test", ir.InternScalar(ir.TU32), 0))
 	stray.BasePtr().SetSched(0, f.g.AST().Body)
@@ -1194,20 +1195,18 @@ func subtreeOf(n ir.Node) map[ir.Node]bool {
 }
 
 // ---------------------------------------------------------------------------
-// R-A bracket-law pins (2026-10-24): >=2-between-dims, T==1, the
-// thread-partitioned-consumer refusal
+// R-A bracket-law pins (2026-10-24): >=2-between-dims, the minimal-legal-tile
+// one-between endpoint
 // ---------------------------------------------------------------------------
 
 // newRed2Fx builds the 2-dim last-axis reduce fixture (the golden redFx
 // shape, decisions supplied by the caller): lhs[d0,d1] loaded over both
 // IVs, piped through an INLINED Map as=[d0,d1], Reduce(0, +), stored into
-// out[d0]. The T==1 sweep endpoint (both decisions at tile 1) and the
-// refusal probe (d0 WARP-single at tile 1, reduced dim sequential) ride
-// this builder. NOTE: a rank-3 T==1 variant with a SEQUENTIAL non-reduced
-// dim is NOT buildable today — the SEQ T==1 single form's index expression
-// IS the raw dimvar, so an epilogue-positioned consumer of it violates the
-// loop-scope invariant at tile-lower time (a latent defect recorded in the
-// task SUMMARY, independent of this task's rulings).
+// out[d0]. The minimal-legal-tile endpoint (both decisions at the floor
+// tile 2, {CTA,100,2}/{WARP,8,2}) rides this builder. NOTE: the former
+// T==1 sweep endpoint and the WARP-single refusal probe were deleted with
+// the 2026-10-24 tile-disable ruling (tile 1 is not a legal schedule); the
+// old rank-3 SEQ-T==1 not-buildable note died with the single form itself.
 func newRed2Fx(t *testing.T, name string) (*fx, ir.Node) {
 	t.Helper()
 	f := newChain(name, 1024, 512)
@@ -1378,76 +1377,90 @@ func TestReducerBracketMultiBetween(t *testing.T) {
 	}
 }
 
-// TestReducerBracketT1 pins R-A's T==1 law (the HI-02 proof): with every
-// dim at tile 1, X is the reduced dim's single loop; Init sits IMMEDIATELY
-// before X's block, Combine IMMEDIATELY after it, and the moved store
-// IMMEDIATELY after Combine — all in X's parental block, with
+// TestReducerBracketMinTile pins R-A's ONE-between-dim law at the
+// minimal-legal-tile endpoint ({CTA,100,2}/{WARP,8,2} — the 2026-10-24
+// tile-disable ruling's floor; the former T==1 sweep endpoint is gone):
+// the single non-reduced dim's walk is the FRESH ELEMENT loop (it takes
+// the position X's single loop held under the old T==1 law), and the
+// whole bracket [Init immediately before X -> X{home{Reduce}} -> Combine
+// immediately after -> the moved store] sits in that element loop, with
 // SchedBlock(combineCall) == SchedBlock(store) (the same-lexical-scope
 // contract the emitted C++ needs: the Combine local and its consumer must
 // share one C++ scope).
-func TestReducerBracketT1(t *testing.T) {
-	f, store := newRed2Fx(t, "redt1")
+func TestReducerBracketMinTile(t *testing.T) {
+	f, store := newRed2Fx(t, "redt1") // identifier kept (R6: fixture names stay)
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
-		{SoC: tiling.SoCTA, LoC: 100, TileSize: 1},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
 	})
 	prov := provenanceOf(t, cache)
-	X := prov.Dims[f.dims[1]].Between
-	if X == nil {
-		t.Fatal("fixture setup: the reduced d1 must carry its single loop as Between")
+	X, home := prov.Dims[f.dims[1]].Between, prov.Dims[f.dims[1]].Inside
+	if X == nil || home == nil {
+		t.Fatal("fixture setup: the reduced d1 must be tiled (Between+Inside)")
 	}
 	if err := runFinalLower(t, f.g, cache); err != nil {
-		t.Fatalf("final-lower over the T==1 reduce (the HI-02 consumer move): %v", err)
+		t.Fatalf("final-lower over the minimal-tile reduce (the HI-02 consumer move): %v", err)
 	}
 	g, k := f.g, f.g.AST()
 
-	initCall, combineCall := callOf(g, "Init"), callOf(g, "Combine")
-	if initCall == nil || combineCall == nil {
-		t.Fatal("exactly one Init and one Combine call must exist")
+	initCall, combineCall, reduceCall := callOf(g, "Init"), callOf(g, "Combine"), callOf(g, "Reduce")
+	if initCall == nil || combineCall == nil || reduceCall == nil {
+		t.Fatal("exactly one Init, one Reduce, and one Combine call must exist")
 	}
-	parentBlk, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
-	if parentBlk == nil {
-		t.Fatal("X's single-loop block must have a parental block")
+	// The single fresh element block: Init's containing block under R-A.
+	elemBlk, initIdx := findItemIn(k, initCall)
+	if elemBlk == nil || initIdx != 0 {
+		t.Fatalf("Init must be item 0 of the element loop, got index %d", initIdx)
 	}
-	items := parentBlk.Items()
-	if items[xIdx-1].Node == nil || items[xIdx-1].Node.BasePtr() != initCall.BasePtr() {
-		t.Fatal("Init must sit IMMEDIATELY before X's block (R-A T==1)")
+	if elemBlk.Kind() != ir.BlockSeqLoop {
+		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
+	// X's parent is the element block; adjacency per R-A.
+	xParent, xIdx := findParentOfBlock(k, X.BasePtr().SchedBlock())
+	if xParent != elemBlk {
+		t.Fatalf("X's parental block must be the element loop (R-A), got %v", xParent)
+	}
+	if xIdx != initIdx+1 {
+		t.Fatalf("Init must sit IMMEDIATELY before X's block: Init at %d, X at %d", initIdx, xIdx)
+	}
+	items := elemBlk.Items()
 	if items[xIdx].Block == nil || items[xIdx].Block.Loop().BasePtr() != X.BasePtr() {
-		t.Fatal("X's block must be at the bracket center (R-A T==1)")
+		t.Fatal("X's block must be at the bracket center (R-A)")
 	}
 	if items[xIdx+1].Node == nil || items[xIdx+1].Node.BasePtr() != combineCall.BasePtr() {
-		t.Fatal("Combine must sit IMMEDIATELY after X's block (R-A T==1)")
+		t.Fatal("Combine must sit IMMEDIATELY after X's block (R-A)")
 	}
 	if items[xIdx+2].Node == nil || items[xIdx+2].Node.BasePtr() != store.BasePtr() {
 		t.Fatal("the store must sit IMMEDIATELY after Combine (the HI-02 same-scope move)")
 	}
-	if combineCall.BasePtr().SchedBlock() != parentBlk || store.BasePtr().SchedBlock() != parentBlk {
-		t.Fatal("SchedBlock(combineCall) and SchedBlock(store) must both be X's parental block")
+	if combineCall.BasePtr().SchedBlock() != elemBlk || store.BasePtr().SchedBlock() != elemBlk {
+		t.Fatal("SchedBlock(combineCall) and SchedBlock(store) must both be the element block")
+	}
+	// Reduce's innermost containing block is Y (home).
+	if rBlk, _ := findItemIn(k, reduceCall); rBlk != home.BasePtr().SchedBlock() {
+		t.Fatalf("Reduce's innermost containing block must be Y (home), got %v", rBlk)
+	}
+	// The element loop walks d0, and the store's d0 coordinate references
+	// the FRESH element dimvar; no reduced-dim dimvar leaks into the
+	// closure.
+	freshElem := ir.OperandsOf(elemBlk.Loop())[0]
+	if d := ir.OperandsOf(freshElem)[0]; d.BasePtr() != f.dims[0].BasePtr() {
+		t.Fatal("the element loop must walk d0 (the non-reduced dim)")
+	}
+	axes := ir.OperandsOf(store)[2:]
+	if len(axes) != 1 {
+		t.Fatalf("the store must carry one axis, got %d", len(axes))
+	}
+	if cl := subtreeOf(axes[0]); !cl[freshElem] {
+		t.Fatal("the store's d0 coordinate must reference the FRESH element dimvar")
 	}
 	if ops := ir.OperandsOf(store); ops[0] == nil || ops[0].BasePtr() != combineCall.BasePtr() {
 		t.Fatal("the store's value must resolve at the Combine call")
 	}
 }
 
-// TestReducerWarpSingleConsumerRefusal pins the thread-partitioned-consumer
-// refusal: a moved consumer referencing the single IV of a WARP-SoC
-// NON-reduced dim (here d0, WARP T==1, while the reduced dim is the
-// sequential d1) fails closed naming the thread-partitioned walk — the
-// is_first_in_cta store gate is single-owner only over CTA-replicated
-// element walks, so a WARP-partitioned output dim would leave a coverage
-// hole.
-func TestReducerWarpSingleConsumerRefusal(t *testing.T) {
-	f, _ := newRed2Fx(t, "wref")
-	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 1},
-		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 1},
-	})
-	err := runFinalLower(t, f.g, cache)
-	if err == nil || !strings.Contains(err.Error(), "thread-partitioned") {
-		t.Fatalf("a moved consumer referencing a WARP-single non-reduced dim's IV must fail closed naming the thread-partitioned walk, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "d0") {
-		t.Fatalf("the refusal must name the offending dim, got %v", err)
-	}
-}
+// TestReducerBracketMinTile's companion refusal probe (the WARP-single
+// consumer refusal) was DELETED with the 2026-10-24 tile-disable ruling:
+// the single form it guarded no longer exists, and its gate
+// (refuseThreadPartitionedConsumers + warpSingleIVs) was removed from
+// reducer.go with the T==1 machinery.

@@ -149,8 +149,14 @@ Reduce(
         gets its own Init/Combine pair and only the LAST tile's partial survives
         (per-tile partials). doc/tca.md §5.10 law: Init/Combine are never placed
         inside the tiling loops of @r — one reduction spans ALL tiles
-    - Untiled path (T == 1 or dim never tiled): X = the single loop, which is
-      also the Reduce's home loop
+    - Zero-between-dims degenerate (the reduced dim is the LNT's only dim,
+      2026-10-24 tile-disable reframing): home (the tile-inside loop) is a
+      DIRECT child of X, so X's parent is trivially the innermost
+      output-element scope — the flat bracket applies (Init immediately
+      before X, Combine immediately after, both in X's parent). There is
+      NO untiled path: every dim is tiled (T >= 2; a TileSize below 2 is
+      rejected at Params validation, record verification, and the
+      tile-lower rewrite backstop).
     - Non-reduced loops interleaved between X and the Reduce home (eg the @m_i
       walk) do NOT extend the reduction space — they stay INSIDE the bracket
 
@@ -210,10 +216,11 @@ Reduce(
 
 ```
 per-dim provenance entry {
-  Between ir.Node // the tile-between forloop (== the single loop when T==1)
-  Inside  ir.Node // the tile-inside forloop (nil when T==1)
+  Between ir.Node // the tile-between forloop
+  Inside  ir.Node // the tile-inside forloop (always populated — every dim
+                  // is tiled, T >= 2; nil is record corruption)
   Soc     int     // the effective SoC (mirrors ASTLoopMeta)
-  Tile    int     // the effective tile size (1 = untiled)
+  Tile    int     // the effective tile size (>= 2 always)
 }
 ```
 

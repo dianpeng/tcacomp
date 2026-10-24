@@ -212,6 +212,24 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 			t.Fatalf("budget error must name MaxCache, got %q", err.Error())
 		}
 	})
+
+	t.Run("tile one decision", func(t *testing.T) {
+		// Gate 2 of the 2026-10-24 tile-disable ruling: a record decision at
+		// TileSize 1 is corruption — tile size 1 is not a legal schedule
+		// (the compiler never generates a non-tiling schedule), so verify
+		// fails closed regardless of the record's other well-formedness.
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			for biv, d := range rec.Iters {
+				d.TileSize = 1
+				rec.Iters[biv] = d
+				return
+			}
+			t.Fatal("the matmul record must carry an iter entry")
+		})
+		if !strings.Contains(err.Error(), "TileSize >= 2") {
+			t.Fatalf("tile-1 error must name the TileSize >= 2 contract, got %q", err.Error())
+		}
+	})
 }
 
 // TestVerifyNonCandidateCoverage pins the R4 fail-closed coverage: over a

@@ -44,22 +44,17 @@ type dimRewrite struct {
 	gridDim   int     // the GridMapping dimension, -1 = none
 	threadDim int     // the ThreadMap dimension, -1 = none
 
-	single    bool    // T==1 form: one loop, no between/inside split
-	between   ir.Node // the between-round forloop (the single loop when T==1)
-	inside    ir.Node // the tile-inside forloop (nil when T==1)
-	betweenIV ir.Node // the round-base dimvar (nil when T==1)
-	insideIV  ir.Node // the in-tile coordinate dimvar (nil when T==1)
-	singleIV  ir.Node // the single loop's dimvar (nil when T>1)
+	between   ir.Node // the between-round forloop
+	inside    ir.Node // the tile-inside forloop
+	betweenIV ir.Node // the round-base dimvar
+	insideIV  ir.Node // the in-tile coordinate dimvar
 
 	// Construction inputs buildNest consumes (bound operands are wrapped
 	// in BoundedDimVar nodes at loop construction):
-	singleIVNode   ir.Node   // T==1: the dimvar
-	singleBound    ir.Node   // T==1: the raw extent
-	singleAttrs    []ir.Node // T==1: annotations
-	betweenBound   ir.Node   // T>1: the raw extent
-	insideBound    ir.Node   // T>1: the materialized tile_max
-	betweenAttrs   []ir.Node // T>1: between-loop annotations
-	insideAttrs    []ir.Node // T>1: inside-loop annotations
+	betweenBound   ir.Node   // the raw extent
+	insideBound    ir.Node   // the materialized tile_max
+	betweenAttrs   []ir.Node // between-loop annotations
+	insideAttrs    []ir.Node // inside-loop annotations
 	coupledThreads int       // CTA dims: the coupled walk's thread count
 
 	indexExpr ir.Node // the dim's rewritten global index expression
@@ -176,7 +171,7 @@ func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 		}
 		lr.prov.Dims[d.dim] = DimProvenance{
 			Between: d.between,
-			Inside:  d.inside, // nil at T==1 (the single-loop form)
+			Inside:  d.inside,
 			Soc:     d.soc,
 			Tile:    d.tile,
 		}
@@ -186,7 +181,7 @@ func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 		// ownership-gate walk read these instead of re-deriving the portion
 		// arithmetic (D3's counting invariant lives here, at the pass that
 		// built the walk).
-		if d.soc == SoCTA && !d.single {
+		if d.soc == SoCTA {
 			lr.prov.Dims[d.dim] = DimProvenance{
 				Between:        d.between,
 				Inside:         d.inside,
@@ -349,10 +344,8 @@ func (lr *lowerRun) tileMax(tile int, extent, offset ir.Node) ir.Node {
 
 // saturatingRemainder materializes the F1 core extent − umin(offset,
 // extent): the exact number of in-bounds rounds/elements remaining at
-// offset, wrapping nowhere in u32. Shared by every tileMax bound and the
-// T==1 WARP single-form mirror gate, whose fused round-enumerating loop
-// wants the remainder under an UNBOUNDED cap (the extent itself), not a
-// tile-bounded one.
+// offset, wrapping nowhere in u32. Its only caller is tileMax — every
+// materialized per-tile bound rides it.
 func (lr *lowerRun) saturatingRemainder(extent, offset ir.Node) ir.Node {
 	clamped := lr.g.NewCall(lowerOrigin, "umin", offset, extent)
 	return lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, extent, clamped)
@@ -392,67 +385,20 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 		if err != nil {
 			return err
 		}
-		switch {
-		case d.tile == 1:
-			// T==1: NO tiling for the dim — a single annotated loop; the
-			// original IV uses map directly to the loop index expression.
-			d.single = true
-			switch d.soc {
-			case SoCSequential:
-				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
-				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.singleAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
-				d.indexExpr, d.roundBase = d.singleIV, d.singleIV
-			case SoCTA:
-				// Single CTA loop at stride LoC: index = iv + grid_rank.
-				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc)))
-				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.singleAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc)), lr.attr("tile", float64(d.tile))}
-				rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
-				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
-				d.roundBase = d.indexExpr
-			case SoCWARP:
-				// Single thread-parallel loop at stride LoC×32.
-				d.singleIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*32)))
-				d.singleAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(d.loc*32)), lr.attr("tile", float64(d.tile))}
-				rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
-				if ctaThreadDim >= 0 {
-					// MIRROR GATE, single form (2026-10-24 ruling): the SAME
-					// CTA-coupled duplication the T>1 WARP path gates — the
-					// coupled group duplicates this dim's ThreadMap
-					// coordinates, so the mirrored half (gate >= 1) would
-					// re-walk the owning half's elements: a double-writer
-					// walk for stores and a double-counted partial under a
-					// uniform reduce bracket. The bound becomes the
-					// F1-saturating expression over offset = rank +
-					// index(ctaThreadDim)·extent: the mirrored half
-					// saturates to ZERO trips, the owning half keeps its
-					// exact in-bounds round count (extent − rank — strictly
-					// tighter than the raw extent, which admitted OOB
-					// phantom rounds). The cap operand is the EXTENT (an
-					// unbounded clamp), NOT the constant 1: the fused single
-					// loop enumerates whole rounds at stride LoC·32, so a
-					// 1-trip cap would under-cover every extent > LoC·32 —
-					// exactly the T==1 reduce sweep point (a 512-element
-					// last axis at a 256-thread warp group) the gate exists
-					// to make numerically correct.
-					gate := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(ctaThreadDim)))
-					offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, rank,
-						lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, gate, extent))
-					d.singleBound = lr.g.NewCall(lowerOrigin, "umin", extent, lr.saturatingRemainder(extent, offset))
-					d.singleIVNode = d.singleIV
-					d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, offset)
-					d.roundBase = d.indexExpr
-					continue
-				}
-				d.singleIVNode, d.singleBound = d.singleIV, extent
-				d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.singleIV, rank)
-				d.roundBase = d.indexExpr
-			}
-			continue
+		// GATE 3 (the 2026-10-24 tile-disable ruling): the fail-closed
+		// backstop over the EFFECTIVE tile (the record decision OR a budget
+		// override). Params.Validate (gate 1) rejects TileSizes entries < 2
+		// and tiling-verify (gate 2) rejects record TileSize < 2, but a
+		// HAND-STAMPED Verified record or a bad override reaching the
+		// rewrite dies HERE — never as a non-tiling (semantically
+		// divergent) rewrite. The single-loop form is deleted; every dim
+		// takes the mechanical between/inside path below.
+		if d.tile < 2 {
+			return fmt.Errorf("tile-lower: iter node %d carries effective tile size %d (record decision or budget override) — tile size 1 is not a legal schedule: the compiler never generates a non-tiling schedule (2026-10-24 ruling; gate 3 backstop — Params.Validate and tiling-verify are gates 1-2)",
+				d.iter.BasePtr().ID(), d.tile)
 		}
 
-		// T > 1: between-round + tile-inside loops.
+		// Between-round + tile-inside loops — the mechanical form, every dim.
 		t := float64(d.tile)
 		switch d.soc {
 		case SoCSequential:
@@ -548,7 +494,7 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 }
 
 // buildNest constructs the generated loops and wires the canonical nest
-// (§6bis PHASE 3): ALL between/single loops nest in dim order, ALL inside
+// (§6bis PHASE 3): ALL between loops nest in dim order, ALL inside
 // loops nest inside them, also in dim order. Construction is inside-out so
 // every body operand is wired at construction time; the loops of each
 // dim are stored on the dimRewrite for PHASE 4 and the epilogue. Returns
@@ -558,23 +504,15 @@ func (lr *lowerRun) buildNest(lw *lntRewrite) ir.Node {
 	// Inside loops, innermost first (reverse dim order).
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
-		if d.single {
-			continue
-		}
 		d.inside = lr.g.NewForLoop(lowerOrigin, d.insideIV,
 			lr.g.NewBoundedDimVar(lowerOrigin, d.insideIV, d.insideBound), inner, d.insideAttrs...)
 		inner = d.inside
 	}
-	// Between/single loops, innermost first.
+	// Between loops, innermost first.
 	for i := len(lw.dims) - 1; i >= 0; i-- {
 		d := lw.dims[i]
-		if d.single {
-			d.between = lr.g.NewForLoop(lowerOrigin, d.singleIV,
-				lr.g.NewBoundedDimVar(lowerOrigin, d.singleIV, d.singleBound), inner, d.singleAttrs...)
-		} else {
-			d.between = lr.g.NewForLoop(lowerOrigin, d.betweenIV,
-				lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound), inner, d.betweenAttrs...)
-		}
+		d.between = lr.g.NewForLoop(lowerOrigin, d.betweenIV,
+			lr.g.NewBoundedDimVar(lowerOrigin, d.betweenIV, d.betweenBound), inner, d.betweenAttrs...)
 		inner = d.between
 	}
 	return inner

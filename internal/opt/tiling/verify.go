@@ -84,8 +84,9 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //     must leave >= 1 warp portion for the coupled inside walk; the CTA
 //     dim's TileSize must not exceed the coupled inside-walk thread count
 //     (HI-03 gate 2 — tile > coupledThreads is a double-writer race);
-//     sequential entries carry LoC 1; every LoC and TileSize >= 1; every
-//     SoC known.
+//     sequential entries carry LoC 1; every LoC >= 1 and every TileSize
+//     >= 2 (the compiler never generates a non-tiling schedule, the
+//     2026-10-24 ruling); every SoC known.
 //   - SITE well-formedness: a promoted site's Tie is a live iter of the
 //     site's LNT or nil; its class is SMEM or FRAG; and the site decision
 //     MATCHES the promotion judge re-run over the record's own schedule
@@ -187,8 +188,8 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				return fmt.Errorf("tiling-verify: %w", err)
 			}
 			d := rec.Iters[biv]
-			if d.LoC < 1 || d.TileSize < 1 {
-				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d / TileSize %d (both must be >= 1)",
+			if d.LoC < 1 || d.TileSize < 2 {
+				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d / TileSize %d (LoC must be >= 1 and TileSize >= 2 — the compiler never generates a non-tiling schedule, the 2026-10-24 ruling)",
 					it.BasePtr().ID(), d.LoC, d.TileSize)
 			}
 			switch d.SoC {
