@@ -44,9 +44,6 @@ package ir
 // one generic loop-nest forest analysis consumes (see the file comment for
 // the membership-edges-only contract). Implementations must be pure read
 // faces — no allocation, no mutation, nil-safe.
-//
-// NOTE: BodyRoot is scheduled for deletion in Step 2 (fix1.md §5 step 2).
-// It remains in Step 1 so loopforest compiles during the transition.
 type LoopSpec interface {
 	// IsLoop reports whether n is a loop-header node (KindIter or
 	// KindForLoop). KindIterCluster, KindDimVar, and every non-FamilyLoop
@@ -59,15 +56,6 @@ type LoopSpec interface {
 	// non-loop nodes. The returned node may be erased or uncollected; the
 	// caller resolves membership.
 	ParentEdge(n Node) Node
-	// BodyRoot returns the operand rooting n's per-iteration body subtree —
-	// for a KindForLoop, ops[2] when the operand list is long enough; nil
-	// for a KindIter (no body operand) and for non-loop nodes.
-	//
-	// DEPRECATED: will be removed in Step 2 of the fix1.md body-operand
-	// removal. ForLoop has no body operand per the sea-of-nodes ruling
-	// (fix1.md §0); this method only exists for the Step 1 → Step 2
-	// transition so loopforest compiles during the rewrite.
-	BodyRoot(n Node) Node
 }
 
 // LoopNesting is the single exported LoopSpec covering the whole FamilyLoop
@@ -107,22 +95,4 @@ func (loopNesting) ParentEdge(n Node) Node {
 		}
 	}
 	return nil
-}
-
-// BodyRoot: a KindForLoop's operands are [iv, bound, body, attrs...] — the
-// body subtree roots at ops[2] (node_loop.go M1). A short operand list
-// (corrupted construction) answers nil rather than panicking; a KindIter
-// has no body operand.
-//
-// DEPRECATED: will be removed in Step 2 of the fix1.md body-operand
-// removal. Kept for Step 1 greenness so loopforest compiles.
-func (loopNesting) BodyRoot(n Node) Node {
-	if n == nil || n.BasePtr() == nil || n.KindOf() != KindForLoop {
-		return nil
-	}
-	ops := OperandsOf(n)
-	if len(ops) < 3 {
-		return nil
-	}
-	return ops[2]
 }
