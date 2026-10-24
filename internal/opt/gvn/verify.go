@@ -112,10 +112,11 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 	}
 
 	// 3. UNIQUE-REPRESENTATIVE — no two participating nodes are one value.
-	bodyRoots := lambdaBodyRoots(g)
+	// Post-fix1.md D-d there is no body-root exemption: lambda bodies ride
+	// ordinary operand slots (D15), so body roots participate like any node.
 	var participating []ir.Node
 	for _, n := range g.AllocatedNodes() {
-		if bodyRoots[n] || !validKindMirror(n.KindOf()) || se.HasSideEffect(n) {
+		if !validKindMirror(n.KindOf()) || se.HasSideEffect(n) {
 			continue
 		}
 		participating = append(participating, n)
