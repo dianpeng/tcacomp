@@ -119,11 +119,16 @@ func (p Pass) Run(_ *opt.Context, g *ir.Graph) error {
 	})
 	ir.Walk(g, mark)
 
-	// AST-roots mode (fix2 D-d): additionally mark every AST item node —
-	// collected recursively through the Prototype and every block of the
-	// Body tree (the post-schedule truth of liveness).
+	// AST-roots mode (fix2 D-d): additionally mark every AST item node PLUS
+	// every Loop block's header node — collected recursively through the
+	// Prototype and every block of the Body tree (the post-schedule truth of
+	// liveness). The loop headers are structural: no item references a
+	// ForLoop through an operand edge (the "nest" attrs point the other
+	// way), yet the emitter reads each block's Loop() operand face (soc/
+	// dosoc/loc annotations), so a root policy without them would erase the
+	// scheduled nest the AST still materializes.
 	if p.astRoots {
-		ir.WalkFrom(astItemNodes(ast), mark)
+		ir.WalkFrom(astRootNodes(ast), mark)
 	}
 
 	// SWEEP the allocation registry to a fixpoint.
@@ -170,13 +175,18 @@ func (p Pass) Run(_ *opt.Context, g *ir.Graph) error {
 	return nil
 }
 
-// astItemNodes collects every AST item's node over the whole kernel — the
-// Prototype block included — in deterministic walk order (Body tree
-// depth-first, then the Prototype's items).
-func astItemNodes(k *ir.ASTKernel) []ir.Node {
+// astRootNodes collects the AST's root nodes over the whole kernel — every
+// AST item's node PLUS every Loop block's header node (Loop(), whose operand
+// closure reaches the IV, the bound wrapper, and the soc/dosoc/loc/nest
+// annotations) — in deterministic walk order (Body tree depth-first, then
+// the Prototype's items).
+func astRootNodes(k *ir.ASTKernel) []ir.Node {
 	var roots []ir.Node
 	var collect func(blk *ir.ASTBlock)
 	collect = func(blk *ir.ASTBlock) {
+		if loop := blk.Loop(); loop != nil {
+			roots = append(roots, loop)
+		}
 		for _, it := range blk.Items() {
 			if it.Node != nil {
 				roots = append(roots, it.Node)

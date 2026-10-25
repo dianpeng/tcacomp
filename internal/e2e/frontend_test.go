@@ -17,9 +17,7 @@ import (
 	"testing"
 
 	"tcacomp/internal/cg"
-	"tcacomp/internal/cg/cxx"
-	"tcacomp/internal/opt"
-	_ "tcacomp/internal/opt/all"
+	"tcacomp/internal/compiler"
 	"tcacomp/internal/syntax"
 	"tcacomp/internal/syntax/lexer"
 )
@@ -148,7 +146,8 @@ int main() {
 }
 `
 
-// compileFrontendKernel runs the real compiler pipeline over one fixture
+// compileFrontendKernel runs the real compiler (the internal/compiler
+// facade — the single syntax→backend composition, fix2 R-F) over one fixture
 // and returns the emitted files (the .cu — the emitted CMakeLists is
 // dropped: the fixture composes its own, mirroring the golden path).
 func compileFrontendKernel(t *testing.T, src string) map[string][]byte {
@@ -169,22 +168,9 @@ func compileFrontendKernel(t *testing.T, src string) map[string][]byte {
 	if len(mod.Kernels) != 1 {
 		t.Fatalf("e2e: want 1 kernel, got %d", len(mod.Kernels))
 	}
-	g, err := mod.Kernels[0].Build()
+	res, err := compiler.CompileKernel(mod.Kernels[0], cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86})
 	if err != nil {
-		t.Fatalf("e2e: frontend lower (pkg rungs) failed: %v", err)
-	}
-	// pkg.Build materializes as its final construction step; the pipeline's
-	// scheduling/tiling passes consume the Level-1 sea (same discipline as
-	// cmd/tcacomp's compileKernel).
-	if err := g.Dematerialize(); err != nil {
-		t.Fatalf("e2e: dematerialize: %v", err)
-	}
-	if err := opt.NewManager(opt.BuildPipeline()).Run(g); err != nil {
-		t.Fatalf("e2e: optimization pipeline failed: %v", err)
-	}
-	res, err := cxx.Emit(g, cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86})
-	if err != nil {
-		t.Fatalf("e2e: emit failed: %v", err)
+		t.Fatalf("e2e: compile through the facade failed: %v", err)
 	}
 	files := map[string][]byte{}
 	for name, content := range res.Files {

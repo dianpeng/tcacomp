@@ -12,9 +12,7 @@ import (
 	"path/filepath"
 
 	"tcacomp/internal/cg"
-	"tcacomp/internal/cg/cxx"
-	"tcacomp/internal/opt"
-	_ "tcacomp/internal/opt/all" // register every pipeline pass
+	"tcacomp/internal/compiler"
 	"tcacomp/internal/syntax"
 	"tcacomp/internal/syntax/lexer"
 )
@@ -94,24 +92,11 @@ func compile(args []string) int {
 	return 0
 }
 
-// compileKernel builds one kernel through the pkg rungs, runs the full
-// optimization pipeline over the dematerialized graph, and writes the
-// emitted files into outDir.
+// compileKernel compiles one kernel through the compiler facade (the single
+// syntax→backend composition — parse was already done; fix2 R-F) and writes
+// the emitted files into outDir.
 func compileKernel(k *syntax.Kernel, outDir string) error {
-	g, err := k.Build()
-	if err != nil {
-		return err
-	}
-	// pkg.Build materializes as its final construction step; the pipeline's
-	// scheduling/tiling passes consume the Level-1 sea, so dematerialize
-	// first (the pipeline re-materializes for codegen).
-	if err := g.Dematerialize(); err != nil {
-		return err
-	}
-	if err := opt.NewManager(opt.BuildPipeline()).Run(g); err != nil {
-		return err
-	}
-	res, err := cxx.Emit(g, sm86Options)
+	res, err := compiler.CompileKernel(k, sm86Options)
 	if err != nil {
 		return err
 	}

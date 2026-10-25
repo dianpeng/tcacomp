@@ -27,6 +27,7 @@ import (
 
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
+	"tcacomp/internal/opt/dce"
 
 	// The composition root: blank-importing opt/all registers every pass
 	// factory this package resolves its windows through.
@@ -58,6 +59,20 @@ var lowerWindow = []string{
 	"schedule",      // 900: sea-of-nodes → AST-style CFG
 	"final-lower",   // 950: reducers/maps/runtime objects over the AST CFG
 }
+
+// The TAIL window (fix2 D-e — ruled Option A): the post-final-lower cleanup
+// the lowers now delegate to. Wired AFTER final-lower, in this order:
+//
+//	memopt  a SECOND instance from the registered factory (R-E composite
+//	        reuse — never a new registry ID): its region rules (a)-(c) no-op
+//	        on the LIR window (C1's chain-totality gate) while rule (d) —
+//	        fill liveness — is reachable in-pipeline for the first time.
+//	dce     the AST-item-roots instance (D-d): collects every non-item sea
+//	        node the lowers left dead, and its item sweep collects the items
+//	        of memopt's erasures.
+//
+// memopt FIRST so the dce instance sees the final residue.
+var tailMemoptID = "memopt"
 
 // resolve turns one window's ID list into fresh pass instances through the
 // registry factories, fail-closed on an unknown ID (a missing pass is a
@@ -97,12 +112,26 @@ func LOWERPasses() []opt.Pass {
 	return passes
 }
 
+// TailPasses returns the exact tail instances Run wires — the memopt factory
+// instance (R-E: reuse the registered pass compositively; never a new ID)
+// followed by the AST-item-roots dce instance — exposed for tests that pin
+// the tail composition in isolation.
+func TailPasses() []opt.Pass {
+	spec, ok := opt.Lookup(tailMemoptID)
+	if !ok {
+		panic(fmt.Errorf("pipeline: pass ID %q is not registered (is the pass package blank-imported via opt/all?)", tailMemoptID))
+	}
+	return []opt.Pass{spec.Factory(), dce.NewASTRoots()}
+}
+
 // Run executes the full pass composition over g: ONE opt.Manager over the
 // concatenated windows, so declarative preconditions (Pass.Requires) are
-// enforced against every pass that ran earlier in the same pipeline run.
-// The graph must be DEMATERIALIZED (a Level-1 sea): the windows' level gates
-// refuse materialized/CFG-carrying graphs, and the LOWER window re-attaches
-// the AST CFG the backend consumes.
+// enforced against every pass that ran earlier in the same pipeline run —
+// the tail memopt's Requires ["gvn"] is satisfied by the HIR window's gvn,
+// and two same-ID instances in one run are fine. The graph must be
+// DEMATERIALIZED (a Level-1 sea): the windows' level gates refuse
+// materialized/CFG-carrying graphs, and the LOWER window attaches the AST
+// CFG the backend consumes.
 func Run(g *ir.Graph) error {
 	hir, err := resolve(hirWindow)
 	if err != nil {
@@ -112,8 +141,9 @@ func Run(g *ir.Graph) error {
 	if err != nil {
 		return err
 	}
-	passes := make([]opt.Pass, 0, len(hir)+len(lower))
+	passes := make([]opt.Pass, 0, len(hir)+len(lower)+2)
 	passes = append(passes, hir...)
 	passes = append(passes, lower...)
+	passes = append(passes, TailPasses()...)
 	return opt.NewManager(passes).Run(g)
 }
