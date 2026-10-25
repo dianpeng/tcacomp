@@ -75,12 +75,54 @@ func (f VisitorFunc) Visit(n Node) VisitResult { return f(n) }
 // via pipeInput), and its order is golden-pinned. Walk is the substrate for
 // analysis and checking (verify, legality); print/dot keep StmtNodes.
 //
-// The stack pops last-pushed first, so roots push in REVERSE visit order:
-// the end node / statements tail-to-head (first pops first), then params
-// reversed (params pop first); within a statement rhs pushes before its def
-// (def pops first).
+// Walk is the level-aware ROOT-SET wrapper over WalkFrom (fix2 D-d's
+// extraction): it builds its root slice in the exact VISIT order the
+// original monolith popped — params (declaration order) first, then the
+// level-specific roots (Level 1: the end node; Level 2: the entry block's
+// statements head→tail, each statement's def before its rhs).
 func Walk(g *Graph, v Visitor) {
 	if g == nil || v == nil {
+		return
+	}
+	// Roots: graph params first (InputParam nodes are defs referenced only
+	// through payload uses, so without them the def-use direction of parameter
+	// ref lists would go unchecked), in declaration order.
+	roots := make([]Node, 0, len(g.params)+1)
+	roots = append(roots, g.params...)
+	if g.materialized || g.cfg != nil {
+		// Level 2: the entry block's statements head→tail, each statement's
+		// def before its rhs (collected tail→head as rhs-before-def pairs,
+		// then reversed into the visit order).
+		var stmts []Node
+		for s := g.cfg.entry.tail; s != nil; s = s.prev {
+			stmts = append(stmts, s.rhs)
+			if !s.def.IsInvalid() {
+				stmts = append(stmts, s.def.SSA().Node())
+			}
+		}
+		for i, j := 0, len(stmts)-1; i < j; i, j = i+1, j-1 {
+			stmts[i], stmts[j] = stmts[j], stmts[i]
+		}
+		roots = append(roots, stmts...)
+	} else {
+		// Level 1: the end node (R2) — the sea's only effect-anchored root;
+		// its operand and ImpactBy paths reach every live store.
+		roots = append(roots, g.end)
+	}
+	WalkFrom(roots, v)
+}
+
+// WalkFrom visits every node reachable from the given roots in deterministic
+// pre-order DFS, calling v.Visit exactly once per node — the same iterative
+// stack/visited-set traversal and the same child relation as Walk (operand
+// defs in slot order, then payload uses, live records only), but over an
+// ARBITRARY root set (fix2 D-d: the mechanical enabler for DCE's AST-item
+// roots). The roots are visited in slice order (roots push in REVERSE so the
+// first pops first); a nil visitor or an empty/nil root slice is a no-op.
+// Nil roots and roots already seen are skipped, so overlapping root sets are
+// safe.
+func WalkFrom(roots []Node, v Visitor) {
+	if v == nil {
 		return
 	}
 	seen := make(map[Node]bool)
@@ -92,26 +134,8 @@ func Walk(g *Graph, v Visitor) {
 		seen[n] = true
 		stack = append(stack, n)
 	}
-	// Roots: graph params first (InputParam nodes are defs referenced only
-	// through payload uses, so without them the def-use direction of parameter
-	// ref lists would go unchecked), in declaration order.
-	if g.materialized || g.cfg != nil {
-		// Level 2: the entry block's statements, tail-to-head so the head
-		// pops first; within a statement, rhs pushes before its def so the
-		// def pops first.
-		for s := g.cfg.entry.tail; s != nil; s = s.prev {
-			push(s.rhs)
-			if !s.def.IsInvalid() {
-				push(s.def.SSA().Node())
-			}
-		}
-	} else {
-		// Level 1: the end node (R2) — the sea's only effect-anchored root;
-		// its operand and ImpactBy paths reach every live store.
-		push(g.end)
-	}
-	for i := len(g.params) - 1; i >= 0; i-- {
-		push(g.params[i])
+	for i := len(roots) - 1; i >= 0; i-- {
+		push(roots[i])
 	}
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]

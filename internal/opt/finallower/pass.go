@@ -9,8 +9,10 @@
 //     RuntimeCallMethod statements (LR-1..LR-3, LR-7, LR-13, LR-14) — one
 //     reduction spanning ALL tiles of the reduced dim, never per-tile
 //     partials (doc/tca.md §5.10).
-//   - MAPS (maplower.go): pure identity projectors eliminated with full
-//     debris disposal (LR-9) — ordered AFTER Reducer Lower, whose @r
+//   - MAPS (maplower.go): pure identity projectors eliminated by the
+//     three-step verb — RAUW onto the body, erase the Map, erase the As
+//     (LR-9 as amended by fix2 D-b: NO debris sweeps; the orphaned lambda
+//     subtree is the tail DCE's) — ordered AFTER Reducer Lower, whose @r
 //     derivation needs the producing Maps alive (LR-2).
 //   - RUNTIME OBJECTS (objects.go): exactly one RuntimeKernelInfo as the
 //     FIRST item of the kernel Body Group, one GridMapping+ThreadMapping
@@ -131,9 +133,10 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return err
 	}
 
-	// The dissolved between-loop disposal (R3): with the Map debris gone,
-	// no live use of a dissolved between dimvar may remain — erase the
-	// dissolved loop headers, fail-closed on any survivor.
+	// The dissolved between-loop disposal (R3, fix2 D-a): erase the
+	// dissolved loop headers and their OWN header nodes — verb-death only;
+	// a surviving AST ITEM still referencing a dissolved header node is a
+	// named hard error, sea-only references are the tail DCE's garbage.
 	if err := lr.finalizeDissolutions(); err != nil {
 		return err
 	}
@@ -209,85 +212,83 @@ type lowering struct {
 }
 
 // dissolveJob is one dissolved between loop awaiting disposal (R3): its
-// loop node, IV, the loop's operand closure (captured BEFORE erasure —
-// Erase unwires the loop's own records), and the originating Reduce for
-// diagnostics.
+// loop node and the originating Reduce for diagnostics.
 type dissolveJob struct {
-	loop    ir.Node
-	iv      ir.Node
-	red     ir.Node
-	closure map[ir.Node]bool // the loop's operand closure (wrapper, attrs, coordinate debris)
+	loop ir.Node
+	red  ir.Node
 }
 
 // finalizeDissolutions disposes the dissolved between loops after Map
-// Lower. The rebuilds orphan the ORIGINAL coordinate expressions (every
-// consumer now reads a rebuilt clone) and the loop's own header debris
-// (bound wrapper, annotations) — a fixpoint sweep erases the zero-use
-// orphans bottom-up, guarded so a still-shared node (a const another live
-// expression reads) is never touched. What may NEVER remain is a live use
-// of the dissolved IV by a non-orphan: such a survivor reads a dimvar
-// whose loop no longer exists in the AST (the emitter would have no
-// iterator for it) — a named hard error.
+// Lower. fix2 D-a (R-A: verb-death only): the ONLY erasures here are the
+// ones the element-loop restructure's rule prescribes — each dissolved loop
+// header and its OWN header nodes (the KeyedAttributes, the BoundedDimVar
+// wrapper, the IV). The dead coordinate spines those erasures orphan stay
+// in the sea: they are the tail DCE's input, never this pass's business.
+// Erase's live-use refusal is the backstop: a header node still holding
+// uses is LEFT IN PLACE unless a surviving AST ITEM references it — such an
+// item reads a dimvar whose loop no longer exists in the AST (the emitter
+// would have no iterator for it), a named hard error. Sea-only references
+// are garbage DCE owns (fix2 §4.8 negative pin (a)'s premise: the lower
+// never crashes on garbage it no longer makes).
 func (lr *lowering) finalizeDissolutions() error {
 	for _, job := range lr.dissolved {
-		cands := make(map[ir.Node]bool, len(job.closure)+8)
-		for n := range job.closure {
-			cands[n] = true
-		}
-		cands[job.iv] = true
-		for _, d := range ir.OperandsOf(job.iv) {
-			for n := range operandClosure(d) {
-				cands[n] = true
-			}
-		}
-		// The IV's transitive USER chain: after the rebuilds every former
-		// consumer reads a clone, so what remains reachable upward from the
-		// IV is exactly the orphaned ORIGINAL coordinate debris (#66-style
-		// expression items of the dissolved blocks).
-		var up func(n ir.Node)
-		up = func(n ir.Node) {
-			for _, u := range ir.UsesOf(n) {
-				usr := u.User()
-				if usr == nil || usr.BasePtr() == nil || usr.BasePtr().Erased() || cands[usr] {
-					continue
-				}
-				cands[usr] = true
-				up(usr)
-			}
-		}
-		up(job.iv)
+		// The loop's own header nodes, captured before the loop itself dies.
+		// ops = [iv, bound, attrs...]; erased in REVERSE so each erasure
+		// finds no live user among the set itself (the attrs are used only
+		// by the loop, the wrapper by the loop, the IV by loop + wrapper).
+		// The dim PARAM and the bound-max const are NOT candidates: the
+		// fresh element loop shares them and they are never erased here.
+		ops := append([]ir.Node(nil), ir.OperandsOf(job.loop)...)
 		if err := lr.mctx.Erase(job.loop); err != nil {
 			return fmt.Errorf("final-lower: reduce node %d: erasing a dissolved between loop: %w", job.red.BasePtr().ID(), err)
 		}
-		// Fixpoint orphan sweep: erase any candidate with zero uses (the
-		// deepest die first, freeing their parents); the IV itself is
-		// excluded until the guard passes.
-		for progress := true; progress; {
-			progress = false
-			for n := range cands {
-				if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.BasePtr() == job.iv.BasePtr() {
-					continue
-				}
-				if len(ir.UsesOf(n)) > 0 {
-					continue // still consumed — a shared leaf or a stranded user
-				}
-				if err := lr.mctx.Erase(n); err != nil {
-					return fmt.Errorf("final-lower: reduce node %d: erasing dissolved-loop debris node %d (%s): %w",
-						job.red.BasePtr().ID(), n.BasePtr().ID(), n.KindOf(), err)
-				}
-				progress = true
+		for i := len(ops) - 1; i >= 0; i-- {
+			n := ops[i]
+			if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+				continue
 			}
-		}
-		if uses := ir.UsesOf(job.iv); len(uses) > 0 {
-			return fmt.Errorf("final-lower: reduce node %d: node %d still references the dissolved between dimvar of loop %d after Map Lower (its value is not defined at that position)",
-				job.red.BasePtr().ID(), uses[0].User().BasePtr().ID(), job.loop.BasePtr().ID())
-		}
-		if err := lr.mctx.Erase(job.iv); err != nil {
-			return fmt.Errorf("final-lower: reduce node %d: erasing a dissolved between dimvar: %w", job.red.BasePtr().ID(), err)
+			if err := lr.mctx.Erase(n); err != nil {
+				if item := lr.itemReferencing(n); item != nil {
+					return fmt.Errorf("final-lower: reduce node %d: AST item node %d (%s) still references the dissolved between header node %d of loop %d after Map Lower (its value is not defined at that position)",
+						job.red.BasePtr().ID(), item.BasePtr().ID(), item.KindOf(), n.BasePtr().ID(), job.loop.BasePtr().ID())
+				}
+				// Sea-only uses remain: dead coordinate debris the tail DCE
+				// owns (fix2 D-a) — leave the node in the sea.
+				continue
+			}
 		}
 	}
 	lr.dissolved = nil
 	return nil
+}
+
+// itemReferencing returns the first AST item node whose operand closure
+// references n (or that IS n), or nil — the surviving-item probe behind
+// finalizeDissolutions' narrowed hard error (fix2 D-a: only an AST ITEM
+// referencing a dissolved header is fatal; sea-only references are
+// garbage DCE owns).
+func (lr *lowering) itemReferencing(n ir.Node) ir.Node {
+	var search func(blk *ir.ASTBlock) ir.Node
+	search = func(blk *ir.ASTBlock) ir.Node {
+		for _, it := range blk.Items() {
+			if it.Node != nil {
+				if it.Node.BasePtr() == n.BasePtr() || operandClosure(it.Node)[n] {
+					return it.Node
+				}
+				continue
+			}
+			if it.Block != nil {
+				if found := search(it.Block); found != nil {
+					return found
+				}
+			}
+		}
+		return nil
+	}
+	if lr.ast.Body == nil {
+		return nil
+	}
+	return search(lr.ast.Body)
 }
 
 // blockIndex builds the block→LNT index per P-11: for each LNT, its

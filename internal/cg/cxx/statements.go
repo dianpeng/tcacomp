@@ -26,6 +26,12 @@ func (e *emitter) statement(n ir.Node) error {
 	// scheduler may still anchor them as items — metadata only.
 	case ir.KindKeyedAttribute:
 		return nil
+	// A lambda item emits nothing in the kernel body: combiners render in
+	// the file-scope section (markClosure skips their anchored params and
+	// bodies), and since fix2 D-b a producing Map's lambda also survives
+	// final-lower as a dead-in-the-sea item — never a kernel statement.
+	case ir.KindLambda:
+		return nil
 	// Loops materialize as Block items, never as statement items.
 	case ir.KindForLoop:
 		return fmt.Errorf("cxx: forloop %d appears as a statement item — the schedule must place it as a Loop block", n.BasePtr().ID())

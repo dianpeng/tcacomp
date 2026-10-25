@@ -81,6 +81,143 @@ func TestDCEGateMaterializedRefused(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// AST-item roots (fix2 D-d): the tail instance over an AST-attached
+// (scheduled) graph — items + the two-root set are the liveness truth.
+// ---------------------------------------------------------------------------
+
+// astRootsFixture builds a hand-attached-AST graph through the ir
+// constructors: params, a live chained store into `out` observed by the end
+// node, a reducer construction + an Init RuntimeCallMethod as AST ITEMS with
+// ZERO SSA users (the D-d headline: effectful runtime calls are items), and
+// an abandoned pure-expression subtree that is NOT an item (the garbage the
+// mode must collect). Returns the graph plus the probe nodes.
+func astRootsFixture() (g *ir.Graph, out, st, end, construction, initCall, deadExpr ir.Node) {
+	g = ir.NewGraph("astroots")
+	f32 := ir.InternScalar(ir.TF32)
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+	out = g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+
+	// The live chain: a store the end node observes.
+	v := g.NewConst("ctor", f32, 1)
+	env := ir.NewEnv()
+	st = g.NewMemStoreChained("ctor", env, out, []ir.Node{m}, v)
+	end = g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+
+	// The effectful runtime statements: zero SSA users, AST items only.
+	init := g.NewConst("ctor", f32, 0)
+	lp := g.NewLambdaInputParam("ctor", "x", f32)
+	lam := g.NewLambdaNode("ctor", []ir.Node{lp}, lp)
+	construction = g.NewRuntimeSequentialReducer("ctor", init, lam)
+	initCall = g.NewRuntimeCallMethod("ctor", "Init", construction)
+
+	// The garbage: an abandoned pure expression that is NOT an item.
+	dc1 := g.NewConst("ctor", f32, 2)
+	dc2 := g.NewConst("ctor", f32, 3)
+	deadExpr = g.NewBinOp("ctor", ir.BinOpAdd, dc1, dc2)
+
+	// Attach a minimal scheduled shape: a Prototype with the params, a Body
+	// Group holding the statements (schedule stamps; the items are what the
+	// AST-roots mode roots on).
+	proto := ir.NewASTPrototype()
+	for _, p := range g.Params() {
+		proto.AppendItem(ir.ASTItem{Node: p})
+		p.BasePtr().SetSched(ir.PrototypeSN, proto)
+	}
+	body := ir.NewASTGroup()
+	for _, n := range []ir.Node{construction, initCall, st} {
+		body.AppendItem(ir.ASTItem{Node: n})
+		n.BasePtr().SetSched(0, body)
+	}
+	if err := g.AttachAST(&ir.ASTKernel{Prototype: proto, Body: body}); err != nil {
+		panic(err)
+	}
+	return g, out, st, end, construction, initCall, deadExpr
+}
+
+// TestDCEASTRootsPreserveEffectfulItems pins fix2 D-d's headline: over an
+// AST-attached graph, the AST-roots instance keeps the effectful runtime
+// calls (zero SSA users, AST items) AND the item-anchored construction,
+// while the plain two-root sweep would erase them (the P-7 hazard —
+// reachability roots do not know runtime-call statements).
+func TestDCEASTRootsPreserveEffectfulItems(t *testing.T) {
+	g, out, st, end, construction, initCall, deadExpr := astRootsFixture()
+
+	if err := (dce.NewASTRoots()).Run(nil, g); err != nil {
+		t.Fatalf("AST-roots Run: %v", err)
+	}
+	assertKept(t, g, out, st, end, construction, initCall)
+	assertGone(t, g, deadExpr)
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("graph must verify after the AST-roots sweep: %v", vs)
+	}
+
+	// The contrast pin: the plain two-root instance over the SAME shape
+	// erases the runtime statements (they have no SSA users and nothing
+	// roots at items) — the mode's reason to exist.
+	g2, _, _, _, construction2, initCall2, _ := astRootsFixture()
+	if err := (dce.Pass{}).Run(nil, g2); err != nil {
+		t.Fatalf("plain Run: %v", err)
+	}
+	assertGone(t, g2, construction2, initCall2)
+}
+
+// TestDCEASTRootsRequireAST pins the mode's gate: no attached AST CFG, no
+// AST-roots run (the mode exists only post-schedule).
+func TestDCEASTRootsRequireAST(t *testing.T) {
+	g, _, _, _, _, _, _ := sweepFixture()
+	err := (dce.NewASTRoots()).Run(nil, g)
+	if err == nil || !strings.Contains(err.Error(), "AST-roots mode requires an attached AST") {
+		t.Fatalf("an unattached AST must fail closed naming the mode, got %v", err)
+	}
+}
+
+// TestDCEASTRootsSweepErasedItems pins the item maintenance (fix2 D-e): AST
+// items whose nodes are tombstoned — by an earlier tail pass or a prior
+// sweep — are removed from every block, so no emitted statement references
+// an erased node.
+func TestDCEASTRootsSweepErasedItems(t *testing.T) {
+	g, _, st, _, construction, initCall, deadExpr := astRootsFixture()
+
+	// Simulate a prior tail pass's erasure: kill the runtime statements by
+	// hand (the construction after its only user, the Init call).
+	mctx := &ir.MutContext{Pass: "test"}
+	if err := mctx.Erase(initCall); err != nil {
+		t.Fatalf("erase the Init call: %v", err)
+	}
+	if err := mctx.Erase(construction); err != nil {
+		t.Fatalf("erase the construction: %v", err)
+	}
+
+	if err := (dce.NewASTRoots()).Run(nil, g); err != nil {
+		t.Fatalf("AST-roots Run: %v", err)
+	}
+	assertGone(t, g, deadExpr)
+	assertKept(t, g, st)
+	// No item anywhere references an erased node anymore.
+	var stale int
+	var walk func(blk *ir.ASTBlock)
+	walk = func(blk *ir.ASTBlock) {
+		for _, it := range blk.Items() {
+			if it.Node != nil && it.Node.BasePtr().Erased() {
+				stale++
+			}
+			if it.Block != nil {
+				walk(it.Block)
+			}
+		}
+	}
+	k := g.AST()
+	walk(k.Body)
+	walk(k.Prototype)
+	if stale != 0 {
+		t.Fatalf("%d AST item(s) still reference erased nodes after the sweep", stale)
+	}
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("graph must verify after the sweep: %v", vs)
+	}
+}
+
 func TestDCEBasicSweep(t *testing.T) {
 	g, out, sum, st, end, deadAlloc, deadExpr := sweepFixture()
 
