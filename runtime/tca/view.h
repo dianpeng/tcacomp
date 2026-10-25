@@ -78,6 +78,7 @@ template <typename T, unsigned Rank>
 class TensorView {
  public:
   static constexpr unsigned kRank = Rank;
+  using ElementType = T;
 
   template <typename... Dims>
   __host__ __device__ TensorView(T* data, Dims... dims) : data_(data) {
@@ -112,6 +113,14 @@ class TensorView {
 
   __host__ __device__ unsigned Dim(unsigned axis) const { return shape_.dims[axis]; }
 
+  // Loader-facing accessors (fix3 D-n): the row-striped copy core walks
+  // contiguous runs, so it needs the raw base and the row-major flat index
+  // beside the checked Get/Set face. T may be const-qualified.
+  __host__ __device__ T* Data() const { return data_; }
+  __host__ __device__ unsigned FlatIndex(const unsigned (&c)[Rank]) const {
+    return shape_.offset_arr(c);
+  }
+
  private:
   T* data_;
   detail::RowMajorShape<Rank> shape_{};
@@ -123,6 +132,7 @@ template <typename T, unsigned Rank>
 class SmemView {
  public:
   static constexpr unsigned kRank = Rank;
+  using ElementType = T;
 
   template <typename... Extents>
   __host__ __device__ SmemView(T* base, Extents... extents) : base_(base) {
@@ -155,6 +165,12 @@ class SmemView {
 
   __host__ __device__ unsigned Extent(unsigned axis) const { return shape_.dims[axis]; }
 
+  // Loader-facing accessors (fix3 D-n): see TensorView.
+  __host__ __device__ T* Data() const { return base_; }
+  __host__ __device__ unsigned FlatIndex(const unsigned (&c)[Rank]) const {
+    return shape_.offset_arr(c);
+  }
+
  private:
   T* base_;
   detail::RowMajorShape<Rank> shape_{};
@@ -168,6 +184,7 @@ class Frag {
  public:
   static constexpr unsigned kRank = Rank;
   static constexpr unsigned kElems = (Dims * ... * 1u);
+  using ElementType = T;
 
   __host__ __device__ Frag() {
     static_assert(Rank >= 1u, "Frag rank must be >= 1");
@@ -199,6 +216,12 @@ class Frag {
   }
 
   __host__ __device__ unsigned Extent(unsigned axis) const { return shape_.dims[axis]; }
+
+  // Loader-facing accessors (fix3 D-n): see TensorView.
+  __host__ __device__ T* Data() { return data_; }
+  __host__ __device__ unsigned FlatIndex(const unsigned (&c)[Rank]) const {
+    return shape_.offset_arr(c);
+  }
 
  private:
   detail::RowMajorShape<Rank> shape_{};
