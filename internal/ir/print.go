@@ -278,8 +278,8 @@ func isStage(n Node) bool {
 		return false
 	}
 	switch n.KindOf() {
-	case KindIterCluster, KindMap, KindReduce, KindMemStore, KindMemStoreSMem,
-		KindFragStore, KindReturn, KindForLoop:
+	case KindIterCluster, KindMap, KindReduce, KindMemStore,
+		KindReturn, KindForLoop:
 		return true
 	}
 	return false
@@ -315,8 +315,6 @@ func pipeInput(n Node) Node {
 		}
 	case KindReduce:
 		next = opAt(n, 0) // D12: piped first, init attribute second, lambda last
-	case KindMemStoreSMem, KindFragStore:
-		next = opAt(n, 0) // the stored value
 	case KindForLoop:
 		// no body operand (sea-of-nodes ruling, fix1.md §0): forloops
 		// are control-flow nodes, never a chain stage themselves.
@@ -496,6 +494,19 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		b.WriteString(")")
 		return b.String()
 	case *memStoreNode:
+		if suffix := classSuffix(t.class); suffix != "" {
+			var b strings.Builder
+			b.WriteString("memstore" + suffix + "(")
+			b.WriteString(r.bufferAccess(t, 2))
+			b.WriteString(", ")
+			if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
+				b.WriteString("%0")
+			} else {
+				b.WriteString(r.value(val))
+			}
+			b.WriteString(")")
+			return b.String()
+		}
 		var b strings.Builder
 		b.WriteString("memstore(")
 		b.WriteString(r.accessText(t))
@@ -518,41 +529,12 @@ func (r *renderer) stageText(n Node, prev Node) string {
 		}
 		return b.String()
 	case *memLoadNode:
+		if suffix := classSuffix(t.class); suffix != "" {
+			return "memload" + suffix + "(" + r.bufferAccess(t, 1) + ")"
+		}
 		return "memload(" + r.memAccess(t, 1) + ")"
 	case *memNewNode:
-		return "memnew(" + r.value(opAt(t, 0)) + ")"
-	case *memLoadSMemNode:
-		return "memloadsmem(" + r.bufferAccess(t, 1) + ")"
-	case *memStoreSMemNode:
-		var b strings.Builder
-		b.WriteString("memstoresmem(")
-		b.WriteString(r.bufferAccess(t, 2))
-		b.WriteString(", ")
-		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
-			b.WriteString("%0")
-		} else {
-			b.WriteString(r.value(val))
-		}
-		b.WriteString(")")
-		return b.String()
-	case *memNewSMemNode:
-		return "memnewsmem(" + r.value(opAt(t, 0)) + ")"
-	case *fragLoadNode:
-		return "fragload(" + r.bufferAccess(t, 1) + ")"
-	case *fragStoreNode:
-		var b strings.Builder
-		b.WriteString("fragstore(")
-		b.WriteString(r.bufferAccess(t, 2))
-		b.WriteString(", ")
-		if val := opAt(t, 0); prev != nil && sameNode(val, prev) {
-			b.WriteString("%0")
-		} else {
-			b.WriteString(r.value(val))
-		}
-		b.WriteString(")")
-		return b.String()
-	case *fragNewNode:
-		return "fragnew(" + r.value(opAt(t, 0)) + ")"
+		return "memnew" + classSuffix(t.class) + "(" + r.value(opAt(t, 0)) + ")"
 	case *forLoopNode:
 		var b strings.Builder
 		b.WriteString("for(")
@@ -605,15 +587,29 @@ func (r *renderer) memAccess(n Node, axesFrom int) string {
 	return b.String()
 }
 
-// bufferAccess renders an LIR memory access's `buffer[biv][biv]...` form:
-// the buffer operand's value rendering followed by one `[biv]` per biv
-// operand (the bivs start at operand `bivsFrom` — 1 for loads, 2 for
-// stores, whose leading operands are the stored value and the buffer). A
-// KeyedAttribute operand in the trailing region is an ANNOTATION, not a
-// coordinate (LO-01, 261021-o61 T5): the tile-lower fill stores carry their
-// loadtile loader-selection variant there, and it renders as the attribute
-// suffix `[key=value]` — never through the keyedattribute value spelling
-// that would read as a coordinate subscript.
+// classSuffix renders the storage-class suffix of a memory-verb node's
+// canonical spelling (fix3 D-h): "" for GMEM (the unsuffixed verb), "[smem]"
+// and "[frag]" for the tiered constructors' nodes.
+func classSuffix(c StorageClass) string {
+	switch c {
+	case StorageSMem:
+		return "[smem]"
+	case StorageFrag:
+		return "[frag]"
+	default:
+		return ""
+	}
+}
+
+// bufferAccess renders a tiered memory access's `buffer[coord][coord]...`
+// form:
+// the buffer operand's value rendering followed by one `[coord]` per
+// trailing operand (the coords start at operand `bivsFrom` — 1 for loads,
+// 2 for stores, whose leading operands are the stored value and the
+// buffer). A KeyedAttribute operand in the trailing region is an
+// ANNOTATION, not a coordinate (LO-01, 261021-o61 T5): it renders as the
+// attribute suffix `[key=value]` — never through the keyedattribute value
+// spelling that would read as a coordinate subscript.
 func (r *renderer) bufferAccess(n Node, bivsFrom int) string {
 	var b strings.Builder
 	if buf := operandAt(n, bivsFrom-1); buf != nil {
@@ -839,10 +835,19 @@ func (r *renderer) value(n Node) string {
 		}
 		return "@" + r.value(opAt(t, 0)) + "/" + r.value(opAt(t, 1))
 	case *memStoreNode:
-		// The store returns the stored value (doc §2.5) — the bare tensor
-		// name in value position (the full access rendering belongs to the
-		// stage printer; the tensor rides slot 1, D14).
-		return "%" + paramNameOfNode(opAt(t, 1))
+		// The GMEM store returns the stored value (doc §2.5) — the bare
+		// tensor name in value position (the full access rendering belongs
+		// to the stage printer; the tensor rides slot 1, D14). A TIERED
+		// store (fix3 D-h: the buffer stores share the kind) has no tensor
+		// name — it renders through the anonymous-def rule like every other
+		// lowered value (%N in definition order).
+		if t.class == StorageGMEM {
+			return "%" + paramNameOfNode(opAt(t, 1))
+		}
+		if num, ok := r.num.Num(n); ok {
+			return fmt.Sprintf("%%%d", num)
+		}
+		return fmt.Sprintf("%%<%d>", n.BasePtr().id)
 	default:
 		if num, ok := r.num.Num(n); ok {
 			return fmt.Sprintf("%%%d", num)

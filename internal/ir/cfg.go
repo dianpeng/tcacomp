@@ -212,7 +212,7 @@ func classifyStmt(rhs Node) StmtKind {
 		return StmtAssign
 	}
 	switch rhs.KindOf() {
-	case KindMemStore, KindMemStoreSMem, KindFragStore, KindReturn:
+	case KindMemStore, KindReturn:
 		return StmtEffect
 	}
 	return StmtAssign

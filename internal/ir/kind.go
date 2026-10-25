@@ -1,10 +1,16 @@
 package ir
 
 // Kind identifies the operator of an IR node. The enumeration is versioned
-// (IR-03): KindVersion 6 inserts KindKernelMeta after KindReturn
-// (quick-261023-cgq — the frontend naming instrumentation node), which
-// renumbered the bridge/LIR constants ONCE, deliberately (the v4
-// KindReturn-insertion precedent). KindVersion 3 is the tinycudaopto re-organization (quick-261018-bl0)
+// (IR-03): KindVersion 7 is the fix3 memory-IR unification (quick-261025-of7,
+// doc/fix3.md R-G/D-h): the six lowered memory kinds
+// (MemLoadSMem/MemStoreSMem/MemNewSMem/FragLoad/FragStore/FragNew) are
+// DELETED — the three verbs MemLoad/MemStore/MemNew parameterized by a
+// storage class (GMEM/SMEM/FRAG, node_lir_memory.go's StorageClass) replace
+// them — which renumbered the LIR constants ONCE, deliberately. KindVersion
+// 6 inserted KindKernelMeta after KindReturn (quick-261023-cgq — the
+// frontend naming instrumentation node), which renumbered the bridge/LIR
+// constants once, deliberately (the v4 KindReturn-insertion precedent).
+// KindVersion 3 is the tinycudaopto re-organization (quick-261018-bl0)
 // — the enum was renumbered ONCE, deliberately, here: HIR kinds group before
 // LIR kinds (D-3), the generic Load/Store and the LoadTile/StoreTile kinds are
 // gone, and the GMEM MemLoad/MemStore/MemNew family plus the lowered
@@ -18,7 +24,8 @@ package ir
 // the tier-boundary rule (HIR kinds < KindForLoop) survives, and from v5
 // onward the rule is append-only again: new kinds introduced by later
 // lowering phases insert before KindEnd within their tier and never
-// renumber existing constants. The pass manager rejects any node
+// renumber existing constants (v7's deletion being the sanctioned
+// exception). The pass manager rejects any node
 // with Kind >= KindEnd or Kind == KindInvalid.
 //
 // The authoritative per-kind metadata (tier, family, arity, doc) lives in
@@ -29,8 +36,10 @@ type Kind uint32
 // KindVersion is the IR node-kind schema version. v3 = the tinycudaopto
 // re-organization; v4 = the Input-list restructure (quick-261019-ktm); v5 =
 // the Input/ImpactBy-only convention (quick-261019-ktm revision: KindLambda
-// joined the HIR tier). Each renumbered the LIR constants once, deliberately.
-const KindVersion = 6
+// joined the HIR tier); v6 = KindKernelMeta (quick-261023-cgq); v7 = the
+// fix3 memory-verb unification (the six lowered memory kinds deleted). Each
+// renumbered the LIR constants once, deliberately.
+const KindVersion = 7
 
 const (
 	KindInvalid Kind = iota // unused slot; verifier and legality reject it
@@ -72,12 +81,6 @@ const (
 	KindForLoop           // lowered loop nest over a bounded dimvar (iv, bound, attrs...) — no body operand (sea-of-nodes: loops are control-flow, no direct link to expressions)
 	KindDimVar            // lowered induction variable, an (init, step) value object
 	KindBoundedDimVar     // lowered dimvar bound to a max — ((iv tuple), Max)
-	KindMemLoadSMem       // lowered SMEM load (src smem buffer, bivs...)
-	KindMemStoreSMem      // lowered SMEM store (value, dst smem buffer, bivs...)
-	KindMemNewSMem        // lowered SMEM allocation (extent)
-	KindFragLoad          // lowered fragment load (src frag buffer, bivs...)
-	KindFragStore         // lowered fragment store (value, dst frag buffer, bivs...)
-	KindFragNew           // lowered fragment allocation (extent)
 	KindTensorDimOf       // lowered shape upper bound: TensorDimOf(tensor, axis const)
 	KindInductionVariable // lowered u32 iteration value: InductionVariable(iter)
 
@@ -164,18 +167,6 @@ func (k Kind) String() string {
 		return "dimvar"
 	case KindBoundedDimVar:
 		return "bdimvar"
-	case KindMemLoadSMem:
-		return "memloadsmem"
-	case KindMemStoreSMem:
-		return "memstoresmem"
-	case KindMemNewSMem:
-		return "memnewsmem"
-	case KindFragLoad:
-		return "fragload"
-	case KindFragStore:
-		return "fragstore"
-	case KindFragNew:
-		return "fragnew"
 	case KindTensorDimOf:
 		return "tensordimof"
 	case KindInductionVariable:
@@ -207,10 +198,11 @@ func (k Kind) String() string {
 	}
 }
 
-// Family classifies a Kind into its node family (D-15). FamilyMemory gained
-// the whole HIR GMEM family (MemLoad/MemStore/MemNew) and the lowered SMEM/
-// FRAG families with the v3 re-organization, replacing FamilyTileOp (the
-// LoadTile/StoreTile kinds are gone — R4d). FamilyCollective gained its
+// Family classifies a Kind into its node family (D-15). FamilyMemory is the
+// three verbs MemLoad/MemStore/MemNew of every storage class (GMEM/SMEM/
+// FRAG — the v7 unification, doc/fix3.md R-G; v3 had grown them into six
+// lowered kinds beside the HIR GMEM family, replacing FamilyTileOp).
+// FamilyCollective gained its
 // first members with final lowering (quick-261022-l1o, LR-5): the three
 // RuntimeXXXReducer constructions. FamilyRuntime is NEW in the same change
 // (KernelInfo/GridMapping/ThreadMapping + RuntimeCallMethod +
@@ -232,9 +224,7 @@ func (k Kind) Family() Family {
 	switch k {
 	case KindConst, KindParam, KindBinOp, KindUnaryOp, KindSelect, KindCast, KindCall:
 		return FamilyScalarExpr
-	case KindMemLoad, KindMemStore, KindMemNew,
-		KindMemLoadSMem, KindMemStoreSMem, KindMemNewSMem,
-		KindFragLoad, KindFragStore, KindFragNew:
+	case KindMemLoad, KindMemStore, KindMemNew:
 		return FamilyMemory
 	case KindIter, KindIterCluster, KindForLoop:
 		return FamilyLoop

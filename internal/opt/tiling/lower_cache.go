@@ -65,9 +65,10 @@ import (
 	"tcacomp/internal/ir"
 )
 
-// The loadtile copy variants (§6's tier rule / doc/tca.md §5.11): the value
-// rides the fill store's trailing KeyedAttribute and the runtime selects
-// the loader from it.
+// The loader variants (§6's tier rule / doc/tca.md §5.11), pass-internal
+// facts recorded on siteFill for the §8 checks — fix3 D-h: the value rides
+// NO IR payload anymore; codegen derives the loader from the fill's
+// storage class (R-H/R-J).
 const (
 	loadTileCta    = 1.0 // cooperative CTA loader (SMEM window class)
 	loadTileThread = 2.0 // per-thread loader (FRAG class)
@@ -84,7 +85,7 @@ type siteFill struct {
 	buffer  ir.Node // the MemNewSMem/FragNew buffer
 	covered []*dimRewrite
 	host    ir.Node // the mandated fill-position loop (R1) — §8 placement anchor
-	variant float64 // the loadtile variant emitted (1 = CTA, 2 = Thread)
+	variant float64 // the loader variant derived from the class (1 = CTA, 2 = Thread; pass-internal fact)
 }
 
 // resolveBudget implements §6's fallback BEFORE any mutation (halving a
@@ -475,9 +476,11 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	}
 	src := lr.g.NewMemLoadChained(lowerOrigin, env, sf.Tensor, fillAxes)
 
-	// Fill store + variant annotation (§6's tier rule): SMEM window class →
-	// cooperative LoadTileCta (1); FRAG class → per-thread LoadTileThread
-	// (2). The covered round bases ride the store's trailing biv operands:
+	// Fill store (§6's tier rule, fix3 D-h): a plain tiered MemStore of the
+	// tile load — SMEM window class → the cooperative LoadTileCta, FRAG
+	// class → the per-thread LoadTileThread, DERIVED at codegen from the
+	// class (R-H/R-J; the retired v0-era loader attribute left the IR). The
+	// covered round bases ride the store's trailing biv operands:
 	// between dimvars only — uniform for the cooperative loader (R1/R2). A
 	// C1b forced-FRAG site's WARP-covered dim is EXCLUDED — its chunk
 	// origin (rank*T + round) carries the per-thread term and already rides
@@ -493,12 +496,11 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		}
 		roundBases = append(roundBases, d.betweenIV)
 	}
-	variantAttr := lr.attr("loadtile", variant)
 	var fillStore ir.Node
 	if class == ClassFRAG {
-		fillStore = lr.g.NewFragStore(lowerOrigin, src, buffer, append(roundBases, variantAttr)...)
+		fillStore = lr.g.NewFragStore(lowerOrigin, src, buffer, roundBases...)
 	} else {
-		fillStore = lr.g.NewMemStoreSMem(lowerOrigin, src, buffer, append(roundBases, variantAttr)...)
+		fillStore = lr.g.NewMemStoreSMem(lowerOrigin, src, buffer, roundBases...)
 	}
 
 	// Access: every use of the erased load reads the buffer at the covered

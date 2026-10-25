@@ -161,8 +161,8 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // present, an iter; a dimvar's operand 0 is a dim InputParam; a
 // paramRef's operand 0 is an InputParam; a cluster's dim operands LEAD its
 // input list; HIR GMEM load/store tensors bind a RoleTensor InputParam;
-// LIR SMEM accesses bind a MemNewSMem buffer; LIR FRAG accesses bind a
-// FragNew buffer; a for-loop binds a dimvar, with trailing operands beyond
+// SMEM-class accesses bind an SMEM-class MemNew buffer; FRAG-class accesses bind a
+// FRAG-class MemNew buffer; a for-loop binds a dimvar, with trailing operands beyond
 // (iv, bound, body) pinned to KeyedAttribute annotations (M1,
 // quick-261021-jay); an LIR store's trailing KeyedAttribute operands (the
 // fill annotation convention, LO-01/quick-261021-o61 T5) are pinned
@@ -247,19 +247,25 @@ func checkNodeShape(n Node, vs *[]Violation) {
 			seenInput = true
 		}
 	case *memLoadNode:
-		checkTensorParam(n, operandAt(t, 0), vs)
+		switch t.class {
+		case StorageGMEM:
+			checkTensorParam(n, operandAt(t, 0), vs)
+		case StorageSMem:
+			checkSMemBuffer(n, operandAt(t, 0), vs)
+		case StorageFrag:
+			checkFragBuffer(n, operandAt(t, 0), vs)
+		}
 	case *memStoreNode:
-		checkTensorParam(n, operandAt(t, 1), vs)
-	case *memLoadSMemNode:
-		checkSMemBuffer(n, operandAt(t, 0), vs)
-	case *memStoreSMemNode:
-		checkSMemBuffer(n, operandAt(t, 1), vs)
-		checkStoreAnnotations(n, vs)
-	case *fragLoadNode:
-		checkFragBuffer(n, operandAt(t, 0), vs)
-	case *fragStoreNode:
-		checkFragBuffer(n, operandAt(t, 1), vs)
-		checkStoreAnnotations(n, vs)
+		switch t.class {
+		case StorageGMEM:
+			checkTensorParam(n, operandAt(t, 1), vs)
+		case StorageSMem:
+			checkSMemBuffer(n, operandAt(t, 1), vs)
+			checkStoreAnnotations(n, vs)
+		case StorageFrag:
+			checkFragBuffer(n, operandAt(t, 1), vs)
+			checkStoreAnnotations(n, vs)
+		}
 	case *forLoopNode:
 		if iv := operandAt(t, 0); iv != nil {
 			if _, ok := iv.(*dimVarNode); !ok {
@@ -333,7 +339,7 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		// LR-3/P-3 + R1/R2 (2026-10-23): the sequential specialization
 		// carries exactly (typed init value, KindLambda); the warp/global
 		// specializations carry exactly (typed init, KindLambda,
-		// RuntimeThreadMapping, staging KindMemNewSMem). Swapped, missing,
+		// RuntimeThreadMapping, staging SMEM-class MemNew). Swapped, missing,
 		// or mis-typed operands are shape violations. A missing operand
 		// leaves an unwired slot (the generic nil-def check also fires);
 		// the count check reads OperandsOf, whose slot count covers
@@ -373,9 +379,11 @@ func checkNodeShape(n Node, vs *[]Violation) {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
 					fmt.Sprintf("%s operand 2 must be the owning LNT's RuntimeThreadMapping (R2), got %s", n.KindOf(), tm.KindOf())))
 			}
-			if st := operandAt(t, 3); st != nil && st.KindOf() != KindMemNewSMem {
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("%s operand 3 must be the staging KindMemNewSMem (R1), got %s", n.KindOf(), st.KindOf())))
+			if st := operandAt(t, 3); st != nil {
+				if sc, _ := StorageClassOf(st); st.KindOf() != KindMemNew || sc != StorageSMem {
+					*vs = append(*vs, nodeViolation(n, invUseDef,
+						fmt.Sprintf("%s operand 3 must be the staging SMEM-class MemNew (R1), got %s", n.KindOf(), st.KindOf())))
+				}
 			}
 		}
 	case *runtimeCallNode:
@@ -506,13 +514,14 @@ func checkNodeShape(n Node, vs *[]Violation) {
 	}
 }
 
-// checkStoreAnnotations pins the LIR store annotation convention (LO-01,
-// quick-261021-o61 T5): a MemStoreSMem/FragStore's trailing operands beyond
-// the fixed [value, dst] slots are its biv coordinates / fill round bases
+// checkStoreAnnotations pins the tiered store annotation convention (LO-01,
+// quick-261021-o61 T5): an SMEM/FRAG-class MemStore's trailing operands
+// beyond the fixed [value, dst] slots are its coordinates / fill round bases
 // plus at most one KeyedAttribute per key, and every such annotation must
-// carry a const value — the runtime reads the loadtile loader-selection
-// variant straight off the attribute, so a non-const or duplicated key is
-// a codegen-facing contract break, not a style issue.
+// carry a const value — a non-const or duplicated key is a codegen-facing
+// contract break, not a style issue. (The retired v0-era loader-selection
+// attribute left the IR with the fix3 D-h unification — loader selection is
+// derived at codegen from the storage class; no annotation rides the fill.)
 func checkStoreAnnotations(n Node, vs *[]Violation) {
 	seen := make(map[string]bool)
 	for i, op := range OperandsOf(n) {
@@ -648,29 +657,33 @@ func checkTensorParam(n Node, tensor Node, vs *[]Violation) {
 	}
 }
 
-// checkSMemBuffer pins an LIR SMEM access's buffer operand to a MemNewSMem
-// node (the lowered suite promotes the buffer into ordinary SSA data flow;
-// the buffer's def must be the allocation itself).
+// checkSMemBuffer pins an SMEM-class access's buffer operand to an
+// SMEM-class MemNew node (the tiered constructors promote the buffer into
+// ordinary SSA data flow; the buffer's def must be the allocation itself,
+// and the classes must agree).
 func checkSMemBuffer(n Node, buf Node, vs *[]Violation) {
 	if buf == nil {
 		return
 	}
-	if _, ok := buf.(*memNewSMemNode); !ok {
+	b, ok := buf.(*memNewNode)
+	if !ok || b.class != StorageSMem {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			"smem buffer operand must be a MemNewSMem node"))
+			"smem buffer operand must be an SMEM-class MemNew node"))
 	}
 }
 
-// checkFragBuffer pins an LIR fragment access's buffer operand to a FragNew
-// node (the lowered suite promotes the buffer into ordinary SSA data flow;
-// the buffer's def must be the allocation itself).
+// checkFragBuffer pins a FRAG-class access's buffer operand to a FRAG-class
+// MemNew node (the tiered constructors promote the buffer into ordinary SSA
+// data flow; the buffer's def must be the allocation itself, and the
+// classes must agree).
 func checkFragBuffer(n Node, buf Node, vs *[]Violation) {
 	if buf == nil {
 		return
 	}
-	if _, ok := buf.(*fragNewNode); !ok {
+	b, ok := buf.(*memNewNode)
+	if !ok || b.class != StorageFrag {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			"frag buffer operand must be a FragNew node"))
+			"frag buffer operand must be a FRAG-class MemNew node"))
 	}
 }
 

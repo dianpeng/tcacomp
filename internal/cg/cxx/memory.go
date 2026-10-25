@@ -7,10 +7,12 @@ import (
 )
 
 // stmtFill emits a fill store as its cooperative loader call (doc/cg.md §6
-// M-3): loadtile=1 → tca::rt::LoadTileCta (cooperative, owns ALL
-// synchronization and internal bounds clamping), loadtile=2 →
-// tca::rt::LoadTileThread (per-thread, no barrier). The compiler never
-// emits barriers (runtime_objects.md §7).
+// M-3, fix3 D-h): the loader is DERIVED from the fill's storage class per
+// R-H/R-J — SMEM window class → tca::rt::LoadTileCta (cooperative, owns
+// ALL synchronization and internal bounds clamping), FRAG class →
+// tca::rt::LoadTileThread (per-thread, no barrier); the retired v0-era
+// attribute is gone. The compiler never emits barriers
+// (runtime_objects.md §7).
 //
 // Source-coordinate convention (pinned from tile-lower's fill construction,
 // lower_cache.go): the fill's value operand is a MemLoad whose axes are the
@@ -26,17 +28,19 @@ import (
 //     search policy does not produce it).
 func (e *emitter) stmtFill(n ir.Node) error {
 	ops := ir.OperandsOf(n)
-	if len(ops) < 4 {
-		return fmt.Errorf("cxx: fill %d malformed (want value, dst, bivs..., variant)", n.BasePtr().ID())
+	if len(ops) < 3 {
+		return fmt.Errorf("cxx: fill %d malformed (want value, dst, bivs...)", n.BasePtr().ID())
 	}
-	src, dst, bivs, variant := ops[0], ops[1], ops[2:len(ops)-1], ops[len(ops)-1]
+	src, dst, bivs := ops[0], ops[1], ops[2:]
 	if src == nil || dst == nil || src.KindOf() != ir.KindMemLoad {
 		return fmt.Errorf("cxx: fill %d value operand is not a MemLoad", n.BasePtr().ID())
 	}
-	vkey, vval := ir.KeyedAttributeOf(variant)
-	v, ok := ir.ConstValueOf(vval)
-	if vkey != "loadtile" || !ok || (v != 1 && v != 2) {
-		return fmt.Errorf("cxx: fill %d carries no loadtile variant const", n.BasePtr().ID())
+	// Loader selection derived from the storage class (R-H/R-J): the same
+	// tier rule the retired loader attribute recorded.
+	sc, _ := ir.StorageClassOf(n)
+	v := 2 // FRAG class: per-thread
+	if sc == ir.StorageSMem {
+		v = 1 // SMEM window class: cooperative
 	}
 
 	srcOps := ir.OperandsOf(src)

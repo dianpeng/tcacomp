@@ -72,9 +72,7 @@ func (Pass) Preserved() []string { return nil }
 // lambda's parameter-definition types at Reduce lowering, never derived
 // from the construction node).
 var untypedKinds = map[ir.Kind]bool{
-	ir.KindMemNew:                   true,
-	ir.KindMemNewSMem:               true,
-	ir.KindFragNew:                  true,
+	ir.KindMemNew:                   true, // every storage class (fix3 D-h)
 	ir.KindAs:                       true,
 	ir.KindLambda:                   true,
 	ir.KindRuntimeKernelInfo:        true,

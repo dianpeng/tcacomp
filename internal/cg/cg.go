@@ -34,7 +34,7 @@ type Options struct {
 
 // CommentLevel is the generated-code comment instrumentation level: section
 // comments are synthesized from facts the IR already carries (soc/dosoc/
-// loc/tile annotations, dim names, loadtile variants, launch totals) so a
+// loc/tile annotations, dim names, loader variants, launch totals) so a
 // reviewer can map semantic regions to the final code without reading the
 // compiler.
 type CommentLevel int

@@ -689,11 +689,9 @@ func TestOracleIntegration(t *testing.T) {
 	wantType(t, store, "store", tensorT(ir.TF32, "m", "k"))
 
 	untyped := map[ir.Kind]bool{
-		ir.KindMemNew:     true,
-		ir.KindMemNewSMem: true,
-		ir.KindFragNew:    true,
-		ir.KindAs:         true,
-		ir.KindLambda:     true,
+		ir.KindMemNew: true, // every storage class (fix3 D-h)
+		ir.KindAs:     true,
+		ir.KindLambda: true,
 	}
 	for _, n := range g.AllocatedNodes() {
 		if ir.TypeOf(n) == nil && !untyped[n.KindOf()] {

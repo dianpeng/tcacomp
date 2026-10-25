@@ -18,7 +18,7 @@ package finallower
 //	(2.1) homogeneity (LR-8) + the specialized construction (LR-7: Soc
 //	     0→Sequential over (init, lambda); 2→Warp / 1→Global over (init,
 //	     lambda, ThreadMapping, staging) per R1/R2): the WARP/GLOBAL
-//	     constructions additionally allocate a staging KindMemNewSMem — one
+//	     constructions additionally allocate a staging SMEM-class MemNew — one
 //	     #warps × sizeof(T) row in the compiler's dynamic-SMEM pool at a
 //	     disjoint D8 offset — inserted with the construction at the head
 //	     end of the OWNING LNT's prologue Group (before the embedded root

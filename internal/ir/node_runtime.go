@@ -171,7 +171,7 @@ func (g *Graph) NewRuntimeSequentialReducer(origin string, init, lambda Node) No
 // NewRuntimeWarpReducer creates the warp-scope reducer construction (X's
 // Soc 2). Operand contract per the R1/R2 ruling (2026-10-23): (typed init,
 // combiner lambda, the owning LNT's RuntimeThreadMapping, the staging
-// KindMemNewSMem — one #warps row in the compiler's dynamic-SMEM pool).
+// SMEM-class MemNew — one #warps row in the compiler's dynamic-SMEM pool).
 // Warp/lane/count identity is runtime-internal, derived from the mapping;
 // the staging row is the ctor-provided SmemView source. The verifier pins
 // all four operands and their kinds.

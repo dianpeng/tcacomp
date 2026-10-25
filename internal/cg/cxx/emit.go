@@ -24,14 +24,14 @@ type emitter struct {
 	deep int              // brace depth (indentation)
 
 	// pre-scanned facts (deterministic: allocation / declaration order).
-	stored    map[ir.Node]bool   // tensor params written by a MemStore
-	buffers   []ir.Node          // live MemNewSMem, allocation order
-	frags     []ir.Node          // live FragNew, allocation order
-	smemOff   map[ir.Node]int    // MemNewSMem → pool byte offset (v0: disjoint, D8)
+	stored    map[ir.Node]bool   // tensor params written by a GMEM MemStore
+	buffers   []ir.Node          // live SMEM-class MemNew, allocation order
+	frags     []ir.Node          // live FRAG-class MemNew, allocation order
+	smemOff   map[ir.Node]int    // SMEM-class MemNew → pool byte offset (v0: disjoint, D8)
 	smemCap   int                // total pool bytes (v0: Σ extents, zero reuse)
 	fillSrc   map[ir.Node]bool   // MemLoads serving as a fill's source (skipped as items)
-	bufTensor map[ir.Node]string // MemNewSMem/FragNew → source tensor name (semantic view names)
-	staging   map[ir.Node]bool   // MemNewSMem nodes serving as reducer staging rows (R1 — inline ctor views, no kernelTop decl)
+	bufTensor map[ir.Node]string // tiered MemNew → source tensor name (semantic view names)
+	staging   map[ir.Node]bool   // SMEM-class MemNew nodes serving as reducer staging rows (R1 — inline ctor views, no kernelTop decl)
 	gated     map[ir.Node]bool   // MemStores of a reduced value (R3 — single-owner gated on is_first_in_cta)
 
 	// symbols.
@@ -221,20 +221,28 @@ func (e *emitter) prescan() error {
 			if ops := ir.OperandsOf(n); len(ops) > 1 && ops[1] != nil {
 				e.stored[ops[1]] = true
 			}
-		case ir.KindMemNewSMem:
-			ext, err := e.byteExtent(n)
-			if err != nil {
-				return err
+		case ir.KindMemNew:
+			// fix3 D-h: one allocation kind, three storage classes — the
+			// class decides the pool side (SMEM: dynamic-pool offsets;
+			// FRAG: register tiles). GMEM temporaries are rejected at the
+			// gates before the prescan runs.
+			sc, _ := ir.StorageClassOf(n)
+			switch sc {
+			case ir.StorageSMem:
+				ext, err := e.byteExtent(n)
+				if err != nil {
+					return err
+				}
+				off := e.smemCap
+				if off%16 != 0 { // 16-byte alignment per buffer view
+					off += 16 - off%16
+				}
+				e.smemOff[n] = off
+				e.smemCap = off + ext
+				e.buffers = append(e.buffers, n)
+			case ir.StorageFrag:
+				e.frags = append(e.frags, n)
 			}
-			off := e.smemCap
-			if off%16 != 0 { // 16-byte alignment per buffer view
-				off += 16 - off%16
-			}
-			e.smemOff[n] = off
-			e.smemCap = off + ext
-			e.buffers = append(e.buffers, n)
-		case ir.KindFragNew:
-			e.frags = append(e.frags, n)
 		}
 	}
 	// Signature names are the local-name collision guard.
@@ -382,11 +390,12 @@ func (e *emitter) buildPureRefs() {
 		switch n.KindOf() {
 		case ir.KindDimVar, ir.KindKeyedAttribute:
 			// Header/annotation carriers: their children (iv init/step,
-			// soc/dosoc/loc/tile/loadtile values) emit as inline literals,
+			// soc/dosoc/loc/tile/loader values) emit as inline literals,
 			// never as locals — descending would false-reference them.
 			return
-		case ir.KindMemNewSMem, ir.KindFragNew:
-			// Allocation declarations (F0, 2026-10-23): their byte-extent
+		case ir.KindMemNew:
+			// Allocation declarations (F0, 2026-10-23; every storage class
+			// since fix3 D-h): their byte-extent
 			// consts render as inline literals in the hoisted preamble
 			// declarations (the pool views, the Frag tiles, the reducer
 			// staging slices) — never as locals. Descending would
@@ -461,20 +470,25 @@ func (e *emitter) byteExtent(n ir.Node) (int, error) {
 	return int(v), nil
 }
 
-// isFillStore reports whether n is a MemStoreSMem/FragStore carrying the
-// trailing loadtile annotation (the fill; doc/cg.md §6 M-3).
+// isFillStore reports whether n is a FILL — a tiered (SMEM/FRAG-class)
+// MemStore whose value operand is a tile-shaped GMEM MemLoad (fix3 D-h:
+// the retired v0-era loader annotation left the IR; selection is DERIVED
+// at codegen from the storage class per R-H/R-J — SMEM window fills take
+// the cooperative LoadTileCta, FRAG fills the per-thread LoadTileThread,
+// the same tier rule the attribute recorded).
 func isFillStore(n ir.Node) bool {
-	switch n.KindOf() {
-	case ir.KindMemStoreSMem, ir.KindFragStore:
-	default:
+	if n == nil || n.KindOf() != ir.KindMemStore {
+		return false
+	}
+	if sc, ok := ir.StorageClassOf(n); !ok || sc == ir.StorageGMEM {
 		return false
 	}
 	ops := ir.OperandsOf(n)
-	if len(ops) < 3 {
+	if len(ops) < 3 || ops[0] == nil || ops[0].KindOf() != ir.KindMemLoad {
 		return false
 	}
-	key, _ := ir.KeyedAttributeOf(ops[len(ops)-1])
-	return key == "loadtile"
+	sc, ok := ir.StorageClassOf(ops[0])
+	return ok && sc == ir.StorageGMEM
 }
 
 // line writes one indented line into the current emission target.

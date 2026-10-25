@@ -101,12 +101,6 @@ func TestCatalogFamilyCoverage(t *testing.T) {
 		KindForLoop:       FamilyLoop,
 		KindDimVar:        FamilyAbstract,
 		KindBoundedDimVar: FamilyAbstract,
-		KindMemLoadSMem:   FamilyMemory,
-		KindMemStoreSMem:  FamilyMemory,
-		KindMemNewSMem:    FamilyMemory,
-		KindFragLoad:      FamilyMemory,
-		KindFragStore:     FamilyMemory,
-		KindFragNew:       FamilyMemory,
 	}
 	for k, f := range want {
 		if got := k.Family(); got != f {

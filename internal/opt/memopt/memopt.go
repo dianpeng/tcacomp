@@ -29,7 +29,7 @@
 //
 // quick-261024-sdk (fix1.md D-f) adds ONE LIR-scoped rule beside the
 // region rules — FILL LIVENESS: an unconsumed buffer store (a
-// KindFragStore/KindMemStoreSMem whose buffer has no live buffer load)
+// tiered (SMEM/FRAG-class) MemStore whose buffer has no live load)
 // is dead code removed together with its unread source GMEM load. The
 // author's correction is explicit: this is memory optimization's domain,
 // never DCE's — the fill's source load is chain-reachable (so DCE keeps
@@ -136,7 +136,7 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 
 	total := 0
 	for _, n := range g.AllocatedNodes() {
-		if isGMEMAccess(n.KindOf()) || isBufferStore(n.KindOf()) {
+		if isGMEMAccess(n) || isBufferStore(n) {
 			total++
 		}
 	}
@@ -219,7 +219,7 @@ func deriveRegions(g *ir.Graph) []region {
 	var order []*ir.Base
 	groups := make(map[*ir.Base][]ir.Node)
 	for _, n := range g.AllocatedNodes() {
-		if !isGMEMAccess(n.KindOf()) {
+		if !isGMEMAccess(n) {
 			continue
 		}
 		t := tensorOf(n)
@@ -493,8 +493,9 @@ func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node, retur
 
 // sweepUnconsumedBufferStores implements rule (d) — fill liveness (D-f,
 // fix1.md): "a buffer store whose buffer has zero live loads is dead
-// together with its source load". An LIR buffer store (KindFragStore /
-// KindMemStoreSMem — tile-lower's fill spill and its SMEM-window sibling)
+// together with its source load". A tiered buffer store (the SMEM/FRAG
+// classes of the unified MemStore — tile-lower's fill spill and its
+// SMEM-window sibling)
 // whose buffer operand has NO live buffer load is unconsumed: the store is
 // erased and, when the stored value is a GMEM load nobody reads, the load
 // dies with it (ordering-only dead-load removal — its chain successors
@@ -504,7 +505,7 @@ func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node, retur
 func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error) {
 	progress := false
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferStore(n.KindOf()) {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferStore(n) {
 			continue
 		}
 		ops := ir.OperandsOf(n)
@@ -531,7 +532,7 @@ func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error)
 func bufferHasLiveReads(g *ir.Graph, buffer ir.Node) bool {
 	bb := buffer.BasePtr()
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferLoad(n.KindOf()) {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || !isBufferLoad(n) {
 			continue
 		}
 		if ops := ir.OperandsOf(n); len(ops) > 0 && ops[0] != nil && ops[0].BasePtr() == bb {
@@ -640,18 +641,38 @@ func hasDataUse(n ir.Node) bool {
 // Shared access predicates.
 // ---------------------------------------------------------------------------
 
-// isGMEMAccess reports whether k is a HIR GMEM access (C4: the LIR SMEM/
-// FRAG families carry no effect chains and never reach the region rules;
-// rule (d) reaches the buffer-store pair directly, D-f).
-func isGMEMAccess(k ir.Kind) bool { return k == ir.KindMemLoad || k == ir.KindMemStore }
+// isGMEMAccess reports whether n is a GMEM-class memory access (C4: the
+// tiered SMEM/FRAG nodes share the verbs since fix3 D-h, so the class —
+// never the kind alone — draws the region rules' scope; rule (d) reaches
+// the buffer-store side directly, D-f).
+func isGMEMAccess(n ir.Node) bool {
+	if n == nil {
+		return false
+	}
+	sc, ok := ir.StorageClassOf(n)
+	return ok && sc == ir.StorageGMEM
+}
 
-// isBufferStore reports whether k is an LIR buffer store of the fill
-// families — rule (d)'s subject (D-f).
-func isBufferStore(k ir.Kind) bool { return k == ir.KindFragStore || k == ir.KindMemStoreSMem }
+// isBufferStore reports whether n is a tiered (SMEM/FRAG-class) store —
+// rule (d)'s subject (D-f; the fill families since fix3 D-i: every tiered
+// store whose value is a GMEM tile load).
+func isBufferStore(n ir.Node) bool {
+	if n == nil || n.KindOf() != ir.KindMemStore {
+		return false
+	}
+	sc, ok := ir.StorageClassOf(n)
+	return ok && sc != ir.StorageGMEM
+}
 
-// isBufferLoad reports whether k is an LIR buffer load of the fill
-// families — the readership side of rule (d)'s liveness predicate.
-func isBufferLoad(k ir.Kind) bool { return k == ir.KindFragLoad || k == ir.KindMemLoadSMem }
+// isBufferLoad reports whether n is a tiered (SMEM/FRAG-class) load — the
+// readership side of rule (d)'s liveness predicate.
+func isBufferLoad(n ir.Node) bool {
+	if n == nil || n.KindOf() != ir.KindMemLoad {
+		return false
+	}
+	sc, ok := ir.StorageClassOf(n)
+	return ok && sc != ir.StorageGMEM
+}
 
 // tensorOf returns n's tensor operand node — operand 0 of a load, operand 1
 // of a store (the region key, C2c) — or nil.
@@ -691,8 +712,7 @@ func axesOf(n ir.Node) []ir.Node {
 // returns input#0, doc §2.5; the LIR buffer store families share the
 // [value, dst, bivs...] layout) — or nil.
 func storeValue(n ir.Node) ir.Node {
-	switch n.KindOf() {
-	case ir.KindMemStore, ir.KindFragStore, ir.KindMemStoreSMem:
+	if n != nil && n.KindOf() == ir.KindMemStore { // every storage class: value rides slot 0
 		if ops := ir.OperandsOf(n); len(ops) > 0 {
 			return ops[0]
 		}
@@ -739,6 +759,9 @@ func firstStoreBehind(n ir.Node) ir.Node {
 		d := edges[0].Def()
 		if d == nil || d.BasePtr().Erased() {
 			return nil
+		}
+		if !isGMEMAccess(d) {
+			return nil // a tiered buffer access never rides a tensor chain
 		}
 		switch d.KindOf() {
 		case ir.KindMemStore:

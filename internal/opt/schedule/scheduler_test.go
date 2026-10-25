@@ -707,7 +707,7 @@ func TestEffectfulNoHoist(t *testing.T) {
 		}
 		// quick-261022-e2u (D-1/D-4): a KindMemNew (GMEM) is a PLACEHOLDER —
 		// anchored at SN -1 into the Prototype block, not scheduled. (The
-		// allocation non-membership likewise governs KindMemNewSMem/KindFragNew,
+		// allocation non-membership likewise governs the tiered MemNew classes,
 		// pinned by the pipeline fill test's buffer-at-SN-0 leg.)
 		if buf.BasePtr().SchedSN() != ir.PrototypeSN || buf.BasePtr().SchedBlock() != k.Prototype {
 			t.Fatalf("GMEM allocation SN/block = %d/%p, want -1/Prototype (placeholder anchoring)", buf.BasePtr().SchedSN(), buf.BasePtr().SchedBlock())

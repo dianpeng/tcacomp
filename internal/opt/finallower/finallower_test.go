@@ -743,8 +743,8 @@ func TestReducerBracketPlacement(t *testing.T) {
 	if ops[2].KindOf() != ir.KindRuntimeThreadMapping {
 		t.Fatalf("operand 2 must be the owning LNT's ThreadMapping (R2), got %s", ops[2].KindOf())
 	}
-	if ops[3].KindOf() != ir.KindMemNewSMem {
-		t.Fatalf("operand 3 must be the staging KindMemNewSMem (R1), got %s", ops[3].KindOf())
+	if sc, _ := ir.StorageClassOf(ops[3]); ops[3].KindOf() != ir.KindMemNew || sc != ir.StorageSMem {
+		t.Fatalf("operand 3 must be the staging SMEM-class MemNew (R1), got %s", ops[3].KindOf())
 	}
 	staging := ops[3]
 	if v, ok := ir.ConstValueOf(ir.OperandsOf(staging)[0]); !ok || v != 64 {

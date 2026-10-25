@@ -1,10 +1,13 @@
 package ir
 
-// node_memory.go holds the HIR GMEM family (D-3: MemLoad/MemStore/MemNew —
-// FamilyMemory's HIR tier). The structural tensor access a store/load names
+// node_memory.go holds the unified memory-verb family (fix3.md R-G/D-h:
+// MemLoad/MemStore/MemNew parameterized by a StorageClass — GMEM via these
+// constructors, SMEM/FRAG via the tiered constructors in
+// node_lir_memory.go; one kind per verb, one struct per kind). The
+// structural tensor access a store/load names
 // is a payload access of InputParam uses at this level (review P1R-01: every
 // reference is an SSAUse, never a name); lowering promotes the pieces into
-// ordinary SSA data flow (the LIR memory family in node_lir_memory.go).
+// ordinary SSA data flow (the tiered constructors in node_lir_memory.go).
 //
 // Effect chaining mirrors the tinycudaopto skeleton's memory.go: the
 // per-tensor GMEM effect chains include READS as well as writes — a load
@@ -13,14 +16,17 @@ package ir
 // second-ImpactBy-first edge while distinct tensors stay isolated (the
 // restrict-alias rule: kernel tensors never alias).
 
-// memLoadNode: HIR GMEM load; ops = [tensor, axes...] — the tensor InputParam
-// first, then one dim InputParam per axis in subscript order. effectIns is
-// the ImpactBy list — the per-tensor ordering edge wired by the env-aware
-// construction path (effect.go), chaining reads into the same effect chains
-// as writes (skeleton memory.go).
+// memLoadNode: a memory load of every storage class; ops = [src, axes...]
+// — GMEM: the tensor InputParam first, then one dim InputParam per axis in
+// subscript order; SMEM/FRAG: the buffer MemNew first, then the coordinate
+// expressions. effectIns is the ImpactBy list — the per-tensor (GMEM) or
+// per-buffer (SMEM/FRAG) ordering edge wired by the env-aware construction
+// paths, chaining reads into the same effect chains as writes (skeleton
+// memory.go).
 type memLoadNode struct {
 	*Base
 	operandList
+	class     StorageClass
 	effectIns []SSAUse
 }
 
@@ -68,17 +74,19 @@ func (g *Graph) NewMemLoadChained(origin string, env *Env, tensor Node, axes []N
 	return n
 }
 
-// memStoreNode: HIR GMEM store — the HIR stage store; ops =
-// [value, tensor, axes...] — the stored value, then the target access's
-// tensor InputParam and one dim InputParam per axis in subscript order
+// memStoreNode: a memory store of every storage class — the HIR stage
+// store; ops = [value, dst, axes...] — the stored value, then the target:
+// GMEM: the tensor InputParam and one dim InputParam per axis in subscript
+// order; SMEM/FRAG: the buffer MemNew and the coordinate expressions
 // (Input/ImpactBy-only convention, quick-261019-ktm revision: the target
 // components are data dependencies and ride the Input list); effectIns is
-// the ImpactBy list — the per-tensor ordering edge wired by the env-aware
-// construction path (effect.go). The store returns the stored value
-// (doc §2.5).
+// the ImpactBy list — the per-tensor (GMEM) ordering edge wired by the
+// env-aware construction path (effect.go). The store returns the stored
+// value (doc §2.5).
 type memStoreNode struct {
 	*Base
 	operandList
+	class     StorageClass
 	effectIns []SSAUse
 }
 
@@ -109,11 +117,14 @@ func (g *Graph) NewMemStore(origin string, tensor Node, axes []Node, value Node)
 	return g.NewNode(KindMemStore, origin, ops...)
 }
 
-// memNewNode: HIR GMEM allocation; ops = [extent]. The created global extent
-// is a Value (the memory's initial def in the skeleton's model).
+// memNewNode: a memory allocation of every storage class; ops = [extent].
+// The created extent is a Value (the memory's initial def in the skeleton's
+// model). SMEM/FRAG allocations carry their class via the tiered
+// constructors (node_lir_memory.go).
 type memNewNode struct {
 	*Base
 	operandList
+	class StorageClass
 }
 
 // NewMemNew creates a HIR GMEM allocation node of the given extent value.
