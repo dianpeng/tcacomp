@@ -467,9 +467,9 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// attrs): the post-fix1 form of the old X-body→home rewire. Retargeting
 	// uniformly — dissolved bearers included — leaves no dissolved loop
 	// referencing another, so finalizeDissolutions can erase the jobs in
-	// any order (the attr of a dissolved bearer is captured in its job's
-	// closure and dies with it, now pointing at a survivor). Anything not
-	// a "nest" attribute still referencing a dissolved loop is a corrupted
+	// any order (each dissolved bearer's own "nest" attr is one of its
+	// header nodes and dies with it, now pointing at a survivor). Anything
+	// not a "nest" attribute still referencing a dissolved loop is a corrupted
 	// restructure — fail closed. The erasure itself is DEFERRED to
 	// finalizeDissolutions (after Map Lower): the piped Map's projection
 	// machinery — the producing Map, its As, and its epilogue-anchored
@@ -532,11 +532,13 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	}
 	for i := range betweenBlks {
 		loop := betweenBlks[i].Loop()
-		// Capture the loop's operand closure BEFORE any erasure — the
-		// finalize sweep's candidate set (wrapper, annotations, and their
-		// coordinate debris).
-		closure := operandClosure(loop)
-		lr.dissolved = append(lr.dissolved, dissolveJob{loop: loop, iv: betweenIVs[i], red: red, closure: closure})
+		// The erasures are DEFERRED to finalizeDissolutions (after Map
+		// Lower): the piped Map's projection machinery — the producing
+		// Map, its As, and its epilogue-anchored lambda — still references
+		// the walk's coordinate expressions until Map Lower rewires those
+		// operands away (fix2 D-a: only the header nodes themselves are
+		// ever erased, never a swept closure).
+		lr.dissolved = append(lr.dissolved, dissolveJob{loop: loop, red: red})
 	}
 
 	// Insert the element chain at X's old position (the OUTERMOST element

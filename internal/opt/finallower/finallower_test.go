@@ -25,6 +25,7 @@ import (
 	"tcacomp/internal/opt/schedule"
 	"tcacomp/internal/opt/tiling"
 	"tcacomp/internal/opt/typeinfer"
+	"tcacomp/internal/pipeline"
 )
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,21 @@ func runTileLowerSchedule(t *testing.T, f *fx, decisions []tiling.IterDecision) 
 func runFinalLower(t *testing.T, g *ir.Graph, cache *opt.Cache) error {
 	t.Helper()
 	return (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, g)
+}
+
+// runTail runs the pipeline's TAIL composition (fix2 D-e: the tail memopt +
+// the AST-item-roots dce) directly over a post-final-lower graph — the
+// re-pin substrate for the D-a/D-b deletions: what final-lower now leaves
+// dead in the sea is the TAIL's to collect (direct invocation, the
+// runMemopt/runFinalLower pattern; the manager-level Requires threading is
+// pinned in internal/pipeline's own tests).
+func runTail(t *testing.T, g *ir.Graph) {
+	t.Helper()
+	for _, p := range pipeline.TailPasses() {
+		if err := p.Run(&opt.Context{Pass: p.ID()}, g); err != nil {
+			t.Fatalf("tail pass %s: %v", p.ID(), err)
+		}
+	}
 }
 
 // liveOfKind collects the graph's live nodes of kind k in allocation order.
@@ -270,10 +286,14 @@ func runMapOnly(t *testing.T) (*fx, *ir.ASTKernel, ir.Node, ir.Node, ir.Node) {
 	return f, f.g.AST(), load, mp, out
 }
 
-// TestMapLowerEliminatesMap pins LR-9: the Map's every use is RAUW'd onto
-// its body expression (the store now reads the load), and the Map node, its
-// trailing As, and its orphaned lambda are all erased — no dangling
-// Map/As/lambda debris survives.
+// TestMapLowerEliminatesMap pins LR-9's VERB (fix2 D-b): the Map's every
+// use is RAUW'd onto its body expression (the store now reads the load),
+// the Map node is erased, and the trailing As is erased. The orphaned
+// lambda is NO LONGER this pass's to sweep: it is an AST ITEM, so it
+// survives as item-anchored debris (the tail dce's item-roots policy keeps
+// it — D-d's post-schedule liveness truth — and the emitter skips lambda
+// closures); the pin asserts it is dead from the SEA's perspective (zero
+// SSA uses) instead.
 func TestMapLowerEliminatesMap(t *testing.T) {
 	f, _, load, mp, out := runMapOnly(t)
 	if !mp.BasePtr().Erased() {
@@ -291,10 +311,18 @@ func TestMapLowerEliminatesMap(t *testing.T) {
 		t.Fatalf("the store's value must be RAUW'd onto the map's body (the load), got %v", ops[0])
 	}
 	_ = out
-	// No dangling Map / As / lambda debris.
-	for _, k := range []ir.Kind{ir.KindMap, ir.KindAs, ir.KindLambda} {
+	// The verb's own erasures: no live Map / As survives.
+	for _, k := range []ir.Kind{ir.KindMap, ir.KindAs} {
 		if got := liveOfKind(f.g, k); len(got) != 0 {
 			t.Fatalf("no live %s may survive Map Lower, got %d", k, len(got))
+		}
+	}
+	// The lambda debris: dead in the sea (zero SSA uses — the Map was its
+	// only user), alive only as an AST item (fix2 D-b/D-d).
+	for _, lam := range liveOfKind(f.g, ir.KindLambda) {
+		if uses := ir.UsesOf(lam); len(uses) != 0 {
+			t.Fatalf("the orphaned lambda node %d still carries %d SSA use(s) — the verb must leave it dead in the sea",
+				lam.BasePtr().ID(), len(uses))
 		}
 	}
 	if vs := ir.Verify(f.g); len(vs) != 0 {
@@ -507,8 +535,11 @@ func TestFlatQueryRewrite(t *testing.T) {
 func TestMapOnlyEndToEnd(t *testing.T) {
 	f, k, _, _, _ := runMapOnly(t)
 
-	// No query / map / debris kinds anywhere.
-	for _, kind := range []ir.Kind{ir.KindMap, ir.KindAs, ir.KindLambda,
+	// No query / map kinds anywhere. (The producing Map's LAMBDA is
+	// deliberately absent from this list since fix2 D-b: the lower no
+	// longer sweeps it, and it is an AST item — item-anchored debris the
+	// tail's item-roots policy keeps and the emitter skips.)
+	for _, kind := range []ir.Kind{ir.KindMap, ir.KindAs,
 		ir.KindRuntimeGridQuery, ir.KindRuntimeThreadQuery} {
 		if got := liveOfKind(f.g, kind); len(got) != 0 {
 			t.Fatalf("live %s nodes survive, got %d", kind, len(got))
@@ -774,8 +805,16 @@ func TestReducerBracketPlacement(t *testing.T) {
 	if !mInside.BasePtr().Erased() {
 		t.Fatal("the dissolved between loop must be erased")
 	}
+	// The dissolved between dimvar: final-lower only erases it when nothing
+	// still uses it (fix2 D-a — verb-death only); the orphaned ORIGINAL
+	// coordinate spine keeps sea uses on it, so it is the TAIL dce's
+	// garbage. Run the tail and pin the handoff: collected there.
+	runTail(t, g)
 	if !mInsideIV.BasePtr().Erased() {
-		t.Fatal("the dissolved between dimvar must be erased")
+		t.Fatal("the dissolved between dimvar must be collected by the tail dce (final-lower no longer sweeps it, fix2 D-a)")
+	}
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("the tailed graph must verify clean, got %v", vs)
 	}
 
 	// The Reduce call: inside home's block (home nested inside X, X inside
@@ -947,8 +986,11 @@ func TestReducerElementLoopConsumers(t *testing.T) {
 	if !cl[elemIV] {
 		t.Fatal("the store's m coordinate must reference the fresh element dimvar")
 	}
+	// The dissolved between dimvar is the tail's garbage now (fix2 D-a):
+	// run the tail and pin it collected.
+	runTail(t, g)
 	if !mInsideIV.BasePtr().Erased() {
-		t.Fatal("the dissolved between dimvar must be erased (R3)")
+		t.Fatal("the dissolved between dimvar must be collected by the tail dce (R3 + fix2 D-a/D-e)")
 	}
 	// No moved consumer references a reduced-dim dimvar.
 	for _, loop := range []ir.Node{X, home} {
@@ -1038,11 +1080,27 @@ func TestTiledReduceEndToEnd(t *testing.T) {
 			t.Fatalf("live %s nodes survive, got %d", kind, len(got))
 		}
 	}
-	// The combiner lambda is the ONE surviving lambda (held by the
-	// construction); the producing Map's lambda debris is gone.
-	lams := liveOfKind(g, ir.KindLambda)
-	if len(lams) != 1 || lams[0].BasePtr() != rx.lambda.BasePtr() {
-		t.Fatalf("exactly the combiner lambda survives, got %d", len(lams))
+	// The combiner lambda survives as the construction's operand (the
+	// runtime owns the application). The producing Map's lambda is NO
+	// LONGER swept (fix2 D-b): it is an AST item, so it may survive as
+	// item-anchored debris (D-d's liveness truth; the emitter skips lambda
+	// closures) — dead in the sea, never an operand of anything live.
+	construction := liveOfKind(g, ir.KindRuntimeWarpReducer)
+	if len(construction) != 1 {
+		t.Fatalf("exactly one reducer construction expected, got %d", len(construction))
+	}
+	lamOps := ir.OperandsOf(construction[0])
+	if len(lamOps) < 2 || lamOps[1].BasePtr() != rx.lambda.BasePtr() {
+		t.Fatal("the combiner lambda must be the construction's operand and stay live")
+	}
+	for _, lam := range liveOfKind(g, ir.KindLambda) {
+		if lam.BasePtr() == rx.lambda.BasePtr() {
+			continue
+		}
+		if uses := ir.UsesOf(lam); len(uses) != 0 {
+			t.Fatalf("a non-combiner lambda node %d still carries %d SSA use(s) — Map Lower's verb must leave the debris dead in the sea",
+				lam.BasePtr().ID(), len(uses))
+		}
 	}
 	kis := liveOfKind(g, ir.KindRuntimeKernelInfo)
 	if len(kis) != 1 {

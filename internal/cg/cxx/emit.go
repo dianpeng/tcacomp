@@ -276,13 +276,25 @@ func (e *emitter) prescan() error {
 	e.scanReducerFacts()
 	e.buildPureRefs()
 
-	// The lambda-owned closure: the scheduler anchors the surviving
-	// combiner lambdas' parameters and bodies as items (typically in the
-	// owning LNT's prologue), but their emission is the file-scope
-	// function — the kernel-body walk skips the whole closure.
+	// The lambda-owned closure: the scheduler anchors the surviving COMBINER
+	// lambdas' parameters and bodies as items (typically in the owning LNT's
+	// prologue), but their emission is the file-scope function — the
+	// kernel-body walk skips the whole closure. Only the reducer
+	// constructions' lambda operands are combiners: since fix2 D-b the
+	// producing Maps' lambdas also survive final-lower (the lower no longer
+	// sweeps them — they are dead-in-the-sea items the pipeline tail keeps),
+	// and their closures are EMITTED statements (the piped value chain), so
+	// marking them would skip live statements.
 	for _, n := range e.g.AllocatedNodes() {
-		if n != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindLambda {
-			e.markClosure(n)
+		if n == nil || n.BasePtr().Erased() {
+			continue
+		}
+		switch n.KindOf() {
+		case ir.KindRuntimeSequentialReducer, ir.KindRuntimeWarpReducer, ir.KindRuntimeGlobalReducer:
+			ops := ir.OperandsOf(n)
+			if len(ops) >= 2 && ops[1] != nil && ops[1].KindOf() == ir.KindLambda {
+				e.markClosure(ops[1])
+			}
 		}
 	}
 	return nil
