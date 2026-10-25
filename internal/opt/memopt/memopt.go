@@ -122,6 +122,18 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 	se := sideeffect.Analyze(g)
 	mctx := &ir.MutContext{Pass: "memopt"}
 
+	// The output-binding set: the end node's DATA operands (pkg/builder.go
+	// Build wires the outputs' stores as the return's values). Rule (c)
+	// never sweeps one — see sweepDeadStore.
+	returned := map[ir.Node]bool{}
+	if end := g.End(); end != nil {
+		for _, v := range ir.OperandsOf(end) {
+			if v != nil {
+				returned[v] = true
+			}
+		}
+	}
+
 	total := 0
 	for _, n := range g.AllocatedNodes() {
 		if isGMEMAccess(n.KindOf()) || isBufferStore(n.KindOf()) {
@@ -162,7 +174,7 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 				if a.KindOf() != ir.KindMemStore || a.BasePtr().Erased() {
 					continue
 				}
-				fired, err := sweepDeadStore(mctx, r, g.End(), a)
+				fired, err := sweepDeadStore(mctx, r, g.End(), a, returned)
 				if err != nil {
 					return err
 				}
@@ -441,9 +453,20 @@ func eliminateShadowedStores(mctx *ir.MutContext, se sideeffect.SideEffects, ori
 // region's accesses and none from the Return) is unobservable, so its data
 // uses are RAUW'd onto its value operand (a store returns input#0 — the
 // rewire is value-preserving) and it is erased. A Return-wired store
-// always keeps its payload use and is NEVER erased (INV-D). The outer
-// fixpoint sweeps tail cascades (S1→S2 both unread) to completion.
-func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node) (bool, error) {
+// always keeps its payload use and is NEVER erased (INV-D), and a store
+// the Return holds as a DATA operand — the pkg builder's output-binding
+// convention (pkg/builder.go Build: the outputs' stores are the return's
+// values) — is equally never erased: that store IS the kernel's output
+// write. Its chain edge alone no longer proves observability once
+// tile-lower's P6 repointing moves the end node's body-internal edges at
+// the nest root (the fix1×fix2 interaction observed on the frontend
+// shape, 2026-10-25: the tail instance swept a live output store and the
+// emitted kernel lost its outputs). The outer fixpoint sweeps tail
+// cascades (S1→S2 both unread) to completion.
+func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node, returned map[ir.Node]bool) (bool, error) {
+	if returned[s] {
+		return false, nil // an output binding's store: observable by contract
+	}
 	if hasEffectSuccessor(r, end, s) {
 		return false, nil
 	}
