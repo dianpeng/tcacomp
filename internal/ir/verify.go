@@ -34,6 +34,14 @@ const (
 	// step must be a positive constant (HI-04's IR-level backstop —
 	// tiling-verify checks the tiling records; this is the graph itself).
 	invLoopStep = "loop-step"
+	// invScopeDominance is the R-I scope invariant (fix3 D-l): every
+	// AST-placed memory/coordinate consumer must be dominated by the loops
+	// its operand closure references — the `dimvar ... has no enclosing
+	// loop in scope` failure class moved from the backend emitter into the
+	// verifier, so the PASS that breaks the invariant is the one that
+	// fails. Active POST-SCHEDULE only (it reads SchedBlock stamps over
+	// the attached AST; the emitter's own gate stays as the backstop).
+	invScopeDominance = "scope-dominance"
 	// (invLoopScope deleted — fix1.md D-c ruling: with no body operand,
 	// the containment-based scoping check is vacuous. The tiling §8 SCOPE
 	// check (coordinates reference only enclosing loops) guards the
@@ -55,6 +63,7 @@ func Verify(g *Graph) []Violation {
 	nodes := walkCheckUseDef(g, &vs)
 	checkDefUse(nodes, &vs)
 	checkLoopInvariants(nodes, &vs)
+	checkScopeDominance(g, &vs)
 	checkConvention(g, &vs)
 	return vs
 }
@@ -854,6 +863,128 @@ func checkLoopStep(loop Node, vs *[]Violation) {
 			fmt.Sprintf("for-loop node %d's dimvar node %d carries step %v — a lowered loop's induction step must be a positive constant (zero or negative strides are infinite or backwards loops)",
 				loop.BasePtr().id, dv.BasePtr().id, v)))
 	}
+}
+
+// checkScopeDominance enforces the R-I scope invariant (fix3 D-l) over the
+// attached AST — POST-SCHEDULE position only: a graph with no AST carries
+// no SchedBlock stamps and no lexical positions, so the check is inactive
+// (the sea's membership is IV-reference based, never positional; fix1.md
+// D-c). For every AST item node, every DimVar in its operand closure must
+// be defined at a block DOMINATING the item's block (ancestor-or-self):
+// a re-placed or hoisted consumer that escapes a loop its coordinates
+// read would render as an out-of-scope iterator reference at codegen —
+// exactly the class the emitter's fail-closed gate catches late (expr.go:
+// `dimvar ... has no enclosing loop in scope`; that gate stays as the
+// backstop). A loop block's BOUND expression evaluates in the PARENT
+// scope, so its closure's dimvars are checked against the parent's
+// ancestry (never the loop's own IV). Unscheduled dimvars (nil SchedBlock)
+// are skipped: their placement is not yet decided, and the pre-schedule
+// world has no positions at all.
+func checkScopeDominance(g *Graph, vs *[]Violation) {
+	k := g.AST()
+	if k == nil || k.Body == nil {
+		return
+	}
+	// blockDominates reports whether maybeAncestor is needle or an ancestor
+	// of it on the AST's parent chain.
+	var parentOf func(blk, needle *ASTBlock) *ASTBlock
+	parentOf = func(blk, needle *ASTBlock) *ASTBlock {
+		for _, it := range blk.Items() {
+			if it.Block != nil {
+				if it.Block == needle {
+					return blk
+				}
+				if p := parentOf(it.Block, needle); p != nil {
+					return p
+				}
+			}
+		}
+		return nil
+	}
+	dominates := func(needle, maybeAncestor *ASTBlock) bool {
+		for b := needle; b != nil; b = parentOf(k.Body, b) {
+			if b == maybeAncestor {
+				return true
+			}
+		}
+		return false
+	}
+	reportItem := func(n Node, blk *ASTBlock) {
+		switch n.KindOf() {
+		case KindReturn, KindKeyedAttribute:
+			// Non-emitting carriers: the return renders nothing in the
+			// kernel body (the launcher owns outputs; its operands are the
+			// output bindings' stores, whose coordinate closures are the
+			// STORES' concern, checked at their own positions), and an
+			// annotation carrier rides its host's operand list.
+			return
+		}
+		for d := range operandClosureOf(n) {
+			if d.KindOf() != KindDimVar {
+				continue
+			}
+			def := d.BasePtr().SchedBlock()
+			if def == nil {
+				continue // unscheduled: no position to dominate
+			}
+			if !dominates(blk, def) {
+				*vs = append(*vs, nodeViolation(n, invScopeDominance,
+					fmt.Sprintf("%s node %d (block %s) references dimvar node %d whose loop does not dominate its position — the coordinate is not in scope",
+						n.KindOf(), n.BasePtr().id, blk.Kind(), d.BasePtr().id)))
+			}
+		}
+	}
+	var walk func(blk *ASTBlock)
+	walk = func(blk *ASTBlock) {
+		parent := parentOf(k.Body, blk)
+		// A loop block's header expressions (the bound's max) evaluate in
+		// the PARENT scope.
+		if l := blk.Loop(); l != nil && parent != nil {
+			if bops := OperandsOf(blk.Bound()); len(bops) == 2 && bops[1] != nil {
+				for d := range operandClosureOf(bops[1]) {
+					if d.KindOf() != KindDimVar {
+						continue
+					}
+					def := d.BasePtr().SchedBlock()
+					if def == nil || dominates(parent, def) {
+						continue
+					}
+					*vs = append(*vs, nodeViolation(l, invScopeDominance,
+						fmt.Sprintf("forloop node %d's bound references dimvar node %d whose loop does not dominate the loop header's scope",
+							l.BasePtr().id, d.BasePtr().id)))
+				}
+			}
+		}
+		for _, it := range blk.Items() {
+			if it.Node != nil {
+				reportItem(it.Node, blk)
+				continue
+			}
+			if it.Block != nil {
+				walk(it.Block)
+			}
+		}
+	}
+	walk(k.Body)
+}
+
+// operandClosureOf collects n's transitive operand-edge closure (self
+// included, live nodes only) — the verifier-side twin of the passes'
+// operandClosure helpers.
+func operandClosureOf(n Node) map[Node]bool {
+	set := make(map[Node]bool)
+	var visit func(x Node)
+	visit = func(x Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || set[x] {
+			return
+		}
+		set[x] = true
+		for _, d := range OperandsOf(x) {
+			visit(d)
+		}
+	}
+	visit(n)
+	return set
 }
 
 // childClosure returns the set of nodes reachable from start over the walk's
