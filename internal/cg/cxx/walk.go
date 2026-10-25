@@ -233,7 +233,10 @@ func (e *emitter) walkBody() error {
 
 // walkBlock emits one AST block. Groups render as plain C++ scopes; Loop
 // blocks render as runtime iterator for-statements (loops.go); every item
-// statement renders per the emission table (doc/cg.md §6).
+// statement renders per the emission table (doc/cg.md §6). The tracked
+// LNT mappings (curGrid/curThread) are SCOPED to the block that constructs
+// them (fix3 D-m: the mapping-driven loader call must never see a mapping
+// from a sibling LNT leaking past its group).
 func (e *emitter) walkBlock(blk *ir.ASTBlock) error {
 	if blk == nil {
 		return nil
@@ -242,6 +245,7 @@ func (e *emitter) walkBlock(blk *ir.ASTBlock) error {
 		if blk.Nest() != nil {
 			e.lntHeader(blk.Nest())
 		}
+		savedGrid, savedThread := e.curGrid, e.curThread
 		e.line("{")
 		e.deep++
 		if err := e.walkItems(blk); err != nil {
@@ -249,6 +253,7 @@ func (e *emitter) walkBlock(blk *ir.ASTBlock) error {
 		}
 		e.deep--
 		e.line("}")
+		e.curGrid, e.curThread = savedGrid, savedThread
 		return nil
 	}
 	return e.walkLoop(blk)

@@ -197,6 +197,10 @@ class ThreadMapping {
   // map — the fold-existing-warps refinement's bound and the staging-extent
   // cross-check read it here, never a magic constant.
   __host__ __device__ unsigned warp_count() const { return dec_.unit_sum(); }
+  // The map's FLAT thread space (fix3 R-J/D-n: the coordination total the
+  // cooperative loader stripes rows over — every thread of the CTA, obtained
+  // THROUGH the map; the compiler never inlines blockDim arithmetic).
+  __host__ __device__ unsigned total() const { return dec_.unit_sum() * 32u; }
 
 #ifndef __CUDACC__
   // CPU unit-test hook: stand in for threadIdx.x.

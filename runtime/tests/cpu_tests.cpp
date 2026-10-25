@@ -288,8 +288,8 @@ void test_loader_row_clamping() {
   tca::rt::SmemView<float, 2u> dst(smem, 5u, 7u);
   tca::rt::TensorView<const float, 3u> view(src, 3u, 5u, 7u);
   tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 2u>,
-                                  tca::rt::TensorView<const float, 3u>, 2u, 3u>(
-      dst, view, base, 0u, 1u);
+                                  tca::rt::TensorWindow<const float, 3u>, 2u, 3u>(
+      dst, tca::rt::TensorWindow(view, base[0], base[1], base[2]), 0u, 1u);
   for (unsigned i = 0u; i < 5 * 7; ++i) CHECK(smem[i] == want[i]);
 
   // The clamp facts, pinned directly: the trailing run clamps once per row
@@ -318,8 +318,8 @@ void test_loader_striping() {
     tca::rt::TensorView<const float, 3u> view(src, 4u, 6u, 8u);
     for (unsigned tid = 0u; tid < nt; ++tid) {
       tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 2u>,
-                                      tca::rt::TensorView<const float, 3u>, 2u, 3u>(
-          dst, view, base, tid, nt);
+                                      tca::rt::TensorWindow<const float, 3u>, 2u, 3u>(
+          dst, tca::rt::TensorWindow(view, base[0], base[1], base[2]), tid, nt);
     }
     for (unsigned i = 0u; i < 6 * 8; ++i) {
       CHECK(smem[i] == want[i]);  // exactly-once ownership: no double writes
@@ -344,18 +344,16 @@ void test_loader_vector_eligibility() {
   // result must equal the aligned (vector-path) copy of the shifted data.
   tca::rt::SmemView<float, 1u> dstA(dstbuf, 16u);
   tca::rt::TensorView<const float, 1u> view(src, 64u);
-  const unsigned b1[1] = {1u};
   tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
-                                  tca::rt::TensorView<const float, 1u>, 1u, 1u>(
-      dstA, view, b1, 0u, 1u);
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      dstA, tca::rt::TensorWindow(view, 1u), 0u, 1u);
   for (unsigned k = 0u; k < 16u; ++k) CHECK(dstbuf[k] == src[1u + k]);
 
   // The aligned form (vector path eligible: trailing 16 %4 == 0, bases
   // aligned) must produce the same values as the scalar reference.
-  const unsigned b0[1] = {0u};
   tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
-                                  tca::rt::TensorView<const float, 1u>, 1u, 1u>(
-      dstA, view, b0, 0u, 1u);
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      dstA, tca::rt::TensorWindow(view, 0u), 0u, 1u);
   for (unsigned k = 0u; k < 16u; ++k) CHECK(dstbuf[k] == src[k]);
 
   // Trailing extent NOT %4: whole copy rides the scalar path.
@@ -363,10 +361,9 @@ void test_loader_vector_eligibility() {
   float out5[5] = {};
   tca::rt::SmemView<float, 1u> d5(out5, 5u);
   tca::rt::TensorView<const float, 1u> v5(small, 5u);
-  const unsigned bz[1] = {0u};
   tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
-                                  tca::rt::TensorView<const float, 1u>, 1u, 1u>(
-      d5, v5, bz, 0u, 1u);
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      d5, tca::rt::TensorWindow(v5, 0u), 0u, 1u);
   for (unsigned k = 0u; k < 5u; ++k) CHECK(out5[k] == small[k]);
 }
 
@@ -378,7 +375,8 @@ void test_loader_frag_thread() {
   tca::rt::Frag<float, 2u, 4u, 8u> frag;
   tca::rt::TensorView<const float, 2u> view(src, 6u, 8u);
   // base (2, 5): axis-0 rows 2..5 all in range; trailing clamps to 8-5=3.
-  tca::rt::LoadTileThread(frag, view, 2u, 5u);
+  tca::rt::ThreadMapping tm(host_info(100u, 512u), -1);
+	tca::rt::LoadTileThread(tm, frag, tca::rt::TensorWindow(view, 2u, 5u));
   for (unsigned r = 0u; r < 4u; ++r) {
     for (unsigned k = 0u; k < 8u; ++k) {
       const float want = (k < 3u) ? src[(2u + r) * 8u + 5u + k] : 0.0f;

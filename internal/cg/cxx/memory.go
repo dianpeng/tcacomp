@@ -6,19 +6,30 @@ import (
 	"tcacomp/internal/ir"
 )
 
-// stmtFill emits a fill store as its cooperative loader call (doc/cg.md §6
-// M-3, fix3 D-h): the loader is DERIVED from the fill's storage class per
-// R-H/R-J — SMEM window class → tca::rt::LoadTileCta (cooperative, owns
-// ALL synchronization and internal bounds clamping), FRAG class →
-// tca::rt::LoadTileThread (per-thread, no barrier); the retired v0-era
-// attribute is gone. The compiler never emits barriers
-// (runtime_objects.md §7).
+// stmtFill emits the fill composition as its cooperative loader call
+// (doc/cg.md §6 M-3, fix3 D-m/D-n per R-H/R-J): the codegen-side fusion of
+// MemNew + tile-shaped MemLoad(GMEM) + MemStore(class, window) into ONE
+// call under the coordination-mapping signature
+//
+//	tca::rt::LoadTileCta/LoadTileThread(mapping, dstView, srcWindowView)
+//
+// — the ThreadMapping comes from the emitter's tracked enclosing-LNT
+// mapping (curThread): the runtime composes mapping->work and the compiler
+// NEVER inlines thread enumeration. The source arrives as a WINDOWED view
+// (tca::rt::TensorWindow) whose coordinate list is the merged tensor-dim
+// tuple the composition carries (the tile load's axes + the store's
+// trailing round bases); the loader receives no raw bases. Loader
+// selection derives from the fill's storage class — SMEM window class →
+// LoadTileCta (cooperative, owns ALL synchronization and internal bounds
+// clamping), FRAG class → LoadTileThread (per-thread, no barrier). The
+// compiler never emits barriers (runtime_objects.md §7). A fill site whose
+// scope lacks a mapping is a named R-D stop — never an emitter patch.
 //
 // Source-coordinate convention (pinned from tile-lower's fill construction,
 // lower_cache.go): the fill's value operand is a MemLoad whose axes are the
 // NON-covered tensor positions (uniform-substituted for the SMEM class),
 // and the trailing bivs are the covered dims' round bases. The merged
-// coordinate tuple is reconstructed in TENSOR DIM ORDER:
+// coordinate tuple is built in TENSOR DIM ORDER:
 //
 //   - len(axes) == rank: the FRAG all-axes form — axes verbatim;
 //   - len(axes) + len(bivs) == rank: every covered position was skipped —
@@ -41,6 +52,13 @@ func (e *emitter) stmtFill(n ir.Node) error {
 	v := 2 // FRAG class: per-thread
 	if sc == ir.StorageSMem {
 		v = 1 // SMEM window class: cooperative
+	}
+	// The coordination mapping (R-J): the enclosing LNT's ThreadMapping. A
+	// fill site with no mapping in scope is an uncovered shape (R-D) — a
+	// named error, never patched around.
+	if e.curThread == "" {
+		return fmt.Errorf("cxx: fill %d sits outside every LNT cluster (no ThreadMapping in scope) — the mapping-driven loader call needs the enclosing LNT's mapping (R-D: uncovered shape, needs a ruling)",
+			n.BasePtr().ID())
 	}
 
 	srcOps := ir.OperandsOf(src)
@@ -109,7 +127,11 @@ func (e *emitter) stmtFill(n ir.Node) error {
 	} else {
 		e.c("per-thread tile fill of %s (LoadTileThread) — no synchronization", ir.InputParamNameOf(tensor))
 	}
-	e.line(loader + "(" + bufView + ", " + view + ", " + join(coords) + ");")
+	// The coordination-mapping call (fix3 D-m/D-n, R-H/R-J): the mapping in,
+	// the destination view, the source as a WINDOWED view — the offset
+	// implicit in the window, the thread enumeration the runtime's.
+	e.line(loader + "(" + e.curThread + ", " + bufView + ", tca::rt::TensorWindow(" + view +
+		", " + join(coords) + "));")
 	return nil
 }
 

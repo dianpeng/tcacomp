@@ -228,6 +228,42 @@ class Frag {
   T data_[kElems > 0u ? kElems : 1u] = {};
 };
 
+// TensorWindow — a GMEM view windowed at a base coordinate (fix3.md R-J /
+// D-m/D-n: the loader's source face). The offset is IMPLICIT in the window:
+// the cooperative loaders receive (mapping, dstView, srcWindow) and compose
+// the mapping into a valid source->dest copy — the caller never passes raw
+// bases and the compiler never inlines the loader's thread enumeration.
+// The window keeps the underlying view's bounds-PREDICATED semantics: the
+// row-striped core clamps per row against the SOURCE dims at the windowed
+// coordinates (out-of-range padding zero-fills).
+template <typename T, unsigned Rank>
+class TensorWindow {
+ public:
+  using ElementType = T;
+  static constexpr unsigned kRank = Rank;
+
+  template <typename... Coords>
+  __host__ __device__ TensorWindow(const TensorView<T, Rank>& v, Coords... coords) : v_(v) {
+    static_assert(sizeof...(Coords) == Rank, "one base coordinate per source axis");
+    const unsigned c[Rank] = {static_cast<unsigned>(coords)...};
+    for (unsigned a = 0u; a < Rank; ++a) base_[a] = c[a];
+  }
+
+  // The windowed base coordinate of source axis a (the implicit offset).
+  __host__ __device__ unsigned Base(unsigned axis) const { return base_[axis]; }
+  // The SOURCE extent of axis a (the clamp domain — not the tile extent).
+  __host__ __device__ unsigned Dim(unsigned axis) const { return v_.Dim(axis); }
+  // Loader-facing accessors (fix3 D-n): the underlying view's raw face.
+  __host__ __device__ T* Data() const { return v_.Data(); }
+  __host__ __device__ unsigned FlatIndex(const unsigned (&c)[Rank]) const {
+    return v_.FlatIndex(c);
+  }
+
+ private:
+  TensorView<T, Rank> v_;
+  unsigned base_[Rank] = {};
+};
+
 }  // namespace rt
 }  // namespace tca
 
