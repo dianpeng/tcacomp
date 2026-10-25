@@ -27,15 +27,20 @@
 //     axes make ValueEqual maximally effective post-GVN), erase/rewire
 //     only — no new nodes, no new kinds.
 //
-// quick-261024-sdk (fix1.md D-f) adds ONE LIR-scoped rule beside the
-// region rules — FILL LIVENESS: an unconsumed buffer store (a
-// tiered (SMEM/FRAG-class) MemStore whose buffer has no live load)
-// is dead code removed together with its unread source GMEM load. The
+// quick-261024-sdk (fix1.md D-f) added ONE tier-scoped rule beside the
+// region rules; fix3 (D-k, R-G) GENERALIZED it over the three verbs: a
+// tiered (SMEM/FRAG-class) MemStore whose buffer has NO surviving MemLoad
+// is dead code removed together with its unread source GMEM load chain —
+// the generic three-verb rule, no fill-shaped special case (the fill is
+// just the composition New + GMEM tile load + tiered store, and the rule
+// fires on ANY unconsumed tiered store alike). The
 // author's correction is explicit: this is memory optimization's domain,
-// never DCE's — the fill's source load is chain-reachable (so DCE keeps
+// never DCE's — the store's source load is chain-reachable (so DCE keeps
 // it) but produces a value nobody reads, which is exactly the
 // ordering-only dead-load class the 2026-10-20 audit named as memopt's
-// open gap.
+// open gap. Store→load FORWARDING over the composition (GMEM tile-load →
+// stored → tiered load) is EXPRESSIBLE since D-k but stays UNIMPLEMENTED
+// (fix3 §5 tracks it open — never add it here without a ruling).
 //
 // Expectation note (review): today's builder graphs rarely fire the rules —
 // tensor reads are paramRefs, not GMEM loads — so the pass's own tests
@@ -181,9 +186,10 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 				progress = progress || fired
 			}
 		}
-		// (d) FILL LIVENESS (D-f, LIR-scoped — outside the regions): a
-		// buffer store whose buffer has no live reads is unconsumed dead
-		// code, removed together with its unread source load.
+		// (d) THE GENERIC THREE-VERB RULE (fix3 D-k — the fix1-era fill
+		// liveness, generalized per R-G): a tiered MemStore whose buffer
+		// has no live reads is unconsumed dead code, removed together with
+		// its unread source load chain.
 		fired, err := sweepUnconsumedBufferStores(mctx, g)
 		if err != nil {
 			return err
@@ -485,23 +491,24 @@ func sweepDeadStore(mctx *ir.MutContext, r region, end ir.Node, s ir.Node, retur
 }
 
 // ---------------------------------------------------------------------------
-// Rule (d) — fill liveness (D-f, quick-261024-sdk). LIR-scoped, outside the
-// regions: the fill families carry no per-tensor GMEM chains of their own
-// (the fill store holds no ImpactBy; its readers chain TO it), so the rule
-// keys on buffer-operand identity and the live-readership predicate alone.
+// Rule (d) — the GENERIC THREE-VERB RULE (fix3 D-k; the fix1-era fill
+// liveness of quick-261024-sdk, generalized per R-G). Tier-scoped, outside
+// the regions: the tiered stores carry no per-tensor GMEM chains of their
+// own (a fill store holds no ImpactBy; its readers chain TO it), so the
+// rule keys on buffer-operand identity and the live-readership predicate
+// alone.
 // ---------------------------------------------------------------------------
 
-// sweepUnconsumedBufferStores implements rule (d) — fill liveness (D-f,
-// fix1.md): "a buffer store whose buffer has zero live loads is dead
-// together with its source load". A tiered buffer store (the SMEM/FRAG
-// classes of the unified MemStore — tile-lower's fill spill and its
-// SMEM-window sibling)
-// whose buffer operand has NO live buffer load is unconsumed: the store is
-// erased and, when the stored value is a GMEM load nobody reads, the load
-// dies with it (ordering-only dead-load removal — its chain successors
-// splice past it, C3). DCE stays untouched; this is memory-optimization
-// domain per the author correction (§0: "a fill is a normal memory load —
-// it must have a memory read consuming it, otherwise it is dead code").
+// sweepUnconsumedBufferStores implements rule (d) — the generic three-verb
+// rule (fix3 D-k): a tiered MemStore (SMEM/FRAG class — the fill
+// composition's store and every other tiered store alike) whose buffer
+// operand has NO live MemLoad is unconsumed: the store is erased and, when
+// the stored value is a GMEM load nobody reads, the load chain dies with
+// it (ordering-only dead-load removal — its chain successors splice past
+// it, C3). DCE stays untouched; this is memory-optimization domain per the
+// author correction (§0: "a fill is a normal memory load — it must have a
+// memory read consuming it, otherwise it is dead code" — the rule now
+// reads the same over every tiered store, fill or not).
 func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error) {
 	progress := false
 	for _, n := range g.AllocatedNodes() {
@@ -515,7 +522,7 @@ func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error)
 		if bufferHasLiveReads(g, ops[1]) {
 			continue
 		}
-		fired, err := removeUnconsumedFill(mctx, n)
+		fired, err := removeUnconsumedStore(mctx, n)
 		if err != nil {
 			return progress, err
 		}
@@ -524,11 +531,11 @@ func sweepUnconsumedBufferStores(mctx *ir.MutContext, g *ir.Graph) (bool, error)
 	return progress, nil
 }
 
-// bufferHasLiveReads reports whether any live buffer load reads buffer —
-// the liveness predicate of rule (d) ("zero live loads", D-f). The load
-// families are the only readers a buffer can have: a buffer name is
-// consumed through its loads, never through a raw operand (construction
-// data edges terminate at the store).
+// bufferHasLiveReads reports whether any live tiered MemLoad reads buffer
+// — the liveness predicate of rule (d). The tiered loads are the only
+// readers a buffer can have: a buffer name is consumed through its loads,
+// never through a raw operand (construction data edges terminate at the
+// store).
 func bufferHasLiveReads(g *ir.Graph, buffer ir.Node) bool {
 	bb := buffer.BasePtr()
 	for _, n := range g.AllocatedNodes() {
@@ -542,14 +549,15 @@ func bufferHasLiveReads(g *ir.Graph, buffer ir.Node) bool {
 	return false
 }
 
-// removeUnconsumedFill erases the buffer store s and, when its value is an
-// unread GMEM load, the load with it (D-f: "dead together with its source
-// load"). The store is value-RAUW'd first (the store families return
-// input#0 — the sweepDeadStore discipline) and erased; the source load —
-// its data uses gone with the store — splices its chain successors past
-// itself and erases. A load that still has a data use is left alone
-// (fail-closed: not this rule's case).
-func removeUnconsumedFill(mctx *ir.MutContext, s ir.Node) (bool, error) {
+// removeUnconsumedStore erases the tiered store s and, when its value is
+// an unread GMEM load, the load with it (the "source chain dies with the
+// store" half of the generic rule). The store is value-RAUW'd first (the
+// store families return input#0 — the sweepDeadStore discipline) and
+// erased; the source load — its data uses gone with the store — splices
+// its chain successors past itself and erases. A value that is not an
+// unread GMEM load (a constant, a still-read expression) simply loses the
+// store: the generic rule makes no fill-shaped assumption.
+func removeUnconsumedStore(mctx *ir.MutContext, s ir.Node) (bool, error) {
 	value := storeValue(s)
 	if value == nil {
 		return false, fmt.Errorf("memopt: buffer store node %d (%s) carries no value operand",

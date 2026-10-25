@@ -89,6 +89,13 @@ func TestTailFillLivenessWiring(t *testing.T) {
 	srcLoad := g.NewMemLoadChained("ctor", env, lhs, []ir.Node{m})
 	fillStore := g.NewFragStore("ctor", srcLoad, buf, m)
 
+	// fix3 D-k's generalization pin: a NON-fill-shaped tiered store (its
+	// value is a constant, not a GMEM tile load) with no buffer reads dies
+	// by the SAME generic three-verb rule — no fill-shaped special case
+	// exists anymore.
+	plainBuf := g.NewFragNew("ctor", m)
+	plainStore := g.NewFragStore("ctor", g.NewConst("ctor", ir.InternScalar(ir.TU32), 7), plainBuf, m)
+
 	// The tensor chain's successor of srcLoad — the removal's splice work.
 	env2 := ir.NewEnv()
 	env2.NoteStore(lhs, srcLoad)
@@ -112,7 +119,7 @@ func TestTailFillLivenessWiring(t *testing.T) {
 		p.BasePtr().SetSched(ir.PrototypeSN, proto)
 	}
 	body := ir.NewASTGroup()
-	for _, n := range []ir.Node{buf, ctlBuf, srcLoad, fillStore, succLoad, ctlLoad, ctlStore, ctlAccess, end} {
+	for _, n := range []ir.Node{buf, plainBuf, srcLoad, fillStore, plainStore, succLoad, ctlLoad, ctlStore, ctlAccess, end} {
 		body.AppendItem(ir.ASTItem{Node: n})
 		n.BasePtr().SetSched(0, body)
 	}
@@ -132,15 +139,21 @@ func TestTailFillLivenessWiring(t *testing.T) {
 		t.Fatalf("tail pipeline: %v", err)
 	}
 
-	// Rule (d) fired in-pipeline: the fill AND its source load are erased.
-	for name, n := range map[string]ir.Node{"fill store": fillStore, "source load": srcLoad} {
+	// The generic three-verb rule fired in-pipeline: the fill AND its
+	// source load are erased, and so is the NON-fill-shaped tiered store
+	// (fix3 D-k: no fill-shaped special case — an unconsumed tiered store
+	// of a constant dies identically).
+	for name, n := range map[string]ir.Node{
+		"fill store": fillStore, "source load": srcLoad, "plain tiered store": plainStore,
+	} {
 		if !n.BasePtr().Erased() {
 			t.Fatalf("the %s must be erased by the tail composition", name)
 		}
 	}
 	// The control fill and the allocations survive (items + live readers).
 	for name, n := range map[string]ir.Node{
-		"buffer B alloc": buf, "buffer C alloc": ctlBuf, "control fill": ctlStore,
+		"buffer B alloc": buf, "plain buffer alloc": plainBuf, "buffer C alloc": ctlBuf,
+		"control fill":   ctlStore,
 		"control source": ctlLoad, "control reader": ctlAccess, "chain successor": succLoad,
 	} {
 		if n.BasePtr().Erased() {
