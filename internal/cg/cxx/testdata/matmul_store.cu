@@ -41,7 +41,7 @@ __global__ void __launch_bounds__(512) Mm(uint32_t d0, uint32_t d1, uint32_t d2,
           for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 256u, thread_map1.index(), 256u, v5); d0_it3.Has(); d0_it3.Next()) {
             auto v12 = (v2 + d0_it3.Index());
             // per-thread tile fill of lhs (LoadTileThread) — no synchronization
-            tca::rt::LoadTileThread(tca_f0, lhs_v, v12, d2_it2.Index());
+            tca::rt::LoadTileThread(thread_map1, tca_f0, tca::rt::TensorWindow(lhs_v, v12, d2_it2.Index()));
             // @d1 inside walk (tile elements) — T=64
             for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v8); d1_it4.Has(); d1_it4.Next()) {
               auto v13 = (d1_it1.Index() + d1_it4.Index());

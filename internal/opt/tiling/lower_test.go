@@ -511,6 +511,62 @@ func subtreeContains(n, target ir.Node) bool {
 	return found
 }
 
+// assertFillPositionDerived is the fix3 D-i SAFETY NET: the R-I derivation
+// — the innermost rewritten loop whose IV the fill composition's operand
+// closure references (nest-chain depth breaks ties inward) — must pick
+// EXACTLY the position fillHost mandates today. Step 4 (D-j) swaps the
+// placement mechanism under this equality; if a shape's derivation
+// disagreed, that swap would MOVE the fill and this pin fires first.
+func assertFillPositionDerived(t *testing.T, g *ir.Graph, fill, mandated ir.Node) {
+	t.Helper()
+	// The composition's coordinate closure: the STORE's operand closure
+	// covers the source load's axes and the covered round bases.
+	closure := map[ir.Node]bool{}
+	for _, n := range flattenSubtree(fill) {
+		closure[n] = true
+	}
+	nestParent := func(loop ir.Node) ir.Node {
+		for _, op := range ir.OperandsOf(loop)[2:] {
+			if key, val := ir.KeyedAttributeOf(op); key == "nest" && val != nil {
+				return val
+			}
+		}
+		return nil
+	}
+	depth := func(loop ir.Node) int {
+		d := 0
+		for {
+			p := nestParent(loop)
+			if p == nil || p.BasePtr() == nil || p.BasePtr().Erased() {
+				return d
+			}
+			loop = p
+			d++
+		}
+	}
+	var best ir.Node
+	bestDepth := -1
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {
+			continue
+		}
+		iv := ir.OperandsOf(n)[0]
+		if iv == nil || !closure[iv] {
+			continue
+		}
+		if d := depth(n); d > bestDepth {
+			best, bestDepth = n, d
+		}
+	}
+	if best == nil {
+		t.Fatal("the fill's closure references no rewritten loop — the R-I derivation has no position to pick")
+	}
+	if best.BasePtr() != mandated.BasePtr() {
+		t.Fatalf("the R-I derivation picks loop %d (nest depth %d), want the mandated position loop %d — the D-j swap would move this fill",
+			best.BasePtr().ID(), bestDepth, mandated.BasePtr().ID())
+	}
+}
+
 // TestRewriteTailSaturatingGuard is the fixture that would have caught
 // CR-01: extents NOT multiples of the round strides (M=1000 CTA with
 // LoC·T = 3200; N=500 WARP with LoC·32·T = 8192) — every materialized
@@ -1118,7 +1174,10 @@ func findFillOf(t *testing.T, g *ir.Graph, buf ir.Node) ir.Node {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 			continue
 		}
-		if n.KindOf() != ir.KindMemStoreSMem && n.KindOf() != ir.KindFragStore {
+		if n.KindOf() != ir.KindMemStore {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageGMEM {
 			continue
 		}
 		if dst := ir.OperandsOf(n)[1]; dst != nil && dst.BasePtr() == buf.BasePtr() {
@@ -1134,25 +1193,19 @@ func findFillOf(t *testing.T, g *ir.Graph, buf ir.Node) ir.Node {
 	return fill
 }
 
-// loadtileVariantOf parses a fill store's live loadtile annotation.
-func loadtileVariantOf(t *testing.T, fill ir.Node) float64 {
+// loaderVariantOf reads a fill store's DERIVED loader variant (fix3
+// D-h: the annotation left the IR; the variant follows the storage class —
+// SMEM window = 1, the cooperative CTA loader; FRAG = 2, per-thread).
+func loaderVariantOf(t *testing.T, fill ir.Node) float64 {
 	t.Helper()
-	ops := ir.OperandsOf(fill)
-	for i := 2; i < len(ops); i++ {
-		op := ops[i]
-		if op == nil || op.KindOf() != ir.KindKeyedAttribute {
-			continue
-		}
-		if key, val := ir.KeyedAttributeOf(op); key == "loadtile" {
-			v, ok := ir.ConstValueOf(val)
-			if !ok {
-				t.Fatalf("fill %d carries a non-const loadtile value", fill.BasePtr().ID())
-			}
-			return v
-		}
+	sc, ok := ir.StorageClassOf(fill)
+	if !ok || sc == ir.StorageGMEM {
+		t.Fatalf("fill %d is not a tiered store", fill.BasePtr().ID())
 	}
-	t.Fatalf("fill %d carries no loadtile annotation", fill.BasePtr().ID())
-	return 0
+	if sc == ir.StorageSMem {
+		return 1
+	}
+	return 2
 }
 
 // TestLowerMatmulSiteSurgery pins the PHASE 4 surgery over the doc's worked
@@ -1179,8 +1232,8 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	}
 	// Buffers: lhs FRAG [T_k] = 4×32 = 128 bytes per thread; rhs SMEM
 	// window [256×T_n][T_k] = 4×256×32×32 = 1 MB (the R2 group window).
-	lbuf := findBuffer(t, fx.g, ir.KindFragNew, 128)
-	rbuf := findBuffer(t, fx.g, ir.KindMemNewSMem, 1048576)
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 128)
+	rbuf := findBuffer(t, fx.g, ir.KindMemNew, 1048576)
 	if ir.TypeOf(lbuf) == nil || ir.TypeOf(rbuf) == nil {
 		t.Fatal("buffers must carry their bound tile tensor types")
 	}
@@ -1188,13 +1241,16 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	// access is a FragLoad, rhs's a MemLoadSMem.
 	var fragAccess, smemAccess ir.Node
 	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		switch n.KindOf() {
-		case ir.KindFragLoad:
+		if n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		sc, _ := ir.StorageClassOf(n)
+		if sc == ir.StorageFrag {
 			fragAccess = n
 			if src := ir.OperandsOf(n)[0]; src.BasePtr() != lbuf.BasePtr() {
 				t.Fatalf("FRAG access node %d reads a foreign buffer %d", n.BasePtr().ID(), src.BasePtr().ID())
 			}
-		case ir.KindMemLoadSMem:
+		} else if sc == ir.StorageSMem {
 			smemAccess = n
 			if src := ir.OperandsOf(n)[0]; src.BasePtr() != rbuf.BasePtr() {
 				t.Fatalf("SMEM access node %d reads a foreign buffer %d", n.BasePtr().ID(), src.BasePtr().ID())
@@ -1219,10 +1275,10 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	}
 	// Fill variants: lhs FRAG → 2 (LoadTileThread); rhs SMEM → 1
 	// (LoadTileCta).
-	if v := loadtileVariantOf(t, findFillOf(t, fx.g, lbuf)); v != 2 {
+	if v := loaderVariantOf(t, findFillOf(t, fx.g, lbuf)); v != 2 {
 		t.Fatalf("lhs fill variant = %v, want 2 (LoadTileThread)", v)
 	}
-	if v := loadtileVariantOf(t, findFillOf(t, fx.g, rbuf)); v != 1 {
+	if v := loaderVariantOf(t, findFillOf(t, fx.g, rbuf)); v != 1 {
 		t.Fatalf("rhs fill variant = %v, want 1 (LoadTileCta)", v)
 	}
 	// Loads-only: the out store survives as a GMEM MemStore.
@@ -1234,8 +1290,8 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
 		t.Fatalf("typeinfer re-run over the lowered matmul must succeed (P8): %v", err)
 	}
-	assertReachable(t, fx.g, ir.KindMemStoreSMem, 1)
-	assertReachable(t, fx.g, ir.KindFragStore, 1)
+	assertReachable(t, fx.g, ir.KindMemStore, 1)
+	assertReachable(t, fx.g, ir.KindMemStore, 1)
 }
 
 // TestMatmulWorkedCheck pins the R1 worked example: the lhs FRAG fill sits
@@ -1251,7 +1307,7 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	p.MaxCache = 1 << 21 // fit the crafted rhs's R2 window (1 MB) — no halving
 	runLowerP(t, fx.g, rec, p)
 
-	lbuf := findBuffer(t, fx.g, ir.KindFragNew, 128)
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 128)
 	lhsFill := findFillOf(t, fx.g, lbuf)
 	src := ir.OperandsOf(lhsFill)[0] // the tile-shaped source MemLoad
 	axes := ir.OperandsOf(src)[1:]
@@ -1268,7 +1324,7 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	kBetweenIV := ir.OperandsOf(nest[2])[0]
 	mInside := nest[3]
 	fillBivs := ir.OperandsOf(lhsFill)[2:]
-	if len(fillBivs) != 2 { // covered round base + the loadtile annotation
+	if len(fillBivs) != 1 { // the covered round base (the loader annotation is gone, fix3 D-h)
 		t.Fatalf("lhs fill must carry its covered round base plus the variant annotation, got %d trailing operands", len(fillBivs))
 	}
 	if fillBivs[0].BasePtr() != kBetweenIV.BasePtr() {
@@ -1286,6 +1342,9 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	if !subtreeContains(storeOf(t, fx.g), mInsideIV) {
 		t.Fatal("the out store's operand closure must reference the M tile-inside loop's IV (out-store control)")
 	}
+	// The fix3 D-i safety net: the R-I derivation (innermost referenced
+	// loop) picks exactly the mandated position.
+	assertFillPositionDerived(t, fx.g, lhsFill, mInside)
 }
 
 // storeOf returns the graph's unique live GMEM MemStore.
@@ -1293,12 +1352,16 @@ func storeOf(t *testing.T, g *ir.Graph) ir.Node {
 	t.Helper()
 	var st ir.Node
 	for _, n := range g.AllocatedNodes() {
-		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindMemStore {
-			if st != nil {
-				t.Fatal("fixture carries more than one GMEM store")
-			}
-			st = n
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
+			continue
 		}
+		if sc, _ := ir.StorageClassOf(n); sc != ir.StorageGMEM {
+			continue // the tiered buffer stores are not GMEM stores
+		}
+		if st != nil {
+			t.Fatal("fixture carries more than one GMEM store")
+		}
+		st = n
 	}
 	if st == nil {
 		t.Fatal("fixture carries no GMEM store")
@@ -1351,7 +1414,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 		t.Fatal("the declined co-traversed load must stay GMEM")
 	}
 	// Window-shaped buffer: 4 B × (64 threads × 8) × 8 = 16384 B.
-	buf := findBuffer(t, fx.g, ir.KindMemNewSMem, 16384)
+	buf := findBuffer(t, fx.g, ir.KindMemNew, 16384)
 	ty, ok := ir.TypeOf(buf).(*ir.NumericType)
 	if !ok || ty.Rank() != 2 {
 		t.Fatalf("the rhs window buffer must be a rank-2 tensor type, got %v", ir.TypeOf(buf))
@@ -1359,7 +1422,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 	// The cooperative fill: variant 1 (LoadTileCta), at the K between-round
 	// body — CTA-uniform round bases only.
 	fill := findFillOf(t, fx.g, buf)
-	if v := loadtileVariantOf(t, fill); v != 1 {
+	if v := loaderVariantOf(t, fill); v != 1 {
 		t.Fatalf("rhs fill variant = %v, want 1 (LoadTileCta)", v)
 	}
 	src := ir.OperandsOf(fill)[0]
@@ -1377,7 +1440,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 	kBetweenIV := ir.OperandsOf(kBetween)[0]
 	// The covered round bases ride the fill's trailing bivs: N and K
 	// between dimvars (uniform), plus the annotation.
-	bases := ir.OperandsOf(fill)[2 : len(ir.OperandsOf(fill))-1]
+	bases := ir.OperandsOf(fill)[2:]
 	if len(bases) != 2 || bases[0].BasePtr() != nBetweenIV.BasePtr() || bases[1].BasePtr() != kBetweenIV.BasePtr() {
 		t.Fatalf("the rhs fill's round bases must be the N,K between dimvars, got %v", bases)
 	}
@@ -1394,17 +1457,23 @@ func TestLowerSMEMWindow(t *testing.T) {
 			t.Fatalf("a cooperative fill's operand closure must never reference element loop %d's IV (§4 layering)", l.BasePtr().ID())
 		}
 	}
+	// The fix3 D-i safety net: the R-I derivation picks exactly the
+	// mandated position (innermost covered dim's between round).
+	assertFillPositionDerived(t, fx.g, fill, kBetween)
 	// The access: N coordinate = thread_map.index(N's slot)·T + i with the
 	// N dim's OWN ThreadMap slot (1, not the hardcoded 0), K coordinate =
 	// the plain inside walk.
 	var access ir.Node
 	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() == ir.KindMemLoadSMem {
+		if n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageSMem {
 			access = n
 		}
 	}
 	if access == nil {
-		t.Fatal("the store's value must read the window buffer through a MemLoadSMem access")
+		t.Fatal("the store's value must read the window buffer through an SMEM-class access")
 	}
 	coords := ir.OperandsOf(access)[1:]
 	if len(coords) != 2 {
@@ -1462,17 +1531,19 @@ func TestLowerDefaultShapeDecline(t *testing.T) {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 			continue
 		}
-		switch n.KindOf() {
-		case ir.KindMemNewSMem, ir.KindMemStoreSMem, ir.KindMemLoadSMem:
-			t.Fatalf("a dropped-SMEM kernel must carry no SMEM nodes; found %s node %d", n.KindOf(), n.BasePtr().ID())
+		if sc, ok := ir.StorageClassOf(n); ok && sc == ir.StorageSMem {
+			t.Fatalf("a dropped-SMEM kernel must carry no SMEM-class nodes; found %s node %d", n.KindOf(), n.BasePtr().ID())
 		}
 	}
-	findBuffer(t, fx.g, ir.KindFragNew, 8) // lhs at the shared K floor tile 2
+	findBuffer(t, fx.g, ir.KindMemNew, 8) // lhs at the shared K floor tile 2
 	// The store's value still reads the ORIGINAL rhs load (untouched GMEM);
 	// the lhs is served from the FRAG buffer.
 	liveLoads := 0
 	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() == ir.KindMemLoad {
+		if n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageGMEM {
 			liveLoads++
 		}
 	}
@@ -1512,7 +1583,7 @@ func TestLowerBodyRootIsLoad(t *testing.T) {
 	if lhs1.BasePtr().Erased() {
 		t.Fatal("the declined load must stay GMEM")
 	}
-	buf := findBuffer(t, fx.g, ir.KindFragNew, 128) // 4 B × T_k(32)
+	buf := findBuffer(t, fx.g, ir.KindMemNew, 128) // 4 B × T_k(32)
 	fill := findFillOf(t, fx.g, buf)
 	// Sea-of-nodes (fix1.md §0): no loop carries an expression operand — the
 	// deleted HI-02 shape (a fill hanging off a loop) is unrepresentable.
@@ -1534,7 +1605,7 @@ func TestLowerBodyRootIsLoad(t *testing.T) {
 	// standard splice: the promoted load's uses moved onto the access).
 	var access ir.Node
 	for _, n := range fx.g.AllocatedNodes() {
-		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindFragLoad {
+		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindMemLoad {
 			access = n
 		}
 	}
@@ -1556,6 +1627,9 @@ func TestLowerBodyRootIsLoad(t *testing.T) {
 	if subtreeContains(fill, kInsideIV) || subtreeContains(fill, ir.OperandsOf(nest[2])[0]) {
 		t.Fatal("the fill's operand closure must reference no inside loop's IV (§4 layering)")
 	}
+	// The fix3 D-i safety net: the R-I derivation picks exactly the
+	// mandated position (the degenerate fallback: no above-tie INS dim).
+	assertFillPositionDerived(t, fx.g, fill, nest[1])
 	if vs := ir.Verify(fx.g); len(vs) != 0 {
 		t.Fatalf("verifier must report zero violations, got %v", vs)
 	}
@@ -1601,8 +1675,8 @@ func TestBudgetFallback(t *testing.T) {
 	if !lhs2.BasePtr().Erased() || !rhs2.BasePtr().Erased() {
 		t.Fatal("both sites must stay promoted after halving under a 4104-byte budget")
 	}
-	findBuffer(t, fx2.g, ir.KindFragNew, 8)       // lhs at T_k = 2
-	findBuffer(t, fx2.g, ir.KindMemNewSMem, 4096) // rhs at window (2,2)
+	findBuffer(t, fx2.g, ir.KindMemNew, 8)    // lhs at T_k = 2
+	findBuffer(t, fx2.g, ir.KindMemNew, 4096) // rhs at window (2,2)
 	assertVerifyAndRootReachable(t, fx2.g)
 
 	// F4 floor drop: a 24-byte budget can never fit the WARP window (>=
@@ -1630,7 +1704,7 @@ func TestBudgetFallback(t *testing.T) {
 	if !lhs2b.BasePtr().Erased() {
 		t.Fatal("the lhs FRAG site must stay promoted at the floor tile 2 (8 B; the tile-1 shared-K drag is gone)")
 	}
-	findBuffer(t, fx2b.g, ir.KindFragNew, 8)
+	findBuffer(t, fx2b.g, ir.KindMemNew, 8)
 	assertVerifyAndRootReachable(t, fx2b.g)
 
 	// Budget of 1: the SMEM site drops; the FRAG site survives at the
@@ -1761,17 +1835,17 @@ func TestSelfCheckInjections(t *testing.T) {
 		}
 	})
 
-	t.Run("fill without loadtile annotation", func(t *testing.T) {
+	t.Run("fill without its derivation facts", func(t *testing.T) {
 		g := ir.NewGraph("inj-attr")
 		u32 := ir.InternScalar(ir.TU32)
-		dim := g.NewInputParam("ctor", ir.RoleDim, "d", nil)
-		ivn := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
 		buf := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
-		src := g.NewMemLoad("ctor", tensorParam(g, "t", 1), []ir.Node{ivn})
-		fill := g.NewMemStoreSMem("ctor", src, buf) // NO trailing annotation
-		lr := &lowerRun{g: g, fills: []*siteFill{{siteID: 8, src: src, store: fill}}}
-		if err := lr.checkNoBarriers(); err == nil || !strings.Contains(err.Error(), "loadtile") {
-			t.Fatalf("a fill without a live loadtile annotation must trip the barrier check, got %v", err)
+		// fix3 D-h: the derivation facts are the tiered class + the GMEM
+		// tile-load source — inject a fill whose value is NOT a load (the
+		// annotation-era injection equivalent).
+		fill := g.NewMemStoreSMem("ctor", g.NewConst("ctor", u32, 0), buf)
+		lr := &lowerRun{g: g, fills: []*siteFill{{siteID: 8, store: fill}}}
+		if err := lr.checkNoBarriers(); err == nil || !strings.Contains(err.Error(), "stores no GMEM tile load") {
+			t.Fatalf("a fill without its derivation facts must trip the barrier check, got %v", err)
 		}
 	})
 
@@ -1915,12 +1989,12 @@ func TestDecideLowerComposition(t *testing.T) {
 	if rhs.BasePtr().Erased() {
 		t.Fatal("the declined rhs load must stay GMEM (untouched)")
 	}
-	buf := findBuffer(t, fx.g, ir.KindFragNew, 4*64)
+	buf := findBuffer(t, fx.g, ir.KindMemNew, 4*64)
 	fill := findFillOf(t, fx.g, buf)
-	if v := loadtileVariantOf(t, fill); v != 2 {
+	if v := loaderVariantOf(t, fill); v != 2 {
 		t.Fatalf("the real-record fragment fill variant = %v, want 2 (LoadTileThread)", v)
 	}
-	bases := ir.OperandsOf(fill)[2 : len(ir.OperandsOf(fill))-1]
+	bases := ir.OperandsOf(fill)[2:]
 	if len(bases) != 1 {
 		t.Fatalf("the lhs fill must ride exactly its covered round base, got %d", len(bases))
 	}
@@ -1934,7 +2008,7 @@ func TestDecideLowerComposition(t *testing.T) {
 	}
 	var access ir.Node
 	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() == ir.KindFragLoad {
+		if n.KindOf() == ir.KindMemLoad {
 			access = n
 		}
 	}
@@ -1957,7 +2031,7 @@ func TestDecideLowerComposition(t *testing.T) {
 // decide→verify→lower triple over the matmul worked example with the REAL
 // searched record, followed by Materialize + Print, renders byte-exactly —
 // the first golden covering a tile-lowered print (the fill store with its
-// loadtile annotation suffix, the window buffer, the lowered index
+// loader-annotation suffix, the window buffer, the lowered index
 // expressions on the surviving GMEM store, the declined rhs's GMEM load).
 //
 // ⚠ DEFERRED CONTRACT, deliberate (261021-o61 T3/T5): Materialize schedules

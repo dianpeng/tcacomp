@@ -192,8 +192,12 @@ func (r *scheduleRun) anchorSchedule() {
 			// Placeholders to known states, NOT statements (e2u D-1): a
 			// MemNew's extent dep at SN 0 must not lift it out of the
 			// signature scope; a -1 dep contributes nothing to the max.
-			// MemNewSMem/FragNew are in-kernel declarations (D-4) and stay
-			// scheduled; extent consts are values and stay scheduled.
+			// Only the GMEM CLASS anchors here (fix3 D-h): the tiered
+			// allocations (SMEM/FRAG) are in-kernel declarations (D-4) and
+			// stay scheduled; extent consts are values and stay scheduled.
+			if sc, _ := ir.StorageClassOf(n); sc != ir.StorageGMEM {
+				continue
+			}
 			r.anchor(n, ir.PrototypeSN)
 			r.prototype.AppendItem(ir.ASTItem{Node: n})
 			n.BasePtr().SetSched(ir.PrototypeSN, r.prototype)
@@ -641,13 +645,20 @@ func (r *scheduleRun) placeEpilogue(root *forNest, epilogue *ir.ASTBlock) error 
 func (r *scheduleRun) newKernel() *ir.ASTKernel {
 	var gmem []ir.ASTGmemAlloc
 	for _, n := range r.nodes {
-		if r.live[n] && n.KindOf() == ir.KindMemNew {
-			var extent ir.Node
-			if ops := ir.OperandsOf(n); len(ops) > 0 {
-				extent = ops[0]
-			}
-			gmem = append(gmem, ir.ASTGmemAlloc{New: n, Extent: extent})
+		if !r.live[n] || n.KindOf() != ir.KindMemNew {
+			continue
 		}
+		// fix3 D-h: only the GMEM CLASS is a kernel-level temporary; the
+		// tiered allocations (SMEM pool rows, FRAG tiles) are buffer
+		// material with their own emission paths.
+		if sc, _ := ir.StorageClassOf(n); sc != ir.StorageGMEM {
+			continue
+		}
+		var extent ir.Node
+		if ops := ir.OperandsOf(n); len(ops) > 0 {
+			extent = ops[0]
+		}
+		gmem = append(gmem, ir.ASTGmemAlloc{New: n, Extent: extent})
 	}
 	return &ir.ASTKernel{
 		Prototype: r.prototype,

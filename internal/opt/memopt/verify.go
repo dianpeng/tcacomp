@@ -85,7 +85,7 @@ func (VerifyPass) Run(_ *opt.Context, g *ir.Graph) error {
 	// on every live GMEM access regardless of eligibility (a killed record
 	// lingering in a skipped region's bearer is corruption too).
 	for _, n := range g.AllocatedNodes() {
-		if !isGMEMAccess(n.KindOf()) {
+		if !isGMEMAccess(n) {
 			continue
 		}
 		for _, e := range ir.ImpactBy(n) {

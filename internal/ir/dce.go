@@ -133,7 +133,7 @@ func markReachable(g *Graph) map[Node]bool {
 // dead-code-eligible when unreferenced.
 func isEffectKind(k Kind) bool {
 	switch k {
-	case KindMemStore, KindMemStoreSMem, KindFragStore, KindReturn:
+	case KindMemStore, KindReturn:
 		return true
 	}
 	return false

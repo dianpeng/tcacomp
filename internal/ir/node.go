@@ -330,18 +330,6 @@ func (g *Graph) allocNode(k Kind, origin string, nSlots int) nodeImpl {
 		n = &dimVarNode{Base: b}
 	case KindBoundedDimVar:
 		n = &boundedDimVarNode{Base: b}
-	case KindMemLoadSMem:
-		n = &memLoadSMemNode{Base: b}
-	case KindMemStoreSMem:
-		n = &memStoreSMemNode{Base: b}
-	case KindMemNewSMem:
-		n = &memNewSMemNode{Base: b}
-	case KindFragLoad:
-		n = &fragLoadNode{Base: b}
-	case KindFragStore:
-		n = &fragStoreNode{Base: b}
-	case KindFragNew:
-		n = &fragNewNode{Base: b}
 	case KindForLoop:
 		n = &forLoopNode{Base: b}
 	case KindIterClusterProject:

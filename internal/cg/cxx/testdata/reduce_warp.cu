@@ -26,14 +26,19 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
     auto c0 = 1024u;
     auto c1 = 512u;
     auto c2 = 0.0f;
+    auto c3 = 0u;
     auto v0 = grid_map0.index(0u);
-    auto c3 = 32u;
-    auto v1 = (v0 * c3);
+    auto c4 = 32u;
+    auto v1 = (v0 * c4);
+    auto c5 = 32u;
+    auto c6 = 1u;
     auto v2 = thread_map1.index(1u);
-    auto c4 = 64u;
-    auto v3 = (v2 * c4);
+    auto c7 = 64u;
+    auto v3 = (v2 * c7);
+    auto c8 = 0u;
     auto v4 = thread_map1.index(0u);
     auto v5 = (v4 * c1);
+    auto c9 = 64u;
     // warp reduction — the combiner is runtime-owned; per-element brackets [Init → reduced-dim walks (Reduce(value)) → Combine]
     tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0, thread_map1, tca::rt::SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem + 0u), 16u));
     // @d0 tile-between rounds — CTA, T=32, LoC=100 (map dim 0)
@@ -41,7 +46,7 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
       auto v6 = (v1 + d0_it0.Index());
       auto v7 = tca::rt::umin(v6, c0);
       auto v8 = (c0 - v7);
-      auto v9 = tca::rt::umin(c3, v8);
+      auto v9 = tca::rt::umin(c5, v8);
       // @d0 walk — sequential, LoC=1
       for (auto d0_it1 = tca::rt::SeqIterator(0u, 1u, v9); d0_it1.Has(); d0_it1.Next()) {
         // per-element bracket opens (argument-free; re-initializes from the construction-time init)
@@ -52,7 +57,7 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
           auto v11 = (v10 + v5);
           auto v12 = tca::rt::umin(v11, c1);
           auto v13 = (c1 - v12);
-          auto v14 = tca::rt::umin(c4, v13);
+          auto v14 = tca::rt::umin(c9, v13);
           // @d1 inside walk (tile elements) — T=64
           for (auto d1_it3 = tca::rt::SeqIterator(0u, 1u, v14); d1_it3.Has(); d1_it3.Next()) {
             auto v15 = (v11 + d1_it3.Index());

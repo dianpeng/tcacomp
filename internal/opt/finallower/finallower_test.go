@@ -743,8 +743,8 @@ func TestReducerBracketPlacement(t *testing.T) {
 	if ops[2].KindOf() != ir.KindRuntimeThreadMapping {
 		t.Fatalf("operand 2 must be the owning LNT's ThreadMapping (R2), got %s", ops[2].KindOf())
 	}
-	if ops[3].KindOf() != ir.KindMemNewSMem {
-		t.Fatalf("operand 3 must be the staging KindMemNewSMem (R1), got %s", ops[3].KindOf())
+	if sc, _ := ir.StorageClassOf(ops[3]); ops[3].KindOf() != ir.KindMemNew || sc != ir.StorageSMem {
+		t.Fatalf("operand 3 must be the staging SMEM-class MemNew (R1), got %s", ops[3].KindOf())
 	}
 	staging := ops[3]
 	if v, ok := ir.ConstValueOf(ir.OperandsOf(staging)[0]); !ok || v != 64 {
@@ -768,17 +768,19 @@ func TestReducerBracketPlacement(t *testing.T) {
 		t.Fatal("exactly one Init, one Reduce, and one Combine call must exist")
 	}
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the element loop block, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the element loop block, got index %d", initIdx)
 	}
+	// fix3 D-j: items RE-PLACED from the dissolved between blocks may precede
+	// Init (in order, at the block head); nothing else may.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the element bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
 	items := elemBlk.Items()
-	if len(items) < 3 || items[1].Block == nil || items[1].Block.Loop().BasePtr() != X.BasePtr() {
+	if len(items) < initIdx+3 || items[initIdx+1].Block == nil || items[initIdx+1].Block.Loop().BasePtr() != X.BasePtr() {
 		t.Fatal("X's block must be the item right after Init inside the element loop")
 	}
-	if items[2].Node == nil || items[2].Node.BasePtr() != combineCall.BasePtr() {
+	if items[initIdx+2].Node == nil || items[initIdx+2].Node.BasePtr() != combineCall.BasePtr() {
 		t.Fatal("Combine must sit immediately after X's block inside the element loop")
 	}
 	// The element loop: same dim and same bound expression as the DISSOLVED
@@ -1143,6 +1145,9 @@ func TestConstLiteralDedup(t *testing.T) {
 	rx := newRedFx(t, false, false)
 	runRedFx(t, rx)
 	g := rx.f.g
+	// fix3 D-o: the dedup left final-lower (a lower never optimizes) — the
+	// pipeline's TAIL owns it now, ahead of its dce instance.
+	runTail(t, g)
 
 	type key struct {
 		ty   *ir.NumericType
@@ -1345,9 +1350,11 @@ func TestReducerBracketMultiBetween(t *testing.T) {
 
 	// The innermost element block: Init's containing block under R-A.
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the INNERMOST element loop, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the INNERMOST element loop, got index %d", initIdx)
 	}
+	// fix3 D-j: re-placed between items may precede Init; nothing between
+	// Init and X's block.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
@@ -1467,9 +1474,11 @@ func TestReducerBracketMinTile(t *testing.T) {
 	}
 	// The single fresh element block: Init's containing block under R-A.
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the element loop, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the element loop, got index %d", initIdx)
 	}
+	// fix3 D-j: re-placed between items may precede Init; nothing between
+	// Init and X's block.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
@@ -1522,3 +1531,74 @@ func TestReducerBracketMinTile(t *testing.T) {
 // the single form it guarded no longer exists, and its gate
 // (refuseThreadPartitionedConsumers + warpSingleIVs) was removed from
 // reducer.go with the T==1 machinery.
+
+// ---------------------------------------------------------------------------
+// fix3 D-p battery: the reduce anchor (final-lower's final gate)
+// ---------------------------------------------------------------------------
+
+// newSeveredRedFx builds the HAND-SEVERED tiled-reduce fixture (fix3 D-p
+// battery negative (b)): identical to newRedFx except the piped Map's
+// producer is a loop-INVARIANT const. The lhs load still happens (chained
+// through the same env — the effect chain and every structural invariant
+// stay intact), but nothing in the Reduce's DATA closure references memory
+// anymore: the 2026-10-24 "Combine returns the init, every output is 0"
+// wall class, severed by hand at the exact edge the anchor exists to name.
+func newSeveredRedFx(t *testing.T) *redFx {
+	t.Helper()
+	f := newChain("redsev", 1024, 512)
+	lhs := f.tensor("lhs", 0, 1)
+	out := f.tensor("out", 0)
+	env := ir.NewEnv()
+	// The severing: the piped producer is a pure REGISTER expression over
+	// the home IVs — structurally sound (it references the loop IVs, so it
+	// lowers inside home and passes every bracket-law check) but it reads
+	// NO memory. The lhs load still happens and stays chained into the
+	// epilogue consumer only: a memory access exists in the kernel, even
+	// effect-chained, yet the Reduce's DATA closure reaches none of it —
+	// the anchor must not count it (liveness never crosses chain edges).
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1)})
+	konst := f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 1)
+	prod := f.g.NewBinOp("ctor", ir.BinOpAdd,
+		f.g.NewCast("ctor", ir.InternScalar(ir.TF32), f.iv(0)),
+		f.g.NewBinOp("ctor", ir.BinOpAdd,
+			f.g.NewCast("ctor", ir.InternScalar(ir.TF32), f.iv(1)), konst))
+	mp := f.g.NewMap("ctor", []ir.Node{prod}, ir.NewLambda(nil, prod), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	init := f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0)
+	red := f.g.NewReduce("ctor", init, mp, ir.NewLambda([]ir.Node{acc, now}, comb))
+	lambda := ir.LambdaOf(red)
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0)}, red)
+	// A poison-style epilogue consumer (the newRedFx knob's pattern) keeps
+	// both iteration chains sea-reachable — WITHOUT entering the Reduce's
+	// value closure: the severing stays surgical.
+	kf32 := f.g.NewCast("ctor", ir.InternScalar(ir.TF32), f.iv(1))
+	keepAlive := f.g.NewBinOp("ctor", ir.BinOpAdd, kf32, load)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store, keepAlive)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	return &redFx{f: f, load: load, mp: mp, red: red, init: init, lambda: lambda, store: store}
+}
+
+// TestReduceAnchorSeveredChainFailsClosed pins fix3 D-p battery negative
+// (b): the anchor fires ON THE LOWERING — a Reduce whose value closure
+// reaches no memory access fails final-lower with its named error, never
+// at numerical acceptance. The tile-lower → schedule prefix must still
+// run clean (the severing is type-legal and chain-legal; only the
+// anchor's semantic predicate rejects it).
+func TestReduceAnchorSeveredChainFailsClosed(t *testing.T) {
+	sx := newSeveredRedFx(t)
+	cache := runTileLowerSchedule(t, sx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+	})
+	err := runFinalLower(t, sx.f.g, cache)
+	if err == nil {
+		t.Fatal("final-lower must fail closed on the hand-severed Reduce chain — the anchor's named error — got nil")
+	}
+	if !strings.Contains(err.Error(), "reduce anchor") {
+		t.Fatalf("want the reduce-anchor error on the severed chain, got: %v", err)
+	}
+}

@@ -18,7 +18,7 @@ package finallower
 //	(2.1) homogeneity (LR-8) + the specialized construction (LR-7: Soc
 //	     0→Sequential over (init, lambda); 2→Warp / 1→Global over (init,
 //	     lambda, ThreadMapping, staging) per R1/R2): the WARP/GLOBAL
-//	     constructions additionally allocate a staging KindMemNewSMem — one
+//	     constructions additionally allocate a staging SMEM-class MemNew — one
 //	     #warps × sizeof(T) row in the compiler's dynamic-SMEM pool at a
 //	     disjoint D8 offset — inserted with the construction at the head
 //	     end of the OWNING LNT's prologue Group (before the embedded root
@@ -339,6 +339,7 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// len(betweenBlks)==1 elemBlk == outermostBlk — the committed
 	// 1-between-dim golden shape is bit-identical.
 	freshIVs := make([]ir.Node, len(betweenBlks))
+	freshBlks := make([]*ir.ASTBlock, len(betweenBlks))
 	var outermostBlk, elemBlk *ir.ASTBlock
 	for i := len(betweenBlks) - 1; i >= 0; i-- {
 		dimParam := ir.OperandsOf(betweenIVs[i])[0]
@@ -365,17 +366,64 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		}
 		outermostBlk = blk
 		freshIVs[i] = freshIV
+		freshBlks[i] = blk
 	}
 	// elemDepth is the INNERMOST element loop's depth (one level per between
 	// dim below X's original parental scope) — the depth the bracket items
 	// are stamped at.
 	elemDepth := lr.scopeDepth(parentBlk) + len(betweenBlks)
 
+	// D-j (fix3, R-I — completes fix2's blocked D-c): the between blocks'
+	// Node items are RE-PLACED by OPERAND SCOPE, never discarded. Capture
+	// them BEFORE the dissolve unlinks the blocks. Classification: an item
+	// whose operand closure references X's OWN IV (a SURVIVING loop that
+	// moves inside the element loops — per-round effectful items, the
+	// frontend trigger's fill) re-places INSIDE X, immediately before home
+	// (the innermost block dominated by that loop, still preceding its
+	// memory successors — the per-round epoch count is preserved); every
+	// other item (whose foreign coordinates are all between-IV-derived —
+	// the source loads, the coordinate binops) re-places into ITS OWN
+	// fresh element loop's item list, in order. fix2 D-c's block-relative
+	// "re-place into L's item list, in order" is superseded by this scope
+	// rule. The rebuild of every re-placed item runs AFTER the walk's and
+	// the moved consumers' rebuilds (the pinned order — an earlier rebuild
+	// emits an extra local and drifts the golden; fix2 SUMMARY Deviation 4).
+	xIV := ir.OperandsOf(x)[0]
+	betweenItems := make([][]ir.Node, len(betweenBlks))
+	var xScoped []ir.Node
+	for i, b := range betweenBlks {
+		for _, it := range b.Items() {
+			if it.Node == nil {
+				continue
+			}
+			if operandClosure(it.Node)[xIV] {
+				xScoped = append(xScoped, it.Node)
+				continue
+			}
+			betweenItems[i] = append(betweenItems[i], it.Node)
+		}
+	}
+	// The scope-scoped (X-class) items re-place inside X AFTER the walk
+	// rebuild below (so the walk never covers them); the fresh-loop items
+	// insert now, in order at their block's head, ahead of the nested
+	// chain block / Init.
+	var rePlaced []ir.Node
+	for i, items := range betweenItems {
+		blk := freshBlks[i]
+		for j, n := range items {
+			if err := blk.InsertItemAt(j, ir.ASTItem{Node: n}); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: re-placing a between item into its element loop: %w", red.BasePtr().ID(), err)
+			}
+			n.BasePtr().SetSched(lr.scopeDepth(parentBlk)+1+i, blk)
+			rePlaced = append(rePlaced, n)
+		}
+	}
+
 	// Init: the FIRST item of the innermost element loop — the per-element
 	// bracket opens here, immediately before X's block (R-A: X is appended
 	// right after, nothing sits between).
 	initCall := lr.g.NewRuntimeCallMethod(lowerOrigin, "Init", construction)
-	if err := elemBlk.InsertItemAt(0, ir.ASTItem{Node: initCall}); err != nil {
+	if err := elemBlk.InsertItemAt(len(betweenItems[len(betweenItems)-1]), ir.ASTItem{Node: initCall}); err != nil {
 		return fmt.Errorf("final-lower: reduce node %d: inserting Init into the element loop: %w", red.BasePtr().ID(), err)
 	}
 	initCall.BasePtr().SetSched(elemDepth, elemBlk)
@@ -455,6 +503,42 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	}
 	if err := rebuildWalk(xBlk); err != nil {
 		return err
+	}
+
+	// D-j, the scope-scoped half: items whose operand closure references
+	// X's own IV re-place INSIDE X, immediately BEFORE home — the innermost
+	// block dominated by that surviving loop, still preceding the memory
+	// successors (each read of the item's buffer must sit inside home's
+	// subtree; anything else is an uncovered shape and fails closed, R-D).
+	// Inserted AFTER the walk rebuild so the walk never covers them; the
+	// re-placed items' own rebuild runs after the consumers' (below).
+	if len(xScoped) > 0 {
+		homeIdx := -1
+		for i, it := range xBlk.Items() {
+			if it.Block == homeBlk {
+				homeIdx = i
+				break
+			}
+		}
+		if homeIdx < 0 {
+			return fmt.Errorf("final-lower: reduce node %d: the home block is not an item of X's block after the restructure (corrupted bracket?)", red.BasePtr().ID())
+		}
+		xDepth := lr.scopeDepth(xBlk)
+		for j, n := range xScoped {
+			if err := xBlk.InsertItemAt(homeIdx+j, ir.ASTItem{Node: n}); err != nil {
+				return fmt.Errorf("final-lower: reduce node %d: re-placing a scope-constrained item inside X: %w", red.BasePtr().ID(), err)
+			}
+			n.BasePtr().SetSched(xDepth, xBlk)
+			rePlaced = append(rePlaced, n)
+			// A re-placed FILL additionally keeps its per-round epoch
+			// contract only if every buffer read follows it: assert the
+			// reads sit inside home's subtree.
+			if sc, ok := ir.StorageClassOf(n); ok && sc != ir.StorageGMEM && n.KindOf() == ir.KindMemStore {
+				if err := lr.assertFillReadsInside(red, n, homeBlk); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	// The orphan guard + disposal. Since quick-261024-sdk removed the body
@@ -557,6 +641,50 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// zero-between degenerate).
 	if err := lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, elemBlk, elemDepth, subs); err != nil {
 		return err
+	}
+
+	// D-j's PINNED rebuild order: the re-placed items' between-IV rebuild
+	// runs LAST — after the walk's and the moved consumers' rebuilds (fix2
+	// SUMMARY Deviation 4: an earlier rebuild of a re-placed pure item makes
+	// the consumers keep referencing it, emitting an extra local and
+	// drifting the golden; rebuilt last, a pure re-placed item whose
+	// consumers read rebuilt clones ends user-free and the emitter's
+	// unreferenced-pure-item skip elides it).
+	for _, n := range rePlaced {
+		if err := lr.rebuildOperands(n, subs); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: rebuilding a re-placed item's between-dim coordinates: %w", red.BasePtr().ID(), err)
+		}
+	}
+	return nil
+}
+
+// assertFillReadsInside fail-closes the D-j scope rule's memory-successor
+// clause (R-D, fix3 §5): a fill re-placed inside X must still precede every
+// read of its buffer — each live tiered load on the buffer must sit inside
+// home's subtree (strictly after the fill's position). A read that would
+// land outside X (e.g. re-placed into an element loop ABOVE the bracket)
+// is an uncovered shape: the lower never improvises a placement for it.
+func (lr *lowering) assertFillReadsInside(red, fill ir.Node, homeBlk *ir.ASTBlock) error {
+	buf := ir.OperandsOf(fill)[1]
+	if buf == nil {
+		return nil
+	}
+	for _, n := range lr.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageGMEM {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 || ops[0] == nil || ops[0].BasePtr() != buf.BasePtr() {
+			continue
+		}
+		blk := n.BasePtr().SchedBlock()
+		if blk == nil || findSubBlock(homeBlk, blk) == nil {
+			return fmt.Errorf("final-lower: reduce node %d: the re-placed fill (node %d) has a buffer read (node %d) outside the home loop — the scope-derived position would not precede it (R-D: uncovered shape, needs a ruling)",
+				red.BasePtr().ID(), fill.BasePtr().ID(), n.BasePtr().ID())
+		}
 	}
 	return nil
 }

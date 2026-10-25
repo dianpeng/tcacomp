@@ -5,57 +5,56 @@ import (
 	"testing"
 )
 
-// TestLIRMemoryVerifyShapes pins the fail-closed shape checks of the LIR
-// memory family (D-3): SMEM accesses bind a MemNewSMem buffer, FRAG accesses
-// bind a FragNew buffer.
+// TestLIRMemoryVerifyShapes pins the fail-closed shape checks of the tiered
+// memory verbs (fix3 D-h): SMEM-class accesses bind an SMEM-class MemNew
+// buffer, FRAG-class accesses bind a FRAG-class MemNew buffer.
 func TestLIRMemoryVerifyShapes(t *testing.T) {
 	f32 := InternScalar(TF32)
 
-	t.Run("memloadsmem rejects non-smem src", func(t *testing.T) {
+	t.Run("smem-class load rejects non-smem src", func(t *testing.T) {
 		g := NewGraph("s2")
 		x := g.NewDimVar("ctor", g.NewInputParam("ctor", RoleDim, "x", nil),
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		lt := g.NewMemLoadSMem("ctor", g.NewConst("ctor", f32, 0), bx)
 		g.NewReturn("ctor", lt)
-		assertViolation(t, g, "smem buffer operand must be a MemNewSMem node")
+		assertViolation(t, g, "smem buffer operand must be an SMEM-class MemNew node")
 	})
 
-	t.Run("memstoresmem rejects non-smem dst", func(t *testing.T) {
+	t.Run("smem-class store rejects non-smem dst", func(t *testing.T) {
 		g := NewGraph("s3")
 		x := g.NewDimVar("ctor", g.NewInputParam("ctor", RoleDim, "x", nil),
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		st := g.NewMemStoreSMem("ctor", g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 0), bx)
 		g.NewReturn("ctor", st)
-		assertViolation(t, g, "smem buffer operand must be a MemNewSMem node")
+		assertViolation(t, g, "smem buffer operand must be an SMEM-class MemNew node")
 	})
 
-	t.Run("fragload rejects non-frag src", func(t *testing.T) {
+	t.Run("frag-class load rejects non-frag src", func(t *testing.T) {
 		g := NewGraph("s5")
 		x := g.NewDimVar("ctor", g.NewInputParam("ctor", RoleDim, "x", nil),
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		fl := g.NewFragLoad("ctor", g.NewConst("ctor", f32, 0), bx)
 		g.NewReturn("ctor", fl)
-		assertViolation(t, g, "frag buffer operand must be a FragNew node")
+		assertViolation(t, g, "frag buffer operand must be a FRAG-class MemNew node")
 	})
 
-	t.Run("fragstore rejects non-frag dst", func(t *testing.T) {
+	t.Run("frag-class store rejects non-frag dst", func(t *testing.T) {
 		g := NewGraph("s6")
 		x := g.NewDimVar("ctor", g.NewInputParam("ctor", RoleDim, "x", nil),
 			g.NewConst("ctor", f32, 0), g.NewConst("ctor", f32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", f32, 64))
 		st := g.NewFragStore("ctor", g.NewConst("ctor", f32, 1), g.NewConst("ctor", f32, 0), bx)
 		g.NewReturn("ctor", st)
-		assertViolation(t, g, "frag buffer operand must be a FragNew node")
+		assertViolation(t, g, "frag buffer operand must be a FRAG-class MemNew node")
 	})
 }
 
-// TestLIRStoreAnnotations pins the LIR fill-store annotation convention
-// (LO-01, quick-261021-o61 T5): a MemStoreSMem/FragStore's trailing
-// KeyedAttribute operands (tile-lower's loadtile loader-selection variant)
-// render as the DISTINCT attribute suffix `[key=value]` — never through the
+// TestLIRStoreAnnotations pins the tiered store annotation convention
+// (LO-01, quick-261021-o61 T5): an SMEM/FRAG-class MemStore's trailing
+// KeyedAttribute operands render as the DISTINCT attribute suffix `[key=value]` — never through the
 // keyedattribute value spelling that would read as a coordinate subscript —
 // and the verifier pins them well-formed: at most one per key, each with a
 // const value.
@@ -68,7 +67,7 @@ func TestLIRStoreAnnotations(t *testing.T) {
 		x := g.NewDimVar("ctor", dx, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
 		smem := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
-		attr := g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 1))
+		attr := g.NewKeyedAttribute("ctor", "note", g.NewConst("ctor", u32, 1))
 		sts := g.NewMemStoreSMem("ctor", g.NewConst("ctor", u32, 0), smem, bx, attr)
 		g.NewReturn("ctor", sts)
 		if vs := Verify(g); len(vs) != 0 {
@@ -78,7 +77,7 @@ func TestLIRStoreAnnotations(t *testing.T) {
 			t.Fatalf("Materialize: %v", err)
 		}
 		p := Print(g)
-		if !strings.Contains(p, "[@x/64][loadtile=1]") {
+		if !strings.Contains(p, "[@x/64][note=1]") {
 			t.Errorf("the annotation must render as the distinct attribute suffix after the coordinates:\n%s", p)
 		}
 		if strings.Contains(p, "keyedattribute(") {
@@ -93,8 +92,8 @@ func TestLIRStoreAnnotations(t *testing.T) {
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
 		frag := g.NewFragNew("ctor", g.NewConst("ctor", u32, 64))
 		fst := g.NewFragStore("ctor", g.NewConst("ctor", u32, 0), frag, bx,
-			g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 2)),
-			g.NewKeyedAttribute("ctor", "loadtile", g.NewConst("ctor", u32, 1)))
+			g.NewKeyedAttribute("ctor", "note", g.NewConst("ctor", u32, 2)),
+			g.NewKeyedAttribute("ctor", "note", g.NewConst("ctor", u32, 1)))
 		g.NewReturn("ctor", fst)
 		assertViolation(t, g, "repeats KeyedAttribute key")
 	})
@@ -106,9 +105,9 @@ func TestLIRStoreAnnotations(t *testing.T) {
 		bx := g.NewBoundedDimVar("ctor", x, g.NewConst("ctor", u32, 64))
 		smem := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
 		sts := g.NewMemStoreSMem("ctor", g.NewConst("ctor", u32, 0), smem, bx,
-			g.NewKeyedAttribute("ctor", "loadtile", x)) // a dimvar, not a const
+			g.NewKeyedAttribute("ctor", "note", x)) // a dimvar, not a const
 		g.NewReturn("ctor", sts)
-		assertViolation(t, g, `trailing KeyedAttribute "loadtile" must carry a const value`)
+		assertViolation(t, g, `trailing KeyedAttribute "note" must carry a const value`)
 	})
 }
 
@@ -165,14 +164,14 @@ func TestLIRMemoryShapesVerifyClean(t *testing.T) {
 			t.Errorf("StorageClassOf(%s) = %v, %v; want %v, true", n.KindOf(), got, ok, want)
 		}
 	}
-	if _, ok := StorageClassOf(st); ok {
-		t.Error("HIR GMEM nodes carry no StorageClass metadata")
+	if sc, ok := StorageClassOf(st); !ok || sc != StorageGMEM {
+		t.Errorf("StorageClassOf(GMEM store) = %v, %v; want gmem, true", sc, ok)
 	}
 
 	p := Print(g)
 	for _, want := range []string{
-		"memstoresmem(%2[@x/64.0], %1)",
-		"fragstore(%12[@x/64.0], %11)",
+		"memstore[smem](%2[@x/64.0], %1)",
+		"memstore[frag](%12[@x/64.0], %11)",
 		"memstore(%out[@x], %0 + %10)",
 		"return %out",
 	} {
@@ -190,12 +189,12 @@ func TestLIRMemoryShapesVerifyClean(t *testing.T) {
 		n    Node
 		want string
 	}{
-		{smem, "memnewsmem(64.0)"},
-		{lt, "memloadsmem(%2[@x/64.0])"},
-		{sts, "memstoresmem(%2[@x/64.0], %1)"},
-		{frag, "fragnew(64.0)"},
-		{fl, "fragload(%12[@x/64.0])"},
-		{fst, "fragstore(%12[@x/64.0], %11)"},
+		{smem, "memnew[smem](64.0)"},
+		{lt, "memload[smem](%2[@x/64.0])"},
+		{sts, "memstore[smem](%2[@x/64.0], %1)"},
+		{frag, "memnew[frag](64.0)"},
+		{fl, "memload[frag](%12[@x/64.0])"},
+		{fst, "memstore[frag](%12[@x/64.0], %11)"},
 	} {
 		if got := Label(check.n, num); got != check.want {
 			t.Errorf("Label = %q, want %q", got, check.want)
@@ -203,8 +202,7 @@ func TestLIRMemoryShapesVerifyClean(t *testing.T) {
 	}
 
 	// Family classification: the whole LIR memory family is FamilyMemory.
-	for _, k := range []Kind{KindMemLoadSMem, KindMemStoreSMem, KindMemNewSMem,
-		KindFragLoad, KindFragStore, KindFragNew} {
+	for _, k := range []Kind{KindMemLoad, KindMemStore, KindMemNew} {
 		if k.Family() != FamilyMemory {
 			t.Errorf("%s must belong to FamilyMemory, got %v", k, k.Family())
 		}

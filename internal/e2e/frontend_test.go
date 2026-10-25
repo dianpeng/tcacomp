@@ -11,13 +11,18 @@ package e2e
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"tcacomp/internal/cg"
+	"tcacomp/internal/cg/cxx"
 	"tcacomp/internal/compiler"
+	"tcacomp/internal/ir"
+	"tcacomp/internal/opt"
+	"tcacomp/internal/pipeline"
 	"tcacomp/internal/syntax"
 	"tcacomp/internal/syntax/lexer"
 )
@@ -208,8 +213,8 @@ func frontendMatmulScaleReference(m, n, q int, scale float32) []float32 {
 // included, the gate the pre-fix1 body model failed on this exact shape —
 // and emit a non-empty .cu. No GPU and no nvcc: the assertion ends at the
 // emitted files, so this runs in every hermetic `go test` pass. The GPU
-// numerical acceptance lives in TestFrontendMatmulScale, which currently
-// stops at the known downstream wall (its skip comment has the details).
+// numerical acceptance lives in TestFrontendMatmulScale (fix3 D-p: green,
+// no skip — both variants within reduceTol, canary 0).
 func TestFrontendMatmulScalePipeline(t *testing.T) {
 	variants := []struct {
 		name string
@@ -224,6 +229,11 @@ func TestFrontendMatmulScalePipeline(t *testing.T) {
 			for name, content := range files {
 				if len(content) == 0 {
 					t.Fatalf("e2e: emitted %s is empty", name)
+				}
+				// fix3 D-p downstream pin: the bracket law (R-A) holds over
+				// the emitted frontend fixture — assert-only, no code change.
+				if err := cxx.ScanBracketLaw(string(content)); err != nil {
+					t.Fatalf("e2e: bracket law violated by emitted %s: %v", name, err)
 				}
 			}
 		})
@@ -267,11 +277,7 @@ func TestFrontendMatmulScale(t *testing.T) {
 			ref := frontendMatmulScaleReference(feM, feN, feQ, feScale)
 			var maxAbs float64
 			worst := -1
-			zeros := 0
 			for i, got := range full {
-				if got == 0 {
-					zeros++
-				}
 				diff := float64(float32(got)) - float64(ref[i])
 				if d := abs(diff); d > maxAbs {
 					maxAbs = d
@@ -279,23 +285,296 @@ func TestFrontendMatmulScale(t *testing.T) {
 				}
 			}
 			if maxAbs > reduceTol {
-				// KNOWN DOWNSTREAM WALL (quick-261024-sdk Step 7 contingency —
-				// this fix is NOT judged by it): on the promoted-load +
-				// innermost-reduce shape the emitted reduced walk carries no
-				// piped producer — no lhs fill read, no multiply, no
-				// reducer.Reduce call — so Combine returns the init and every
-				// output is 0. Tile-lower's recast §8 itself passes (the
-				// pipeline completes; pinned hermetically by
-				// TestFrontendMatmulScalePipeline). The wall lives in the
-				// map/final-lower stages on this shape and needs its own
-				// ruling; only the exact all-zero signature skips — any other
-				// mismatch still fails.
-				if zeros == len(full) {
-					t.Skip("known downstream wall: the reduced walk loses its piped producer (all outputs = init * scale) — needs its own ruling, out of scope for 261024-sdk")
-				}
 				t.Errorf("e2e: frontend matmul max abs diff = %g > tolerance %g at flat %d: got %g, want %g",
 					maxAbs, reduceTol, worst, full[worst], ref[worst])
 			}
 		})
+	}
+}
+
+// TestFrontendMatmulScaleSanitizer extends the sanitizer coverage to the
+// frontend fixture (fix3 D-p): memcheck + racecheck over the real compiled
+// kernel, zero errors — the derived fill placement and the composition's
+// ordinary memory-chain ordering are race-freedom-relevant surfaces.
+func TestFrontendMatmulScaleSanitizer(t *testing.T) {
+	skipUnlessE2E(t)
+	san, ok := FindTool("compute-sanitizer", "/usr/local/cuda-12.2/bin/compute-sanitizer")
+	if !ok {
+		t.Skip("compute-sanitizer not found")
+	}
+	files := compileFrontendKernel(t, frontendMatmulWritten)
+	var srcFile string
+	for name := range files {
+		srcFile = name
+	}
+	files["runner.cu"] = []byte(runnerPrologue + fmt.Sprintf(feRunnerTail, feM, feN, feQ, feScale))
+	files["CMakeLists.txt"] = []byte(fmt.Sprintf(fixtureCMake,
+		"FeMatmulSan", "fe_mm_san", srcFile, "fe_mm_san_e2e"))
+	bin := BuildFixture(t, files, "fe_mm_san_e2e", runtimeDirAbs(t))
+	for _, tool := range []string{"memcheck", "racecheck"} {
+		out, err := RunCmd(t, "sanitizer:"+tool, san, "--tool", tool, bin)
+		if err != nil {
+			t.Fatalf("e2e: frontend matmul %s run failed: %v\n%s", tool, err, out)
+		}
+		requireZeroSanitizerErrors(t, tool, out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fix3 D-p battery: graph-level (hermetic) pins over the frontend fixture
+// ---------------------------------------------------------------------------
+
+// compileFrontendGraph drives the real pipeline to the GRAPH (not the
+// emission): parse → semacheck → Build → Dematerialize → the pass windows.
+// tail selects the cleanup tail: true runs the exact user path
+// (pipeline.Run); false stops after LOWER (fix3 D-p battery negative (a)
+// pins what the lower output alone guarantees).
+func compileFrontendGraph(t *testing.T, src string, tail bool) *ir.Graph {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"tca-common.tca":   frontendCommon,
+		"matmul_scale.tca": src,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("e2e: write fixture %s: %v", name, err)
+		}
+	}
+	mod, err := syntax.ParseModule(lexer.NewFileSet(), filepath.Join(dir, "matmul_scale.tca"))
+	if err != nil {
+		t.Fatalf("e2e: frontend parse/semacheck failed: %v", err)
+	}
+	if len(mod.Kernels) != 1 {
+		t.Fatalf("e2e: want 1 kernel, got %d", len(mod.Kernels))
+	}
+	g, err := mod.Kernels[0].Build()
+	if err != nil {
+		t.Fatalf("e2e: kernel build failed: %v", err)
+	}
+	if err := g.Dematerialize(); err != nil {
+		t.Fatalf("e2e: dematerialize failed: %v", err)
+	}
+	if tail {
+		if err := pipeline.Run(g); err != nil {
+			t.Fatalf("e2e: pipeline run failed: %v", err)
+		}
+		return g
+	}
+	passes := append(pipeline.HIRPasses(), pipeline.LOWERPasses()...)
+	if err := opt.NewManager(passes).Run(g); err != nil {
+		t.Fatalf("e2e: HIR+LOWER run failed: %v", err)
+	}
+	return g
+}
+
+// feWalkItems visits every AST item node with its containing block.
+func feWalkItems(blk *ir.ASTBlock, fn func(n ir.Node, containing *ir.ASTBlock)) {
+	for _, it := range blk.Items() {
+		if it.Node != nil {
+			fn(it.Node, blk)
+		}
+		if it.Block != nil {
+			feWalkItems(it.Block, fn)
+		}
+	}
+}
+
+// feBlockContains reports whether root is target or an ancestor of it.
+func feBlockContains(root, target *ir.ASTBlock) bool {
+	if root == target {
+		return true
+	}
+	for _, it := range root.Items() {
+		if it.Block != nil && feBlockContains(it.Block, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// feOperandClosure collects n's transitive Input-operand closure (the R-I
+// coordinate closure — data-dependency edges only).
+func feOperandClosure(n ir.Node) map[ir.Node]bool {
+	cl := map[ir.Node]bool{}
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || cl[x] {
+			return
+		}
+		cl[x] = true
+		for _, op := range ir.OperandsOf(x) {
+			visit(op)
+		}
+	}
+	visit(n)
+	return cl
+}
+
+// feImpactClosure collects n's transitive ImpactBy (memory-chain
+// predecessor) closure — the ordinary effect chain, walked backwards.
+func feImpactClosure(n ir.Node) map[ir.Node]bool {
+	cl := map[ir.Node]bool{}
+	var visit func(x ir.Node)
+	visit = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || cl[x] {
+			return
+		}
+		cl[x] = true
+		for _, u := range ir.ImpactBy(x) {
+			visit(u.Def())
+		}
+	}
+	visit(n)
+	return cl
+}
+
+// TestFrontendMatmulScaleLowerNoTailStillVerifies is fix3 D-p battery
+// negative (a): with the TAIL removed, the lower output still verifies —
+// the sea may hold garbage (here: the duplicate literal consts the tail's
+// dedup exists to erase, the fix2 D-e measurement's drift class) while the
+// items stay clean. The verifier and the anchor are liveness-scoped: dead
+// weight in the sea is never a violation.
+func TestFrontendMatmulScaleLowerNoTailStillVerifies(t *testing.T) {
+	g := compileFrontendGraph(t, frontendMatmulWritten, false)
+	if vs := ir.Verify(g); len(vs) != 0 {
+		t.Fatalf("the TAIL-less lower output must verify clean (garbage in the sea, not in the items), got: %v", vs)
+	}
+	type constKey struct {
+		ty   *ir.NumericType
+		bits uint64
+	}
+	counts := map[constKey]int{}
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindConst {
+			continue
+		}
+		v, ok := ir.ConstValueOf(n)
+		if !ok {
+			continue
+		}
+		ty := ir.ConstTypeOf(n)
+		if ty == nil {
+			ty = ir.TypeOf(n)
+		}
+		nt, ok := ty.(*ir.NumericType)
+		if !ok || nt == nil {
+			continue
+		}
+		counts[constKey{nt, math.Float64bits(v)}]++
+	}
+	dupes := 0
+	for _, c := range counts {
+		if c > 1 {
+			dupes++
+		}
+	}
+	if dupes == 0 {
+		t.Fatal("the no-TAIL run must leave garbage in the sea (live duplicate consts) — otherwise negative (a) pins nothing")
+	}
+}
+
+// TestFrontendMatmulScaleFillCompositionScope is fix3 D-p battery negative
+// (c): the re-placed fill composition (D-i's MemNew + tile-shaped GMEM
+// load + class store) lands DOMINATED-BY-SCOPE — inside the body of every
+// surviving loop whose IV its coordinate closure references (the frontend
+// between-round loop X; D-j closing fix2's D-c) — and the buffer's window
+// loads chain AFTER the store (the ordinary memory chain intact).
+func TestFrontendMatmulScaleFillCompositionScope(t *testing.T) {
+	g := compileFrontendGraph(t, frontendMatmulWritten, true)
+	k := g.AST()
+
+	// The fill compositions: a class store whose target is a MemNew buffer
+	// and whose value is a GMEM load.
+	type fillSite struct {
+		store  ir.Node
+		buffer ir.Node
+	}
+	var fills []fillSite
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
+			continue
+		}
+		if class, ok := ir.StorageClassOf(n); !ok || class == ir.StorageGMEM {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) < 2 || ops[0] == nil || ops[1] == nil {
+			continue
+		}
+		if ops[1].KindOf() != ir.KindMemNew || ops[1].BasePtr().Erased() {
+			continue
+		}
+		if ops[0].KindOf() != ir.KindMemLoad {
+			continue
+		}
+		if class, ok := ir.StorageClassOf(ops[0]); !ok || class != ir.StorageGMEM {
+			continue
+		}
+		fills = append(fills, fillSite{store: n, buffer: ops[1]})
+	}
+	if len(fills) == 0 {
+		t.Fatal("the frontend matmul must carry at least one fill composition (the between-block cache)")
+	}
+
+	for _, fs := range fills {
+		closure := feOperandClosure(fs.store)
+
+		// (i) dominated-by-scope (the SchedBlock pin): the store's block is
+		// inside the body of every loop whose IV the composition's
+		// coordinate closure references.
+		var storeBlk *ir.ASTBlock
+		feWalkItems(k.Body, func(n ir.Node, containing *ir.ASTBlock) {
+			if n.BasePtr() == fs.store.BasePtr() {
+				storeBlk = containing
+			}
+		})
+		if storeBlk == nil {
+			t.Fatalf("fill store %d is not an AST item — the composition must be placed", fs.store.BasePtr().ID())
+		}
+		if sb := fs.store.BasePtr().SchedBlock(); sb != storeBlk {
+			t.Fatalf("fill store %d's SchedBlock stamp %v != its containing block %v", fs.store.BasePtr().ID(), sb, storeBlk)
+		}
+		refLoops := 0
+		var scope func(blk *ir.ASTBlock)
+		scope = func(blk *ir.ASTBlock) {
+			for _, it := range blk.Items() {
+				if it.Block == nil {
+					continue
+				}
+				if iv := it.Block.IV(); iv != nil && !iv.BasePtr().Erased() && closure[iv] {
+					refLoops++
+					if !feBlockContains(it.Block, storeBlk) {
+						t.Fatalf("fill store %d's block is NOT dominated by the scope of the loop its closure references (IV node %d) — the D-j re-placement regressed",
+							fs.store.BasePtr().ID(), iv.BasePtr().ID())
+					}
+				}
+				scope(it.Block)
+			}
+		}
+		scope(k.Body)
+		if refLoops == 0 {
+			t.Fatalf("fill store %d's closure references no surviving loop — the R-I derivation had no anchor", fs.store.BasePtr().ID())
+		}
+
+		// (ii) memory-chain order intact: every live window load of the
+		// buffer chains (transitively) after the fill store.
+		windows := 0
+		for _, n := range g.AllocatedNodes() {
+			if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemLoad {
+				continue
+			}
+			ops := ir.OperandsOf(n)
+			if len(ops) == 0 || ops[0] == nil || ops[0].BasePtr() != fs.buffer.BasePtr() {
+				continue
+			}
+			windows++
+			if !feImpactClosure(n)[fs.store] {
+				t.Fatalf("window load %d of buffer %d does not chain after the fill store %d — the composition's memory-chain order broke",
+					n.BasePtr().ID(), fs.buffer.BasePtr().ID(), fs.store.BasePtr().ID())
+			}
+		}
+		if windows == 0 {
+			t.Fatalf("buffer %d carries no window loads — the fill would be dead", fs.buffer.BasePtr().ID())
+		}
 	}
 }

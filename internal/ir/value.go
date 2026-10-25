@@ -292,18 +292,14 @@ func contentHash(n Node) uint64 {
 		// two getattr reads over the same object with distinct attributes
 		// never merge.
 		return mixString(valueHashOffset, t.attribute)
-	case *memLoadSMemNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
-	case *memStoreSMemNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
-	case *memNewSMemNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
-	case *fragLoadNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
-	case *fragStoreNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
-	case *fragNewNode:
-		return mixUint32(valueHashOffset, uint32(t.class))
+	case *memLoadNode, *memStoreNode, *memNewNode:
+		// fix3 D-h: the storage class is identity content (a same-kind node
+		// of another class never merges — the tiered constructors' whole
+		// distinction). NOTE: EffectOf marks every memory node full, so
+		// these nodes never actually enter a GVN bucket (the one-of-a-kind
+		// sentinel); the arms keep the content contract total regardless.
+		sc, _ := StorageClassOf(t)
+		return mixUint32(valueHashOffset, uint32(sc))
 	default:
 		return valueHashOffset
 	}
@@ -349,23 +345,14 @@ func contentEqual(a, b Node) bool {
 	case *runtimeGetAttributeNode:
 		tb, ok := b.(*runtimeGetAttributeNode)
 		return ok && ta.attribute == tb.attribute
-	case *memLoadSMemNode:
-		tb, ok := b.(*memLoadSMemNode)
+	case *memLoadNode:
+		tb, ok := b.(*memLoadNode)
 		return ok && ta.class == tb.class
-	case *memStoreSMemNode:
-		tb, ok := b.(*memStoreSMemNode)
+	case *memStoreNode:
+		tb, ok := b.(*memStoreNode)
 		return ok && ta.class == tb.class
-	case *memNewSMemNode:
-		tb, ok := b.(*memNewSMemNode)
-		return ok && ta.class == tb.class
-	case *fragLoadNode:
-		tb, ok := b.(*fragLoadNode)
-		return ok && ta.class == tb.class
-	case *fragStoreNode:
-		tb, ok := b.(*fragStoreNode)
-		return ok && ta.class == tb.class
-	case *fragNewNode:
-		tb, ok := b.(*fragNewNode)
+	case *memNewNode:
+		tb, ok := b.(*memNewNode)
 		return ok && ta.class == tb.class
 	default:
 		return true // no content fields beyond operands/payloads/lambdas

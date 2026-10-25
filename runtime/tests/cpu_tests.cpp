@@ -10,6 +10,7 @@
 #include <initializer_list>
 
 #include "tca/iterator.h"
+#include "tca/loader.h"
 #include "tca/mapping.h"
 #include "tca/reducer.h"
 #include "tca/view.h"
@@ -231,6 +232,157 @@ void test_umin_umax() {
   CHECK(umax(5u, 3u) == 5u);
   CHECK(umax(4u, 4u) == 4u);
   CHECK(umax(0u, 7u) == 7u);
+}
+
+// ---------------------------------------------------------------------------
+// The loader's row-striped window copy (fix3 D-n, signature-internal
+// performance rework; the PUBLIC signatures and the window->axis contract
+// are unchanged). The CPU layer pins the decomposition: per-row tail
+// clamping, leading-OOB zero-fill, thread striping, the 128-bit vector
+// path's eligibility + fallback, and the portable per-thread entry point.
+// cp.async is nvcc-only — the goldens + the e2e gate carry it.
+// ---------------------------------------------------------------------------
+
+// reference_window_copy is the semantic reference: every window cell takes
+// src.GetAt(full coordinate) — T{} where the source suppresses.
+template <unsigned DR, unsigned SR>
+void reference_window_copy(float* dst, const unsigned (&dext)[DR], const float* src,
+                           const unsigned (&sext)[SR], const unsigned (&base)[SR]) {
+  unsigned n = 1u;
+  for (unsigned d = 0u; d < DR; ++d) n *= dext[d];
+  for (unsigned i = 0u; i < n; ++i) {
+    unsigned w[DR];
+    unsigned rem = i;
+    for (unsigned d = DR; d-- > 0u;) {
+      w[d] = rem % dext[d];
+      rem /= dext[d];
+    }
+    unsigned c[SR];
+    for (unsigned a = 0u; a < SR; ++a) c[a] = base[a];
+    for (unsigned j = 0u; j < DR; ++j) c[SR - DR + j] += w[j];
+    // The source view's bounds suppression (out-of-range -> T{}).
+    bool ok = true;
+    for (unsigned a = 0u; a < SR; ++a) {
+      if (c[a] >= sext[a]) ok = false;
+    }
+    dst[i] = ok ? src[c[0] * (sext[1] * sext[2]) + c[1] * sext[2] + c[2]] : 0.0f;
+  }
+}
+
+// (i) The decomposition over one DR=2-of-SR=3 window: full rows, a
+// clamped trailing run, and a leading-OOB row that zero-fills.
+void test_loader_row_clamping() {
+  float src[3 * 5 * 7];
+  for (unsigned i = 0u; i < 3 * 5 * 7; ++i) src[i] = static_cast<float>(i) + 0.25f;
+
+  // Window [5, 7) over axes 1..2 at base (1, 2, 4): trailing axis clamps to
+  // 7 - 4 = 3 valid cells; row (axis1 == 3) is leading-OOB (2 + 3 >= 5).
+  const unsigned dext[2] = {5u, 7u};
+  const unsigned sext[3] = {3u, 5u, 7u};
+  const unsigned base[3] = {1u, 2u, 4u};
+  float want[5 * 7];
+  reference_window_copy<2, 3>(want, dext, src, sext, base);
+
+  float smem[5 * 7];
+  for (unsigned i = 0u; i < 5 * 7; ++i) smem[i] = -777.0f;
+  tca::rt::SmemView<float, 2u> dst(smem, 5u, 7u);
+  tca::rt::TensorView<const float, 3u> view(src, 3u, 5u, 7u);
+  tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 2u>,
+                                  tca::rt::TensorWindow<const float, 3u>, 2u, 3u>(
+      dst, tca::rt::TensorWindow(view, base[0], base[1], base[2]), 0u, 1u);
+  for (unsigned i = 0u; i < 5 * 7; ++i) CHECK(smem[i] == want[i]);
+
+  // The clamp facts, pinned directly: the trailing run clamps once per row
+  // (7 vs 7-4), and the leading-OOB row zero-fills (suppression).
+  CHECK(smem[0 * 7 + 0] == want[0 * 7 + 0]);            // valid run
+  CHECK(smem[0 * 7 + 3] == 0.0f);                       // clamped tail zero-fills
+  CHECK(smem[3 * 7 + 0] == 0.0f);                       // leading-OOB row zero-fills
+  CHECK(smem[4 * 7 + 6] == want[4 * 7 + 6]);            // last row mirrors too
+}
+
+// (ii) Thread striping: every (tid, nthreads) enumeration partitions the
+// rows exactly; any partitioning equals the single-thread copy.
+void test_loader_striping() {
+  float src[4 * 6 * 8];
+  for (unsigned i = 0u; i < 4 * 6 * 8; ++i) src[i] = static_cast<float>(i) * 0.5f;
+  const unsigned dext[2] = {6u, 8u};
+  const unsigned sext[3] = {4u, 6u, 8u};
+  const unsigned base[3] = {1u, 1u, 2u};
+  float want[6 * 8];
+  reference_window_copy<2, 3>(want, dext, src, sext, base);
+
+  for (unsigned nt : {1u, 2u, 3u, 7u, 16u, 512u}) {
+    float smem[6 * 8];
+    for (unsigned i = 0u; i < 6 * 8; ++i) smem[i] = -7.0f;
+    tca::rt::SmemView<float, 2u> dst(smem, 6u, 8u);
+    tca::rt::TensorView<const float, 3u> view(src, 4u, 6u, 8u);
+    for (unsigned tid = 0u; tid < nt; ++tid) {
+      tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 2u>,
+                                      tca::rt::TensorWindow<const float, 3u>, 2u, 3u>(
+          dst, tca::rt::TensorWindow(view, base[0], base[1], base[2]), tid, nt);
+    }
+    for (unsigned i = 0u; i < 6 * 8; ++i) {
+      CHECK(smem[i] == want[i]);  // exactly-once ownership: no double writes
+    }
+  }
+}
+
+// (iii) The 128-bit vector path: eligibility is per-row alignment, and a
+// misaligned source base falls back to the scalar run with IDENTICAL
+// results. vec16_ok is pinned true/false directly.
+void test_loader_vector_eligibility() {
+  alignas(16) float src[64];
+  alignas(16) float dstbuf[64];
+  for (unsigned i = 0u; i < 64u; ++i) src[i] = static_cast<float>(i);
+  CHECK(tca::rt::detail::vec16_ok(dstbuf, src) == true);          // both 16B aligned
+  CHECK(tca::rt::detail::vec16_ok(dstbuf + 1u, src) == false);    // dst misaligned
+  CHECK(tca::rt::detail::vec16_ok(dstbuf, src + 1u) == false);    // src misaligned
+  CHECK(tca::rt::detail::vec16_ok(dstbuf + 4u, src + 4u) == true);
+
+  // A window whose source base coordinate is NOT 4-element aligned (base 1
+  // on the trailing axis) forces the scalar fallback row-by-row; the
+  // result must equal the aligned (vector-path) copy of the shifted data.
+  tca::rt::SmemView<float, 1u> dstA(dstbuf, 16u);
+  tca::rt::TensorView<const float, 1u> view(src, 64u);
+  tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      dstA, tca::rt::TensorWindow(view, 1u), 0u, 1u);
+  for (unsigned k = 0u; k < 16u; ++k) CHECK(dstbuf[k] == src[1u + k]);
+
+  // The aligned form (vector path eligible: trailing 16 %4 == 0, bases
+  // aligned) must produce the same values as the scalar reference.
+  tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      dstA, tca::rt::TensorWindow(view, 0u), 0u, 1u);
+  for (unsigned k = 0u; k < 16u; ++k) CHECK(dstbuf[k] == src[k]);
+
+  // Trailing extent NOT %4: whole copy rides the scalar path.
+  float small[5] = {9.0f, 8.0f, 7.0f, 6.0f, 5.0f};
+  float out5[5] = {};
+  tca::rt::SmemView<float, 1u> d5(out5, 5u);
+  tca::rt::TensorView<const float, 1u> v5(small, 5u);
+  tca::rt::detail::load_tile_rows<false, tca::rt::SmemView<float, 1u>,
+                                  tca::rt::TensorWindow<const float, 1u>, 1u, 1u>(
+      d5, tca::rt::TensorWindow(v5, 0u), 0u, 1u);
+  for (unsigned k = 0u; k < 5u; ++k) CHECK(out5[k] == small[k]);
+}
+
+// (iv) The per-thread entry point end-to-end (portable, dual-compiled): a
+// Frag fill over a rank-2 window with a clamped tail.
+void test_loader_frag_thread() {
+  float src[6 * 8];
+  for (unsigned i = 0u; i < 6 * 8; ++i) src[i] = static_cast<float>(i) * 0.25f;
+  tca::rt::Frag<float, 2u, 4u, 8u> frag;
+  tca::rt::TensorView<const float, 2u> view(src, 6u, 8u);
+  // base (2, 5): axis-0 rows 2..5 all in range; trailing clamps to 8-5=3.
+  tca::rt::ThreadMapping tm(host_info(100u, 512u), -1);
+	tca::rt::LoadTileThread(tm, frag, tca::rt::TensorWindow(view, 2u, 5u));
+  for (unsigned r = 0u; r < 4u; ++r) {
+    for (unsigned k = 0u; k < 8u; ++k) {
+      const float want = (k < 3u) ? src[(2u + r) * 8u + 5u + k] : 0.0f;
+      CHECK(frag.Get(r, k) == want);
+    }
+  }
 }
 
 float add_f(float a, float b) { return a + b; }
@@ -476,6 +628,10 @@ int main() {
   test_tensor_view();
   test_smem_view();
   test_umin_umax();
+  test_loader_row_clamping();
+  test_loader_striping();
+  test_loader_vector_eligibility();
+  test_loader_frag_thread();
   test_seq_reducer();
   test_warp_reducer_host_branch();
   test_warp_reducer_bracket_simulation();

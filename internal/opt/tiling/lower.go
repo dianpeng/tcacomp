@@ -483,16 +483,19 @@ func (lr *lowerRun) checkFillOrdering(fill *siteFill) error {
 		visit(n)
 		return seen
 	}
-	// Every live buffer access (FragLoad / MemLoadSMem) on the fill's
-	// buffer must have fill.store among its chain predecessors. No live
-	// access at all: vacuous pass (the fill is unconsumed dead code —
-	// memopt's fill-liveness removal (D-f), not an §8 violation).
+	// Every live tiered buffer access (SMEM/FRAG-class MemLoad, fix3 D-h)
+	// on the fill's buffer must have fill.store among its chain
+	// predecessors. No live access at all: vacuous pass (the fill is
+	// unconsumed dead code — memopt's fill-liveness removal (D-f), not an
+	// §8 violation).
 	for _, n := range lr.g.AllocatedNodes() {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
 			continue
 		}
-		k := n.KindOf()
-		if k != ir.KindFragLoad && k != ir.KindMemLoadSMem {
+		if n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageGMEM {
 			continue
 		}
 		// Confirm this access reads the fill's buffer.
@@ -571,30 +574,27 @@ func (lr *lowerRun) checkNoStaleLoads(rec *Record, dropped map[uint64]bool) erro
 // (F5/ME-04, ruled 2026-10-21 — a check that re-reads a baked constant is
 // vacuous and forbidden): the pass constructs no barrier-emitting node
 // (v0's kind suite has no sync kinds — the constructive half), and the
-// operative half PARSES the live `loadtile` KeyedAttribute back out of
-// every emitted fill store's operand list — the attribute is the runtime's
-// loader-selection contract, and a fill that lost it (or carries a
-// non-const value) must fail the pass, not surface at codegen time.
+// operative half re-reads every emitted fill store's DERIVATION FACTS —
+// since fix3 D-h the loader selection is DERIVED at codegen from the fill's
+// storage class + composition shape (R-H/R-J; the retired v0-era
+// attribute left the IR), so the check pins exactly those facts: the store
+// is a TIERED MemStore (SMEM/FRAG class) whose value operand is a GMEM
+// MemLoad — a fill that lost either half must fail the pass, not surface
+// at codegen time.
 func (lr *lowerRun) checkNoBarriers() error {
 	for _, fill := range lr.fills {
-		found := false
-		ops := ir.OperandsOf(fill.store)
-		for i := 2; i < len(ops); i++ { // stores: trailing operands after [value, dst]
-			op := ops[i]
-			if op == nil || op.KindOf() != ir.KindKeyedAttribute {
-				continue
-			}
-			key, val := ir.KeyedAttributeOf(op)
-			if key != "loadtile" {
-				continue
-			}
-			if _, ok := ir.ConstValueOf(val); !ok {
-				return fmt.Errorf("tile-lower: fill for site %d carries a non-const loadtile variant value", fill.siteID)
-			}
-			found = true
+		sc, ok := ir.StorageClassOf(fill.store)
+		if fill.store.KindOf() != ir.KindMemStore || !ok || sc == ir.StorageGMEM {
+			return fmt.Errorf("tile-lower: fill for site %d is not a tiered (SMEM/FRAG-class) MemStore — the codegen loader derivation has no class to read (§6, fix3 R-H)",
+				fill.siteID)
 		}
-		if !found {
-			return fmt.Errorf("tile-lower: fill for site %d carries no live loadtile variant annotation (the runtime's loader-selection contract, §6)",
+		ops := ir.OperandsOf(fill.store)
+		if len(ops) == 0 || ops[0] == nil || ops[0].KindOf() != ir.KindMemLoad {
+			return fmt.Errorf("tile-lower: fill for site %d stores no GMEM tile load — the codegen loader derivation has no source (§6, fix3 R-H)",
+				fill.siteID)
+		}
+		if lsc, _ := ir.StorageClassOf(ops[0]); lsc != ir.StorageGMEM {
+			return fmt.Errorf("tile-lower: fill for site %d stores a non-GMEM load — the loader call's source must be the tile-shaped GMEM MemLoad (§6, fix3 R-H)",
 				fill.siteID)
 		}
 	}

@@ -41,7 +41,7 @@ import "slices"
 // EFFECTFUL — loads included, nil ImpactBy included — under the single-slot
 // memory model: each memory region is one slot, tensor subscripts are too
 // coarse to disprove aliasing between a load and a write, so all operations
-// on one memory node must serialize. Allocations (MemNew/MemNewSMem/FragNew)
+// on one memory node must serialize. Allocations (MemNew of every class)
 // are effectful under the fresh-object rule as well: merging distinct
 // allocations is unsound — each allocation denotes a distinct memory object
 // (LLVM never CSEs allocas). The verdict stays SELF-SCOPED ([4].3): no
@@ -111,7 +111,7 @@ func (e Effect) String() string {
 // scheduler and its licmHoistableKinds whitelist): the schedule pass now
 // gates effectful hoisting itself — a memory-ACCESS kind with invariant
 // operands floors at its operand-containing loop (HI-02), while the
-// allocation kinds (MemNew/MemNewSMem/FragNew) are exempt: hoisting a
+// allocation kind (MemNew, every class) is exempt: hoisting a
 // shared declaration is semantics-preserving. Neither DCE, Materialize's
 // isEffectKind, nor the legality windows consult EffectOf (that part is
 // unchanged).

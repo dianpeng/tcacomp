@@ -214,7 +214,10 @@ func TestPipelineFillInsideHost(t *testing.T) {
 	// searched defaults).
 	var fill ir.Node
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindFragStore {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
+			continue
+		}
+		if sc, _ := ir.StorageClassOf(n); sc != ir.StorageFrag {
 			continue
 		}
 		if fill != nil {
@@ -260,8 +263,8 @@ func TestPipelineFillInsideHost(t *testing.T) {
 
 	// Fragment buffer: the allocation-exemption pin — SN 0 in the FIRST
 	// prologue Group.
-	if len(ops) < 2 || ops[1] == nil || ops[1].KindOf() != ir.KindFragNew {
-		t.Fatalf("fill ops[1] = %v, want the KindFragNew buffer", kindOf(ops[1]))
+	if len(ops) < 2 || ops[1] == nil || ops[1].KindOf() != ir.KindMemNew {
+		t.Fatalf("fill ops[1] = %v, want the FRAG-class MemNew buffer", kindOf(ops[1]))
 	}
 	buf := ops[1]
 	if got := buf.BasePtr().SchedSN(); got != 0 {

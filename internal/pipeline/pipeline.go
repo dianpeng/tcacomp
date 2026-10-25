@@ -24,6 +24,7 @@ package pipeline
 
 import (
 	"fmt"
+	"math"
 
 	"tcacomp/internal/ir"
 	"tcacomp/internal/opt"
@@ -112,16 +113,91 @@ func LOWERPasses() []opt.Pass {
 	return passes
 }
 
-// TailPasses returns the exact tail instances Run wires — the memopt factory
-// instance (R-E: reuse the registered pass compositively; never a new ID)
-// followed by the AST-item-roots dce instance — exposed for tests that pin
-// the tail composition in isolation.
+// TailPasses returns the exact tail instances Run wires — the pipeline-owned
+// const dedup (fix3 D-o), then the memopt factory instance (R-E: reuse the
+// registered pass compositively; never a new ID), then the AST-item-roots
+// dce instance (its item sweep collects the dedup's erased duplicates) —
+// exposed for tests that pin the tail composition in isolation.
 func TailPasses() []opt.Pass {
 	spec, ok := opt.Lookup(tailMemoptID)
 	if !ok {
 		panic(fmt.Errorf("pipeline: pass ID %q is not registered (is the pass package blank-imported via opt/all?)", tailMemoptID))
 	}
-	return []opt.Pass{spec.Factory(), dce.NewASTRoots()}
+	return []opt.Pass{constDedupPass{}, spec.Factory(), dce.NewASTRoots()}
+}
+
+// constDedupPass is the MINIMAL pipeline-owned tail const dedup (fix3 D-o,
+// the fix2 D-e measurement's ruled escape clause): GVN (110) predates the
+// passes that mint most const atoms (tile-lower/schedule/final-lower), and
+// nothing else re-dedups them — without this step the codegen-ready IR
+// carries duplicate literal nodes per (type, value) and the goldens drift.
+// NOT a registry ID (R-E: a pipeline-owned composite step, like the tail
+// dce instance) and NOT a lower's business (R-A/R-B: canonicalizeConsts
+// was exiled from final-lower). Erases run BEFORE the tail's dce instance
+// so its item sweep collects the duplicates' AST items.
+type constDedupPass struct{}
+
+// ID identifies the composite step in manager instrumentation.
+func (constDedupPass) ID() string { return "const-dedup" }
+
+// Requires: no ordering preconditions (it is a fixpoint-free leaf sweep).
+func (constDedupPass) Requires() []string { return nil }
+
+// Produces: builder-output stage — consts are legal at every stage, and
+// the pass erases nodes only.
+func (constDedupPass) Produces() opt.Stage { return opt.StageConstructed }
+
+// Preserved: nothing — every analysis is invalidated.
+func (constDedupPass) Preserved() []string { return nil }
+
+// Run dedups literal constants: at most one live const node per
+// (type, value) pair survives (the lowest-ID def of the pair; allocation
+// order). Consts are immutable leaves, so sharing is unconditionally
+// sound; the interned NumericType pointer keys exactly. The declared
+// payload type (ConstTypeOf) is the canonical key — the typeinfer cell is
+// nil for most post-typeinfer consts, exactly the population this step
+// exists for.
+func (constDedupPass) Run(_ *opt.Context, g *ir.Graph) error {
+	if g == nil {
+		return fmt.Errorf("pipeline: const-dedup: nil graph")
+	}
+	type constKey struct {
+		ty   *ir.NumericType
+		bits uint64
+	}
+	canon := make(map[constKey]ir.Node)
+	mctx := &ir.MutContext{Pass: "const-dedup"}
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindConst {
+			continue
+		}
+		v, ok := ir.ConstValueOf(n)
+		if !ok {
+			continue
+		}
+		ty := ir.ConstTypeOf(n)
+		if ty == nil {
+			ty = ir.TypeOf(n)
+		}
+		nt, ok := ty.(*ir.NumericType)
+		if !ok || nt == nil {
+			continue // nothing safe to key on
+		}
+		k := constKey{nt, math.Float64bits(v)}
+		c, seen := canon[k]
+		if !seen {
+			canon[k] = n
+			continue
+		}
+		if err := mctx.ReplaceAllUsesWith(n, c); err != nil {
+			return fmt.Errorf("pipeline: const-dedup: canonicalizing const #%d onto #%d: %w",
+				n.BasePtr().ID(), c.BasePtr().ID(), err)
+		}
+		if err := mctx.Erase(n); err != nil {
+			return fmt.Errorf("pipeline: const-dedup: erasing duplicate const #%d: %w", n.BasePtr().ID(), err)
+		}
+	}
+	return nil
 }
 
 // Run executes the full pass composition over g: ONE opt.Manager over the
@@ -141,9 +217,10 @@ func Run(g *ir.Graph) error {
 	if err != nil {
 		return err
 	}
-	passes := make([]opt.Pass, 0, len(hir)+len(lower)+2)
+	tail := TailPasses()
+	passes := make([]opt.Pass, 0, len(hir)+len(lower)+len(tail))
 	passes = append(passes, hir...)
 	passes = append(passes, lower...)
-	passes = append(passes, TailPasses()...)
+	passes = append(passes, tail...)
 	return opt.NewManager(passes).Run(g)
 }

@@ -265,20 +265,15 @@ func typeOfNode(n ir.Node, memo map[*ir.Base]ir.Type) (ir.Type, error) {
 	// --- memory (spec (4): HIR and LIR alike) ---
 
 	case ir.KindMemLoad:
-		return memLoadType(n, ops, memo)
-
-	case ir.KindMemStore, ir.KindMemStoreSMem, ir.KindFragStore:
-		// The store returns the stored value's type (doc §2.5). No
-		// cross-check against the target: post-lowering axes are IVs, so
-		// the stored shape is not statically derivable.
-		return operandType(n, ops, 0, memo)
-
-	case ir.KindMemLoadSMem, ir.KindFragLoad:
-		// Same partial/full deref shape as memload — but only once the
-		// buffer carries a tensor type. Today's buffers (memnewsmem/
-		// fragnew) are untyped allocations, so the rule fails closed
-		// ("same, regardless whether HIR or LIR": the LIR rule exists and
-		// the future cache-lowering pass satisfies it by typing buffers).
+		// fix3 D-h: one verb, two shapes by storage class — the GMEM load
+		// takes the tensor-axes rule; the SMEM/FRAG buffer load takes the
+		// buffer-dtype rule (same partial/full deref shape as memload, but
+		// only once the buffer carries a tensor type — today's buffers are
+		// untyped allocations until cache lowering binds them, so the rule
+		// fails closed: "same, regardless whether HIR or LIR").
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageGMEM {
+			return memLoadType(n, ops, memo)
+		}
 		if len(ops) == 0 || ops[0] == nil {
 			return nil, nodeErr(n, "operand slot 0 is unwired")
 		}
@@ -291,7 +286,14 @@ func typeOfNode(n ir.Node, memo map[*ir.Base]ir.Type) (ir.Type, error) {
 		}
 		return derefType(n, ops, nt, memo)
 
-	case ir.KindMemNew, ir.KindMemNewSMem, ir.KindFragNew:
+	case ir.KindMemStore:
+		// The store returns the stored value's type (doc §2.5), every
+		// storage class alike. No cross-check against the target:
+		// post-lowering coords are IVs, so the stored shape is not
+		// statically derivable.
+		return operandType(n, ops, 0, memo)
+
+	case ir.KindMemNew:
 		// Untyped allocations by default. EXCEPTION (quick-261021-jay):
 		// cache lowering BINDS a buffer dtype (the MemLoadSMem rule's own
 		// message names it: "cache lowering must bind buffer types first")

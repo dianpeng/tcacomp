@@ -16,8 +16,9 @@ func (e *emitter) statement(n ir.Node) error {
 		return nil
 	}
 	switch n.KindOf() {
-	// Hoisted declarations — nothing at their scheduled position.
-	case ir.KindInputParam, ir.KindMemNewSMem, ir.KindFragNew:
+	// Hoisted declarations — nothing at their scheduled position (every
+	// allocation class; GMEM temporaries are rejected at the gates).
+	case ir.KindInputParam, ir.KindMemNew:
 		return nil
 	// The end node is metadata (the launcher owns outputs); emits nothing.
 	case ir.KindReturn:
@@ -36,20 +37,23 @@ func (e *emitter) statement(n ir.Node) error {
 	case ir.KindForLoop:
 		return fmt.Errorf("cxx: forloop %d appears as a statement item — the schedule must place it as a Loop block", n.BasePtr().ID())
 
-	// GMEM through the TensorView shim (D3/D6).
+	// The memory verbs, dispatched by storage class (fix3 D-h): GMEM
+	// through the TensorView shim (D3/D6); the SMEM/FRAG tiers through
+	// their buffer views, with the FILL composition (a tiered store of a
+	// GMEM tile load) fused into its cooperative loader call (R-H).
 	case ir.KindMemLoad:
+		if sc, _ := ir.StorageClassOf(n); sc != ir.StorageGMEM {
+			return e.stmtBufLoad(n)
+		}
 		return e.stmtMemLoad(n)
 	case ir.KindMemStore:
-		return e.stmtMemStore(n)
-
-	// SMEM/FRAG buffers.
-	case ir.KindMemLoadSMem, ir.KindFragLoad:
-		return e.stmtBufLoad(n)
-	case ir.KindMemStoreSMem, ir.KindFragStore:
-		if isFillStore(n) {
-			return e.stmtFill(n)
+		if sc, _ := ir.StorageClassOf(n); sc != ir.StorageGMEM {
+			if isFillStore(n) {
+				return e.stmtFill(n)
+			}
+			return e.stmtBufStore(n)
 		}
-		return e.stmtBufStore(n)
+		return e.stmtMemStore(n)
 
 	// Runtime objects (final-lower product).
 	case ir.KindRuntimeKernelInfo, ir.KindRuntimeGridMapping, ir.KindRuntimeThreadMapping,
