@@ -15,34 +15,43 @@ package tiling
 // a mismatch fails closed, and the site's CLASS is re-derived from the
 // covered dims' SoC (the R2 tier rule) and must agree with the record.
 //
-// FILL PLACEMENT (R1, ruled 2026-10-21 — VARIANT-DEPENDENT; the former
-// unconditional "immediately before the tile-inside loops" rule is
-// SUPERSEDED — it mandated a position at which the fill's own per-thread
-// coordinates were undefined, the HI-01 inconsistency):
+// THE FILL IS A COMPOSITION (fix3.md R-G/D-i): the three plain verbs —
+// MemNew(class, extents) + a tile-shaped MemLoad(GMEM, tensor-level, axes
+// + round bases: siteFill.src) + MemStore(class, buffer, value = the tile
+// load) — never a fused node. Every buffer access is a plain
+// MemLoad(class, buffer, windowed coords). Ordering rides the ORDINARY
+// memory-effect chain alone (C7: the source load chains on the source
+// tensor exactly as NewMemLoadChained would; the accesses chain after the
+// fill store on the buffer's own chain — the fill dominates its reads in
+// the sea's explicit effect order, and the §8 ORDERING check (lower.go)
+// verifies exactly that over the ordinary ImpactBy edges; no special
+// fill-edge reading exists).
 //
-//   - LoadTileThread (FRAG class, all covered dims sequential): the fill
-//     sits INSIDE the element loop that DEFINES its per-thread coordinate —
-//     the INSIDE loop of the innermost above-tie INS dim (the fill key,
-//     e.g. the worked example's lhs refills per m-element inside M.inside;
-//     fallback when no above-tie INS dim exists: the innermost covered
-//     dim's between loop). Its coordinates are the index expressions
-//     defined AT that position: covered dims ride their round bases, INS
-//     dims above the fill point keep their full (post-RAUW) index
-//     expressions.
-//   - LoadTileCta (SMEM window class, any covered dim WARP-assigned): the
-//     fill sits at the innermost covered dim's BETWEEN-round body, with
-//     CTA-UNIFORM coordinates ONLY — round bases (between dimvars and
-//     CTA-rank offsets); never a per-thread (ThreadMap) term. A WARP dim
-//     above the tie has NO uniform coordinate and fails closed.
+// FILL PLACEMENT IS DERIVED, NEVER MANDATED (fix3.md R-I): a memory
+// item's position is the innermost block dominated by every surviving
+// loop its coordinate closure references, still preceding its memory
+// successors. The R1-era variant-dependent MANDATE is STRUCK —
+// fillHost()'s mechanism is retained through fix3 D-j ONLY so placement
+// does not move before the derivation lands in final-lower's element-loop
+// restructure; the suite pins that the derivation (innermost referenced
+// loop) picks exactly the position fillHost mandates today (the D-i
+// safety net, lower_test.go assertFillPositionDerived). Historical shape
+// (what the derivation reproduces on today's graphs):
 //
-// Structural realization (the F8 splice, 261021-o61 T3, sea-of-nodes
-// recast fix1.md D-e): the fill is ordered before its readers through the
-// per-buffer effect chain — every buffer access (which replaced the load's
-// uses) chains after the fill via its ImpactBy edge, and the §8 ORDERING
-// check (lower.go) verifies the fill is a chain predecessor of every buffer
-// access of the site. The fill re-executes per fill-key epoch because its
-// coordinates read that epoch's induction variable. Membership is via IV
-// references (fix1.md §0), never a body operand.
+//   - FRAG class (per-thread fill): the fill key's INSIDE loop — the
+//     position whose defining coordinate the fill's closure references
+//     (e.g. the worked example's lhs refills per m-element inside
+//     M.inside); degenerate fallback: the innermost covered dim's between
+//     loop.
+//   - SMEM window class (cooperative fill): the innermost covered dim's
+//     BETWEEN-round body, with CTA-UNIFORM coordinates ONLY — round bases
+//     (between dimvars and CTA-rank offsets); never a per-thread
+//     (ThreadMap) term. A WARP dim above the tie has NO uniform
+//     coordinate and fails closed.
+//
+// The fill re-executes per fill-key epoch because its coordinates read
+// that epoch's induction variable. Membership is via IV references
+// (fix1.md §0), never a body operand.
 //
 // WINDOW SIZING + ACCESS (R2, ruled 2026-10-21 — rank-in-index =>
 // window-in-shape): a covered WARP dim's buffer extent is #threads_d x T_d
@@ -51,13 +60,6 @@ package tiling
 // thread_map.index(d)·T_d + i (d = the dim's ThreadMap slot, i = the
 // sequential inside walk). SEQ covered dims contribute T_d and index by
 // their plain inside coordinate. FRAG buffers are per-thread: plain i.
-//
-// Effect wiring (construction-exempt, the ir env-chained constructors'
-// precedent): the fill's source load chains on the source tensor exactly
-// as NewMemLoadChained would (an Env primed with the erased load's chain
-// predecessors); the buffer accesses chain after the fill on the buffer's
-// own chain, so the fill dominates its reads in the sea's explicit effect
-// order.
 
 import (
 	"fmt"
@@ -80,11 +82,15 @@ const (
 type siteFill struct {
 	siteID  uint64
 	load    ir.Node // the erased GMEM load (tombstone after surgery)
-	src     ir.Node // the fill's tile-shaped source MemLoad
-	store   ir.Node // the fill store (MemStoreSMem/FragStore)
-	buffer  ir.Node // the MemNewSMem/FragNew buffer
+	src     ir.Node // the fill's tile-shaped GMEM source MemLoad (composition verb 2)
+	store   ir.Node // the fill store: a tiered MemStore of src (composition verb 3)
+	buffer  ir.Node // the tiered MemNew allocation (composition verb 1)
 	covered []*dimRewrite
-	host    ir.Node // the mandated fill-position loop (R1) — §8 placement anchor
+	// host is the R1-ERA mandated position loop — NOT a mandate anymore
+	// (fix3 D-i): placement is DERIVED (R-I). The mechanism is retained
+	// through D-j so placement does not move before final-lower derives
+	// it; the suite pins derivation == this position (the D-i safety net).
+	host    ir.Node
 	variant float64 // the loader variant derived from the class (1 = CTA, 2 = Thread; pass-internal fact)
 }
 
@@ -512,9 +518,9 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// by its plain inside coordinate (the thread identity is implicit in
 	// the fragment's registers). SEQ dims index by their plain inside
 	// coordinate either way. The accesses chain after the fill on the
-	// buffer's own effect chain — this is also the F8 structural splice:
-	// the fill becomes reachable from the host loop's body-operand subtree
-	// through its readers and is ordered before them.
+	// buffer's own effect chain — the ORDINARY memory chain (C7, fix3 D-i:
+	// no special fill-edge reading) — so the fill dominates its readers in
+	// the sea's explicit effect order and stays reachable through them.
 	coords := make([]ir.Node, 0, len(covered))
 	for _, d := range covered {
 		if d.soc == SoCWARP && class == ClassSMEM {
@@ -571,8 +577,10 @@ func (lr *lowerRun) owningRewrite(iter ir.Node) (*lntRewrite, error) {
 	return nil, fmt.Errorf("covered iter node %d belongs to no rewritten LNT", iter.BasePtr().ID())
 }
 
-// fillHost returns the variant-mandated fill-position loop (R1, §6bis
-// PHASE 4):
+// fillHost returns the fill-position loop — the R1-era rule, retained
+// verbatim through fix3 D-j so placement does not move before the
+// derivation lands (R-I: the same position is what the derivation picks;
+// the suite's assertFillPositionDerived pins that equality):
 //
 //   - ClassSMEM (cooperative LoadTileCta): the INNERMOST covered dim's
 //     between-round loop — the fill runs once per round of that dim,

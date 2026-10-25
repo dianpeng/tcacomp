@@ -511,6 +511,62 @@ func subtreeContains(n, target ir.Node) bool {
 	return found
 }
 
+// assertFillPositionDerived is the fix3 D-i SAFETY NET: the R-I derivation
+// — the innermost rewritten loop whose IV the fill composition's operand
+// closure references (nest-chain depth breaks ties inward) — must pick
+// EXACTLY the position fillHost mandates today. Step 4 (D-j) swaps the
+// placement mechanism under this equality; if a shape's derivation
+// disagreed, that swap would MOVE the fill and this pin fires first.
+func assertFillPositionDerived(t *testing.T, g *ir.Graph, fill, mandated ir.Node) {
+	t.Helper()
+	// The composition's coordinate closure: the STORE's operand closure
+	// covers the source load's axes and the covered round bases.
+	closure := map[ir.Node]bool{}
+	for _, n := range flattenSubtree(fill) {
+		closure[n] = true
+	}
+	nestParent := func(loop ir.Node) ir.Node {
+		for _, op := range ir.OperandsOf(loop)[2:] {
+			if key, val := ir.KeyedAttributeOf(op); key == "nest" && val != nil {
+				return val
+			}
+		}
+		return nil
+	}
+	depth := func(loop ir.Node) int {
+		d := 0
+		for {
+			p := nestParent(loop)
+			if p == nil || p.BasePtr() == nil || p.BasePtr().Erased() {
+				return d
+			}
+			loop = p
+			d++
+		}
+	}
+	var best ir.Node
+	bestDepth := -1
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {
+			continue
+		}
+		iv := ir.OperandsOf(n)[0]
+		if iv == nil || !closure[iv] {
+			continue
+		}
+		if d := depth(n); d > bestDepth {
+			best, bestDepth = n, d
+		}
+	}
+	if best == nil {
+		t.Fatal("the fill's closure references no rewritten loop — the R-I derivation has no position to pick")
+	}
+	if best.BasePtr() != mandated.BasePtr() {
+		t.Fatalf("the R-I derivation picks loop %d (nest depth %d), want the mandated position loop %d — the D-j swap would move this fill",
+			best.BasePtr().ID(), bestDepth, mandated.BasePtr().ID())
+	}
+}
+
 // TestRewriteTailSaturatingGuard is the fixture that would have caught
 // CR-01: extents NOT multiples of the round strides (M=1000 CTA with
 // LoC·T = 3200; N=500 WARP with LoC·32·T = 8192) — every materialized
@@ -1286,6 +1342,9 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	if !subtreeContains(storeOf(t, fx.g), mInsideIV) {
 		t.Fatal("the out store's operand closure must reference the M tile-inside loop's IV (out-store control)")
 	}
+	// The fix3 D-i safety net: the R-I derivation (innermost referenced
+	// loop) picks exactly the mandated position.
+	assertFillPositionDerived(t, fx.g, lhsFill, mInside)
 }
 
 // storeOf returns the graph's unique live GMEM MemStore.
@@ -1398,6 +1457,9 @@ func TestLowerSMEMWindow(t *testing.T) {
 			t.Fatalf("a cooperative fill's operand closure must never reference element loop %d's IV (§4 layering)", l.BasePtr().ID())
 		}
 	}
+	// The fix3 D-i safety net: the R-I derivation picks exactly the
+	// mandated position (innermost covered dim's between round).
+	assertFillPositionDerived(t, fx.g, fill, kBetween)
 	// The access: N coordinate = thread_map.index(N's slot)·T + i with the
 	// N dim's OWN ThreadMap slot (1, not the hardcoded 0), K coordinate =
 	// the plain inside walk.
@@ -1565,6 +1627,9 @@ func TestLowerBodyRootIsLoad(t *testing.T) {
 	if subtreeContains(fill, kInsideIV) || subtreeContains(fill, ir.OperandsOf(nest[2])[0]) {
 		t.Fatal("the fill's operand closure must reference no inside loop's IV (§4 layering)")
 	}
+	// The fix3 D-i safety net: the R-I derivation picks exactly the
+	// mandated position (the degenerate fallback: no above-tie INS dim).
+	assertFillPositionDerived(t, fx.g, fill, nest[1])
 	if vs := ir.Verify(fx.g); len(vs) != 0 {
 		t.Fatalf("verifier must report zero violations, got %v", vs)
 	}
