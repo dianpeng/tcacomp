@@ -82,29 +82,36 @@ func ClusterInputs(n Node) []Node {
 	return append([]Node(nil), ops[dims:]...)
 }
 
-// forLoopNode: lowered loop nest; ops = [iv, bound, body, attrs...] — the
-// bounded induction variable, its bound, the body subtree (an LIR memory
-// store, a nested forloop, or another effect-carrying stage), and trailing
-// KeyedAttribute annotations (M1, quick-261021-jay: the tile-lower pass's
-// soc/dosoc/loc materialization metadata — the catalog arity is variadic
-// and the verifier pins every trailing operand to a KeyedAttribute).
+// forLoopNode: lowered loop nest; ops = [iv, bound, attrs...] — the
+// bounded induction variable, its bound, and trailing KeyedAttribute
+// annotations (M1, quick-261021-jay: the tile-lower pass's soc/dosoc/loc
+// materialization metadata — the catalog arity is variadic and the verifier
+// pins every trailing operand to a KeyedAttribute).
+//
+// Sea-of-nodes design (2026-10-24 author ruling, fix1.md §0): a loop node
+// is a control-flow node with NO body. Membership is implicit via IV
+// back-references; ordering is via data + side-effect edges only. There is
+// never a direct link from a control-flow node to an expression.
 type forLoopNode struct {
 	*Base
 	operandList
 }
 
 // NewForLoop creates an explicit lowered loop over the bounded induction
-// variable iv, bounded by bound, with body as the loop body subtree. attrs
-// are optional trailing KeyedAttribute annotations (M1): the annotation
-// vocabulary the loop-tile-lower pass emits is "soc" (0=seq, 1=cta,
-// 2=thr — the materialization primitive selector), "dosoc" (the loop's
-// map dimension), and "loc" (that loop's materialization concurrency).
-// The verifier's shape check enforces the iv operand kind and the
-// annotation operand kinds.
-func (g *Graph) NewForLoop(origin string, iv, bound, body Node, attrs ...Node) Node {
-	n := g.allocNode(KindForLoop, origin, 3+len(attrs)).(*forLoopNode)
-	ops := make([]Node, 0, 3+len(attrs))
-	ops = append(ops, iv, bound, body)
+// variable iv, bounded by bound. attrs are optional trailing KeyedAttribute
+// annotations (M1): the annotation vocabulary the loop-tile-lower pass emits
+// is "soc" (0=seq, 1=cta, 2=thr — the materialization primitive selector),
+// "dosoc" (the loop's map dimension), and "loc" (that loop's materialization
+// concurrency). The verifier's shape check enforces the iv operand kind and
+// the annotation operand kinds.
+//
+// There is no body operand: loops are control-flow nodes with no body
+// (fix1.md §0 ruling). Membership is implicit via IV references; ordering
+// rides data + chain edges.
+func (g *Graph) NewForLoop(origin string, iv, bound Node, attrs ...Node) Node {
+	n := g.allocNode(KindForLoop, origin, 2+len(attrs)).(*forLoopNode)
+	ops := make([]Node, 0, 2+len(attrs))
+	ops = append(ops, iv, bound)
 	ops = append(ops, attrs...)
 	wireOperands(n, ops...)
 	return n

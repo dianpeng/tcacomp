@@ -639,14 +639,17 @@ func TestGVNReduceParticipates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Lambda-body-root skip (design decision 6)
+// Lambda body roots participate (fix1.md D-d — the exemption is deleted)
 // ---------------------------------------------------------------------------
 
-// TestGVNLambdaBodyRootSkip pins the one non-SSAUse edge's pass-level
-// policy: a node structurally equal to a map's lambda body root survives
-// (body roots are one-of-a-kind for GVN — RAUW cannot rewire lam.Body),
-// while body INTERIORS still dedup through their record-holding users.
-func TestGVNLambdaBodyRootSkip(t *testing.T) {
+// TestGVNLambdaBodyRootParticipates pins the post-D-d policy: a node
+// structurally equal to a map's lambda body root is ORDINARY GVN prey —
+// body roots ride an ordinary operand slot (D15, "every reference ... rides
+// an ordinary operand slot"), so RAUW rewires the lambda's body operand
+// like any use. The deleted exemption (design decision 6) belonged to the
+// pre-D15 raw-pointer body; with no body operands there is nothing to
+// exempt.
+func TestGVNLambdaBodyRootParticipates(t *testing.T) {
 	g := ir.NewGraph("bodyroot")
 	f32 := ir.InternScalar(ir.TF32)
 	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
@@ -663,18 +666,23 @@ func TestGVNLambdaBodyRootSkip(t *testing.T) {
 
 	runGVN(t, g)
 
-	// The twin is NOT a body root, so it participates — but its only
-	// structural equal IS the root, which never enters the table: both
-	// survive.
-	assertKept(t, g, root, twin, mp)
+	// The twin participates and merges onto the representative; the lambda's
+	// body operand rewires to the survivor (an ordinary operand slot).
+	assertKept(t, g, root, mp)
+	assertGone(t, g, twin)
+	lamNode := ir.LambdaOf(mp)
+	if body := ir.LambdaBodies(mp)[0]; body == nil || body.BasePtr() != root.BasePtr() {
+		t.Fatalf("the lambda's body operand must resolve to the surviving root, got %v (lambda %v)", body, lamNode)
+	}
 	runGvnVerify(t, g)
 }
 
 // TestGVNLambdaInteriorDedup pins that body interiors dedup: two maps
 // sharing lambda-param atoms, whose select body roots each wrap a binop
 // over the same operands — the interior binops merge (the loser body's
-// operand record rewires to the surviving interior), while the body ROOTS
-// stay one-of-a-kind.
+// operand record rewires to the surviving interior). Post-D-d the body
+// ROOTS merge too (no exemption): the second select, lambda, and map all
+// dedup onto the first, RAUW rewiring their ordinary operand slots.
 func TestGVNLambdaInteriorDedup(t *testing.T) {
 	g := ir.NewGraph("interior")
 	f32 := ir.InternScalar(ir.TF32)
@@ -697,10 +705,13 @@ func TestGVNLambdaInteriorDedup(t *testing.T) {
 
 	runGVN(t, g)
 
-	assertGone(t, g, d2)
-	assertKept(t, g, d1, s1, s2, m1)
-	if ops := ir.OperandsOf(s2); len(ops) != 3 || ops[0] != d1 {
-		t.Fatalf("s2's interior operand must resolve to d1, got %v", ops)
+	assertGone(t, g, d2, s2, m2)
+	assertKept(t, g, d1, s1, m1)
+	if ops := ir.OperandsOf(s1); len(ops) != 3 || ops[0] != d1 {
+		t.Fatalf("the surviving body root's interior operand must resolve to d1, got %v", ops)
+	}
+	if body := ir.LambdaBodies(m1)[0]; body == nil || body.BasePtr() != s1.BasePtr() {
+		t.Fatalf("m1's lambda body must be the surviving select, got %v", body)
 	}
 	runGvnVerify(t, g)
 }

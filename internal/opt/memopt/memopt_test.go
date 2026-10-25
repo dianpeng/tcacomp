@@ -769,3 +769,109 @@ func TestMemoptVerifyGateMaterializedRefused(t *testing.T) {
 		t.Fatalf("a refused graph must be untouched: %d nodes before, %d after", before, after)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Family 11 — fill liveness (fix1.md D-f, quick-261024-sdk): an unconsumed
+// buffer store (a fill whose buffer has no live reads) is removed together
+// with its unread source load; a consumed fill survives. DCE stays out of
+// it — the source load is chain-reachable, so this is memopt's rule alone.
+// ---------------------------------------------------------------------------
+
+// fillLivenessFixture builds tile-lower's fill shape by hand through the
+// ir constructors:
+//
+//	lhs/lhs2 (GMEM tensors):  srcLoad → succLoad (a chained tensor read)
+//	frag buffer B:            fillStore(srcLoad → B) with NO reader
+//	frag buffer C:            ctlStore(ctlLoad → C) + ctlAccess(C)
+//	end:                      Return(succLoad, ctlAccess)
+//
+// The unconsumed fill's source load carries a chain successor (succLoad)
+// so the removal's C3 splice has real work; the control fill on C has a
+// live buffer load and must come through untouched.
+func fillLivenessFixture() (g *ir.Graph, srcLoad, fillStore, buf, succLoad, ctlLoad, ctlStore, ctlBuf, ctlAccess ir.Node) {
+	g = ir.NewGraph("fill-liveness")
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	lhs2 := g.NewInputParam("ctor", ir.RoleTensor, "lhs2", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+
+	// The unconsumed fill: B's only store, no buffer load anywhere.
+	buf = g.NewFragNew("ctor", m)
+	env := ir.NewEnv()
+	srcLoad = g.NewMemLoadChained("ctor", env, lhs, []ir.Node{m})
+	fillStore = g.NewFragStore("ctor", srcLoad, buf, m)
+
+	// The tensor chain's successor of srcLoad — the splice's exercise.
+	env2 := ir.NewEnv()
+	env2.NoteStore(lhs, srcLoad)
+	succLoad = g.NewMemLoadChained("ctor", env2, lhs, []ir.Node{m})
+
+	// The control fill: C holds a store AND a live reader.
+	ctlBuf = g.NewFragNew("ctor", m)
+	ctlLoad = g.NewMemLoadChained("ctor", env, lhs2, []ir.Node{m})
+	ctlStore = g.NewFragStore("ctor", ctlLoad, ctlBuf, m)
+	bufEnv := ir.NewEnv()
+	bufEnv.NoteStore(ctlBuf, ctlStore)
+	ctlAccess = g.NewFragLoadChained("ctor", bufEnv, ctlBuf, m)
+
+	g.NewReturnChained("ctor", env, []ir.Node{out}, succLoad, ctlAccess)
+	return g, srcLoad, fillStore, buf, succLoad, ctlLoad, ctlStore, ctlBuf, ctlAccess
+}
+
+// TestMemoptFillLiveness (fix1.md 7.2c): the unconsumed fill dies with its
+// source load, the chain successor splices past the removed chain-head load
+// (C3, edge dropped), and the consumed control fill survives with its
+// reader's ordering edge intact.
+func TestMemoptFillLiveness(t *testing.T) {
+	g, srcLoad, fillStore, buf, succLoad, ctlLoad, ctlStore, ctlBuf, ctlAccess := fillLivenessFixture()
+	runMemopt(t, g)
+
+	assertGone(t, g, fillStore, srcLoad)
+	assertKept(t, g, buf, succLoad, ctlLoad, ctlStore, ctlBuf, ctlAccess)
+
+	// The splice: srcLoad was chain-first on lhs, so succLoad drops its
+	// ordering edge rather than re-pointing at nothing.
+	assertNoImpactBy(t, succLoad)
+
+	// The control fill's ordering fact is intact: the reader still chains
+	// after the fill store.
+	assertImpactBy(t, ctlAccess, ctlStore)
+
+	// Idempotence: a second run changes nothing further.
+	runMemopt(t, g)
+	assertKept(t, g, buf, succLoad, ctlLoad, ctlStore, ctlBuf, ctlAccess)
+	assertClean(t, g, fillStore, srcLoad)
+}
+
+// TestMemoptFillLivenessSpliceToPred: the same unconsumed fill, but its
+// source load has a chain PREDECESSOR — the successor must re-point at it
+// (SetDef, C3), keeping the tensor chain total. The predecessor store holds
+// a DIFFERENT position than the loads, so rule (a)'s proven-path check
+// blocks forwarding and the fill-liveness removal is the only rule that
+// can fire — the test isolates rule (d)'s splice.
+func TestMemoptFillLivenessSpliceToPred(t *testing.T) {
+	g := ir.NewGraph("fill-splice")
+	f32 := ir.InternScalar(ir.TF32)
+	m := g.NewInputParam("ctor", ir.RoleDim, "m", nil)
+	m2 := g.NewInputParam("ctor", ir.RoleDim, "m2", nil)
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	lhs := g.NewInputParam("ctor", ir.RoleTensor, "lhs", ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "m"}}))
+	v := g.NewConst("ctor", f32, 1)
+
+	env := ir.NewEnv()
+	predStore := g.NewMemStoreChained("ctor", env, lhs, []ir.Node{m2}, v)
+	srcLoad := g.NewMemLoadChained("ctor", env, lhs, []ir.Node{m})
+	buf := g.NewFragNew("ctor", m)
+	fillStore := g.NewFragStore("ctor", srcLoad, buf, m)
+
+	env2 := ir.NewEnv()
+	env2.NoteStore(lhs, srcLoad)
+	succLoad := g.NewMemLoadChained("ctor", env2, lhs, []ir.Node{m})
+	g.NewReturnChained("ctor", env, []ir.Node{out}, succLoad)
+
+	runMemopt(t, g)
+	assertGone(t, g, fillStore, srcLoad)
+	assertKept(t, g, predStore, buf, succLoad)
+	assertImpactBy(t, succLoad, predStore)
+	assertClean(t, g, fillStore, srcLoad)
+}

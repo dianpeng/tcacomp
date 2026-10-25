@@ -1,8 +1,8 @@
-statement #134:
+statement #139:
   memstore(%out[runtimegridquery(index, 0) * 64 + @d0(init=0, step=6400) + @d0(init=runtimethreadquery(index), step=256)][@d1(init=0, step=64) + @d1(init=0, step=1)][@d2(init=0, step=64) + @d2(init=0, step=1)], %2 * %9)
 
-statement #135:
+statement #140:
   return %out
 
-statement #136:
+statement #141:
   fragstore(%3[@d2(init=0, step=64)][loadtile=2], %39)

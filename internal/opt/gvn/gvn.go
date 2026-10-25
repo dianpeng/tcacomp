@@ -93,8 +93,8 @@ func (Pass) Preserved() []string { return nil }
 //     record-holders inside the body. Upgrade path when lambda-body CSE
 //     ever matters: a MutContext body-rewire choke point.
 //
-//   - One pass over the allocation registry: skip erased nodes and body
-//     roots; hash; on a bucket hit confirmed by ValueEqual, hard-assert
+//   - One pass over the allocation registry: skip erased nodes;
+//     hash; on a bucket hit confirmed by ValueEqual, hard-assert
 //     neither side is effectful (below), RAUW the duplicate onto the
 //     representative, verify zero uses remain, Erase it — CSE is performed
 //     along the way ([4.6]). With no match, the node becomes the bucket's
@@ -109,12 +109,11 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 	}
 
 	se := sideeffect.Analyze(g)
-	bodyRoots := lambdaBodyRoots(g)
 	table := make(map[uint64][]ir.Node)
 	mctx := &ir.MutContext{Pass: "gvn"}
 
 	for _, n := range g.AllocatedNodes() {
-		if n == nil || n.BasePtr().Erased() || bodyRoots[n] {
+		if n == nil || n.BasePtr().Erased() {
 			continue
 		}
 		v, ok := n.(ir.Value)
@@ -161,23 +160,4 @@ func (Pass) Run(_ *opt.Context, g *ir.Graph) error {
 		}
 	}
 	return nil
-}
-
-// lambdaBodyRoots collects every live node that is the Body of some
-// allocated map/reduce lambda — the one-of-a-kind set for GVN (design
-// decision 6). Computed fresh by each pass so erased bearers (from an
-// earlier gvn run) free their body roots for later participation.
-func lambdaBodyRoots(g *ir.Graph) map[ir.Node]bool {
-	roots := make(map[ir.Node]bool)
-	if g == nil {
-		return roots
-	}
-	for _, n := range g.AllocatedNodes() {
-		for _, b := range ir.LambdaBodies(n) {
-			if b != nil {
-				roots[b] = true
-			}
-		}
-	}
-	return roots
 }

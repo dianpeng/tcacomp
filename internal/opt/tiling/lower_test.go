@@ -127,21 +127,58 @@ func loopsOf(g *ir.Graph) []ir.Node {
 	return out
 }
 
-// nestOf returns the live for-loops in NEST order (outermost first),
-// following body operands. The pass builds nests inside-out, so allocation
-// order is the reverse — tests reason in dim order.
+// nestParent returns the loop's canonical-chain parent: the value of its
+// "nest" KeyedAttribute (fix1.md §0: loop-to-loop structure is permitted
+// explicitly; buildNest wires each generated loop to its parent this way).
+// The root carries no nest attribute and answers nil.
+func nestParent(l ir.Node) ir.Node {
+	for _, op := range ir.OperandsOf(l) {
+		if op == nil || op.KindOf() != ir.KindKeyedAttribute {
+			continue
+		}
+		key, val := ir.KeyedAttributeOf(op)
+		if key == "nest" {
+			return val
+		}
+	}
+	return nil
+}
+
+// nestOf returns the live for-loops in NEST order (outermost first). Each
+// non-root loop carries a "nest" KeyedAttribute whose value is its parent
+// (child→parent links), so the walk inverts those links: the unique loop
+// with no parent is the root, and every parent has exactly one child (the
+// canonical chain is linear). The pass builds nests inside-out, so
+// allocation order is the reverse — tests reason in dim order.
 func nestOf(t *testing.T, g *ir.Graph) []ir.Node {
 	t.Helper()
 	loops := loopsOf(g)
-	isBody := make(map[*ir.Base]bool, len(loops))
+	childOf := make(map[*ir.Base]ir.Node, len(loops))
+	hasParent := make(map[*ir.Base]bool, len(loops))
 	for _, l := range loops {
-		if body := ir.OperandsOf(l)[2]; body != nil && body.KindOf() == ir.KindForLoop {
-			isBody[body.BasePtr()] = true
+		p := nestParent(l)
+		if p == nil {
+			continue
 		}
+		if p.KindOf() != ir.KindForLoop {
+			t.Fatalf("loop %d nest parent %d is not a for-loop",
+				l.BasePtr().ID(), p.BasePtr().ID())
+		}
+		if p.BasePtr() == l.BasePtr() {
+			t.Fatalf("loop %d is its own nest parent", l.BasePtr().ID())
+		}
+		if hasParent[l.BasePtr()] {
+			t.Fatalf("loop %d carries more than one nest attribute", l.BasePtr().ID())
+		}
+		hasParent[l.BasePtr()] = true
+		if _, dup := childOf[p.BasePtr()]; dup {
+			t.Fatalf("loop %d has two nest children (branched nest?)", p.BasePtr().ID())
+		}
+		childOf[p.BasePtr()] = l
 	}
 	var root ir.Node
 	for _, l := range loops {
-		if !isBody[l.BasePtr()] {
+		if !hasParent[l.BasePtr()] {
 			if root != nil {
 				t.Fatalf("multiple nest roots: %d and %d", root.BasePtr().ID(), l.BasePtr().ID())
 			}
@@ -152,7 +189,7 @@ func nestOf(t *testing.T, g *ir.Graph) []ir.Node {
 		t.Fatal("no nest root found")
 	}
 	var out []ir.Node
-	for n := root; n != nil && n.KindOf() == ir.KindForLoop; n = ir.OperandsOf(n)[2] {
+	for n := root; n != nil; n = childOf[n.BasePtr()] {
 		out = append(out, n)
 	}
 	if len(out) != len(loops) {
@@ -643,10 +680,19 @@ func TestRewriteMinimalTile(t *testing.T) {
 	if len(loops) != 4 {
 		t.Fatalf("two dims at the floor tile 2 must yield exactly four loops (between+inside per dim), got %d", len(loops))
 	}
-	// Nest: [d0.between, d1.between, d0.inside, d1.inside]; the innermost
-	// body is the store.
-	if got := ir.OperandsOf(loops[3])[2]; got == nil || got.BasePtr() != store.BasePtr() {
-		t.Fatalf("the innermost inside loop's body must be the store")
+	// Nest: [d0.between, d1.between, d0.inside, d1.inside]; sea-of-nodes
+	// (fix1.md §0): the innermost loop has NO body operand — every operand
+	// is a header (iv dimvar, bounded dimvar) or a keyed attribute. The
+	// store's membership rides its IV references, pinned below.
+	for i, op := range ir.OperandsOf(loops[3]) {
+		if op == nil {
+			t.Fatalf("innermost loop operand %d is nil", i)
+		}
+		switch op.KindOf() {
+		case ir.KindDimVar, ir.KindBoundedDimVar, ir.KindKeyedAttribute:
+		default:
+			t.Fatalf("innermost loop operand %d (%s) is an expression link — loops carry no body (fix1.md §0)", i, op.KindOf())
+		}
 	}
 	// The between rounds step by LoC·T for the CTA dim (the CTA-group round
 	// stride) and by the tile for the SEQ dim; the inside walks step 1.
@@ -1228,18 +1274,17 @@ func TestMatmulWorkedCheck(t *testing.T) {
 	if fillBivs[0].BasePtr() != kBetweenIV.BasePtr() {
 		t.Fatal("the lhs fill's round base must be the K between loop's dimvar (filled per k_o round)")
 	}
-	// STRUCTURAL PLACEMENT (R1/F8): the fill is reachable from M.inside's
-	// BODY operand subtree (data + effect edges) — the fill key position —
-	// and, being a per-thread fill, is exempt from the element-loop rule.
-	lr := &lowerRun{g: fx.g}
-	body := ir.OperandsOf(mInside)[2]
-	if !lr.reachableFrom(body)[lhsFill.BasePtr()] {
-		t.Fatal("the lhs fill must be data-reachable from the M tile-inside loop's body operand (the R1 fill-key position)")
+	// STRUCTURAL PLACEMENT (R1/F8), sea-of-nodes (fix1.md §0/D-e): there is
+	// no body operand — membership is IV-reference. The fill is inside
+	// M.inside because its operand closure references M.inside's IV (the
+	// fill-key position), and the whole compute nest (out store included)
+	// is controlled by the same reference.
+	mInsideIV := ir.OperandsOf(mInside)[0]
+	if !subtreeContains(lhsFill, mInsideIV) {
+		t.Fatal("the lhs fill's operand closure must reference the M tile-inside loop's IV (the R1 fill-key position)")
 	}
-	// Out-store control: the GMEM store stays an operand-descendant of the
-	// M.inside body subtree (the whole compute nest is controlled by it).
-	if !lr.operandSubtreeOf(body)[storeOf(t, fx.g).BasePtr()] {
-		t.Fatal("the out store must remain inside the M tile-inside loop's body subtree (out-store control)")
+	if !subtreeContains(storeOf(t, fx.g), mInsideIV) {
+		t.Fatal("the out store's operand closure must reference the M tile-inside loop's IV (out-store control)")
 	}
 }
 
@@ -1336,17 +1381,17 @@ func TestLowerSMEMWindow(t *testing.T) {
 	if len(bases) != 2 || bases[0].BasePtr() != nBetweenIV.BasePtr() || bases[1].BasePtr() != kBetweenIV.BasePtr() {
 		t.Fatalf("the rhs fill's round bases must be the N,K between dimvars, got %v", bases)
 	}
-	// STRUCTURAL PLACEMENT: the fill is reachable from the K between
-	// loop's body operand (the mandated SMEM position) and is NOT an
-	// operand-descendant of any element (inside) loop's body — §4
-	// layering, the HI-02 class.
-	lr := &lowerRun{g: fx.g}
-	if !lr.reachableFrom(ir.OperandsOf(kBetween)[2])[fill.BasePtr()] {
-		t.Fatal("the cooperative fill must be data-reachable from the K between loop's body operand (R1 SMEM position)")
+	// STRUCTURAL PLACEMENT, sea-of-nodes (fix1.md §0/D-e): there is no body
+	// operand — placement is IV-reference. The fill sits at the K between
+	// round position (its closure references the K between IV) and, being
+	// cooperative, its closure references no element (inside) loop's IV —
+	// §4 layering, the HI-02 class.
+	if !subtreeContains(fill, kBetweenIV) {
+		t.Fatal("the cooperative fill's operand closure must reference the K between loop's IV (R1 SMEM position)")
 	}
 	for _, l := range []ir.Node{nest[3], nest[4], nest[5]} { // M.i, N.i, K.i
-		if lr.operandSubtreeOf(ir.OperandsOf(l)[2])[fill.BasePtr()] {
-			t.Fatalf("a cooperative fill must never sit inside element loop %d's body operand subtree (§4 layering)", l.BasePtr().ID())
+		if subtreeContains(fill, ir.OperandsOf(l)[0]) {
+			t.Fatalf("a cooperative fill's operand closure must never reference element loop %d's IV (§4 layering)", l.BasePtr().ID())
 		}
 	}
 	// The access: N coordinate = thread_map.index(N's slot)·T + i with the
@@ -1469,28 +1514,47 @@ func TestLowerBodyRootIsLoad(t *testing.T) {
 	}
 	buf := findBuffer(t, fx.g, ir.KindFragNew, 128) // 4 B × T_k(32)
 	fill := findFillOf(t, fx.g, buf)
-	// No loop's body operand is the fill — the HI-02 shape is gone.
+	// Sea-of-nodes (fix1.md §0): no loop carries an expression operand — the
+	// deleted HI-02 shape (a fill hanging off a loop) is unrepresentable.
 	for _, l := range loopsOf(fx.g) {
-		if body := ir.OperandsOf(l)[2]; body != nil && body.BasePtr() == fill.BasePtr() {
-			t.Fatalf("the fill must never BE a loop's body operand (the deleted HI-02 path placed a fill inside an element loop); loop %d", l.BasePtr().ID())
+		for i, op := range ir.OperandsOf(l) {
+			switch op.KindOf() {
+			case ir.KindDimVar, ir.KindBoundedDimVar, ir.KindKeyedAttribute:
+			default:
+				t.Fatalf("loop %d operand %d (%s) is an expression link — loops carry no body (fix1.md §0)",
+					l.BasePtr().ID(), i, op.KindOf())
+			}
 		}
 	}
-	// The K inside loop's body slot moved onto the buffer ACCESS (the
-	// standard splice: RAUW of the body-root load).
 	nest := nestOf(t, fx.g) // M.b, K.b, M.i, K.i
 	kInside := nest[3]
-	body := ir.OperandsOf(kInside)[2]
-	if body == nil || body.KindOf() != ir.KindFragLoad {
-		t.Fatalf("the K inside loop's body must be the buffer access after the RAUW, got %v", body)
+	kInsideIV := ir.OperandsOf(kInside)[0]
+	kBetweenIV := ir.OperandsOf(nest[1])[0]
+	// The buffer ACCESS holds the K inside membership after the RAUW (the
+	// standard splice: the promoted load's uses moved onto the access).
+	var access ir.Node
+	for _, n := range fx.g.AllocatedNodes() {
+		if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindFragLoad {
+			access = n
+		}
 	}
-	if src := ir.OperandsOf(body)[0]; src.BasePtr() != buf.BasePtr() {
-		t.Fatal("the body access must read the site's own buffer")
+	if access == nil {
+		t.Fatal("the buffer access must survive the rewrite")
 	}
-	// The fill sits at its mandated host (no above-tie INS dim exists:
-	// the innermost covered dim's between body) — reachable from there.
-	lr := &lowerRun{g: fx.g}
-	if !lr.reachableFrom(ir.OperandsOf(nest[1])[2])[fill.BasePtr()] {
-		t.Fatal("the fill must be data-reachable from the K between loop's body operand (the fallback fill position)")
+	if !subtreeContains(access, kInsideIV) {
+		t.Fatalf("the buffer access must reference the K inside loop's IV (membership, fix1.md §0), got %v", access)
+	}
+	if src := ir.OperandsOf(access)[0]; src.BasePtr() != buf.BasePtr() {
+		t.Fatal("the access must read the site's own buffer")
+	}
+	// The fill sits at its mandated host (the innermost covered dim's
+	// between round): its closure references the K between IV and no
+	// element (inside) loop's IV — §4 layering.
+	if !subtreeContains(fill, kBetweenIV) {
+		t.Fatal("the fill's operand closure must reference the K between loop's IV (the fallback fill position)")
+	}
+	if subtreeContains(fill, kInsideIV) || subtreeContains(fill, ir.OperandsOf(nest[2])[0]) {
+		t.Fatal("the fill's operand closure must reference no inside loop's IV (§4 layering)")
 	}
 	if vs := ir.Verify(fx.g); len(vs) != 0 {
 		t.Fatalf("verifier must report zero violations, got %v", vs)
@@ -1604,22 +1668,26 @@ func TestSelfCheckInjections(t *testing.T) {
 		}
 	})
 
-	t.Run("fill placement unreachable", func(t *testing.T) {
-		g := ir.NewGraph("inj-place")
+	t.Run("fill ordering missing chain edge", func(t *testing.T) {
+		g := ir.NewGraph("inj-order")
 		u32 := ir.InternScalar(ir.TU32)
 		dim := g.NewInputParam("ctor", ir.RoleDim, "d", nil)
 		ivn := g.NewDimVar("ctor", dim, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
 		loop := g.NewForLoop("ctor", ivn, g.NewBoundedDimVar("ctor", ivn, g.NewConst("ctor", u32, 8)),
 			g.NewConst("ctor", u32, 0))
 		buf := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
-		// A fill floating OUTSIDE the host's body subtree: exactly the
-		// CR-02 shape the placement check must catch.
 		src := g.NewMemLoad("ctor", tensorParam(g, "t", 1), []ir.Node{ivn})
 		fill := g.NewMemStoreSMem("ctor", src, buf)
-		lr := &lowerRun{g: g, fills: []*siteFill{{siteID: 3, src: src, store: fill, host: loop, variant: loadTileCta}}}
-		if err := lr.checkFillPlacement(); err == nil || !strings.Contains(err.Error(), "fill-position loop") {
-			t.Fatalf("an unspliced fill must trip the placement check, got %v", err)
+		// An access on the buffer WITHOUT the chain edge to the fill: the
+		// F8 splice edge is the structural ORDERING fact (fix1.md D-e), and
+		// this is the 7.2a non-vacuity pin — a fill whose buffer has live
+		// reads that do not chain back to it must fail.
+		access := g.NewMemLoadSMem("ctor", buf, ivn)
+		lr := &lowerRun{g: g, fills: []*siteFill{{siteID: 3, src: src, store: fill, buffer: buf, host: loop, variant: loadTileCta}}}
+		if err := lr.checkFillPlacement(); err == nil || !strings.Contains(err.Error(), "not a chain predecessor") {
+			t.Fatalf("an access without the fill's chain edge must trip ORDERING, got %v", err)
 		}
+		_ = access
 	})
 
 	t.Run("fill scope leak", func(t *testing.T) {
@@ -1665,18 +1733,19 @@ func TestSelfCheckInjections(t *testing.T) {
 		buf := g.NewMemNewSMem("ctor", g.NewConst("ctor", u32, 64))
 		src := g.NewMemLoad("ctor", tensorParam(g, "t", 1), []ir.Node{ivn})
 		fill := g.NewMemStoreSMem("ctor", src, buf)
-		// The loop's BODY OPERAND is the fill — the HI-02 shape: a
-		// cooperative fill inside an element loop.
-		loop := g.NewForLoop("ctor", ivn, g.NewBoundedDimVar("ctor", ivn, g.NewConst("ctor", u32, 8)), fill)
+		// The fill's coordinates ride the inside (element-loop) walk's IV
+		// — the HI-02 shape, unrepresentable as a body operand post-fix1.md
+		// and caught by the LAYERING-IV recast (D-e).
+		loop := g.NewForLoop("ctor", ivn, g.NewBoundedDimVar("ctor", ivn, g.NewConst("ctor", u32, 8)))
 		lr := &lowerRun{
 			g: g,
 			rewrites: []*lntRewrite{{dims: []*dimRewrite{{
 				soc: SoCSequential, inside: loop, between: loop, betweenIV: ivn, insideIV: ivn,
 			}}}},
-			fills: []*siteFill{{siteID: 7, src: src, store: fill, host: loop, variant: loadTileCta}},
+			fills: []*siteFill{{siteID: 7, src: src, store: fill, buffer: buf, host: loop, variant: loadTileCta}},
 		}
-		if err := lr.checkFillPlacement(); err == nil || !strings.Contains(err.Error(), "element loop") {
-			t.Fatalf("a cooperative fill inside an element loop must trip the layering check, got %v", err)
+		if err := lr.checkFillPlacement(); err == nil || !strings.Contains(err.Error(), "inside-loop dimvar") {
+			t.Fatalf("a cooperative fill referencing an element loop's IV must trip the layering check, got %v", err)
 		}
 	})
 

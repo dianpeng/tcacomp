@@ -103,7 +103,7 @@ func TestEffectVerdictsMemoryFamily(t *testing.T) {
 	if e := EffectOf(iter); e.Has() {
 		t.Fatal("iter must be free under the node-local EffectOf ([2.3] belongs to the accumulated analysis)")
 	}
-	if e := EffectOf(g.NewForLoop("ctor", dv, val, val)); e.Has() {
+	if e := EffectOf(g.NewForLoop("ctor", dv, val)); e.Has() {
 		t.Fatal("forloop must be free under the node-local EffectOf")
 	}
 	if e := EffectOf(dv); e.Has() {

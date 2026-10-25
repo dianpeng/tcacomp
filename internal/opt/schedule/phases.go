@@ -6,7 +6,7 @@ package schedule
 //
 //	gate → markLive → deriveForest (spec Step 0)
 //	     → anchorSchedule (spec 3.1 + the SN -1 prototype anchors)
-//	     → computeCaps → propagate (spec 3.2) → applyEffectfulFloor
+//	     → computeCaps → propagate (spec 3.2)
 //	     → classify → assignOwnership → resolveEpilogueHomes
 //	     → buildKernel (spec Step 1) → newKernel (spec Step 2)
 //
@@ -17,6 +17,7 @@ package schedule
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"tcacomp/internal/ir"
@@ -74,9 +75,23 @@ func newScheduleRun(g *ir.Graph) *scheduleRun {
 }
 
 // markLive builds the LIVE SET: everything reachable from the sea roots
-// via ir.Walk (the same traversal checkLegality uses). Erased and
-// unreachable building debris is never scheduled. The graph's transient
-// marks are Run-scoped: Run resets them before and after (defer).
+// via ir.Walk (the same traversal checkLegality uses), then the
+// fix1.md Step 5 loop-node extension. With the body operands gone, a
+// non-root loop node has no walk-inbound edge: its children point AT it
+// only through the child→parent "nest" attribute, and the P6 repoint
+// wired the end node's completion edge at the nest ROOT (ordered "after
+// the whole loop"). §0 makes loop liveness ordinary — a loop is live
+// because its IV is used ("a use of L's IV is membership in L"), not by
+// containment. So a non-walk-live KindForLoop whose IV dimvar (ops[0])
+// is walk-live is marked live TOGETHER WITH its header triple (loop, iv,
+// bound) and the bound's transitive operand closure — tile-lower's
+// round-base arithmetic (the umin/sub chains feeding tile-between bounds)
+// is referenced ONLY through those bounds, and pre-fix1 it was walk-live
+// through the body operand, so reviving the bound without its closure
+// would strand the chain unplaced. anchorSchedule anchors all three
+// header nodes. A loop whose IV nobody uses stays dead: deriveForest's
+// fail-closed gate still refuses it (dead building debris, not
+// scheduled).
 func (r *scheduleRun) markLive() {
 	ir.Walk(r.g, ir.VisitorFunc(func(n ir.Node) ir.VisitResult {
 		n.BasePtr().MarkAlive()
@@ -84,6 +99,32 @@ func (r *scheduleRun) markLive() {
 	}))
 	for _, n := range r.nodes {
 		r.live[n] = n.BasePtr().Alive()
+	}
+	var stamp func(x ir.Node)
+	stamp = func(x ir.Node) {
+		if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || r.live[x] {
+			return
+		}
+		x.BasePtr().MarkAlive()
+		r.live[x] = true
+		for _, d := range ir.DataDeps(x) {
+			stamp(d)
+		}
+	}
+	for _, n := range r.nodes {
+		if n.KindOf() != ir.KindForLoop || r.live[n] {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 || ops[0] == nil || !r.live[ops[0]] {
+			continue
+		}
+		n.BasePtr().MarkAlive()
+		r.live[n] = true
+		stamp(ops[0])      // the iv: header-triple liveness
+		if len(ops) >= 2 { // the bound + its closure (round-base chains)
+			stamp(ops[1])
+		}
 	}
 }
 
@@ -180,25 +221,91 @@ func (r *scheduleRun) anchor(n ir.Node, depth int) {
 	r.anchored[n] = true
 }
 
-// computeCaps derives the TWO CONTAINMENT CAPS (quick-261022-b2m): capOp
-// is the deepest loop whose BODY-OPERAND subtree contains n (the HI-02
-// floor's reference); capUni is the deepest loop whose body reaches n
-// through the UNIFORM closure (data + impact-predecessor edges — CR-01's
-// fix: tile-lower makes fills loop members via effect chains). capUni >=
-// capOp by construction; nests are chains, so every contained node is
-// contained at EVERY depth 1..capUni within its root.
+// computeCaps derives the TWO CONTAINMENT CAPS (quick-261022-b2m), both
+// from the ONE membership relation now (fix1.md Step 5): capOp — the
+// HI-02 effectful floor's reference — and capUni — the placement
+// bound/ownership reference — are each the deepest loop whose IV the
+// node's data-dep closure references (membership via IV back-references,
+// §0; the fill's epoch membership rides its coordinates' IV references,
+// §1.4, so the old effect-chain reach inclusion is subsumed). The
+// two-map structure survives because the rulings they serve (HI-02 floor
+// vs CR-01 placement) remain distinct consumers even though the
+// derivation collapsed onto one relation. Nests are chains, so every
+// member is contained at EVERY depth 1..cap within its root.
+//
+// Both caps then take the C3 COMPLETION CUT: a node whose closure touches
+// a ForLoop node (or that the end node's completion chain parks after a
+// loop — NewReturnChained's trailing-operand order is the construction
+// world's completion edge, the same chain P6 keeps intact as
+// "end.operand = final store") is ordered AFTER that loop's whole nest,
+// so no cap may reach the loop's depth or deeper — the cut resolves D-c's
+// incoherence (uses L's IV yet ordered after L) as AFTER, which is what
+// sends the end node, post-nest stores, and kernel-level reduction
+// consumers to the epilogue while their raw IV membership runs deep. The
+// FOLD-COMPLETION cut (reduceCompletionCutOf, §5.1) applies the same
+// AFTER resolution to the consumers of a KindReduce's whole-domain value:
+// their propagated SN already equals the feeding walk's depth, so this
+// cut is what distinguishes epilogue placement from fix1.md's rejected
+// closure-extended Option D.
 func (r *scheduleRun) computeCaps() {
 	r.capOp = make(map[ir.Node]int, len(r.nodes))
 	r.capUni = make(map[ir.Node]int, len(r.nodes))
 	for _, t := range r.nests {
-		for n := range t.body {
+		for n := range t.members {
 			if t.depth > r.capOp[n] {
 				r.capOp[n] = t.depth
 			}
-		}
-		for n := range t.reach {
 			if t.depth > r.capUni[n] {
 				r.capUni[n] = t.depth
+			}
+		}
+	}
+	depthOf := make(map[ir.Node]int, len(r.nests))
+	for _, t := range r.nests {
+		depthOf[t.loop] = t.depth
+	}
+	// The fold-completion floor: each KindReduce's shallowest member-nest
+	// depth — the input to reduceCompletionCutOf (§5.1; see nest.go).
+	reduceFloor := make(map[ir.Node]int)
+	for _, t := range r.nests {
+		for n := range t.members {
+			if n.KindOf() != ir.KindReduce {
+				continue
+			}
+			if d, ok := reduceFloor[n]; !ok || t.depth < d {
+				reduceFloor[n] = t.depth
+			}
+		}
+	}
+	cut := func(n ir.Node, below int) {
+		if below < r.capOp[n] {
+			r.capOp[n] = below
+		}
+		if below < r.capUni[n] {
+			r.capUni[n] = below
+		}
+	}
+	for _, n := range r.nodes { // closure-touch completion edges (C3)
+		if !r.live[n] || n.KindOf() == ir.KindForLoop {
+			continue
+		}
+		if c := completionCutOf(n, depthOf); c < math.MaxInt {
+			cut(n, c)
+		}
+		if c := reduceCompletionCutOf(n, reduceFloor); c < math.MaxInt {
+			cut(n, c)
+		}
+	}
+	if end := r.g.End(); end != nil { // end-chain completion edges (P6)
+		ops := ir.DataDeps(end)
+		for i, op := range ops {
+			if op == nil || op.BasePtr() == nil || op.BasePtr().Erased() || op.KindOf() == ir.KindForLoop {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if d, ok := depthOf[ops[j]]; ok {
+					cut(op, d-1)
+				}
 			}
 		}
 	}
@@ -235,26 +342,18 @@ func (r *scheduleRun) propagate() {
 	}
 }
 
-// applyEffectfulFloor is the HI-02 FLOOR (quick-261022-b2m): a live
-// memory-ACCESS node (effectful, non-allocation) never hoists above its
-// operand-containing loop — floor SN at capOp, then RE-propagate so
-// floors flow to consumers (a kernel-level consumer of a floored in-loop
-// load becomes an epilogue node, not a prologue reader). Allocations are
-// exempt (isAllocationKind): hoisting a shared declaration is
-// semantics-preserving (the buffer pin: SN 0).
-func (r *scheduleRun) applyEffectfulFloor() {
-	for _, n := range r.nodes {
-		if !r.live[n] || r.anchored[n] || n.KindOf() == ir.KindForLoop {
-			continue
-		}
-		if ir.EffectOf(n).Has() && !isAllocationKind(n.KindOf()) {
-			if c := r.capOp[n]; c > n.BasePtr().SchedSN() {
-				n.BasePtr().SetSched(c, nil)
-			}
-		}
-	}
-	r.propagate()
-}
+// applyEffectfulFloor was the HI-02 floor over the body-model capOp
+// (quick-261022-b2m); quick-261024-sdk deletes it with the body model.
+// Under the ONE IV-membership relation the floor is structurally subsumed:
+// membership requires an IV reference, the IV is anchored at its loop's
+// depth, and propagation maxes over deps — so every member's SN already
+// equals or exceeds its membership cap before classification (the
+// epoch-varying fill lands in-loop by construction), while a fully
+// invariant access references no IV, is unordered w.r.t. the loop, and
+// legally hoists (fix1.md §0: ordering is dependency-only). HI-02's
+// protective content — an epoch-varying access never hoists out of its
+// host — is now emergent; the fill-idiom subtest in scheduler_test.go
+// pins it.
 
 // classify is the TWO-CASE PLACEMENT decision (no clamp,
 // quick-261022-b2m): a live non-anchored non-ForLoop node is IN-LOOP
@@ -277,14 +376,16 @@ func (r *scheduleRun) classify() {
 
 // assignOwnership is UNIFORM OWNERSHIP: an in-loop node at final SN r
 // belongs to the LNT of the FIRST loop (allocation order) at depth r
-// whose UNIFORM reach contains it — first-claim wins, single placement
+// whose membership set contains it — first-claim wins, single placement
 // (the old body-only claim starved effect-chained members like the fills,
-// CR-01). Map order stays irrelevant: first claim per node wins.
+// CR-01; post-fix1 the membership set is the IV relation, which already
+// carries the fills through their coordinates' IV references). Map order
+// stays irrelevant: first claim per node wins.
 func (r *scheduleRun) assignOwnership() {
 	r.owner = make(map[ir.Node]*forNest, len(r.nodes))
 	for _, t := range r.nests { // allocation order of the loops
 		rank := t.depth
-		for n := range t.reach {
+		for n := range t.members {
 			if r.live[n] && n.KindOf() != ir.KindForLoop && !r.anchored[n] &&
 				r.owner[n] == nil && n.BasePtr().SchedSN() == rank {
 				r.owner[n] = nestRoot(t)
@@ -566,22 +667,12 @@ func nestRoot(t *forNest) *forNest {
 	return t
 }
 
-// isAllocationKind reports the HI-02 floor EXEMPTION (quick-261022-b2m
-// ruling 5): MemNew/MemNewSMem/FragNew are effectful under the fresh-object
-// rule but are shared DECLARATIONS consumed at multiple depths — the SMEM
-// window buffer is an operand of the shallow per-round fill AND of the deep
-// in-body accesses. Flooring an allocation at its deepest accessor would
-// place it after the fill and fire the cross-block ordering net; hoisting a
-// declaration is semantics-preserving (the pin: the buffer lands at SN 0,
-// first prologue). Only memory-ACCESS kinds (loads/stores) take the floor.
-func isAllocationKind(k ir.Kind) bool {
-	switch k {
-	case ir.KindMemNew, ir.KindMemNewSMem, ir.KindFragNew:
-		return true
-	default:
-		return false
-	}
-}
+// isAllocationKind was the HI-02 floor's allocation exemption
+// (quick-261022-b2m ruling 5); quick-261024-sdk deletes it with the floor.
+// Under the ONE IV-membership relation the exemption is unnecessary: an
+// allocation whose extent references no IV is not a member (SN 0, the
+// prologue/prototype pin holds naturally), and the fresh-object rule needs
+// no placement machinery of its own.
 
 // buildLBBN is the spec's step 1.1 for one nest: recursively create the
 // Loop BB for every nested loop (mapping each LIR loop node to its Loop

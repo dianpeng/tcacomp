@@ -274,7 +274,7 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 	}
 
 	// (2.2) R3 — the per-output-element restructure.
-	return lr.buildElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall, anchor)
+	return lr.buildElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall)
 }
 
 // buildElementLoop implements R3 under the R-A bracket law (2026-10-24
@@ -291,7 +291,7 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 // is not defined per element).
 func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTBlock,
 	betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT,
-	construction, combineCall, anchor ir.Node) error {
+	construction, combineCall ir.Node) error {
 
 	parentBlk, xIdx := lr.findBlockItem(xBlk)
 	if parentBlk == nil || xIdx < 0 {
@@ -324,10 +324,10 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		}
 	}
 
-	// Build the fresh uniform element chain innermost-first (each loop's
-	// body operand is wired at construction — the piped producer anchors the
-	// innermost body, the sea-level reachability anchor; the AST blocks
-	// carry the real statement order). Uniform: init 0, step 1, soc 0
+	// Build the fresh uniform element chain innermost-first (the AST blocks
+	// carry the real statement order — since quick-261024-sdk removed the
+	// body slot there is NO loop-to-loop operand to wire; the loops are
+	// chained solely as Block items). Uniform: init 0, step 1, soc 0
 	// (sequential), loc 1 — every thread walks every element, which is what
 	// keeps Combine's collectives uniformly reached.
 	//
@@ -339,13 +339,12 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// len(betweenBlks)==1 elemBlk == outermostBlk — the committed
 	// 1-between-dim golden shape is bit-identical.
 	freshIVs := make([]ir.Node, len(betweenBlks))
-	innermost := anchor
 	var outermostBlk, elemBlk *ir.ASTBlock
 	for i := len(betweenBlks) - 1; i >= 0; i-- {
 		dimParam := ir.OperandsOf(betweenIVs[i])[0]
 		freshIV := lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
 		freshWrapper := lr.g.NewBoundedDimVar(lowerOrigin, freshIV, boundMaxs[i])
-		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper, innermost,
+		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper,
 			lr.g.NewKeyedAttribute(lowerOrigin, "soc", lr.u32c(0)),
 			lr.g.NewKeyedAttribute(lowerOrigin, "loc", lr.u32c(1)))
 		blk, err := ir.NewASTLoop(freshLoop)
@@ -364,7 +363,7 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		if i == len(betweenBlks)-1 {
 			elemBlk = blk // the FIRST built is the INNERMOST element loop
 		}
-		outermostBlk, innermost = blk, freshLoop
+		outermostBlk = blk
 		freshIVs[i] = freshIV
 	}
 	// elemDepth is the INNERMOST element loop's depth (one level per between
@@ -458,30 +457,78 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		return err
 	}
 
-	// The orphan guard + disposal. First: X's loop BODY operand pointed at
-	// the outermost between loop (the scheduler's chain wiring) — rewire it
-	// onto home's loop, X's new direct child, so the dissolved loop's last
-	// legitimate use dies. The erasure itself is DEFERRED to
+	// The orphan guard + disposal. Since quick-261024-sdk removed the body
+	// slot, X carries no body operand; the IR-level chain wiring is
+	// tile-lower's canonical-chain "nest" attribute — every non-root chain
+	// loop holds one pointing at its canonical parent. The restructure
+	// dissolves the between loops, so EVERY referrer — always such a "nest"
+	// attribute — is retargeted onto the nearest surviving canonical
+	// ancestor (walking the dissolved chain upward through the "nest"
+	// attrs): the post-fix1 form of the old X-body→home rewire. Retargeting
+	// uniformly — dissolved bearers included — leaves no dissolved loop
+	// referencing another, so finalizeDissolutions can erase the jobs in
+	// any order (the attr of a dissolved bearer is captured in its job's
+	// closure and dies with it, now pointing at a survivor). Anything not
+	// a "nest" attribute still referencing a dissolved loop is a corrupted
+	// restructure — fail closed. The erasure itself is DEFERRED to
 	// finalizeDissolutions (after Map Lower): the piped Map's projection
 	// machinery — the producing Map, its As, and its epilogue-anchored
 	// lambda — still references the walk's coordinate expressions until
 	// Map Lower disposes them, so the between dimvar's use list only
 	// reaches zero there.
-	homeLoop := homeBlk.Loop()
-	rewired := false
-	for _, u := range ir.UsesOf(betweenBlks[0].Loop()) {
-		if usr := u.User(); usr != nil && usr.BasePtr() == x.BasePtr() {
-			if err := lr.mctx.SetDef(u, homeLoop); err != nil {
-				return fmt.Errorf("final-lower: reduce node %d: rewiring X's body operand onto home: %w", red.BasePtr().ID(), err)
+	dissolving := make(map[ir.Node]bool, len(betweenBlks))
+	for _, b := range betweenBlks {
+		dissolving[b.Loop()] = true
+	}
+	// nestParentOf reads a loop's canonical parent through its own "nest"
+	// attribute operand (nil when the loop is the chain root).
+	nestParentOf := func(loop ir.Node) ir.Node {
+		for _, op := range ir.OperandsOf(loop) {
+			if key, val := ir.KeyedAttributeOf(op); key == "nest" && val != nil {
+				return val
 			}
-			rewired = true
-			break
+		}
+		return nil
+	}
+	type retarget struct {
+		use    ir.SSAUse
+		target ir.Node
+	}
+	var retargets []retarget
+	for _, b := range betweenBlks {
+		loop := b.Loop()
+		for _, u := range ir.UsesOf(loop) { // collected before any SetDef mutates use lists
+			usr := u.User()
+			if usr == nil || usr.BasePtr() == nil {
+				continue
+			}
+			if key, _ := ir.KeyedAttributeOf(usr); key != "nest" {
+				return fmt.Errorf("final-lower: reduce node %d: node %d (%s) still references the dissolved between loop %d after the element-loop restructure",
+					red.BasePtr().ID(), usr.BasePtr().ID(), usr.KindOf(), loop.BasePtr().ID())
+			}
+			// Walk the canonical ancestor chain (each loop's own "nest" attr)
+			// past the dissolved region; the attr retargets onto the first
+			// surviving ancestor. The walk always advances at least one hop —
+			// `loop` itself is dissolving, so it can never be the target.
+			target := loop
+			for {
+				parent := nestParentOf(target)
+				if parent == nil || parent.BasePtr() == nil || parent.BasePtr().Erased() {
+					return fmt.Errorf("final-lower: reduce node %d: the dissolved between loop %d has no surviving canonical ancestor to retarget its nest reference onto",
+						red.BasePtr().ID(), loop.BasePtr().ID())
+				}
+				target = parent
+				if !dissolving[parent] {
+					break
+				}
+			}
+			retargets = append(retargets, retarget{use: u, target: target})
 		}
 	}
-	if !rewired && len(ir.UsesOf(betweenBlks[0].Loop())) > 0 {
-		u := ir.UsesOf(betweenBlks[0].Loop())[0]
-		return fmt.Errorf("final-lower: reduce node %d: node %d (%s) still references the dissolved between loop %d after the element-loop restructure",
-			red.BasePtr().ID(), u.User().BasePtr().ID(), u.User().KindOf(), betweenBlks[0].Loop().BasePtr().ID())
+	for _, rt := range retargets {
+		if err := lr.mctx.SetDef(rt.use, rt.target); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: retargeting a dissolved between loop's nest reference: %w", red.BasePtr().ID(), err)
+		}
 	}
 	for i := range betweenBlks {
 		loop := betweenBlks[i].Loop()

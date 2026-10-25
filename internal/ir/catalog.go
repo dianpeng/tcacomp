@@ -55,7 +55,7 @@ var catalog = []kindEntry{
 	{KindLambda, TierHIR, FamilyAbstract, -1, "lambda expression: (param declarations..., body); map/reduce carry it as their trailing input"},
 
 	// --- LIR tier ---
-	{KindForLoop, TierLIR, FamilyLoop, -1, "lowered loop nest: (iv dimvar, bound bdimvar, body, KeyedAttribute annotations... (M1, quick-261021-jay))"},
+	{KindForLoop, TierLIR, FamilyLoop, -1, "lowered loop nest: (iv dimvar, bound bdimvar, KeyedAttribute annotations... (M1, quick-261021-jay)) — no body operand (sea-of-nodes ruling, fix1.md §0)"},
 	{KindDimVar, TierLIR, FamilyAbstract, 3, "lowered induction variable: (dim, init, step) value object"},
 	{KindBoundedDimVar, TierLIR, FamilyAbstract, 2, "dimvar bound to a max: ((iv tuple), max)"},
 	{KindMemLoadSMem, TierLIR, FamilyMemory, -1, "SMEM load: (src smem buffer, bivs...)"},

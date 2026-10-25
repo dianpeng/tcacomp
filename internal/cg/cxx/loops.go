@@ -137,9 +137,11 @@ func (e *emitter) walkLoop(blk *ir.ASTBlock) error {
 
 // requireSocAttr gates on the soc annotation existing on the ForLoop itself
 // (tile-lower stamps it at every construction site; its absence is a
-// pipeline bug) and agreeing with the block class.
+// pipeline bug) and agreeing with the block class. Attribute operands start
+// at ops[2] since fix1 (quick-261024-sdk) removed the body slot: the
+// ForLoop layout is [iv, bound, attrs...].
 func (e *emitter) requireSocAttr(loop ir.Node, soc int) error {
-	for _, op := range ir.OperandsOf(loop)[3:] {
+	for _, op := range ir.OperandsOf(loop)[2:] {
 		key, val := ir.KeyedAttributeOf(op)
 		if key != "soc" || val == nil {
 			continue
@@ -166,9 +168,11 @@ func socName(soc int) string {
 }
 
 // loopTile reads the loop's tile annotation (quick-261023-cgq: tile-lower
-// stamps it beside soc/dosoc/loc — the same KeyedAttribute channel).
+// stamps it beside soc/dosoc/loc — the same KeyedAttribute channel). The
+// attribute operands start at ops[2] since fix1 (quick-261024-sdk) removed
+// the body slot: the ForLoop layout is [iv, bound, attrs...].
 func (e *emitter) loopTile(loop ir.Node) (int, bool) {
-	for _, op := range ir.OperandsOf(loop)[3:] {
+	for _, op := range ir.OperandsOf(loop)[2:] {
 		key, val := ir.KeyedAttributeOf(op)
 		if key != "tile" || val == nil {
 			continue

@@ -10,20 +10,23 @@
 // algorithm serving BOTH loop dialects, driven by the ir-owned
 // ir.LoopNesting spec (internal/ir/loopspec.go, ruling D-01) — the HIR
 // KindIter suite (links by the EXPLICIT parent operand, ParentEdge) and
-// the LIR KindForLoop suite (links by BODY-OPERAND CONTAINMENT,
-// BodyRoot). At any pipeline stage exactly one dialect is live (tile-lower
-// retires every iter), so there is no stage detection; a hypothetical
-// mixed graph links coherently under the same rules.
+// the LIR KindForLoop suite (links by IV DATA-DEP REFERENCE DERIVATION,
+// fix1.md D-b: loop L_in is nested in L_out iff L_out's IV dimvar is in
+// L_in's data-dep operand closure). At any pipeline stage exactly one
+// dialect is live (tile-lower retires every iter), so there is no stage
+// detection; a hypothetical mixed graph links coherently under the same
+// rules.
 //
 // MEMBERSHIP EDGES ONLY (ruling D-04, the quick-261022-b2m lesson — THE
 // REASON THE SPEC INTERFACE EXISTS): linking uses ParentEdge and
-// BodyRoot-operand containment and NEVER the uniform data+effect closure.
-// tile-lower's repointChains (lower_rewrite.go P6) re-points every
-// post-nest consumer's ImpactBy edge at a FOREIGN nest's root loop ("the
-// ForLoop node as effect-def" denotes whole-loop completion), so loop
-// nodes are uniform-reachable from other nests' bodies: a closure-based
-// link would cross-nest sibling LNTs and destroy the loop-nest-tree
-// decomposition. Completion edges ORDER; membership edges NEST.
+// IV-data-dep reference derivation and NEVER the uniform data+effect
+// closure. tile-lower's repointChains (lower_rewrite.go P6) re-points
+// every post-nest consumer's ImpactBy edge at a FOREIGN nest's root loop
+// ("the ForLoop node as effect-def" denotes whole-loop completion), so
+// loop nodes are uniform-reachable from other nests' bodies: a
+// closure-based link would cross-nest sibling LNTs and destroy the
+// loop-nest-tree decomposition. Completion edges ORDER; membership edges
+// NEST. Effect edges are NEVER linking input (C3).
 //
 // DEPTH BASE (ruling D-02): roots are depth 0, children parent+1 — the
 // historic iter-forest convention. Every tiling consumer uses depths
@@ -36,9 +39,13 @@
 //     members.
 //   - LINK: a node's parent is its spec ParentEdge target when that target
 //     is a collected loop; otherwise the FIRST collected loop (allocation
-//     order) whose BodyRoot-derived operand-closure subtree contains it —
-//     first-match wins, deterministic. The containment closure walks
-//     OPERAND slots only (the same membership-edge discipline).
+//     order) whose IV dimvar appears in the candidate child's data-dep
+//     operand closure. For LIR forloops: loop L_in is nested in L_out iff
+//     L_out's IV dimvar is in L_in's data-dep operand closure (fix1.md D-b).
+//     The closures are computed lazily (at most one per loop) and walk
+//     OPERAND slots only — membership edges, never the uniform data+effect
+//     closure (D-04). Effect edges are NEVER linking input (C3: completion
+//     edges order, never nest).
 //   - SEPARATE STRUCTURE: the forest is its own tree type, NEVER baked
 //     into IR nodes — computed on the fly, one snapshot per Analyze call.
 //   - READ-ONLY: per the analysis-package contract, Analyze never mutates
@@ -105,11 +112,13 @@ func (f Forest) NodeOf(loop ir.Node) (*Tree, bool) {
 //
 //  2. LINK: for each loop x in allocation order — ParentEdge first: when
 //     x's explicit parent operand p is a collected loop, p is x's parent.
-//     Otherwise containment: the FIRST loop y (allocation order, y != x)
-//     whose BodyRoot-derived operand-closure subtree contains x becomes
-//     x's parent. The closures are computed lazily (at most one per loop)
-//     and walk OPERAND slots only — membership edges, never the uniform
-//     data+effect closure (D-04). x leaves the root set on either link.
+//     Otherwise IV-data-dep derivation (fix1.md D-b): the FIRST loop y
+//     (allocation order, y != x) whose IV dimvar appears in x's data-dep
+//     operand closure becomes x's parent. The closures are computed
+//     lazily (at most one per loop) and walk OPERAND slots only —
+//     membership edges, never the uniform data+effect closure (D-04).
+//     Effect edges are NEVER linking input (C3). x leaves the root set on
+//     either link.
 //
 //  3. DEPTH: DFS from each root in Roots() order — root 0, child =
 //     parent + 1. Cycle-safe by construction: mutually-parenting loops
@@ -133,15 +142,15 @@ func Analyze(g *ir.Graph) Forest {
 		order = append(order, n)
 	}
 
-	// bodyCaches: lazily computed BodyRoot operand-closure per loop (the
-	// containment sets of the LINK step). Operand slots only, cycle-guarded.
-	bodyCaches := make(map[ir.Node]map[ir.Node]bool, len(order))
-	bodyOf := func(loop ir.Node) map[ir.Node]bool {
-		if set, ok := bodyCaches[loop]; ok {
+	// ivCaches: lazily computed data-dep operand closure per loop (the
+	// IV-membership sets of the LINK step). Operand slots only, cycle-guarded.
+	ivCaches := make(map[ir.Node]map[ir.Node]bool, len(order))
+	closureOf := func(loop ir.Node) map[ir.Node]bool {
+		if set, ok := ivCaches[loop]; ok {
 			return set
 		}
-		set := operandClosure(spec.BodyRoot(loop))
-		bodyCaches[loop] = set
+		set := operandClosure(loop)
+		ivCaches[loop] = set
 		return set
 	}
 
@@ -156,16 +165,27 @@ func Analyze(g *ir.Graph) Forest {
 				continue
 			}
 		}
-		for _, y := range order {
-			if y == x {
-				continue
-			}
-			if bodyOf(y)[x] {
-				yt := trees[y]
-				xt.Parent = yt
-				yt.Children = append(yt.Children, xt)
-				nonRoot[xt] = true // x is reachable from its parent: not a root
-				break              // first container in allocation order wins
+		// IV-data-dep derivation (fix1.md D-b): x nests under the first
+		// loop y whose IV dimvar appears in x's data-dep operand closure.
+		// Only for KindForLoop (HIR iters link via ParentEdge above).
+		if x.KindOf() == ir.KindForLoop {
+			xClosure := closureOf(x)
+			for _, y := range order {
+				if y == x || y.KindOf() != ir.KindForLoop {
+					continue
+				}
+				yOps := ir.OperandsOf(y)
+				if len(yOps) == 0 {
+					continue
+				}
+				yIV := yOps[0] // the dimvar
+				if yIV != nil && xClosure[yIV] {
+					yt := trees[y]
+					xt.Parent = yt
+					yt.Children = append(yt.Children, xt)
+					nonRoot[xt] = true
+					break // first container in allocation order wins
+				}
 			}
 		}
 	}
@@ -192,7 +212,9 @@ func Analyze(g *ir.Graph) Forest {
 
 // operandClosure computes the transitive operand-slot closure from root,
 // allocation-visit order, cycle-guarded, skipping nil/erased nodes — the
-// membership-edge containment set (never DataDeps+ImpactBy; D-04).
+// IV-membership-edge closure (never DataDeps+ImpactBy; D-04). Used to
+// derive whether one forloop's IV dimvar appears in another forloop's
+// operand closure (fix1.md D-b).
 func operandClosure(root ir.Node) map[ir.Node]bool {
 	set := make(map[ir.Node]bool)
 	if root == nil {
