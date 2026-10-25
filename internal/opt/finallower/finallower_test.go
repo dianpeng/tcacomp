@@ -768,17 +768,19 @@ func TestReducerBracketPlacement(t *testing.T) {
 		t.Fatal("exactly one Init, one Reduce, and one Combine call must exist")
 	}
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the element loop block, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the element loop block, got index %d", initIdx)
 	}
+	// fix3 D-j: items RE-PLACED from the dissolved between blocks may precede
+	// Init (in order, at the block head); nothing else may.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the element bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
 	items := elemBlk.Items()
-	if len(items) < 3 || items[1].Block == nil || items[1].Block.Loop().BasePtr() != X.BasePtr() {
+	if len(items) < initIdx+3 || items[initIdx+1].Block == nil || items[initIdx+1].Block.Loop().BasePtr() != X.BasePtr() {
 		t.Fatal("X's block must be the item right after Init inside the element loop")
 	}
-	if items[2].Node == nil || items[2].Node.BasePtr() != combineCall.BasePtr() {
+	if items[initIdx+2].Node == nil || items[initIdx+2].Node.BasePtr() != combineCall.BasePtr() {
 		t.Fatal("Combine must sit immediately after X's block inside the element loop")
 	}
 	// The element loop: same dim and same bound expression as the DISSOLVED
@@ -1345,9 +1347,11 @@ func TestReducerBracketMultiBetween(t *testing.T) {
 
 	// The innermost element block: Init's containing block under R-A.
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the INNERMOST element loop, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the INNERMOST element loop, got index %d", initIdx)
 	}
+	// fix3 D-j: re-placed between items may precede Init; nothing between
+	// Init and X's block.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
@@ -1467,9 +1471,11 @@ func TestReducerBracketMinTile(t *testing.T) {
 	}
 	// The single fresh element block: Init's containing block under R-A.
 	elemBlk, initIdx := findItemIn(k, initCall)
-	if elemBlk == nil || initIdx != 0 {
-		t.Fatalf("Init must be item 0 of the element loop, got index %d", initIdx)
+	if elemBlk == nil || initIdx < 0 {
+		t.Fatalf("Init must be an item of the element loop, got index %d", initIdx)
 	}
+	// fix3 D-j: re-placed between items may precede Init; nothing between
+	// Init and X's block.
 	if elemBlk.Kind() != ir.BlockSeqLoop {
 		t.Fatalf("the bracket host must be a SeqLoop (uniform), got %s", elemBlk.Kind())
 	}
