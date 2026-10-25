@@ -161,6 +161,14 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return fmt.Errorf("final-lower: verifier reported %d violation(s) after the lowering: %s",
 			len(vs), vs[0])
 	}
+
+	// The REDUCE ANCHOR — final-lower's FINAL gate (fix3 D-p): every live
+	// Reduce(value) call's value closure must reach memory subscripted by
+	// an enclosing loop's IV (a severed piped chain fails here, at the
+	// lowering, never at numerical acceptance).
+	if err := lr.anchorReduceCalls(); err != nil {
+		return err
+	}
 	return nil
 }
 
