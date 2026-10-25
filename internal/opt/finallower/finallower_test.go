@@ -1145,6 +1145,9 @@ func TestConstLiteralDedup(t *testing.T) {
 	rx := newRedFx(t, false, false)
 	runRedFx(t, rx)
 	g := rx.f.g
+	// fix3 D-o: the dedup left final-lower (a lower never optimizes) — the
+	// pipeline's TAIL owns it now, ahead of its dce instance.
+	runTail(t, g)
 
 	type key struct {
 		ty   *ir.NumericType

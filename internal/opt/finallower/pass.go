@@ -145,15 +145,13 @@ func (Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return err
 	}
 
-	// Literal canonicalization: GVN (110) predates the passes that mint most
-	// const atoms (tile-lower/schedule/final-lower), so without this step the
-	// codegen-ready IR carries duplicate literal nodes per (type, value).
-	if err := lr.canonicalizeConsts(); err != nil {
-		return err
-	}
+	// (Literal canonicalization EXILED — fix3 D-o, R-A/R-B: a lower never
+	// optimizes. GVN predates the passes that mint most const atoms, so
+	// the pipeline's TAIL now owns a minimal const dedup ahead of its dce
+	// instance — internal/pipeline's constDedupPass.)
 
 	// The erased-item sweep: no AST item anywhere may reference an erased
-	// node (Map bodies, retired queries, Reduce nodes, duplicate literals).
+	// node (Map bodies, retired queries, Reduce nodes).
 	// The query rewrite replaced its own items in place; everything else
 	// lands here.
 	lr.sweepErasedItems()

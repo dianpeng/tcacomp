@@ -15,6 +15,7 @@ import (
 	"tcacomp/internal/opt/schedule"
 	"tcacomp/internal/opt/tiling"
 	"tcacomp/internal/opt/typeinfer"
+	"tcacomp/internal/pipeline"
 )
 
 // ---------------------------------------------------------------------------
@@ -63,7 +64,11 @@ func matmulStoreGraph(name string) *ir.Graph {
 // under DefaultParams) and fails the test on any error.
 func runPipeline(t *testing.T, g *ir.Graph) {
 	t.Helper()
-	if err := opt.NewManager(opt.BuildPipeline()).Run(g); err != nil {
+	// fix3 D-o: the REAL composition is the pipeline orchestrator's —
+	// HIR + LOWER + the TAIL (const dedup, memopt, AST-roots dce). The
+	// registry pipeline keeps its catalog role; the goldens pin the path
+	// users actually compile through (the facade wires pipeline.Run).
+	if err := pipeline.Run(g); err != nil {
 		t.Fatalf("default pipeline run = %v", err)
 	}
 }
