@@ -1,3 +1,28 @@
-.claude/*
+# Claude / agent machinery
+.claude/
+
+# Go build artifacts (scripts/build.sh output, test/coverage binaries)
+bin/
+*.exe
+*.test
+*.out
+
+# CMake / Ninja build directories
+build/
+cmake-build-*/
+*-build/
+# ...but internal/syntax/build is a tracked Go source package, not a build dir
+!internal/syntax/build/
+
+# Editor files
 *.swp
-runtime/tests/build/
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+
+# nvcc / object intermediates
+*.o
