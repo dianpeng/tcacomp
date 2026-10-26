@@ -116,19 +116,27 @@ type IterDecision struct {
 // means the cache sits directly above the OUTERMOST loop of the site's
 // LNT. DoSoC is deliberately absent — the lower pass derives it (§1c).
 //
-// The 2026-10-21 rulings (R2/R4/F4/F6) make the record self-describing:
-// Reuse is the per-thread re-traversal count within one fill epoch (0
-// when not computed), Bytes the site's footprint under the window-bytes
-// model (SMEM window bytes; per-thread bytes for FRAG), and Reason the
-// decline explanation on a non-promoted entry ("" when promoted).
-// Non-candidates (cross-LNT / never-bucketed loads, R4) are declared
-// with Promoted=false entries — never silently dropped.
+// The 2026-10-21 rulings (R2/R4/F4/F6) make the record self-describing —
+// Reuse is the site's re-traversal count within one fill epoch (0 when
+// not computed) under the 2026-10-26 one-currency amendment semantics
+// (§2.4/§2.7: COLLECTIVE per window instance for SMEM sites, PER-THREAD
+// for FRAG sites — the holders scaling that puts FRAG traffic in the same
+// CTA-wide currency lives only in the objective, never in the record),
+// Bytes the site's footprint under the window-bytes model (SMEM window
+// bytes; per-thread bytes for FRAG), and Reason the decline explanation
+// on a non-promoted entry ("" when promoted). Non-candidates (cross-LNT
+// / never-bucketed loads, R4) are declared with Promoted=false entries —
+// never silently dropped.
 type SiteDecision struct {
 	Promoted bool
 	Tie      ir.Node
 	Class    CacheClass
-	// Reuse is the per-thread reuse count the judge computed (>= 2 on
-	// every promoted site; the computed value on a reuse decline; else 0).
+	// Reuse is the reuse count the judge computed under the §2.4
+	// one-currency amendment: COLLECTIVE per window instance for SMEM
+	// sites (>= 2 on every promoted site — collective trips on a reuse
+	// dim are at least its tile), PER-THREAD for FRAG sites; the computed
+	// value on a decline; else 0. The holders scaling to the CTA-wide
+	// currency lives only in the objective, never here.
 	Reuse int
 	// Bytes is the site's window-model footprint (window bytes for SMEM,
 	// per-thread bytes for FRAG); the computed value on a frag-byte or
@@ -150,9 +158,10 @@ const (
 	// ReasonFragBytes: the per-thread FRAG footprint exceeds
 	// MaxFragPerThread (F6).
 	ReasonFragBytes = "FRAG bytes exceed MaxFragPerThread (F6)"
-	// ReasonLowReuse: per-thread reuse < 2 — the cached bytes are not
-	// re-traversed by the owning thread, so no traffic is avoided.
-	ReasonLowReuse = "per-thread reuse < 2: no traffic avoided"
+	// ReasonLowReuse: reuse < 2 in the site's currency (collective for
+	// SMEM, per-thread for FRAG — the §2.4 one-currency gate): the cached
+	// bytes are not re-traversed, so no CTA-wide traffic is avoided.
+	ReasonLowReuse = "reuse < 2 in the site's currency: no traffic avoided"
 	// ReasonEvicted: the site WAS promotion-eligible but the kernel-wide
 	// MASRAM gates overflowed and the greedy value-density spill (fix4
 	// §2.6) demoted it to GMEM — the loops stay tiled, only the cache is
