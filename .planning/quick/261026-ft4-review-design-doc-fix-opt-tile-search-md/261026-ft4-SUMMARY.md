@@ -28,6 +28,16 @@ Also endorsed: TBL/TIL structural table, CuMAP, per-dim tiles / searched LoC / e
 - Updated: `.planning/STATE.md` (quick-task row + Last activity)
 - **Not touched:** doc/fix/fix-opt-tile-search.md (the author's WIP — review only, per task scope)
 
+## Round 2 (same day) — re-review after the author's revision
+
+- [1] CTA side RESOLVED (absolute-count LoC, Π ≤ MaxLoC.cta, gridDim.x = max-over-LNTs Π = the F4 product model). WARP side regressed into a NEW CRITICAL: MALoC.thr = Mul switches warp composition from the implemented disjoint-shard (sum) model to tensor-product — lower.go/ThreadMap/R2 window-bytes all assume shards; doc now contains both models. Recommend warps stay Σ ≤ 32.
+- [2] reuse_score = Π(overlapped T_d): improved (tile volume) but not "actual reuse" — no re-traversal multiplier, no elem bytes, no −1; recommend bytes×(reuse−1) (judgeSite computes both) and drop /MaxSRAM normalization (traffic ≫ budget).
+- [3] GoC = partition count: intent ACCEPTED (now encodes the granularity direction; "3+3" comment finally coherent) — but formula text still names the product variables, and goc_max's 2×N arm caps the score at 0.75 for M=4; use goc_max=6.
+- [4] Rebutted: registers ≠ L1 on sm_86 (separate 256KB RF; ≤255 regs ≈1KB/thread); counterexample — 60KB/thread FRAG + 4KB SMEM passes the 64KB pool then spills to local (L1/L2) = worse than GMEM. Single pool acceptable ONLY with a per-thread FRAG ceiling retained; two budgets cleanest.
+- [5] M=4 ✓ but two stale "5" lines remain.
+- NEW: N1 −1 exhaust rule dangling (no quota pool left to exhaust); N2 presets now the parallelism ceiling — ~10× regression (10 CTAs / 8 warps vs 100 CTAs / 16 warps at old defaults); N3 MaxLoC.cta=2^31−1 vacuous; N4 blockDim unit (warps→threads ×32) + name typos; N5 MASRAM scope still unstated.
+- Positive: absolute-count LoC converges toward the record contract (M2 narrows to loosening verify's LoC==MaxCTA check); launcher max-over-LNTs + guard-bail is a good addition.
+
 ## Deviations
 
 - Review executed inline rather than via spawned gsd-planner/gsd-executor: the analysis required the loop-tiling rulings context already loaded in-session; GSD guarantees (PLAN/SUMMARY/STATE/atomic commits) preserved.

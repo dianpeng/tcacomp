@@ -138,3 +138,69 @@ The module split maps onto the existing package without a rewrite:
 - **Config** — `Params` already is the "config as input with sane defaults" surface; extend it with the new knobs (MaxPartitionCta/Thr, LoC presets, α if it survives) and keep `Validate` fail-fast.
 
 Invariants the rewrite must not silently drop: fixed enumeration order + first-strict-max (golden determinism); fail-closed on unknown iters/no-decision; kernel-wide floor threading; ≥1 CTA gate; tile ≥ 2 legality; the F2 floor; per-site gates (reuse ≥ 2, FRAG cap, CTA-covered refusal) as distinct from the aggregate budget.
+
+---
+
+# Round 2 (2026-10-26) — re-review after revision
+
+The revision addressed the four CRITICALs: absolute-count LoC replaces percentages (C1), reuse_score redefined over overlapping-dim tiles (C2), GoC clarified as partition counting (C3), single FRAG+SMEM pool defended (C4), M=4 settled (H2, partly). Verdict per point, then new findings the edit introduced.
+
+## [1] Quota → absolute counts — CTA side RESOLVED; warp side regressed into a new ambiguity
+
+**CTA: resolved and correct.** LoC = # CTAs per CTA dim, `MALoC.cta = Π LoC ≤ MaxLoC.cta`, and `gridDim.x = max over LNTs of Π` is exactly the product decomposition F4 prescribes ("CTA total per LNT = product over CTA dims"), with the smaller-LNT overflow handled by the existing whole-body-skip guards. The "percentage which is invalid" self-diagnosis is right. (But see N2/N3 — the bound is now vacuous and the presets are now the parallelism ceiling.)
+
+**WARP: new CRITICAL.** `MALoC.thr = Mul all THR LoCs ≤ 32` silently switches the warp composition from the **disjoint-shard** model to a **tensor-product** warp space:
+
+- Implemented model (F4 ruling + search.go/lower.go): independent WARP dims get *disjoint whole-warp shards* (a **sum**); the CTA dim's coupled inside walk takes the *remaining* warps (`coupledThreads = (PortionWarp − warpPortion) × warpsPerPortion × 32`, search.go:222); ThreadMap carries m+n tuple dims; an SMEM-class WARP dim's window is sized `LoC × 32 × T` (the shard's threads).
+- The doc's Π model is a legitimate *alternative* (classic 2-D block decomposition: warp index factors as (w_a, w_b), each warp owns one tile pair) — but it is **not what the lower pass, the runtime ThreadMap, the R2 rank-in-index identity, and the window-bytes cost model implement**, and the structural section still says "partitioned by a partition of thread space" (sum language). The doc now contains both models at once.
+
+**Pick one, per level:** (a) warps stay disjoint shards → `MALoC.thr = Σ LoC ≤ 32`, blockDim = (Σ warps) × 32, and everything downstream survives unchanged — **recommended**; or (b) warps go tensor-product → the TBL/TIL structural rules, coupled-walk ownership, window-bytes, fill mechanics, and ThreadMap must all be re-derived first (a codegen redesign, well beyond a search rewrite).
+
+## [2] reuse_score — improved, but still not "actual reuse"
+
+`reuse_size = Π(overlapped dims' tile_size)` captures tile volume (bigger overlapping tiles ⇒ more co-traversal captured) — a real improvement over occupied bytes. Three gaps remain:
+
+1. **No re-traversal multiplier.** Benefit = cached volume × (times re-read − 1); the re-reads come from the inner walks of dims **not** in the covered set (the implemented reuse model: tie + inner non-covered dims' inside-walk trips). A compute dim covered by no site is invisible to the score: same tiles, 4 vs 1024 re-reads → identical score, ~256× different traffic avoided.
+2. **Unit mismatch.** "Reuse bytes" currently has *element* units (no elem size) — fp8 vs fp16 sites incomparable — and dividing an element count by MaxSRAM (bytes) is dimensionally wrong.
+3. **No −1.** A tile read once avoids nothing (the reuse ≥ 2 gate exists for exactly this).
+
+**Recommendation unchanged:** `reuse_size := bytes × (reuse − 1)` — `judgeSite` already computes both factors. **Caveat if adopted:** Σ(bytes × (reuse−1)) is a *traffic* quantity and routinely exceeds MaxSRAM (the multiplier!), so `/MaxSRAM` normalization breaks (scores ≫ 1). Rank by raw traffic within the LNT, or normalize by the max seen during the search — not by the budget.
+
+Also: "M ≥ 2 as hard constraints for findINS filter" is ambiguous — set **cardinality** ≥ 2 (the implemented singleton-set filter), overlap-**dim count** ≥ 2, or tensor rank ≥ CacheDims=2 (also implemented)? If it means dim count ≥ 2, note it would *exclude* the matmul K-overlap case (lhs/rhs overlap in exactly 1 dim) — the flagship.
+
+## [3] GoC = partition count — intent ACCEPTED; the text must actually change
+
+Counting partitions (dims) instead of LoC magnitudes fixes C3's core defect: 1 WARP dim (1/6) vs 2 WARP dims (2/6) now differ in the direction the 28×1024 argument wants, and the "at most 3 + 3" comment finally makes sense. Two fixes needed:
+
+- The formula line still reads `(total_cta_loc + total_cta_thr)/goc_max` — under the new MALoC those names denote **products** (a lone CTA dim @ LoC 10 → 10/6 > 1). Write it as `(total_cta + total_thr)/goc_max` over the **same expanded-instance list MAPM counts** (a CTA dim contributes +1 CTA *and* +1 THR partition).
+- `goc_max = max(3+3, 2 × #iterations)`: with M=4 the second arm yields 8 while only ≤6 partitions are constructible → the score caps at 0.75 forever. Use `goc_max = MaxPartition.cta + MaxPartition.thr = 6`.
+
+Residual (accepted as heuristic): still shape-blind (runtime-dynamic extents — D12), so it rewards splitting whenever legal. That's fine as a tiebreaker; it's why α should probably favor reuse.
+
+## [4] Single FRAG+SMEM pool — the L1 argument doesn't hold for registers; the pool needs one more gate
+
+On sm_86, **registers are not L1**: the register file is a separate 256 KB SRAM per SM (64K × 32-bit, ≤ 255 regs/thread); L1 and SMEM share the 128 KB unified cache (≤ 100 KB SMEM opt-in). FRAG sites live in registers (`LoadTileThread`); they cost L1 only when they **spill** — at which point local-memory traffic (L1/L2-backed) makes them *worse than the GMEM load they replaced*, the exact regression F6 was ruled against.
+
+Concrete unsoundness of the pool alone: `total_frag` is a sum of **per-thread** byte counts, so a schedule with total_frag = 60 KB + total_smem = 4 KB passes the 64 KB pool while needing 60 KB of registers **per thread** — 60× the ~1 KB architectural ceiling → guaranteed spill. The pool cannot see per-thread pressure because it mixes per-thread and per-CTA units.
+
+**Resolution (author's call):** (a) two budgets — MaxCache (SMEM, per-CTA) + MaxFragPerThread (registers, per-thread), both already Params — cleanest, matches hardware; or (b) keep the single 64 KB pool as a policy simplification **plus a per-thread FRAG ceiling as a second gate** (256 B default, the existing knob). Pool-alone is not sound. ("Objective only accounts reuse" — agreed, and orthogonal: that's the objective; this is the constraint's unit problem.)
+
+## [5] M = 4 — settled, but two stale lines contradict it
+
+Delete "Notes for now it is 5" (Input) and "For now we clamp only 5 most nested loops" (Feasible Area). The arithmetic `(3·3·3)^4 = 531,441` is correct for M=4; note the WindowK default changes 5→4 in Params.
+
+## New findings introduced by this revision
+
+- **N1 — the −1 exhaust rule is dangling.** "The last CTA/THR LoC can be assigned −1, use up whatever left in runtime" presupposes the deleted percentage pool. Under absolute counts there is nothing "left" — −1 is undefined. Delete it or redefine (e.g., last dim per category takes ⌊policy_max / Π(others)⌋). The Objective's "all concurrency will be exhausted regardlessly" is the same stale quota language.
+- **N2 — the presets are now the parallelism ceiling, and it dropped ~10×.** Old model: portions *exhausted* the space (CTA dim = full MaxCTA = 100 CTAs; warp dim = 16 warps = 512 threads at defaults). New model, presets as absolute counts with no functioning remainder rule: a CTA dim tops out at **10 CTAs** (vs 100), a warp dim at **8 warps = 256 threads** (vs 512). That is a large parallelism regression baked into the search space. Grow the presets (e.g., CTAs {2,5,10,25,50,100}, warps {1,2,4,8,16,32}) or restore an exhaust rule. Also decide whether the old runtime contract (threads/CTA a multiple of 8 warps, ≥ 256) survives — it was deleted, and blockDim = Π×32 is a multiple of 32 but no longer ≥ 256.
+- **N3 — MaxLoC.cta = 2^31−1 is vacuous.** The old MaxCTA=100 policy bound is gone entirely; nothing real bounds the launch (see N2). MALoC.cta should carry an actual Params bound.
+- **N4 — launcher section slips.** blockDim.x = "max of all LNT's total_cta_thr": (a) name — `total_cta_thr` → the MALoC-defined `total_thr_loc`; (b) unit — total_thr_loc is in **warps** under the new LoC, blockDim.x is **threads**, so × 32. (The gridDim.x max-over-LNTs + guard-bail shape is right and a genuinely good addition — kernel-level coherence the old doc lacked.)
+- **N5 — MASRAM scope still unstated.** The launcher section proves kernel-level thinking, but per-LNT vs kernel-wide SMEM budget (the implemented running-floors model, R3) is still unsaid.
+
+## Positive convergence worth noting
+
+The new absolute-count LoC is *closer* to the published record's contract than the old portion-index proposal was (record LoC is already an absolute count). The remaining M2 delta narrows to: tiling-verify currently enforces CTA LoC == MaxCTA exactly (full exhaustion) — under multi-dim presets that check loosens to "LoC ∈ presets and Π == gridDim".
+
+## Still open from Round 1 (untouched by this revision)
+
+H1 (MAPM sums over the post-tiling list still not computable as written — count expanded instances), H4 (eviction: pop order, post-eviction scoring, error contract vs the 2026-10-24 tiling-never-disabled ruling), H5 (tier rules: CTA-covered refusal, C1b forced-FRAG, window-bytes `LoC×32×T` group factor), M1 (determinism/tie-break), M5 (tile presets vs current {32,64,128,256}), M6 (naming continuity), M7 (constraint 5 vacuous).
