@@ -297,6 +297,23 @@ Author will accept sane recommendations outright and wants only genuinely ambigu
 - R2. **GoC's authority (A3):** may granularity ever override real traffic differences? (a) tiebreak-only — traffic strictly primary, GoC breaks exact ties [rec: hypothetical utilization should never beat measurable bytes]; or (b) α-blend (α≈0.75) — but then the traffic term needs a defined per-LNT normalization for the blend to be meaningful.
 - R3. **Zero-cache outcome (D3):** when the budget forces evicting ALL sites: (a) allow the tiled-uncached schedule + emit a warning [rec: the whole point of eviction is graceful degradation; erroring at zero makes eviction useless for tight budgets]; or (b) hard error, fail-loud (matches project culture + the 2026-10-24 ruling's spirit, changes observable compiler behavior).
 
+---
+
+# Round 5 (2026-10-26) — rulings locked; matmul inference on the objective
+
+**Rulings:** R1 = yes (keep MaxFragPerThread=256B) **plus the FRAG definition**: a FRAG site = ALL covered dims SEQ-assigned → the window lives in a single thread's registers, walked wholly by that thread. Consequence (corrects Round-4 B2): **per-thread FRAG bytes = Π(covered T_d) × elem — no lane division** (the ⌈T/32⌉ lane split applies only to WARP-tile interiors, which are SMEM-class anyway). Min site = T₁·T₂·sizeof(dtype) per the author. Note: at 256 B, 2-D all-SEQ fragments (32×32 fp16 = 2 KB) decline — keep 256 B for v0 (single-dim fragments like matmul lhs = 128 B fit); the knob is exactly the hyperparameter-tunable surface the Implementation section wants. R2 = tiebreak-only (GoC never overrides traffic). R3 = allow zero-cache + warning.
+
+## The inference: does traffic-objective + GoC tiebreak reach the canonical matmul schedule?
+
+Model: C[M,N] = Σ_k A[M,K]·B[N,K], nest M→N→K, A refs (m,k), B refs (n,k), K reduced. findINS sites: A covered {k} tie N; B covered {n,k} tie M. Budgets SMEM 64 KB, FRAG/thread 256 B, Π warp LoC ≤ 32.
+
+1. **M=CTA is FORCED, jointly by CuMAP + the tier rules.** All-warp vectors violate CuMAP. N=CTA ⇒ B's covered set contains a CTA dim ⇒ site REFUSED ⇒ B uncached ⇒ B re-read per m-row (O(M·N·K) traffic) — dominated. K=CTA ⇒ same for A. Only M=CTA leaves both sites cacheable (neither covers m). The structure falls out of the constraints — no heuristic needed.
+2. **N=WARP beats N=SEQ on traffic, not just GoC.** N=SEQ ⇒ B all-SEQ-covered ⇒ FRAG at T_n·T_k·elem ≥ 2 KB > 256 B ⇒ declined ⇒ B uncached — dominated. N=WARP ⇒ B = SMEM window K_n·T_n·T_k·elem ≤ 64 KB, reuse = the CTA's T_m-row re-traversal of the window.
+3. **Tiles: the objective's gradient = the classic arithmetic.** B contributes window·(T_m·rounds − 1), A contributes T_k·elem·(n-walk − 1) — both grow with tile span and re-traversal, so the search maximizes T_n·T_k until the 64 KB window binds (e.g. K_n=4, T_n=T_k=64 fp16 = 32 KB) and T_m to its max preset (T_m enters only through reuse — no budget covers m — so it maxes, which is genuinely traffic-optimal). This reproduces the canonical (T_m large, T_n·T_k budget-bound) shape.
+4. **Result: the canonical schedule M=CTA / N=WARP / K=SEQ, max tiles — reached by constraint-forcing + traffic gradient, with GoC only reinforcing.** Notably the OLD model's emergent pick was M=CTA/N=SEQ/**K=WARP** with rhs declined (ReasonLowReuse — the shard model's intra-thread-only reuse couldn't see B's re-traversal); the factorization cost model's cross-warp sharing flips it to the classic shape. Evidence the new objective is not just different but better.
+
+**The one caveat — the reduced dim K.** K=SEQ vs K=WARP (warp split-k, mechanically legal — warp-specialized reduction was built for it) can tie or flip on pure traffic depending on extents, and **GoC's partition-count tiebreak systematically prefers K=WARP** (4/6 vs 3/6 partitions). Split-k's reduction-staging cost (SMEM staging + barriers per output round) is unmodeled, so the tiebreak can pick split-k where classic K=SEQ is actually faster. Options: (a) accept split-k as a legitimate find (it IS optimal in some regimes; cost modeling is future NominalExtent-style work); (b) v0 policy "reduced dims default SEQ" — one line, the decide pass can see the reducer, removes the surprise from the golden regen. **Rec: (b) for v0, (a) when a reduction-cost term exists.** ← the single remaining question for the author.
+
 1. **Doc finalization** — fold A/B/C/D answers into fix-opt-tile-search.md (+ the tier/cost formulas of B); author or a quick task.
 2. **Decide-half rewrite** — cost model (B) + searcher (A/C/D) in internal/opt/tiling with unit tests; verify checks updated (E1).
 3. **Lower-half rewrite** — residue-class forms + fill mechanics (E2) + runtime mapping contract (E3); goldens regen + re-pin (E5).
