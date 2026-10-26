@@ -238,3 +238,57 @@ Delete remainder-−1 — no quota pool exists. Replacement that fixes N2 + N3 i
 1. **Exhaustive reading** — blockDim = Π K × 32 exactly, launch-what-you-factorize? (The alternative — always launch 32 warps and let slack warp-coordinates bail — also works via guards but wastes residency and needs a co-ownership rule specified.)
 2. **−1 semantics** — absorb-to-bound (recommended above), or delete entirely?
 3. **The CTA policy cap** — gridDim.x needs a real bound (keep a MaxCTA-style Params knob; 2^31−1 is not a policy).
+
+---
+
+# Round 4 (2026-10-26) — factorization CONFIRMED; refactor authorized; final-decision checklist
+
+**Author's rulings:** (1) warp allocation granularity = per warp (32 threads), Π LoC ≤ 32, blockDim = Π × 32 — the exhaustive launch reading is CONFIRMED; (2) −1/portions DELETED — precise allocations, launch config derived from the chosen schedule's settlement; (3) gridDim bound = the CUDA runtime's 2^31−1 or a more conservative Params value — actual gridDim = factorization of the CTA assignments per LNT (max over LNTs). The large refactor is AUTHORIZED ("current implementation is broken in terms of scheduling").
+
+All three sound right. Two precision notes: (a) with −1 gone, the **preset lists are the parallelism ceiling** — a lone warp dim maxes at its largest preset (use 32 = 1024 threads if you want full blocks from single-dim schedules), a lone CTA dim at its largest CTA preset; (b) blockDim = max-over-LNTs of Π K × 32, with smaller LNTs' excess warps/CTAs whole-body-skipping via the per-LNT map + rank guards (the F5 mechanism) — this must be stated as the load-bearing cross-LNT rule.
+
+## The definitive open-items checklist (what "crystal clear" still requires)
+
+**A. Objective — 4 decisions**
+- A1 [D] Reuse term := `bytes × (reuse − 1)` (traffic avoided; both factors already computed) — vs the doc's Π(overlapped T_d). Rec: traffic form.
+- A2 [D] Normalization: none for within-LNT ranking (dividing traffic by MaxSRAM breaks — traffic ≫ budget). If GoC is kept, make the two terms scale-comparable per LNT or drop normalization.
+- A3 [D] GoC: keep the partition-count form? If kept: `(total_cta + total_thr)/goc_max` over MAPM's expanded instances, `goc_max = 6`, delete the 2×N arm, fix the formula text (it still names the product variables). Rec: optional tiebreaker at α ≥ 0.75 favoring reuse, or drop.
+- A4 [M] Determinism: fixed enumeration order, first strict max wins (keep the current INV; golden-test load-bearing).
+
+**B. Cost model under factorization — 1 decision + derivations (the R2 bill, now in scope)**
+- B1 [D] **Lane decomposition** within an owning warp's tile: 32 lanes split T elements — consecutive chunks (⌈T/32⌉ per lane, prefix masks match the existing lane-prefix contract) or strided (lane l takes ≡ l mod 32, matches the coupled-walk convention). Everything downstream (FRAG bytes, masks, reuse trips) keys off this. Rec: consecutive chunks.
+- B2 [M] Per-thread FRAG bytes := ⌈T_d/32⌉ × elem × (other covered dims' factors) — a ~32× change from the shard model's per-thread T_d; all FRAG sizes re-derived.
+- B3 [M] Window-bytes for SMEM sites under residue ownership: the site's group window = (warps sharing the relevant coordinate) × chunk — new formula replacing `alloc = LoC × 32`.
+- B4 [M] Cross-warp reuse: loads whose subscripts miss a warp dim are read by all W/K_d warps sharing the coordinate — traffic formula counts cross-warp served reads.
+- B5 [M] Tier rules re-derived: CTA-covered refusal (still valid?), C1b forced-FRAG (thread-varying coordinate → per-thread window), the new warp-shared-window class.
+- B6 [D] The reuse ≥ 2 gate: per-thread trips or total-including-cross-warp? Rec: promote iff traffic avoided > 0 (total view).
+
+**C. Constraints & presets — 5 decisions**
+- C1 [D] Warp K presets: rec {2,4,8,16,32} (32 enables full-block single-dim schedules).
+- C2 [D] CTA presets: rec {2,4,8,16,32,64} (or similar); single-dim ceiling = max preset.
+- C3 [D] Tile presets: keep {32,64,128,256} (current) or the doc's {32,64,128}. Rec: keep 256 (rank-1 covered sites can afford it).
+- C4 [D] **FRAG budget** (round-2 counterexample unanswered): the 64 KB pool alone admits 60 KB/thread registers → spill. Rec: keep MaxFragPerThread (256 B) as a hard per-thread gate alongside whatever pool you choose.
+- C5 [D] gridDim policy cap: rec a Params knob with a real default (e.g., 512) rather than 2^31−1.
+- C6 [M] Search-space arithmetic updates with the final preset sizes — e.g., (3 SoC × 4 tiles × 5 LoC)^4 ≈ 13M/LNT: fine only with incremental MAPM/MALoC pruning during enumeration + memoized per-site judgments; budget the preset lists accordingly.
+- C7 [M] MAPM/MALoC rewritten over expanded instances (H1); constraint (5) deleted (M7); K=1/LoC=1 warp dims pruned (≡ SEQ, dominated); CuMAP kept.
+
+**D. Eviction — 3 decisions (H4, untouched across all rounds)**
+- D1 [D] Pop order: least traffic-value-per-byte first (rec), or smallest-bytes, or a real subset search (2^MaxCS = 65K worst case — affordable).
+- D2 [M] Score computed on the post-eviction site set.
+- D3 [D] Error contract: with eviction, every structurally-valid candidate is feasible; the worst case becomes loops-tiled-≥2-with-zero-caches. Rec: allow it silently BUT keep hard errors for structural infeasibility (no CTA dim, tile < 2) — this consciously extends the 2026-10-24 ruling; say so in the doc.
+
+**E. Contracts — mechanical, but each is a work item (the refactor's real size)**
+- E1 Record + verify: LoC absolute counts (now aligned); tiling-verify's `CTA LoC == MaxCTA` → `LoC ∈ presets ∧ Π == gridDim`; warp Π ≤ 32; F2 check DELETED; launch derivation (gridDim = max_LNT Π, blockDim = max_LNT Π × 32) — rec: recomputed by lower/codegen from per-iter decisions, no new record field.
+- E2 lower.go: residue-class loop-rewrite forms; coupled CTA interior walk = blockDim-strided; fills per the re-derived tier rules.
+- E3 Runtime: ThreadMapping warp coordinates from the factorization; assert-and-trap pre-conditions REPLACED (blockDim = Π K × 32, warp count ≤ 32); runtime_objects.md updated.
+- E4 Pipeline position unchanged (tiling@114 → tiling-verify@115 → tile-lower); kernel-wide SMEM floors (R3) retained — still needs one sentence in the doc (N5).
+- E5 Golden fixtures WILL change (new cost model → new chosen schedules): sanctioned regen + re-pin + e2e numerical verification on the A6000, per the fix3 C11 precedent.
+
+**F. Doc mechanics** — delete the two stale "5" lines; rewrite the structural section in factorization terms; fix the GoC formula text + goc_max; launcher section names/units (blockDim = Π K × 32; `total_cta_thr` → warp-product name); typo pass; Params naming map (M6).
+
+## Recommended refactor sequencing
+
+1. **Doc finalization** — fold A/B/C/D answers into fix-opt-tile-search.md (+ the tier/cost formulas of B); author or a quick task.
+2. **Decide-half rewrite** — cost model (B) + searcher (A/C/D) in internal/opt/tiling with unit tests; verify checks updated (E1).
+3. **Lower-half rewrite** — residue-class forms + fill mechanics (E2) + runtime mapping contract (E3); goldens regen + re-pin (E5).
+4. **E2E** — numerical acceptance + compute-sanitizer (memcheck/racecheck) on the A6000.
