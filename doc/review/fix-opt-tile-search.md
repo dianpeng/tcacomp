@@ -204,3 +204,37 @@ The new absolute-count LoC is *closer* to the published record's contract than t
 ## Still open from Round 1 (untouched by this revision)
 
 H1 (MAPM sums over the post-tiling list still not computable as written — count expanded instances), H4 (eviction: pop order, post-eviction scoring, error contract vs the 2026-10-24 tiling-never-disabled ruling), H5 (tier rules: CTA-covered refusal, C1b forced-FRAG, window-bytes `LoC×32×T` group factor), M1 (determinism/tie-break), M5 (tile presets vs current {32,64,128,256}), M6 (naming continuity), M7 (constraint 5 vacuous).
+
+---
+
+# Round 3 (2026-10-26) — the factorization ruling (author decision)
+
+**Ruling:** BOTH levels partition by **factorization** — each WARP-SoC dim chooses K (warps), Π K ≤ 32; CTA already Π (round 2). Launch parameters fully dynamic ("no statically set one-size-fits-all").
+
+## Assessment: ENDORSED — coherent, uniform, and more conventional than what it replaces — under one reading that must be confirmed
+
+The clean reading is **exhaustive launch**: blockDim.x = Π K × 32 *exactly* — you launch precisely what the schedule factorizes. Then the model is watertight:
+
+- Warp index w factors uniquely into coordinates (c_1..c_n) (reverse stride-shape); dim d's TBL distributes by residue class: warp c_d owns tiles ≡ c_d (mod K_d).
+- A tile combination (t_1..t_n) is executed by exactly ONE warp — no redundancy, no idle warps, no co-ownership ambiguity. (K_d = 1 is vacuous distribution ≡ SEQ semantics — a dominated vector; prune it.)
+- Π K ≤ 32 is pure hardware feasibility (1024 threads); this is literally how CUDA blocks/grids decompose — the shard model it replaces was the unusual design.
+- **F2 dissolves**: no "remaining warps" concept exists, so the coupled-portion starvation hazard cannot arise. coupledThreads := blockDim (= Π K × 32).
+- **Dynamic launch is already supported by the runtime model**: per-LNT map remapping (F5) + rank/extent guards let LNTs smaller than the launched max whole-body-skip; the reducer's warp identity is map-derived (`warp_index()`/`warp_count()` from ThreadMapping, runtime_objects.md #11) — survives a dynamic blockDim.
+
+## The bill this ruling obligates (the honest cost — it outgrows "search rewrite")
+
+1. **R2's reuse identity flips.** "All reuse is intra-thread; window-SMEM buys capacity, not sharing" was a *consequence of shards*. Under factorization, cross-warp sharing is real: a load whose subscripts miss warp dim d (e.g. B[k] with M also warp-distributed) is read by all W/K_d warps sharing the c_k coordinate — one fill serves them all. This makes the cost model *more accurate*, but every shard-derived formula is now stale: `siteReuseCount` (per-thread trips), `siteWindowBytes` (alloc = LoC×32), the C1b forced-FRAG rule, fill mechanics (LoadTileCta stripes).
+2. **lower.go's loop-rewrite forms** (chunk-granularity strides over shard #threads) → residue-class ownership forms.
+3. **tiling-verify + runtime contract**: "CTA LoC == MaxCTA" → "LoC ∈ presets ∧ Π == gridDim"; the assert-and-trap pre-condition (CTAs multiple of 10, threads ≥ 256 / multiple of 8 warps) is repealed — blockDim = Π K × 32 (any multiple of 32), gridDim = Π CTA LoC ≤ a real policy cap.
+4. **The doc's structural section** ("partitioned by a partition of thread space regarding that CTA") must be rewritten in factorization terms — it still speaks shard language.
+5. **Scope decision**: the search doc either carries the new bytes/reuse formulas itself, or explicitly points at loop_tile_lower.md / runtime_objects.md revisions. The searcher must NOT be implemented against judgeSite's shard-model numbers.
+
+## N1 resolved concretely (recommendation)
+
+Delete remainder-−1 — no quota pool exists. Replacement that fixes N2 + N3 in the same stroke: **−1 := absorb-the-slack** — the last dim per category takes ⌊bound / Π(others)⌋, with bound = 32 warps (warp category) / a real MaxCTA-style policy cap (CTA category). Effects: a lone warp dim at −1 launches 32 warps = 1024 threads (restores the old default's parallelism); a lone CTA dim at −1 launches the full policy grid; MaxLoC.cta stops being vacuous. Presets become pure factor choices: warps {2,4,8,16} + −1; CTAs {2,4,8,16,…} + −1 (drop 1 — dominated by SEQ).
+
+## Decisions to confirm with the author
+
+1. **Exhaustive reading** — blockDim = Π K × 32 exactly, launch-what-you-factorize? (The alternative — always launch 32 warps and let slack warp-coordinates bail — also works via guards but wastes residency and needs a co-ownership rule specified.)
+2. **−1 semantics** — absorb-to-bound (recommended above), or delete entirely?
+3. **The CTA policy cap** — gridDim.x needs a real bound (keep a MaxCTA-style Params knob; 2^31−1 is not a policy).
