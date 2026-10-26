@@ -87,7 +87,7 @@ Retired: `PortionCTA`, `PortionWarp`, `AutoWarpPortion`, `WarpPortion`, `MaxThre
 - **Bytes**:
   - FRAG per thread = `Π(covered T_d) × sizeof(dtype)` — NO lane division (the thread walks all covered dims wholly). Min site = T₁·T₂·sizeof(dtype).
   - SMEM window buffer = `Π over covered dims of (factor_d × T_d) × sizeof(dtype)`, where a WARP-covered dim contributes `factor_d = K_d` (one window per warp coordinate) and a SEQ-covered dim contributes 1. **This is 32× smaller than the old shard-model `#threads_d × T_d`** — rhs-class sites now fit.
-- **Reuse** = re-reads of a filled window before its next fill: the per-thread/per-lane interior walks of the re-traversal dims (tie + iters strictly inner than the tie, minus covered), **× the cross-warp sharing factor** — a load whose subscripts MISS a warp dim d is re-read by all warps sharing the other coordinates (factorization makes windows genuinely shared; the shard model's intra-thread-only identity no longer holds).
+- **Reuse** = re-reads of a filled window before its next fill: the per-thread/per-lane interior walks of the re-traversal dims (tie + iters strictly inner than the tie, minus covered), **× the cross-warp sharing factor**. The sharing factor is EXACT: for an SMEM-window site, `sharing = Π over WARP-assigned dims that are NOT in the load's subscript set of K_d` (warps differing only on such coordinates read the SAME window instance — factorization makes windows genuinely shared); for a FRAG site, `sharing = 1` (the window lives in one thread's registers). The shard model's intra-thread-only identity no longer holds.
 - **Promotion gate**: traffic avoided (`bytes × (reuse − 1)`) > 0; FRAG site per-thread bytes ≤ MaxFragPerThread.
 
 ### 2.5 Objective
@@ -147,6 +147,7 @@ A WARP-assigned REDUCED dim d (split-k over K_d warp coordinates):
 - Reducer protocol (per output element, unchanged shape): `Init` before the element walk → `Reduce(v)` per element → `Combine()` after. Under split-k, `Init/Reduce` run in each of the K_d warps; **`Combine` is called by ALL warps (uniform-call rule)** — warps outside this output's combine set call it too and stage the identity (zero `Reduce` calls ⇒ identity accumulates); the staging + `__syncthreads` + replicated fold over `warp_count()` then yields the full sum to every thread; the single owner (existing R3 single-owner store gate) stores.
 - Ownership masks: lane-prefix over the lane-chunk walk (§1.4); the k-coordinate warp set = warps differing only in slot d.
 - **Implementation risk note**: this is the most intricate emission in the refactor — implement behind the flag, land with a dedicated e2e numerical test (split-k matmul variant) before flipping the default.
+- **Wave-1 defense in depth**: while `ReducedDimWarp=false`, tile-lower FAILS CLOSED (hard error) on any WARP-assigned dim whose walk feeds a reducer — if the decide-side feasible-area gate ever misses one, the pipeline must stop loudly, never emit an undesigned lowering.
 
 ## §4 Runtime — `runtime/`
 
