@@ -35,8 +35,14 @@ import (
 // bound parameterized: u32 extents 1024/1024/kExtent over the M→N→K iter
 // chain, InductionVariable-wired lhs[m][k] and rhs[n][k] loads, and a
 // chained store of lhs*rhs over [m,n,k]. The searched tiling defaults
-// promote lhs (SMEM window) and decline rhs (ReasonLowReuse) — exactly one
-// fill exists per run.
+// under the 2026-10-26 one-currency reuse amendment (fix4 §2.4) promote
+// BOTH sites at M=cta/4/256, N=seq/1/256, K=warp/2/32: lhs as a 4 B
+// per-thread lane-chunk FRAG (reuse 256 = T_N) and rhs as a 65536 B SMEM
+// window at the MaxCache cap (collective reuse 256 = T_M) — so each run
+// carries ONE fragment fill (LoadTileThread, lhs) plus ONE cooperative
+// SMEM fill (LoadTileCta, rhs). The pins below only walk the FRAGMENT
+// fill; the SMEM fill's placement is derived, not mandated (2026-10-25
+// ruling), and is not pinned here.
 func matmulGraphK(name string, kExtent float64) *ir.Graph {
 	g := ir.NewGraph(name)
 	u32 := ir.InternScalar(ir.TU32)
@@ -210,8 +216,10 @@ func TestPipelineFillInsideHost(t *testing.T) {
 	g := matmulGraphK("mm-k32768", 32768)
 	k := runPipeline(t, g)
 
-	// Exactly one live fragment fill (lhs promoted, rhs declined by the
-	// searched defaults).
+	// Exactly one live FRAGMENT fill: lhs's 4 B lane chunk. (rhs promotes
+	// as the 65536 B SMEM window under the one-currency amendment — its
+	// cooperative fill is SMEM-class storage, so the fragment walk below
+	// does not see it.)
 	var fill ir.Node
 	for _, n := range g.AllocatedNodes() {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
