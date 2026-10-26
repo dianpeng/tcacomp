@@ -127,6 +127,13 @@ type lntFacts struct {
 	// CS is the admitted candidate set (doc order: set-size, rank, MaxCS
 	// filters applied).
 	CS []SiteFacts
+	// reduced is the kernel-wide reducer-consuming iter set (R-REDUCED),
+	// populated by the DECIDE pass's Run AFTER analyzeOverlap returns —
+	// discovery itself stays pure (fix4 §2.4 "Discovery: unchanged"); the
+	// feasible-area search prunes WARP digits on these iters while
+	// Params.ReducedDimWarp is false. Consumers that do not search (the
+	// lower, verify's fact re-derivation) leave it nil.
+	reduced map[ir.Node]bool
 }
 
 // findINS returns every Iter node a MemLoad's subscripts reference

@@ -130,9 +130,14 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 
 // stagingCount resolves the staging row's ELEMENT count (R1: #warps = the
 // CTA's warp count): the byte extent final-lower allocated divided by the
-// element size, cross-checked against the launch total's warp count — a
-// disagreement means the provenance and the launch options disagree, which
-// is a named error, never a guess.
+// element size. The staging row size is the source of truth (sized by
+// final-lower from the tiling provenance's MaxThreadsPerCTA).
+//
+// NOTE (fix4 T5 debt): the old cross-check against opts.MaxThreadsPerCTA
+// is retired here because the launch dimensions now derive from the tiling
+// provenance, not from cg.Options. T5 will rewire the emitter to read
+// launch dimensions from the provenance record and re-add a cross-check
+// against the actual kernel launch config.
 func (e *emitter) stagingCount(staging ir.Node, ts string, owner ir.Node) (uint, error) {
 	ext, err := e.byteExtent(staging)
 	if err != nil {
@@ -146,12 +151,7 @@ func (e *emitter) stagingCount(staging ir.Node, ts string, owner ir.Node) (uint,
 		return 0, fmt.Errorf("cxx: reducer %d staging row of %d B is not a whole multiple of %s (%d B)",
 			owner.BasePtr().ID(), ext, ts, size)
 	}
-	count := uint(ext / size)
-	if want := uint(e.opts.MaxThreadsPerCTA / 32); count != want {
-		return 0, fmt.Errorf("cxx: reducer %d staging row holds %d slots, want the launch's warp count %d (provenance/launch disagreement)",
-			owner.BasePtr().ID(), count, want)
-	}
-	return count, nil
+	return uint(ext / size), nil
 }
 
 // initType resolves a reducer construction's element type T from its init

@@ -137,11 +137,12 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		return fmt.Errorf("tile-lower: cache entry under %q is %T, want *Record", RecordName, got)
 	}
 	// F7 (ruled 2026-10-21): the record must carry tiling-verify's stamp —
-	// the per-iter feasibility re-checks (CTA LoC == MaxCTA, warp-portion
-	// multiples, the F2 coupled floor, the v0 policy, the kernel-wide
-	// budgets) live there, and an unvalidated record must not reach the
-	// rewrite. Direct Run callers bypass the pass-manager precondition, so
-	// the stamp is checked here too — fail closed.
+	// the per-iter feasibility re-checks of the fix4 model (LoC preset
+	// membership, the per-LNT factorization product bounds, the CTA-dim
+	// presence, the tile floor, the kernel-wide budget sums, the judge
+	// cross-check) live there, and an unvalidated record must not reach
+	// the rewrite. Direct Run callers bypass the pass-manager
+	// precondition, so the stamp is checked here too — fail closed.
 	if !rec.Verified {
 		return errors.New("tile-lower: the tiling record carries no tiling-verify stamp — run tiling-verify before tile-lower (F7: a corrupted record must not reach the rewrite unvalidated)")
 	}

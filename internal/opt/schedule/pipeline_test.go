@@ -158,10 +158,10 @@ func TestPipelineMatmulSchedule(t *testing.T) {
 		t.Fatal("the lexical Group must carry the LNT record via Nest()")
 	}
 	// Loop-kind/depth structure — the observed stable dump: the tile-lowered
-	// M→N→K chain materializes as six loops, CTA→Seq→Seq→Thr→Seq→Seq
+	// M→N→K chain materializes as six loops, CTA→Seq→Thr→Thr→Seq→Seq
 	// (the C1b forced-FRAG precedence's optimum assigns both N and K
 	// sequential — the single Thr loop is M's coupled inside walk).
-	wantKinds := []ir.BlockKind{ir.BlockCTALoop, ir.BlockSeqLoop, ir.BlockSeqLoop,
+	wantKinds := []ir.BlockKind{ir.BlockCTALoop, ir.BlockSeqLoop, ir.BlockThrLoop,
 		ir.BlockThrLoop, ir.BlockSeqLoop, ir.BlockSeqLoop}
 	var gotKinds []ir.BlockKind
 	for b := rootBlockOf(t, blocks[0]); b != nil; {
@@ -361,11 +361,11 @@ func TestPipelinePreservesTilingProvenance(t *testing.T) {
 		if !ok {
 			t.Fatalf("LNT root node %d carries no mapping plan", lnt.Root.BasePtr().ID())
 		}
-		if len(plan.GridPortions) != 1 || plan.GridPortions[0] != -1 {
-			t.Fatalf("grid portions = %v, want [-1]", plan.GridPortions)
+		if len(plan.GridPortions) != 1 || plan.GridPortions[0] <= 0 {
+			t.Fatalf("grid portions = %v, want [positive CTA LoC] (fix4 absolute-shape model)", plan.GridPortions)
 		}
-		if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[1] != -1 {
-			t.Fatalf("thread portions = %v, want [warpPortion, -1]", plan.ThreadPortions)
+		if len(plan.ThreadPortions) != 1 || plan.ThreadPortions[0] <= 0 {
+			t.Fatalf("thread portions = %v, want [positive warp K] (fix4 absolute-shape model)", plan.ThreadPortions)
 		}
 	}
 }

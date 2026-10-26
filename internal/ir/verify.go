@@ -557,22 +557,27 @@ func checkStoreAnnotations(n Node, vs *[]Violation) {
 }
 
 // checkRuntimeMappingShape pins the P-3 mapping constructor encoding
-// (quick-261022-l1o): ops = [kernel_info, ndim const TI32, portion consts
-// TI32 ...] with len(portions) == ndim >= 1, each portion >= 1, and -1 (the
-// remainder) allowed ONLY as the last portion (the D3 remainder rule). The
-// dedicated kind is what makes this verifier-pinnable (LR-4).
+// (quick-261022-l1o, fix4 §3.2): ops = [kernel_info, ndim const TI32,
+// shape consts TI32 ...] with len(shapes) == ndim. Grid mappings always
+// carry ndim >= 1 (CuMAP: every LNT has at least one CTA dim). Thread
+// mappings allow ndim == 0 (an LNT with zero WARP-assigned dims launches
+// one warp — the empty product of warp K_d = 1, blockDim = 32). Each
+// shape value is >= 1; -1 (the D3 remainder) is allowed ONLY as the
+// last entry on grid mappings (legacy sentinel — fix4 T5 retires it).
+// The dedicated kind is what makes this verifier-pinnable (LR-4).
 func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 	ops := OperandsOf(t)
 	if len(ops) < 2 {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			fmt.Sprintf("%s must carry (kernel_info, ndim, portions...), got %d operands", n.KindOf(), len(ops))))
+			fmt.Sprintf("%s must carry (kernel_info, ndim, shapes...), got %d operands", n.KindOf(), len(ops))))
 		return
 	}
 	if ki := ops[0]; ki != nil && ki.KindOf() != KindRuntimeKernelInfo {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
 			fmt.Sprintf("%s operand 0 must be a RuntimeKernelInfo node, got %s", n.KindOf(), ki.KindOf())))
 	}
-	// The ndim const: const, TI32, >= 1.
+	// The ndim const: const, TI32. Grid mapping ndim >= 1; thread mapping
+	// ndim >= 0 (zero WARP dims is a valid fix4 schedule).
 	nd, ok := ConstValueOf(ops[1])
 	if !ok {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
@@ -584,9 +589,13 @@ func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 			fmt.Sprintf("%s operand 1 (ndim) must be a const-i32", n.KindOf())))
 		return
 	}
-	if nd < 1 {
+	minNdim := 1 // grid mapping: CuMAP requires at least one CTA dim
+	if n.KindOf() == KindRuntimeThreadMapping {
+		minNdim = 0 // thread mapping: zero WARP dims is valid (fix4 factorization model)
+	}
+	if nd < float64(minNdim) {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			fmt.Sprintf("%s ndim must be >= 1, got %v", n.KindOf(), nd)))
+			fmt.Sprintf("%s ndim must be >= %d, got %v", n.KindOf(), minNdim, nd)))
 		return
 	}
 	portions := ops[2:]

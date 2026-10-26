@@ -103,10 +103,9 @@ func runLower(t *testing.T, g *ir.Graph, rec *Record) {
 
 // runLowerP runs the pass over g with a crafted record and explicit
 // params. The budget-sensitive crafted fixtures (matmulRecord's
-// WARP-covered rhs) need a MaxCache that fits the R2 WINDOW pricing —
-// resolveBudget prices that site at 4 x (8 warps x 32) x 32 x 32 = 1 MB,
-// so the 64 KB default budget would (correctly, per the rulings) halve
-// and drop it.
+// WARP-covered rhs) price at the fix4 factor-model window —
+// K×T_n × T_k × 4 = 8×32×32×4 = 32 KB — inside the 64 KB default, so the
+// explicit-budget cases below tighten MaxCache deliberately.
 func runLowerP(t *testing.T, g *ir.Graph, rec *Record, p Params) {
 	t.Helper()
 	cache := opt.NewCache()
@@ -626,8 +625,8 @@ func TestRewriteCTADim(t *testing.T) {
 	if got := dimvarStep(t, between); got != 3200 {
 		t.Fatalf("CTA between step = %v, want LoC×T = 3200", got)
 	}
-	if got := dimvarStep(t, inside); got != 256 {
-		t.Fatalf("CTA inside step = %v, want coupled threads = 256", got)
+	if got := dimvarStep(t, inside); got != 32 {
+		t.Fatalf("CTA inside step = %v, want blockDim = 32 (no WARP dim: one warp)", got)
 	}
 	// The inside IV's INIT is the FLAT zero-operand thread query
 	// (Index() = flatRank + i*coupledThreads — the single-owner mechanism).
@@ -758,11 +757,11 @@ func TestRewriteMinimalTile(t *testing.T) {
 	if got := dimvarStep(t, loops[1]); got != 2 {
 		t.Fatalf("d1's between IV must step by the tile 2, got %v", got)
 	}
-	// The CTA coupled inside walk is the flat-init stride (coupledThreads
-	// = (PortionWarp−AutoWarpPortion)·quantum·32 = 256 at defaults); the SEQ
+	// The CTA coupled inside walk is the flat-init stride (blockDim =
+	// (Π warp K) × 32 = 32 here — no WARP dim in this fixture); the SEQ
 	// inside walk steps 1.
-	if got := dimvarStep(t, loops[2]); got != 256 {
-		t.Fatalf("d0's coupled inside IV must step by the coupled thread count 256, got %v", got)
+	if got := dimvarStep(t, loops[2]); got != 32 {
+		t.Fatalf("d0's coupled inside IV must step by the blockDim 32 (no WARP dim), got %v", got)
 	}
 	if got := dimvarStep(t, loops[3]); got != 1 {
 		t.Fatalf("d1's inside IV must step 1, got %v", got)
@@ -780,26 +779,50 @@ func TestRewriteMinimalTile(t *testing.T) {
 	assertVerifyAndRootReachable(t, fx.g)
 }
 
-// TestLowerCoupledTileBackstop pins HI-03 gate 3: a Verified crafted record
-// whose CTA dim carries TileSize 512 (over the default coupled 256) reaches
-// the rewrite and trips the backstop beside the F2 floor — never a
-// double-writer coupled walk. (Params.Validate and tiling-verify, gates 1-2,
-// would reject it first in the real pipeline; the crafted record bypasses
-// both.)
-func TestLowerCoupledTileBackstop(t *testing.T) {
-	fx := newChain32("ctaback", 4096)
+// TestLowerMultiDimGuard pins the fix4 R-SEAM fail-closed guard: a
+// Verified crafted record carrying TWO CTA dims (legal under the fix4
+// feasible area — MAPM admits up to 3) reaches the rewrite and STOPS with
+// the fix4 T4 error — the single-dim templates must never linearize a
+// multi-dim parallel schedule. The old tile-vs-coupled backstop is
+// DELETED with R-HI03 (the flat-init coupled walk is single-owner exact
+// for ANY tile_max), so tile sizes over the blockDim no longer error.
+func TestLowerMultiDimGuard(t *testing.T) {
+	fx := newChain32("multidim", 4096, 4096)
 	bodyStore(fx)
 	rec := recordOf(t, fx, map[int]IterDecision{
-		0: {SoC: SoCTA, LoC: 100, TileSize: 512},
+		0: {SoC: SoCTA, LoC: 2, TileSize: 32},
+		1: {SoC: SoCTA, LoC: 2, TileSize: 32},
 	}, nil)
 	cache := opt.NewCache()
 	cache.Put(rec)
 	err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
-	if err == nil || !strings.Contains(err.Error(), "coupled") {
-		t.Fatalf("a CTA TileSize over the coupled thread count must trip the rewrite backstop naming the coupled walk, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "fix4 T4") {
+		t.Fatalf("a two-CTA-dim record must fail closed naming fix4 T4, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
-		t.Fatalf("the backstop error must name the tile and the coupled count, got %q", err.Error())
+	// The WARP-side arm of the same guard.
+	fx2 := newChain32("multidim2", 4096, 4096)
+	bodyStore(fx2)
+	rec2 := recordOf(t, fx2, map[int]IterDecision{
+		0: {SoC: SoCWARP, LoC: 2, TileSize: 32},
+		1: {SoC: SoCWARP, LoC: 2, TileSize: 32},
+	}, nil)
+	cache2 := opt.NewCache()
+	cache2.Put(rec2)
+	err = (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache2}, fx2.g)
+	if err == nil || !strings.Contains(err.Error(), "fix4 T4") {
+		t.Fatalf("a two-WARP-dim record must fail closed naming fix4 T4, got %v", err)
+	}
+	// Post-R-HI03: a CTA TileSize OVER the blockDim lowers clean (the
+	// flat-init walk is single-owner exact for any tile_max).
+	fx3 := newChain32("bignodim", 4096)
+	bodyStore(fx3)
+	rec3 := recordOf(t, fx3, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 2, TileSize: 512},
+	}, nil)
+	cache3 := opt.NewCache()
+	cache3.Put(rec3)
+	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
+		t.Fatalf("a CTA tile over the blockDim must lower clean post-R-HI03, got %v", err)
 	}
 }
 
@@ -905,13 +928,13 @@ func TestRewriteTypeinferRerun(t *testing.T) {
 	}
 }
 
-// TestProvenancePublished pins P-5 (quick-261022-l1o): after tile-lower over
-// a decided LNT, the cache holds the provenance record with one per-dim
-// entry per rewritten dim (Between/Inside/Soc/Tile; every dim is tiled,
-// T >= 2 — the 2026-10-24 tile-disable ruling — so Inside is ALWAYS
-// populated) and one per-LNT MappingPlan (grid [-1] always; thread
-// [warpPortion, -1] with warpPortion auto-resolved — 4 when
-// a CTA dim exists, 8 otherwise).
+// TestProvenancePublished pins P-5 (quick-261022-l1o, fix4 §3.2): after
+// tile-lower over a decided LNT, the cache holds the provenance record
+// with one per-dim entry per rewritten dim (Between/Inside/Soc/Tile;
+// every dim is tiled, T >= 2 — the 2026-10-24 tile-disable ruling — so
+// Inside is ALWAYS populated) and one per-LNT MappingPlan of ABSOLUTE
+// factorization shapes derived from the record's own decisions: grid =
+// the per-CTA-dim LoCs, thread = the per-WARP-dim warp counts.
 func TestProvenancePublished(t *testing.T) {
 	fx := newChain32("prov", 1024, 2048, 512)
 	bodyStore(fx)
@@ -956,9 +979,14 @@ func TestProvenancePublished(t *testing.T) {
 			t.Fatalf("dim %d entry = %+v, want Between!=nil Inside!=nil Soc=%v Tile=%d", i, e, d.soc, d.tile)
 		}
 	}
+	// The CTA dim's coupled facts: blockDim = (Π warp K) × 32 = 8×32 = 256.
+	if e := prov.Dims[fx.dims[0]]; e.CoupledThreads != 256 || e.CoupledDoSoC != 0 {
+		t.Fatalf("CTA dim coupled facts = (%d threads, dosoc %d), want (256, 0)", e.CoupledThreads, e.CoupledDoSoC)
+	}
 
-	// Per-LNT plan: keyed by the generated nest root; grid [-1]; thread
-	// [4, -1] (a CTA dim exists → AutoWarpPortion).
+	// Per-LNT plan: keyed by the generated nest root; grid [100] (the CTA
+	// dim's absolute LoC); thread [8] (the WARP dim's warp count); the
+	// derived launch blockDim rides MaxThreadsPerCTA = 256.
 	if len(prov.LNTs) != 1 {
 		t.Fatalf("provenance must hold one plan per rewritten LNT, got %d", len(prov.LNTs))
 	}
@@ -966,20 +994,24 @@ func TestProvenancePublished(t *testing.T) {
 	if !ok {
 		t.Fatal("the per-LNT plan must be keyed by the generated nest root ForLoop")
 	}
-	if len(plan.GridPortions) != 1 || plan.GridPortions[0] != -1 {
-		t.Fatalf("grid portions = %v, want [-1] (v0: the whole PortionCTA space)", plan.GridPortions)
+	if len(plan.GridPortions) != 1 || plan.GridPortions[0] != 100 {
+		t.Fatalf("grid shapes = %v, want [100] (the CTA dim's absolute LoC)", plan.GridPortions)
 	}
-	if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[0] != AutoWarpPortion || plan.ThreadPortions[1] != -1 {
-		t.Fatalf("thread portions = %v, want [%d, -1] (CTA dim present → auto warp portion)", plan.ThreadPortions, AutoWarpPortion)
+	if len(plan.ThreadPortions) != 1 || plan.ThreadPortions[0] != 8 {
+		t.Fatalf("thread shapes = %v, want [8] (the WARP dim's warp count)", plan.ThreadPortions)
+	}
+	if prov.MaxThreadsPerCTA != 256 {
+		t.Fatalf("derived launch blockDim = %d, want 256 (8 warps x 32)", prov.MaxThreadsPerCTA)
 	}
 	if prov.Name() != ProvenanceName {
 		t.Fatalf("Name() = %q, want %q", prov.Name(), ProvenanceName)
 	}
 }
 
-// TestProvenanceWarpOnlyPlan pins the auto-resolution's other branch: an
-// LNT with NO CTA dim resolves warpPortion to PortionWarp (8) — thread
-// [8, -1].
+// TestProvenanceWarpOnlyPlan pins the shape vectors' other branch: an
+// LNT with NO CTA dim carries an EMPTY grid vector and its single WARP
+// dim's count — grid [], thread [8]; the launch is 8 warps = 256
+// threads.
 func TestProvenanceWarpOnlyPlan(t *testing.T) {
 	fx := newChain32("prov-warp", 512)
 	bodyStore(fx)
@@ -996,9 +1028,15 @@ func TestProvenanceWarpOnlyPlan(t *testing.T) {
 		t.Fatalf("one plan expected, got %d", len(prov.LNTs))
 	}
 	for _, plan := range prov.LNTs {
-		if len(plan.ThreadPortions) != 2 || plan.ThreadPortions[0] != PortionWarp || plan.ThreadPortions[1] != -1 {
-			t.Fatalf("thread portions = %v, want [%d, -1] (no CTA dim → full warp portion)", plan.ThreadPortions, PortionWarp)
+		if len(plan.GridPortions) != 0 {
+			t.Fatalf("grid shapes = %v, want [] (no CTA dim)", plan.GridPortions)
 		}
+		if len(plan.ThreadPortions) != 1 || plan.ThreadPortions[0] != 8 {
+			t.Fatalf("thread shapes = %v, want [8] (the WARP dim's warp count)", plan.ThreadPortions)
+		}
+	}
+	if prov.MaxThreadsPerCTA != 8*32 {
+		t.Fatalf("derived launch blockDim = %d, want %d", prov.MaxThreadsPerCTA, 8*32)
 	}
 }
 
@@ -1231,9 +1269,10 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 		t.Fatal("both promoted loads must be erased")
 	}
 	// Buffers: lhs FRAG [T_k] = 4×32 = 128 bytes per thread; rhs SMEM
-	// window [256×T_n][T_k] = 4×256×32×32 = 1 MB (the R2 group window).
+	// window [K×T_n][T_k] = 8×32 × 32 × 4 = 32768 B (the fix4 factor
+	// window — one K_n×T_n slab per warp coordinate).
 	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 128)
-	rbuf := findBuffer(t, fx.g, ir.KindMemNew, 1048576)
+	rbuf := findBuffer(t, fx.g, ir.KindMemNew, 32768)
 	if ir.TypeOf(lbuf) == nil || ir.TypeOf(rbuf) == nil {
 		t.Fatal("buffers must carry their bound tile tensor types")
 	}
@@ -1370,11 +1409,11 @@ func storeOf(t *testing.T, g *ir.Graph) ir.Node {
 }
 
 // smemWindowFx builds the SMALL-shape SMEM-window fixture: M(CTA LoC=100
-// T=8), N(WARP LoC=2 = 64 threads T=8), K(SEQ T=8) — the R2 window on rhs's
-// covered {N,K} is 4 × 64 × 8 × 8 = 16384 B, comfortably inside the 64 KB
-// default budget, so the cooperative window path lowers un-halved. A second
-// co-traversed load satisfies the overlap admission filter (set size >= 2)
-// and stays declined (GMEM).
+// T=8), N(WARP K=2 T=8), K(SEQ T=8) — the fix4 factor window on rhs's
+// covered {N,K} is (K_n×T_n) × T_k × 4 = 2×8 × 8 × 4 = 512 B, comfortably
+// inside the 64 KB default budget, so the cooperative window path lowers
+// un-halved. A second co-traversed load satisfies the overlap admission
+// filter (set size >= 2) and stays declined (GMEM).
 func smemWindowFx(t *testing.T) (fx fixture, rhs, other, store ir.Node) {
 	t.Helper()
 	fx = newChain32("smemwin", 128, 128, 64) // M, N, K
@@ -1405,7 +1444,7 @@ func TestLowerSMEMWindow(t *testing.T) {
 		rhs.BasePtr().ID():   {Promoted: true, Tie: nil, Class: ClassSMEM},
 		other.BasePtr().ID(): {Promoted: false, Reason: ReasonLowReuse},
 	})
-	runLower(t, fx.g, rec) // default 64 KB budget fits the 16384 B window
+	runLower(t, fx.g, rec) // default 64 KB budget fits the 512 B window
 
 	if !rhs.BasePtr().Erased() {
 		t.Fatal("the promoted rhs load must be erased")
@@ -1413,8 +1452,8 @@ func TestLowerSMEMWindow(t *testing.T) {
 	if other.BasePtr().Erased() {
 		t.Fatal("the declined co-traversed load must stay GMEM")
 	}
-	// Window-shaped buffer: 4 B × (64 threads × 8) × 8 = 16384 B.
-	buf := findBuffer(t, fx.g, ir.KindMemNew, 16384)
+	// Window-shaped buffer: (K_n×T_n) × T_k × 4 B = 2×8 × 8 × 4 = 512 B.
+	buf := findBuffer(t, fx.g, ir.KindMemNew, 512)
 	ty, ok := ir.TypeOf(buf).(*ir.NumericType)
 	if !ok || ty.Rank() != 2 {
 		t.Fatalf("the rhs window buffer must be a rank-2 tensor type, got %v", ir.TypeOf(buf))
@@ -1504,20 +1543,18 @@ func TestLowerSMEMWindow(t *testing.T) {
 	}
 }
 
-// TestLowerDefaultShapeDecline pins the R2 accepted consequence: at the
-// default worked-example SHAPE, the crafted rhs's SMEM window can never fit
-// a tight budget (its minimum legal window is 4 × 256 × 1 × 2 = 2048 B —
-// the 2026-10-24 ruling's floor-2 amendment RAISED the old 1024 B minimum
-// at tile 1), so the F4 fallback halving hits the floor and DROPS the site
-// to GMEM. The floor amendment also changed the lhs side: the shared K
-// iter can no longer be dragged to tile 1, so the lhs FRAG site rides K
-// down to the floor tile 2 (8 B, far inside MaxFragPerThread) and STAYS
-// PROMOTED — the old both-stay-GMEM expectation died with the tile-1 drag.
+// TestLowerDefaultShapeDecline pins the budget floor drop: at the
+// worked-example SHAPE, the crafted rhs's SMEM window (K_n×T_n×T_k×4 at
+// N=WARP/8) can never fit a tight budget — its minimum legal window is
+// 8×2×2×4 = 128 B (the 2026-10-24 ruling's floor-2 amendment) — so the
+// F4 fallback halving hits the floor and DROPS the site to GMEM. The
+// lhs FRAG site rides the shared K iter down to the floor tile 2 (8 B,
+// far inside MaxFragPerThread) and STAYS PROMOTED.
 func TestLowerDefaultShapeDecline(t *testing.T) {
 	fx, lhs, rhs, store := matmulUsed()
 	rec := matmulRecord(t, fx, lhs, rhs)
 	p := DefaultParams()
-	p.MaxCache = 512 // below rhs's minimum legal window (2048 B): floor drop
+	p.MaxCache = 64 // below rhs's minimum legal window (128 B): floor drop
 	runLowerP(t, fx.g, rec, p)
 
 	if rhs.BasePtr().Erased() {
@@ -1654,10 +1691,10 @@ func TestBudgetFallback(t *testing.T) {
 		t.Fatal("with a fitting budget both sites must promote")
 	}
 
-	// Halving survival: tile-8 decisions under a 4104-byte budget halve
-	// the rhs window to (2,2) — 4·256·2·2 = 4096 B — while the lhs FRAG
-	// site halves to 8 B; both stay promoted (the FRAG sum 8 is well
-	// inside MaxFragPerThread).
+	// Halving survival: tile-8 decisions under a 1024-byte budget halve
+	// the rhs window to (4,4) — 8·4·4·4 = 512 B — while the lhs FRAG site
+	// halves to 16 B; both stay promoted (the FRAG sum is well inside
+	// MaxFragPerThread).
 	fx2, lhs2, rhs2, _ := matmulUsed()
 	rec2 := matmulRecord(t, fx2, lhs2, rhs2)
 	for biv := range rec2.Iters {
@@ -1668,22 +1705,21 @@ func TestBudgetFallback(t *testing.T) {
 	cache := opt.NewCache()
 	cache.Put(rec2)
 	p := DefaultParams()
-	p.MaxCache = 4104
+	p.MaxCache = 1024
 	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx2.g); err != nil {
 		t.Fatalf("budget-fallback run: %v", err)
 	}
 	if !lhs2.BasePtr().Erased() || !rhs2.BasePtr().Erased() {
-		t.Fatal("both sites must stay promoted after halving under a 4104-byte budget")
+		t.Fatal("both sites must stay promoted after halving under a 1024-byte budget")
 	}
-	findBuffer(t, fx2.g, ir.KindMemNew, 8)    // lhs at T_k = 2
-	findBuffer(t, fx2.g, ir.KindMemNew, 4096) // rhs at window (2,2)
+	findBuffer(t, fx2.g, ir.KindMemNew, 16)  // lhs at T_k = 4
+	findBuffer(t, fx2.g, ir.KindMemNew, 512) // rhs at window (4,4)
 	assertVerifyAndRootReachable(t, fx2.g)
 
-	// F4 floor drop: a 24-byte budget can never fit the WARP window (>=
-	// 4096 B at the floor tile 2) — rhs halving reaches the floor and
-	// DROPS. The floor amendment changed the lhs side: the shared K iter
-	// no longer drags to tile 1, so lhs rides K to the floor tile 2 (8 B,
-	// inside MaxFragPerThread) and STAYS PROMOTED.
+	// F4 floor drop: a 64-byte budget can never fit the WARP window (the
+	// floor-tile-2 minimum is 8·2·2·4 = 128 B) — rhs halving reaches the
+	// floor and DROPS; the lhs FRAG site rides the shared K iter to the
+	// floor tile 2 (8 B, inside MaxFragPerThread) and STAYS PROMOTED.
 	fx2b, lhs2b, rhs2b, _ := matmulUsed()
 	rec2b := matmulRecord(t, fx2b, lhs2b, rhs2b)
 	for biv := range rec2b.Iters {
@@ -1694,12 +1730,12 @@ func TestBudgetFallback(t *testing.T) {
 	cache2b := opt.NewCache()
 	cache2b.Put(rec2b)
 	p2b := DefaultParams()
-	p2b.MaxCache = 24
+	p2b.MaxCache = 64
 	if err := (LowerPass{Params: p2b}).Run(&opt.Context{Pass: "tile-lower", Cache: cache2b}, fx2b.g); err != nil {
 		t.Fatalf("budget-drop run: %v", err)
 	}
 	if rhs2b.BasePtr().Erased() {
-		t.Fatal("the rhs SMEM site must drop back to GMEM under a 24-byte budget (F4 floor drop)")
+		t.Fatal("the rhs SMEM site must drop back to GMEM under a 64-byte budget (F4 floor drop)")
 	}
 	if !lhs2b.BasePtr().Erased() {
 		t.Fatal("the lhs FRAG site must stay promoted at the floor tile 2 (8 B; the tile-1 shared-K drag is gone)")
@@ -1925,7 +1961,7 @@ func assertReachable(t *testing.T, g *ir.Graph, k ir.Kind, want int) {
 // and declines rhs with its reason.
 func TestDecideLowerComposition(t *testing.T) {
 	p := DefaultParams()
-	fx, lhs, rhs, store := matmulUsed()
+	fx, lhs, rhs, _ := matmulUsed()
 	cache := opt.NewCache()
 	ctx := &opt.Context{Pass: "tiling", Cache: cache}
 	if err := (Pass{Params: p}).Run(ctx, fx.g); err != nil {
@@ -1936,29 +1972,39 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatalf("cache entry under %q is %T, want *Record", RecordName, cache.Get(RecordName))
 	}
 
-	// The REAL searched record over the worked example: the winning schedule
-	// assigns M=CTA/100, N=SEQ/1, K=SEQ/1, all at T=64 — under the C1b
-	// forced-FRAG precedence (2026-10-23) lhs (covered {K}, INS {M,K})
-	// carries a thread-varying NON-covered source coordinate (M is the CTA
-	// dim), so it promotes as a forced FRAGMENT: 256 per-thread bytes
-	// (4 B × T=64) with per-thread reuse 64 (its n-walk); rhs (covered
-	// {N,K}, no thread-varying non-covered INS iter but 16384 per-thread
-	// bytes) declines the F6 gate. The decide pass publishes the record
-	// UNSTAMPED (F7: tiling-verify owns the stamp).
+	// The REAL searched record over the worked example (the fix4 model's
+	// winner, probed): the schedule assigns M=CTA/4/256 (the R-LOCCAP cap
+	// at T=256: ceil(1024/256) = 4), N=SEQ/1/256, K=WARP/2/32 — the
+	// K=WARP factorization's smaller blockDim (64) raises the M coupled
+	// walk to 4 trips and dominates the objective. lhs (covered {K}, a
+	// WARP dim under the C1b forced-FRAG precedence — M is a thread-varying
+	// non-covered coordinate) promotes as a 4-byte per-lane FRAGMENT with
+	// reuse 256 (its n-walk); rhs (covered {N SEQ, K WARP}) promotes as a
+	// 2·32·256·4 = 65536 B SMEM window at the MaxCache cap with reuse 4.
+	// The decide pass publishes the record UNSTAMPED (F7: tiling-verify
+	// owns the stamp).
+	dM, dN, dK := decisionOf(t, rec, fx.iters[0]), decisionOf(t, rec, fx.iters[1]), decisionOf(t, rec, fx.iters[2])
+	if dM.SoC != SoCTA || dM.LoC != 4 || dM.TileSize != 256 ||
+		dN.SoC != SoCSequential || dN.TileSize != 256 ||
+		dK.SoC != SoCWARP || dK.LoC != 2 || dK.TileSize != 32 {
+		t.Fatalf("searched schedule = M%s/%d/%d N%s/%d/%d K%s/%d/%d, want the probed winner",
+			dM.SoC, dM.LoC, dM.TileSize, dN.SoC, dN.LoC, dN.TileSize, dK.SoC, dK.LoC, dK.TileSize)
+	}
 	sl, ok := rec.SiteDecisionOf(lhs)
 	if !ok {
 		t.Fatal("the searched record must carry lhs's site entry")
 	}
-	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4*64 || sl.Reuse != 64 {
-		t.Fatalf("searched lhs decision = %+v, want promoted %s of %d B with per-thread reuse 64",
-			sl, ClassFRAG, 4*64)
+	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4 || sl.Reuse != 256 {
+		t.Fatalf("searched lhs decision = %+v, want promoted %s of 4 B (the K lane chunk) with reuse 256",
+			sl, ClassFRAG)
 	}
 	sr, ok := rec.SiteDecisionOf(rhs)
 	if !ok {
 		t.Fatal("the searched record must carry rhs's site entry")
 	}
-	if sr.Promoted || sr.Reason != ReasonFragBytes {
-		t.Fatalf("searched rhs decision = %+v, want declined with reason %q", sr, ReasonFragBytes)
+	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 4 {
+		t.Fatalf("searched rhs decision = %+v, want promoted %s of 65536 B (at the MaxCache cap) with reuse 4",
+			sr, ClassSMEM)
 	}
 	if rec.Verified {
 		t.Fatal("the decide pass must publish the record unstamped (F7)")
@@ -1976,47 +2022,20 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatalf("tile-lower over the real record: %v", err)
 	}
 
-	// Lowered products: the promoted lhs exercises the forced-FRAG path end
-	// to end — a 256 B FragNew buffer, a per-thread LoadTileThread fill
-	// (variant 2) riding K's between-round dimvar (K is SEQ/1 at T=64:
-	// between stride LoC×T = 64), and the plain-inside-IV access (C1b: no
-	// ThreadMap rank query in the FRAGMENT access coordinate — the per-
-	// thread strip origin lives on the FILL's GMEM source coordinate, which
-	// carries the rank query); the declined rhs stays GMEM untouched.
-	if !lhs.BasePtr().Erased() {
-		t.Fatal("the promoted lhs load must be erased")
+	// Lowered products: BOTH sites promote — lhs as a 4 B FragNew buffer
+	// (variant 2, the per-lane chunk ceil(32/32) = 1 element of the
+	// WARP-covered K dim) and rhs as a 65536 B MemNewSMem factor window
+	// (variant 1, the cooperative loader) — and the loads are erased.
+	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
+		t.Fatal("both promoted loads must be erased")
 	}
-	if rhs.BasePtr().Erased() {
-		t.Fatal("the declined rhs load must stay GMEM (untouched)")
-	}
-	buf := findBuffer(t, fx.g, ir.KindMemNew, 4*64)
-	fill := findFillOf(t, fx.g, buf)
-	if v := loaderVariantOf(t, fill); v != 2 {
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 4)
+	rbuf := findBuffer(t, fx.g, ir.KindMemNew, 65536)
+	if v := loaderVariantOf(t, findFillOf(t, fx.g, lbuf)); v != 2 {
 		t.Fatalf("the real-record fragment fill variant = %v, want 2 (LoadTileThread)", v)
 	}
-	bases := ir.OperandsOf(fill)[2:]
-	if len(bases) != 1 {
-		t.Fatalf("the lhs fill must ride exactly its covered round base, got %d", len(bases))
-	}
-	if step, ok := ir.ConstValueOf(ir.OperandsOf(bases[0])[2]); !ok || step != 64 {
-		t.Fatalf("the round base must be K's between dimvar (step LoC×T = 64), got step %v", step)
-	}
-	// The per-thread strip origin (ThreadMap rank query) rides the fill's
-	// GMEM source coordinate, NOT the fragment access.
-	if !subtreeHasKind(t, fx.g, ir.OperandsOf(fill)[0], ir.KindRuntimeThreadQuery) {
-		t.Fatal("the fill's GMEM source coordinate must carry the ThreadMap rank query (per-thread strip origin)")
-	}
-	var access ir.Node
-	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() == ir.KindMemLoad {
-			access = n
-		}
-	}
-	if access == nil {
-		t.Fatal("the store's value must read the fragment buffer through a FragLoad access")
-	}
-	if subtreeHasKind(t, fx.g, ir.OperandsOf(access)[1], ir.KindRuntimeThreadQuery) {
-		t.Fatal("the fragment access coordinate must be the plain inside IV — C1b forbids the rank query there")
+	if v := loaderVariantOf(t, findFillOf(t, fx.g, rbuf)); v != 1 {
+		t.Fatalf("the real-record smem fill variant = %v, want 1 (LoadTileCta)", v)
 	}
 
 	if vs := ir.Verify(fx.g); len(vs) != 0 {

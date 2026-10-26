@@ -7,22 +7,22 @@ __device__ static __forceinline__ T RedwarpCombine0(T p0, T p1) {
 }
 
 // Redwarp: launch 100 CTAs x 512 threads (tiling Params; the runtime asserts divisibility)
-// dynamic SMEM pool: 64 B (v0: disjoint offsets, zero reuse)
+// dynamic SMEM pool: 32 B (v0: disjoint offsets, zero reuse)
 namespace {
 
 __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out) {
   tca::rt::TensorView<const float, 2u> lhs_v(lhs, d0, d1);
   tca::rt::TensorView<float, 1u> out_v(out, d0);
-  // dynamic SMEM pool (64 B): one pool, disjoint v0 offsets — the future RA pass overlaps them
+  // dynamic SMEM pool (32 B): one pool, disjoint v0 offsets — the future RA pass overlaps them
   extern __shared__ __align__(16) char tca_smem[];
 
   tca::rt::KernelInfo kinfo;
   // LNT #0: d0=CTA(T=32,LoC=100) d1=thread/warp(T=64,LoC=256) dim=thread/warp(LoC=256) d1=sequential(T=64,LoC=1)
   {
-    // CTA-space mapping (portions -1 — the launch grammar this nest remaps)
-    tca::rt::GridMapping grid_map0(kinfo, -1);
-    // per-CTA thread-space mapping (portions 4, -1)
-    tca::rt::ThreadMapping thread_map1(kinfo, 4, -1);
+    // CTA-space mapping (portions 100 — the launch grammar this nest remaps)
+    tca::rt::GridMapping grid_map0(kinfo, 100);
+    // per-CTA thread-space mapping (portions 8)
+    tca::rt::ThreadMapping thread_map1(kinfo, 8);
     auto c0 = 1024u;
     auto c1 = 512u;
     auto c2 = 0.0f;
@@ -40,7 +40,7 @@ __global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const f
     auto v5 = (v4 * c1);
     auto c9 = 64u;
     // warp reduction — the combiner is runtime-owned; per-element brackets [Init → reduced-dim walks (Reduce(value)) → Combine]
-    tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0, thread_map1, tca::rt::SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem + 0u), 16u));
+    tca::rt::WarpReducer<float> reducer0(c2, RedwarpCombine0, thread_map1, tca::rt::SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem + 0u), 8u));
     // @d0 tile-between rounds — CTA, T=32, LoC=100 (map dim 0)
     for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 100u, 0u, 3200u, c0); d0_it0.Has(); d0_it0.Next()) {
       auto v6 = (v1 + d0_it0.Index());
@@ -82,7 +82,7 @@ void RedwarpLaunch(const tca::Tensor<float, 2u>& lhs, tca::Tensor<float, 1u>& ou
   const uint32_t d0 = lhs.Dim(0u);
   const uint32_t d1 = lhs.Dim(1u);
   TCA_REQUIRE(out.Dim(0u) == d0, "out.Dim(0) must equal d0 (dim d0)");
-  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 64u);
-  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 64u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
+  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 32u);
+  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 32u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
   TCA_CUDA_CHECK(cudaGetLastError());
 }
