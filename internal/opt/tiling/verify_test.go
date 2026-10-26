@@ -151,6 +151,25 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 		}
 	})
 
+	t.Run("sequential loc not one", func(t *testing.T) {
+		// SEQ dims carry LoC == 1 (one tile in the sequence dimension
+		// = the whole dim is one tile). A sequential LoC != 1 is
+		// off the implicit SEQ preset list = corruption.
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			for biv, d := range rec.Iters {
+				if d.SoC == SoCSequential {
+					d.LoC = 5 // not 1
+					rec.Iters[biv] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry at least one SEQ entry")
+		})
+		if !strings.Contains(err.Error(), "preset") {
+			t.Fatalf("SEQ LoC != 1 error must name the preset list, got %q", err.Error())
+		}
+	})
+
 	t.Run("promoted site tied outside its lnt", func(t *testing.T) {
 		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
 			// Target an already-promoted entry deterministically: forcing
