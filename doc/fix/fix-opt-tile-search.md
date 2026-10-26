@@ -1,229 +1,136 @@
-# Improving the loop tiling schedule search algorithm
+# The loop-tiling schedule search algorithm (finalized design)
 
-- Current status
-  - Very naive scheduling algorithm
-  - The code structure is not a strictly mapping from the algorithm
+- Status: FINAL — all rulings folded in (design review doc/review/fix-opt-tile-search.md, rounds 1–6, 2026-10-26).
+- Purpose: replace the naive PSched search in `internal/opt/tiling` (uniform tile, no LoC search, binary budget gate, ≤1+≤1 policy) with a formalized, general-purpose optimizer over per-dim (SoC, LoC, TileSize) assignments with cache eviction.
+- Supersedes (explicitly):
+  - The **disjoint-shard warp model** (2026-10-20/21 composition rulings: "threads = sum of disjoint whole-warp shards", coupled walk = remaining warps, the F2 floor) → replaced by **factorization at both levels**.
+  - The **portion grammar** (PORTION_CTA/PORTION_WARP percentages, −1 remainder, AutoWarpPortion) → replaced by **absolute counts**.
+  - The **v0 searcher policy** (≤1 CTA dim + ≤1 independent WARP dim per LNT) → **repealed**; multi-dim same-category assignment is the point of MAPM.
+  - The runtime **assert-and-trap pre-conditions** (CTAs multiple of 10; ≥256 threads, multiple of 8 warps) → replaced by the launch-derivation contract below.
+  - The **weighted two-term objective** of earlier drafts → **traffic-avoided primary, partition-count tiebreak only**.
 
-- Define a formalized and unambigious general purpose searching algorithm
-  - Finding out our parallisation scheduling/assignment
+## 1. Input
 
-# Search Algorithm
+- A loop nest of N iterations. The search window is the **M innermost consecutive** iterations of the nest's root→deepest-leaf spine (loops outside the window default SEQ; non-spine loops default SEQ).
+- **M = 4** (default; `Params.WindowK` changes 5 → 4).
 
-- The following design doc describe a general purpose of scheduling assignment
+## 2. Schedule Assignment
 
-## Input
-- A loop nests, ie N nested iterations
-  - We will choose a sub-set of the N iterations, for now we choose up to M **inner most consequetive loops**
-    - By default, set **M = 4**
-      - Notes for now it is 5
+Each window iteration gets one **Schedule Assignment**:
 
-## Problem Formulation
+- **(1) SoC** — space of concurrency: `Sequential | CTA | WARP`.
+- **(2) LoC** — level of concurrency, an ABSOLUTE count (portions/percentages are invalid and deleted):
+  - CTA: **# of CTAs allocated to this dimension** (a preset factor).
+  - WARP: **# of warps allocated to this dimension** (a preset factor; 1 warp = 32 threads).
+  - Sequential: always 1 (implicit, not searched).
+- **(3) TileSize** — the per-dimension tile extent owned per round; presets {32, 64, 128, 256}. Tile 1 is not a legal schedule (2026-10-24 ruling); every entry ≥ 2.
 
-- For each iterations, assign an **Schedule Assignment** in allowed scheduling space
-  - A Schedule Assignment is
-    - (1) SoC: space of concurrency
-      - Sequential
-      - CTA
-      - Thread/WARP
-    - (2) LoC: level of concurrency
-      - Sequential: = 1 always
-      - CTA: **# of CTAs per allocated dimension**
-        - Notes: we use to use a percentage which is invalid
-        - And also the kernel launcher's gridDim.x parameter must be dynamically derived accordingly
-          - Later on described
+### 2.1 Composition = FACTORIZATION (both levels)
 
-      - Thread/WARP: **# of WARPs per allocated dimension**
-        - Notes: we use to use a percentage which is invalid
-        - And also the kernel launcher's gridDim.x parameter must be dynamically derived accordingly
-          - Later on described
-        - 1 means 1 WARP, ie 32 threads
+- **CTA space**: `gridDim.x = Π (CTA LoC over CTA-assigned dims)`. Each CTA has a coordinate (via reverse stride-shape decomposition of `cuda_linear_id`); in dim d, **CTA c owns tiles ≡ c (mod LoC_d)**.
+- **Warp space**: the warp index factors uniquely into one coordinate per WARP-assigned dim, `Π (warp K) ≤ 32` warps total; in dim d, **warp c owns tiles ≡ c (mod K_d)**.
+- Every tile combination is owned by **exactly one (CTA, warp)** — no redundant execution, no idle warps. `blockDim.x = Π K × 32` **exactly**: we launch precisely what the schedule factorizes (exhaustive launch).
+- A WARP dim with K = 1 is vacuous distribution ≡ SEQ — pruned from the feasible area (dominated).
 
-    - (3) TileSize: corresponding dimension's size of stride responsible for a SoC
-      - For example tile_size = 32 for a CTA means:
-        - each CTA will be responsible for managing a consequtive 32 elements for that dimension
-      - TileSize decides the inner tile-inside-loop's iteration space's upper bound
-      - It also implicity defines the SMEM/FRAG cache size
-        - SRAM, ie SMEM or FRAG, based cache are always per tile
-        - Tile size defines the size of the SMEM size locally
+### 2.2 Structural hierarchy (TBL / TIL, in factorization terms)
 
-  - A Schedule Assignment is **Structural/Heirachy**
-    - Denote:
-      - Tile Between Loop as TBL
-      - Tile Inside Loop as TIL
-    - (1) CTA
-      - TBL: CTA level concurrency
-        - (1) A consequtive tile_size iteration space is mapped to a specific CTA
-          - Each CTA is mapped to cta_index * <tile_size>
-          - [0, <tile_size>] [<tile_size>, 2 * <tile_size>] ... etc
-      - TIL: Thread level concurrency
-        - Structurally, the tile inside loop is partitioned by a partition of thread space regarding that CTA
-    - (2) Thr
-      - TBL: **Thread Level Concurrency** within the assigned CTA
-      - TIL: **Sequential loop**
-    - (3) Sequential
-      - TBL: Sequential
-      - TIL: Sequential
+Each original iteration becomes a Tile-Between-Loop and a Tile-Inside-Loop:
 
-    - In short
-      - A CTA assignment, implicitly uses 2 parallisation SoC
-        - CTA for loop between
-        - THR for loop inside
-      - A THREAD assignment, implicitly just use ONE SoC
-        - THR for loop between
-        - SEQ for loop inside
-      - A Sequential assignment, both TBL and TIL are sequential
+| SoC | TBL (between) | TIL (inside) |
+|---|---|---|
+| CTA | CTA residue-class tiles (coordinate mod LoC) | **coupled walk**: distributed over ALL `blockDim` threads, element-strided (thread t owns every blockDim-th element) |
+| WARP | warp residue-class tiles (coordinate mod K) | owning warp's **32 lanes split the tile into consecutive ⌈T/32⌉ chunks** |
+| SEQ | sequential rounds (every thread) | each thread walks the full T interior sequentially (its own coordinates) |
 
-  - SRAM caching
-    - As a side effect, the SRAM caching parameter will be locked down
+- Expanded SoC instances (what the constraints count): a CTA dim contributes **1 CTA instance + 1 THR instance** (its coupled TIL); a WARP dim contributes 1 THR instance; SEQ contributes none. "A CTA assignment implicitly uses 2 SoC."
+- F2 (coupled-portion floor) is **deleted** — there is no "remaining warps" concept; `coupledThreads := blockDim`.
 
-- Constraints
-  - For a specific proposal scheduling
-    - A list of iterations with its own **Schedule Assignment**
-    - NOTES the list of iteration is **AFTER TILING**
-      - ie if input is 3 nests, now it is 6
-  - (1) maximum allowed parallisation mapping: MAPM
-    - SUM all iteration's # of CTA and THR/WARP
-      - Denote total CTA as total_cta
-      - Denote total THR as total_thr
-    - total_cta <= MaxPartition.cta (maximum allowed cta partitaion)
-    - total_thr <= MaxPartition.thr (maximum allowed thread partition)
-    - By default
-      - MaxPartition.cta = 3
-      - MaxParittion.thr = 3
-      - Ie similar to cuda's (x/y/z) mapping
+## 3. Constraints
 
-  - (2) maximum allowed LoC: MALoC
-    - **Mul** all iteration's # total LoC
-      - For all iterations that is categorized as CTA assignment SoC: Mul all LoC
-        - Denoted as total_cta_loc
-      - For all iterations that is categorized as THR assignment SoC: Mul all LoC
-        - Denoted as total_thr_loc
-    - total_cta_loc <= MaxLoC.cta
-    - total_cta_thr <= MaxLoC.thr
-    - By default
-      - MaxLoC.thr = 32 (ie 32 WARPs maximum allowed per CTA)
-      - MaxLoC.cta = 2^31 - 1 (ie maximum allowed value in gridDim.x)
+Checked over the **expanded instance list** (per §2.2) and the **factorizations** (per §2.1):
 
-  - (3) maximum allowed SRAM: MASRAM
-    - ie # of total bytes allowed for caching
-    - For each iteration's CACHE SITE
-      - For storage class to be SEQUENTIAL, sum all its byte size
-        - denoted as total_frag
-      - For storage class to be THR, sum all its byte size
-        - denoted as total_smem
-    - Ensure total_frag + total_smem <= MaxSRAM
-    - By default
-      - MaxSRAM = 64kb
+- **(1) MAPM** — max parallelization mapping: `#CTA dims ≤ MaxPartition.cta = 3` and `#THR instances ≤ MaxPartition.thr = 3` (WARP dims + CTA dims).
+- **(2) MALoC** — factorization bounds: `Π CTA LoC ≤ MaxCTA` (Params; default 512 — a real policy bound, not the vacuous 2^31−1) and `Π warp K ≤ 32` (hardware: 1024 threads).
+- **(3) MASRAM** — TWO budget gates (units differ; a single pool alone is unsound — round-5 R1 ruling):
+  - SMEM: kernel-wide sum of promoted SMEM windows ≤ `MaxCache` = 64 KB.
+  - FRAG: kernel-wide per-thread FRAG sum ≤ `MaxFragPerThread` = 256 B. A FRAG site is **all covered dims SEQ-assigned** — the window lives in a single thread's registers and is walked wholly by it; per-thread bytes = `Π(covered T_d) × sizeof(dtype)`. (At 256 B, 2-D all-SEQ fragments (32×32 fp16 = 2 KB) decline — accepted for v0; the knob is the hyperparameter surface.)
+- **(4) CuMAP** — at least one CTA-assigned dim (CUDA thread-model requirement). Violation = structural infeasibility = hard error.
 
-  - (4) cuda mapping: CuMAP
-    - For all iteration schedule assignment, at least one must be CTA
-      - This is easy to understand, since if no iteration uses a CTA assignment, cuda will not work
+### 3.1 Kernel-launch derivation (fully dynamic — no static one-size-fits-all)
 
-  - (5) implicitly, the # of loop iterations constriants total # of SoC
+- `gridDim.x = max over LNTs of (Π CTA LoC)`; `blockDim.x = max over LNTs of (Π warp K) × 32`.
+- Each LNT **remaps its own Grid/Thread mappings** from its own factorization at its nest head (per-LNT scoped maps — the existing F5 mechanism). CTAs/warps beyond a smaller LNT's product **whole-body-skip** via the existing rank/extent guards, so the max-over-LNTs launch is safe.
+- Runtime pre-conditions (replacing assert-and-trap): blockDim is a multiple of 32 with warp count ≤ 32; gridDim ≤ MaxCTA.
 
-  - For kernel launcher configuration
-    - (1) We are always using 1 * 1 allocation, ie gridDim.x and blockDim.x are relevant
-    - (2) For gridDim.x parameter
-      - **maximum of all LNT in kernel's total_cta_loc**
-    - (3) For blockDim.x parameter
-      - **maximum of all LNT in kernel's total_cta_thr**
+## 4. Objective function
 
-- Objective Function
-  - **NOTES, we use a new and well defined objective functions**
-  - NOTES about concurrency
-    - The allocation will uses a portion like LoC, and by MaLoC constraints, all concurrency will be exhausted regardlessly
-  - In short, it is composed of 2 parts, with a weighted sum
-    - [1] **maximize SMEM/FRAG reuse**
-    - [2] **granularity of concurrency**
-      - Since we will partition all given threads totally anway
-      - We want to optimize the granularity of partition
-        - Ie fine grained partition always lead to better utilization
-        - We are given irregular unknown tensor as input, fine grained parition will have less chance to waste CPUs
-          - Ie thread quick return because shape mismatch/OOB
-        - ie threads (1024) vs thread(32) * thread(32)
-        - the latter 32 * 32 will have high chance to waste less than a single 1024
-          - Consider a 28 * 1024 tensor, the first one will ONLY have 28 concurrency at most, even given 1024
-            - The latter will have 28 * 32 concurrency, which is way better than first one
-      - Propotional to the SM utilization
+- **Primary (strict): maximize GMEM traffic avoided** = `Σ over promoted sites of bytes × (reuse − 1)`, computed on the **post-eviction** site set (§6).
+- **Tiebreak (exact ties only): partition count** GoC = `total_cta + total_thr` over expanded instances (≤ 6); i.e. `goc_score = (total_cta + total_thr) / 6`. GoC NEVER overrides a traffic difference — hypothetical utilization never beats measurable bytes (round-5 R2 ruling).
+- **Determinism**: fixed enumeration order (outermost window dim = most significant digit; digits ordered SoC, then LoC ascending, then tile ascending), first strict maximum wins.
 
-  - The objective function can be defined as
-    - (1) **maximize SMEM/FRAG reuse**, normalize to [0.0, 1.0]
-      - for each group resulted in findINS
-        - each element in a certain set will be overlapped with others for M dimension
-          - M >= 2 as hard constraints for findINS filter
-        - For a SMEM/FRAG site, its reuse bytes are defined by
-          - Multiplication of all overlaped dimension's tile_size
-          - Denoted as reuse_size
-      - reuse_score = **SUMATION of reuse_size of all sites** / MaxSRAM
-    - (2) **granularity of concurrency**, ie GoC, normalized [0.0, 1.0]
-      - goc_max = max(MaxPartition.cta + MaxParition.thr, 2 * # of iterations)
-        - ie coarsely counting allowed total maximum loc, at most 3 + 3 will be allowed
-      - goc_score = (total_cta_loc + total_cta_thr) / goc_max
-    - (3) objective_function = alpha * reuse_score + (1.0 - alpha) * goc_score
-      - by default alpha = 0.5
+> **KNOWN BIAS — objective evolution note (author ruling, 2026-10-26).** The tiebreak prefers parallelism over sequential (e.g. warp split-k on a reduced dim: 4/6 vs 3/6 partitions) whose reduction-staging cost (SMEM staging + barriers per output round) is **not modeled**. This bias is **accepted for v0**; there is deliberately **no special-case policy** (e.g. "reduced dims stay SEQ") — we are not certain sequential is better for reduction either. The search algorithm is formula-agnostic: enriching the score with more factors (reduction cost, shape-aware utilization via the dormant NominalExtent knob) improves the optimum **without any algorithm change**. Polish the formula later, not the searcher.
 
-- Feasible Area
-  - Each iteration can be assigned one of the 3 possible SoC
-  - Each iteration can have one of the tile_size in a preset list
-    - Assuming it contains 32/64/128 (totally 3 different sets)
-  - Each iteration can be assigned with specific types of LoC
-    - For CTA LoC pre list: (1, 5, 10)
-    - For THR LoC pre list: (1, 4, 8)
-    - All are 3 elements
-    - Notes due to the exhaust rule, the last CTA/THR LoC can be simply assigned with -1
-      - use up whatever left in runtime
-      - effectively limit the searching space
-  - For now we clamp only 5 most nested loops
-  - The total searching space is
-    - (3 * 3 * 3)  ^ 4 = 531441
-    - The searching space is pretty managable
-  - Notes, SRAM assignment will use a backtracking algorithm to find feasible one
-    - tile_size decides **if the SRAM is populated, what the SRAM costs it will incur**
-    - to decide weather a potential SRAM site is populated, we use a simple backtrace algorithm to find
-    - notes to find **potential set of SRAM, use existed findINS algorithm**
-      - already implemented in overlap.go
+## 5. Cost model (site judgments)
 
-## Searching Algorithm
+- **Discovery** (existing, unchanged): `findINS` + `analyzeOverlap`/`newSiteFacts` in overlap.go — INS sets (cardinality ≥ 2 filter: a singleton set has no reuse), tie = innermost non-referenced iter, covered = the trailing `CacheDims` (=2) cached dims, reuse dims = tie + iters strictly inner than the tie, minus covered. Tensor rank ≥ CacheDims; `MaxCS` caps the candidate set.
+- **Tier rules** (in order):
+  1. Any covered dim **CTA-assigned → site REFUSED** (no coherent fill variant; kept for this refactor, revisit later).
+  2. **C1b forced-FRAG**: any non-covered referenced iter (INS) assigned CTA or WARP — a thread-varying source coordinate — forces ClassFRAG regardless of the covered dims' SoC.
+  3. Any covered dim **WARP-assigned → SMEM window** class (cooperative fill, buffer holds one window per warp coordinate of the WARP-covered dims).
+  4. All covered dims SEQ → **FRAG** (per-thread registers).
+- **Bytes**:
+  - FRAG (per thread): `Π(covered T_d) × sizeof(dtype)` — no lane division.
+  - SMEM window (buffer): `Π over covered dims of (factor_d × T_d) × sizeof(dtype)`, where a WARP-covered dim contributes `factor_d = K_d` (its per-round residue tiles, one per warp coordinate) and a SEQ-covered dim contributes `factor_d = 1`.
+- **Reuse** = the number of times a filled window is re-read before its next fill: the per-thread/per-lane interior walks of the site's re-traversal dims (tie + inner non-covered), **times the cross-warp sharing factor** — a load whose subscripts MISS a warp dim d is re-read by every warp sharing the other coordinates (factorization makes windows genuinely shared; the shard model's "all reuse is intra-thread" identity no longer holds).
+- **Promotion gate**: promote iff traffic avoided (`bytes × (reuse − 1)`) > 0 (total view, cross-warp included); FRAG bytes ≤ MaxFragPerThread per site.
+- **Cross-LNT**: SMEM and FRAG sums are KERNEL-WIDE — running floors threaded through LNTs in deterministic `Roots()` order; site dedupe by MemLoad id (D11).
 
-- Overview
-  - A exhausted search that optimize the objective function
-  - Perform backtrace ONLY WHEN **MASRAM** constraints violation
-    - Like Chattin-Briggs RA allocation
-    - For all assignment combination, always try to fullfill ALL SMEM requirements in candidative set
-    - If success, we are done to evaluation
-    - Otherwise
-      - Try to pop one SMEM/FRAG cache out of the cache site and recalcuate constraints
-      - Until we satisfy the given constraints
-  
-- Algorithm
-  - Permutate one instance in **Feasible Area**
-  - Check its constraints
-    - Using SRAM Backtrace algorithm to make the candidate satisfy MASRAM constraints rule
-  - If constriants NOT satisfied, continue to next one
-  - Otherwise evaluation
-    - calculate the score based on objective function
-    - update the maximum one as candidative assignment
-  - Return the optimal one searching by the algorithm
+## 6. Search algorithm
 
+Exhaustive search with greedy cache eviction:
 
-# Implementation
+1. **Enumerate** the feasible area (§7) in fixed order, with **incremental constraint pruning** (reject a partial vector as soon as MAPM/MALoC/CuMAP is violated — never enumerate-then-filter).
+2. **Judge sites** for each candidate — memoized: a site's judgment depends only on the (SoC, LoC, TileSize) of the dims it touches, so cache judgments across candidates sharing those.
+3. **Budget check** (both MASRAM gates against the kernel-wide floors). If violated: **greedy eviction (Chaitin–Briggs-style spill, not backtracking)** — repeatedly drop the site with the least value density, where `density = value/bytes = reuse − 1` (ties: smaller bytes first), until both gates pass. Evicted sites are demoted to GMEM; their tile shapes remain (loops stay tiled).
+4. **Score** the post-eviction set: traffic avoided (primary), partition count (tiebreak). Update on strict improvement; on exact tie keep the earlier-enumerated candidate.
+5. **Return** the best schedule found.
 
-- Current implementation is really messy
-  - The algorithm lacks a clear separation of concernces
-    - Iterator that exhausts feasiable area
-    - Constraints checking
-    - Objective function score obtaining
-    - Evaluation and updates
+- **Structural infeasibility** (no CTA dim possible, no legal LoC factorization, tile < 2) → **hard error** (extends the 2026-10-24 "tiling never disabled" ruling: loops are always tiled ≥ 2).
+- **Zero-cache outcome** (budget forces evicting ALL sites) → **allowed, emit a warning** (round-5 R3 ruling — graceful degradation is the point of eviction; erroring at zero would make eviction useless exactly when budgets are tight).
 
-- Desired implementation
-  - Very well organized code
-  - [1] All configuration parameter as pass input with sane default
-    - Configurable and may use hyper-parameter optimizer to customize them in the future
-  - [2] Implementation by module
-    - (1) Iterator for feasiable area management
-    - (2) Constraints checking and backtracing for adjustment
-      - Notes the backtracing of SRAM will finalize the SMEM part
-    - (3) Score evaluation
-      - Obtaining the objective function score based on the proposal scheduling
-    - (4) Updating if current scheduling is better than the recoreded best one
-    - (5) Finally, return the best one we have searched
+## 7. Feasible area
+
+- Per window dim: SoC (3) × LoC preset × TileSize (4), where LoC presets are
+  - CTA: {2, 4, 8, 16, 32, 64}
+  - WARP: {2, 4, 8, 16, 32}
+  - SEQ: {1} (implicit)
+- K = 1 WARP dims pruned (≡ SEQ, dominated); presets are the parallelism ceiling (there is no remainder rule) — {…, 32} lets a single warp dim reach a full 1024-thread block.
+- Upper bound per LNT: `((1 + 6 + 5) SoC-LoC combos) × 4 tiles = 48` per dim → `48^4 ≈ 5.3M` candidates — tractable ONLY with the incremental pruning and memoization of §6.
+
+## 8. Implementation
+
+### 8.1 Module separation (the current code mixes all of these)
+
+1. **Iterator** — feasible-area enumeration with incremental constraint pruning.
+2. **Constraints + eviction** — MAPM/MALoC/CuMAP checks over expanded instances; the two MASRAM gates; the spill loop.
+3. **Score** — the site judge (tier rules, bytes, reuse) + traffic objective + partition tiebreak, on the post-eviction set.
+4. **Update** — strict-max with fixed-order determinism.
+5. **Return** — best schedule + budget consumption for the caller's running floors.
+
+### 8.2 Parameters (all as pass input, sane defaults; the hyperparameter-optimizer surface)
+
+`WindowK=4`, `TileSizes={32,64,128,256}`, `CtaLoCPresets={2,4,8,16,32,64}`, `WarpLoCPresets={2,4,8,16,32}`, `MaxPartitionCta=3`, `MaxPartitionThr=3`, `MaxCTA=512` (gridDim policy cap), `MaxWarpsPerCTA=32` (hardware), `MaxCache=65536`, `MaxFragPerThread=256`, `CacheDims=2`, `MaxCS=16`. **Retired**: PortionCTA/PortionWarp/AutoWarpPortion/WarpPortion/MaxThreadsPerCTA/MaxCTA-as-exhaustion.
+
+### 8.3 Contract changes (the refactor's real size)
+
+- **Record**: per-iter (SoC, LoC absolute, TileSize) keyed by BIV; per-site (promoted/tie/class/reuse/bytes/reason) keyed by MemLoad id. Launch derivation recomputed by lower/codegen (gridDim = max_LNT Π, blockDim = max_LNT Π × 32) — no new record field.
+- **tiling-verify**: `CTA LoC == MaxCTA` → `LoC ∈ presets ∧ Π == gridDim`; warp `Π K ≤ 32`; F2 check deleted; the two budget gates re-checked kernel-wide.
+- **lower (loop_tile_lower)**: residue-class loop rewrite forms (replacing chunk-stride shard forms); coupled walk = blockDim-strided; fills per the re-derived tier rules; runtime contract updated (runtime_objects.md).
+- **Pipeline position unchanged**: tiling@114 → tiling-verify@115 → loop-tile-lower.
+- **Goldens WILL change** (new cost model → new chosen schedules; e.g. the flagship is expected to flip from M=CTA/N=SEQ/K=WARP to the canonical M=CTA/N=WARP/K=SEQ) — sanctioned regen + re-pin + e2e numerical verification on the A6000, per the fix3 C11 precedent.
+
+### 8.4 Sequencing
+
+1. Decide-half rewrite (cost model §5 + searcher §6 + verify §8.3) with unit tests.
+2. Lower-half rewrite (rewrite forms, fills, runtime mapping contract); goldens regen + re-pin.
+3. E2E: numerical acceptance + compute-sanitizer (memcheck/racecheck) on the A6000.
