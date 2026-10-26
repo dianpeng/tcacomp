@@ -1973,16 +1973,21 @@ func TestDecideLowerComposition(t *testing.T) {
 	}
 
 	// The REAL searched record over the worked example (the fix4 model's
-	// winner, probed): the schedule assigns M=CTA/4/256 (the R-LOCCAP cap
-	// at T=256: ceil(1024/256) = 4), N=SEQ/1/256, K=WARP/2/32 — the
-	// K=WARP factorization's smaller blockDim (64) raises the M coupled
-	// walk to 4 trips and dominates the objective. lhs (covered {K}, a
-	// WARP dim under the C1b forced-FRAG precedence — M is a thread-varying
-	// non-covered coordinate) promotes as a 4-byte per-lane FRAGMENT with
-	// reuse 256 (its n-walk); rhs (covered {N SEQ, K WARP}) promotes as a
-	// 2·32·256·4 = 65536 B SMEM window at the MaxCache cap with reuse 4.
-	// The decide pass publishes the record UNSTAMPED (F7: tiling-verify
-	// owns the stamp).
+	// winner under the 2026-10-26 one-currency amendment, checker-derived
+	// round 2): the schedule assigns M=CTA/4/256 (the R-LOCCAP cap at
+	// T=256: ceil(1024/256) = 4), N=SEQ/1/256, K=WARP/2/32, blockDim 64 —
+	// score 16776960 (rhs 65536×255 = 16711680 + lhs 4×255×64 = 65280),
+	// 256 ahead of the closest challengers at 16776704 (N=SEQ/1/128 +
+	// K=WARP/2/64 or K=WARP/4/32). lhs (covered {K}, a WARP dim under the
+	// C1b forced-FRAG precedence — M is a thread-varying non-covered
+	// coordinate) promotes as a 4-byte per-lane FRAGMENT with per-thread
+	// reuse 256 (its n-walk; §2.7 keeps FRAG record semantics per-thread);
+	// rhs (covered {N SEQ, K WARP}) promotes as a 2·32·256·4 = 65536 B
+	// SMEM window at the MaxCache cap with COLLECTIVE reuse T_M = 256 (the
+	// old per-thread ceil(256/64) = 4 trips × 64 readers = the same
+	// collective 256; sharing 1 since the only WARP dim K ∈ rhs's
+	// subscripts). The decide pass publishes the record UNSTAMPED (F7:
+	// tiling-verify owns the stamp).
 	dM, dN, dK := decisionOf(t, rec, fx.iters[0]), decisionOf(t, rec, fx.iters[1]), decisionOf(t, rec, fx.iters[2])
 	if dM.SoC != SoCTA || dM.LoC != 4 || dM.TileSize != 256 ||
 		dN.SoC != SoCSequential || dN.TileSize != 256 ||
@@ -2002,8 +2007,8 @@ func TestDecideLowerComposition(t *testing.T) {
 	if !ok {
 		t.Fatal("the searched record must carry rhs's site entry")
 	}
-	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 4 {
-		t.Fatalf("searched rhs decision = %+v, want promoted %s of 65536 B (at the MaxCache cap) with reuse 4",
+	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 256 {
+		t.Fatalf("searched rhs decision = %+v, want promoted %s of 65536 B (at the MaxCache cap) with collective reuse 256 (= T_M; the pre-amendment per-thread count was 4)",
 			sr, ClassSMEM)
 	}
 	if rec.Verified {

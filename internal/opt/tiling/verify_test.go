@@ -337,13 +337,30 @@ func TestVerifyForLoopStep(t *testing.T) {
 }
 
 // TestVerifyKernelWideFragGate pins the F6 kernel-wide gate at the verify
-// side: a genuine FRAG-promoting record (32 B at tile 8) verifies green
-// under the mirrored params, and the recomputed kernel-wide FRAG sum is
-// gated against THIS pass's MaxFragPerThread — a 31-byte budget flags it.
+// side: a genuine FRAG-promoting record verifies green under the mirrored
+// params, and the recomputed kernel-wide FRAG sum is gated against THIS
+// pass's MaxFragPerThread — a tight budget flags it.
+//
+// §2.4 sweep (2026-10-26 amendment; the flip from the old 32 B pin is
+// DETERMINISTIC): under the one-currency model the lhs contest is
+// bytes × (reuse − 1) × holders = ceil(8/32)·4 × 7 × (K·32) for a K=WARP
+// vector (C1b FRAG, the K lane chunk), vs 32 × 7 × 32 = 7168 for the
+// all-SEQ vector —
+// K=WARP/8/8 TIES the all-SEQ vector at 7168 and takes it on
+// partitionCount (3 > 2, the strictly-greater key), and every larger K
+// dominates outright, so the winner is a K=WARP vector (M=CTA/…/8,
+// N=SEQ/1/8, K=WARP/Kmax/8): lhs becomes a 4 B lane-chunk FRAG and
+// promotedFrag moves 32 → 4. The rhs declines in BOTH currencies: an
+// all-SEQ rhs (256 B ≤ MaxFragPerThread) hits reuse 1 on the M CTA dim
+// (per-thread ceil(8/blockDim) = 1) → ReasonLowReuse; any K=WARP rhs is
+// an SMEM window of 8·8·K·4 ≥ 512 B > MaxCache 100 → evicted
+// ReasonEvicted; ReasonFragBytes cannot fire (256 ≤ MaxFragPerThread).
+// tight.MaxFragPerThread must sit UNDER the 4 B sum (31 could never fire
+// post-flip) — 3 keeps the F6 sub-check live.
 func TestVerifyKernelWideFragGate(t *testing.T) {
 	fx, _, _ := matmul()
 	decideP := DefaultParams()
-	decideP.TileSizes = []int{8} // FRAG-friendly: lhs = 4·8 = 32 B, reuse 8
+	decideP.TileSizes = []int{8} // single tile preset: every dim tiles at 8
 	decideP.MaxCache = 100       // SMEM windows never fit: the FRAG tier wins
 
 	cache, rec := runDecide(t, fx.g, decideP)
@@ -353,17 +370,17 @@ func TestVerifyKernelWideFragGate(t *testing.T) {
 			promotedFrag += sd.Bytes
 		}
 	}
-	if promotedFrag != 32 {
-		t.Fatalf("the fixture must promote exactly one 32 B FRAG site, got %d B", promotedFrag)
+	if promotedFrag != 4 {
+		t.Fatalf("the fixture must promote exactly one 4 B FRAG site (the K=WARP winner's lane chunk ceil(8/32) = 1 element x 4 B), got %d B", promotedFrag)
 	}
 	if err := verifyWith(fx.g, cache, decideP); err != nil {
 		t.Fatalf("verify must be green under the mirrored params: %v", err)
 	}
 	tight := decideP
-	tight.MaxFragPerThread = 31
+	tight.MaxFragPerThread = 3 // under the 4 B sum: the F6 gate must fire
 	err := verifyWith(fx.g, cache, tight)
 	if err == nil {
-		t.Fatal("the kernel-wide FRAG gate must fire under a 31-byte budget")
+		t.Fatal("the kernel-wide FRAG gate must fire under a 3-byte budget")
 	}
 	if !strings.Contains(err.Error(), "MaxFragPerThread") {
 		t.Fatalf("the FRAG budget error must name MaxFragPerThread, got %q", err.Error())
