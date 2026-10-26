@@ -838,7 +838,7 @@ func TestSimplifyPipelineWiring(t *testing.T) {
 	g, _, _, _, _, _, loadL, loadR, _, mp := docExample(t)
 	var l1 []opt.Pass
 	for _, p := range opt.BuildPipeline() {
-		if p.ID() == "schedule" {
+		if p.ID() == "tile-lower" {
 			break
 		}
 		l1 = append(l1, p)

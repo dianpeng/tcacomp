@@ -53,12 +53,14 @@ package tiling
 // that epoch's induction variable. Membership is via IV references
 // (fix1.md §0), never a body operand.
 //
-// WINDOW SIZING + ACCESS (R2, ruled 2026-10-21 — rank-in-index =>
-// window-in-shape): a covered WARP dim's buffer extent is #threads_d x T_d
-// (the whole group's round window — the decide side's siteWindowBytes
-// prices the same product), and the access index on that dim is
-// thread_map.index(d)·T_d + i (d = the dim's ThreadMap slot, i = the
-// sequential inside walk). SEQ covered dims contribute T_d and index by
+// WINDOW SIZING + ACCESS (fix4 §2.4/§3.3, R-C1B): a covered WARP dim's
+// SMEM buffer extent is K_d x T_d (one window per warp coordinate — the
+// SAME factor the decide side's shared siteWindowBytes prices; the old
+// whole-group #threads_d x T_d shard window is gone, 32x smaller now),
+// and the access index on that dim is thread_map.index(d)·T_d + i (d =
+// the dim's ThreadMap slot in warp units, i = the lane's sequential
+// inside walk). A C1b forced-FRAG site sizes its WARP-covered dim at
+// ceil(T_d/32) per lane. SEQ covered dims contribute T_d and index by
 // their plain inside coordinate. FRAG buffers are per-thread: plain i.
 
 import (
@@ -361,13 +363,14 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		return fmt.Errorf("tile-lower: site %d carries no element type (the buffer extent is not derivable)", id)
 	}
 
-	// Buffer: the R2 WINDOW model — per covered dim, WARP dims contribute
-	// the whole group's round window (#threads_d = LoC_d x 32 elements of
-	// T_d each) for the SMEM class; a C1b forced-FRAG site prices and sizes
-	// its WARP-covered dim per thread (T_d alone — each thread holds its own
-	// chunk). SEQ dims contribute T_d either way. The byte total is exactly
-	// the decide side's siteWindowBytes product with the same class (one
-	// budget, both halves).
+	// Buffer: the fix4 §2.4/§3.3 WINDOW model (R-C1B) — per covered dim,
+	// the SAME factors the decide side's shared siteWindowBytes prices
+	// (one budget, both halves; a divergence would break the fail-closed
+	// record agreement): a WARP-covered dim contributes K_d x T_d under
+	// the SMEM class (one window per warp coordinate — 32x smaller than
+	// the old whole-group shard window) and ceil(T_d/32) under a C1b
+	// forced-FRAG site (the lane's consecutive chunk); SEQ dims
+	// contribute T_d either way.
 	// The tile TENSOR TYPE binds via SetType — the typeinfer MemLoadSMem rule's
 	// own message names this pass as the binder ("cache lowering must bind
 	// buffer types first"), the one documented exception to P8's
@@ -376,8 +379,12 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	dims := make([]ir.DimRef, 0, len(covered))
 	for _, d := range covered {
 		extent := d.tile
-		if d.soc == SoCWARP && class == ClassSMEM {
-			extent = d.loc * 32 * d.tile // the group window, rank-in-index (R2)
+		if d.soc == SoCWARP {
+			if class == ClassSMEM {
+				extent = d.loc * d.tile // K_d windows of T_d each (rank-in-index)
+			} else {
+				extent = ceilDiv(d.tile, 32) // C1b: the lane's chunk (§3.3)
+			}
 		}
 		bytes *= extent
 		name := ""

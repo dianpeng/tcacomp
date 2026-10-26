@@ -364,39 +364,73 @@ func TestConstValueOf(t *testing.T) {
 	}
 }
 
-// TestDefaultParams pins the final-design defaults (loop_tiling.md "LoC
-// concurrency bounds, the FINAL MODEL"): 100 CTAs (Ampere's 108 rounded
-// DOWN to the PortionCTA multiple), 512 threads per CTA (= 16 warps),
-// WarpPortion auto, and the rest unchanged — the legacy LoC presets and
-// objective weights are gone from the surface entirely.
+// TestSiteFactsReaders pins the fix4 site-facts additions: the INS
+// membership set (the cross-warp sharing factor's input) and the shared
+// const-extent reader (the R-LOCCAP cap's input).
+func TestSiteFactsReaders(t *testing.T) {
+	fx, lhs, _ := matmul()
+	facts := overlapOf(fx, DefaultParams())
+	sf := siteOf(t, facts, lhs)
+	insSet := sf.INSSet()
+	if len(insSet) != 2 || !insSet[fx.iters[0]] || !insSet[fx.iters[2]] {
+		t.Fatalf("INSSet(lhs) = %v, want the M and K iters", insSet)
+	}
+	if insSet[fx.iters[1]] {
+		t.Fatal("iterN is not in lhs's INS")
+	}
+	if e, ok := constExtentOf(fx.iters[0]); !ok || e != 1024 {
+		t.Fatalf("constExtentOf(M) = (%d, %v), want (1024, true)", e, ok)
+	}
+	if _, ok := constExtentOf(nil); ok {
+		t.Fatal("constExtentOf(nil) must report false")
+	}
+}
+
+// TestDefaultParams pins the fix4 §2.1 defaults: window K=4, tiles
+// {32,64,128,256}, CTA LoC presets {2,4,8,16,32,64}, warp presets
+// {2,4,8,16,32}, MAPM caps 3/3, MaxCTA 512, MaxWarpsPerCTA 32, 64 KB
+// SMEM, 256 B/thread FRAG, CacheDims 2, MaxCS 16, ReducedDimWarp false.
 func TestDefaultParams(t *testing.T) {
 	p := DefaultParams()
-	if p.MaxCTA != 100 {
-		t.Fatalf("MaxCTA default must be 100 (108 rounded down to the PortionCTA multiple), got %d", p.MaxCTA)
+	if p.WindowK != 4 {
+		t.Fatalf("WindowK default must be 4 (fix4 2.1), got %d", p.WindowK)
 	}
-	if p.MaxThreadsPerCTA != 512 {
-		t.Fatalf("MaxThreadsPerCTA default must be 512 (= 16 warps), got %d", p.MaxThreadsPerCTA)
+	if p.MaxCTA != 512 {
+		t.Fatalf("MaxCTA default must be 512 (the gridDim policy cap), got %d", p.MaxCTA)
 	}
-	if p.WarpPortion != 0 {
-		t.Fatalf("WarpPortion default must be 0 (auto), got %d", p.WarpPortion)
+	if p.MaxWarpsPerCTA != 32 {
+		t.Fatalf("MaxWarpsPerCTA default must be 32 (the hardware bound), got %d", p.MaxWarpsPerCTA)
 	}
-	if p.MaxCache != 65536 || p.MaxFragPerThread != 256 || p.CacheDims != 2 || p.MaxCS != 16 || p.WindowK != 5 || p.NominalExtent != 4096 {
+	if p.MaxPartitionCta != 3 || p.MaxPartitionThr != 3 {
+		t.Fatalf("MAPM caps must be 3/3, got %d/%d", p.MaxPartitionCta, p.MaxPartitionThr)
+	}
+	if p.ReducedDimWarp {
+		t.Fatal("ReducedDimWarp default must be false (Wave 1)")
+	}
+	if p.MaxCache != 65536 || p.MaxFragPerThread != 256 || p.CacheDims != 2 || p.MaxCS != 16 || p.NominalExtent != 4096 {
 		t.Fatalf("secondary defaults changed: %+v", p)
 	}
-	wantTiles := []int{32, 64, 128, 256}
-	if len(p.TileSizes) != len(wantTiles) {
-		t.Fatalf("TileSizes default must be %v, got %v", wantTiles, p.TileSizes)
+	assertIntList(t, "TileSizes", p.TileSizes, []int{32, 64, 128, 256})
+	assertIntList(t, "CtaLoCPresets", p.CtaLoCPresets, []int{2, 4, 8, 16, 32, 64})
+	assertIntList(t, "WarpLoCPresets", p.WarpLoCPresets, []int{2, 4, 8, 16, 32})
+}
+
+// assertIntList pins an int-list field exactly.
+func assertIntList(t *testing.T, name string, got, want []int) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s default must be %v, got %v", name, want, got)
 	}
-	for i, ts := range wantTiles {
-		if p.TileSizes[i] != ts {
-			t.Fatalf("TileSizes default must be %v, got %v", wantTiles, p.TileSizes)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s default must be %v, got %v", name, want, got)
 		}
 	}
 }
 
 // TestParamsValidate pins DefaultParams' cleanliness and every Validate
-// error class — the portion divisibility cases mirror the runtime
-// assert-and-trap pre-conditions.
+// error class on the fix4 §2.1 surface (preset lists, bounds, MAPM caps,
+// the hardware warp bound, the tile floor).
 func TestParamsValidate(t *testing.T) {
 	if err := DefaultParams().Validate(); err != nil {
 		t.Fatalf("DefaultParams must validate clean, got %v", err)
@@ -405,17 +439,19 @@ func TestParamsValidate(t *testing.T) {
 		name string
 		mut  func(*Params)
 	}{
-		{"threads not warp multiple", func(p *Params) { p.MaxThreadsPerCTA = 1023 }},
-		{"threads below one warp", func(p *Params) { p.MaxThreadsPerCTA = 16 }},
-		{"threads below portion minimum", func(p *Params) { p.MaxThreadsPerCTA = 64 }},
-		{"cta not portion multiple", func(p *Params) { p.MaxCTA = 99 }},
-		{"cta zero", func(p *Params) { p.MaxCTA = 0 }},
-		{"warp portion negative", func(p *Params) { p.WarpPortion = -1 }},
-		{"warp portion above cap", func(p *Params) { p.WarpPortion = PortionWarp + 1 }},
+		{"windowk zero", func(p *Params) { p.WindowK = 0 }},
 		{"zero tile size", func(p *Params) { p.TileSizes = []int{32, 0} }},
 		{"one tile size", func(p *Params) { p.TileSizes = []int{32, 1} }},
 		{"empty tile list", func(p *Params) { p.TileSizes = nil }},
-		{"windowk zero", func(p *Params) { p.WindowK = 0 }},
+		{"empty cta presets", func(p *Params) { p.CtaLoCPresets = nil }},
+		{"cta preset below two", func(p *Params) { p.CtaLoCPresets = []int{2, 1} }},
+		{"empty warp presets", func(p *Params) { p.WarpLoCPresets = nil }},
+		{"warp preset below two", func(p *Params) { p.WarpLoCPresets = []int{1} }},
+		{"mapm cta zero", func(p *Params) { p.MaxPartitionCta = 0 }},
+		{"mapm thr zero", func(p *Params) { p.MaxPartitionThr = 0 }},
+		{"maxcta below two", func(p *Params) { p.MaxCTA = 1 }},
+		{"warps per cta zero", func(p *Params) { p.MaxWarpsPerCTA = 0 }},
+		{"warps per cta over 32", func(p *Params) { p.MaxWarpsPerCTA = 33 }},
 		{"cachedims zero", func(p *Params) { p.CacheDims = 0 }},
 		{"maxcache negative", func(p *Params) { p.MaxCache = -1 }},
 		{"maxfrag zero", func(p *Params) { p.MaxFragPerThread = 0 }},
@@ -433,10 +469,9 @@ func TestParamsValidate(t *testing.T) {
 		})
 	}
 
-	// The 2026-10-24 tile-disable ruling's gate 1 contract: a below-2 entry
-	// is rejected naming "not a legal schedule" (tile 1 is not a legal
-	// schedule — the compiler never generates a non-tiling schedule), and
-	// the minimal legal set {2,...} validates.
+	// The 2026-10-24 tile-disable ruling's contract: a below-2 entry is
+	// rejected naming "not a legal schedule", and the minimal legal set
+	// {2,...} validates.
 	p := DefaultParams()
 	p.TileSizes = []int{2, 32, 64}
 	if err := p.Validate(); err != nil {
@@ -449,42 +484,5 @@ func TestParamsValidate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not a legal schedule") {
 		t.Fatalf("the rejection must name the ruling's contract, got: %v", err)
-	}
-}
-
-// TestParamsValidateCoupledTileGate pins HI-03 gate 1: a TileSizes entry
-// over the auto-resolved coupled inside-walk thread count is a named error
-// (the flat-init coupled walk is single-owner exact only while
-// tile <= coupled — a larger tile is a double-writer race); DefaultParams
-// (max tile 256 == coupled 256) stays valid; the coupled == 0 configuration
-// (WarpPortion == PortionWarp) skips the tile comparison and stays the F2
-// floor's error to raise.
-func TestParamsValidateCoupledTileGate(t *testing.T) {
-	p := DefaultParams()
-	p.TileSizes = []int{32, 512}
-	err := p.Validate()
-	if err == nil || !strings.Contains(err.Error(), "coupled") {
-		t.Fatalf("a tile over the coupled thread count must fail closed naming the coupled walk, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
-		t.Fatalf("the error must name the tile and the coupled count, got %q", err.Error())
-	}
-	if err := DefaultParams().Validate(); err != nil {
-		t.Fatalf("DefaultParams must stay valid under the coupled tile gate, got %v", err)
-	}
-	// coupled == 0 (WarpPortion == PortionWarp): the comparison is skipped.
-	legal := DefaultParams()
-	legal.WarpPortion = PortionWarp
-	legal.TileSizes = []int{512}
-	if err := legal.Validate(); err != nil {
-		t.Fatalf("the WarpPortion == PortionWarp configuration must skip the tile gate (the F2 floor owns it), got %v", err)
-	}
-	// The coupled count follows the thread budget: 256 threads -> 128.
-	small := DefaultParams()
-	small.MaxThreadsPerCTA = 256
-	small.TileSizes = []int{256}
-	err = small.Validate()
-	if err == nil || !strings.Contains(err.Error(), "128") {
-		t.Fatalf("the coupled count must follow the thread budget (256 threads -> 128), got %v", err)
 	}
 }

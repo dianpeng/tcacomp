@@ -5,22 +5,28 @@
 // ASTKernel; it never mutates the graph.
 package cg
 
-// Options configures one backend emission. The launch totals are the tiling
-// Params the pipeline ran under (doc/cg.md §1.3): they are deliberately NOT
-// read from the graph — the launch config is not an IR node (LR-15), and the
-// analysis cache does not carry the tiling record past the schedule pass, so
-// the driver captures them when it builds the pipeline and passes them here.
+// Options configures one backend emission. The launch totals are supplied
+// by the driver (doc/cg.md §1.3); in the fix4 factorization model they
+// should match the tiling provenance's derived launch dimensions — the
+// driver reads them from the tiling record when it builds the pipeline
+// and passes them here (the launch config is not an IR node, LR-15).
+//
+// NOTE (fix4 T5): cg.Options will be redesigned in T5 to read launch
+// dimensions from the graph's tiling provenance directly; for now these
+// fields are passed in by the driver / test harness and must match what
+// the tiling pass decided.
 type Options struct {
 	// KernelName overrides the emitted kernel symbol base name; empty uses
 	// the graph's name (the KindKernelMeta node, when present, takes
 	// precedence over both — quick-261023-cgq).
 	KernelName string
-	// MaxCTA is gridDim.x (a positive multiple of PortionCTA=10; validated
-	// by the tiling Params before the pipeline runs, re-asserted by the
-	// emitted launcher's tca::rt::ValidateLaunch).
+	// MaxCTA is gridDim.x (positive). In the fix4 model this is the
+	// product of CTA-assigned dims' LoC values; the driver supplies it
+	// from the tiling provenance.
 	MaxCTA int
-	// MaxThreadsPerCTA is blockDim.x (a whole-warp multiple with a warp
-	// count that is a multiple of PortionWarp=8, 256 threads minimum).
+	// MaxThreadsPerCTA is blockDim.x (a whole-warp multiple, i.e. a
+	// multiple of 32). In the fix4 model this is (Π warp K_d) × 32
+	// derived from the tiling record; the driver supplies it.
 	MaxThreadsPerCTA int
 	// TargetSM is the targeted compute capability major-minor packed as
 	// major*100+minor (86 = sm_86, the A6000). Pins the generated

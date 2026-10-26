@@ -333,9 +333,10 @@ func TestMapLowerEliminatesMap(t *testing.T) {
 // TestRuntimeObjectsInserted pins LR-11: exactly one RuntimeKernelInfo as
 // item 0 of the kernel Body Group (SN 0, Prototype untouched — its items
 // are exactly the kernel params), and every LNT's prologue Group starts
-// with [RuntimeGridMapping, RuntimeThreadMapping] built from the provenance
-// plan (grid [-1]; thread [AutoWarpPortion, -1] — the CTA-dim branch), both
-// stamped SN 0/prologue.
+// with [RuntimeGridMapping, RuntimeThreadMapping] built from the
+// provenance plan's ABSOLUTE factorization shapes (fix4 §3.2; this
+// fixture's crafted record carries one CTA dim and no WARP dim: grid
+// [100], thread []), both stamped SN 0/prologue.
 func TestRuntimeObjectsInserted(t *testing.T) {
 	f, k, _, _, _ := runMapOnly(t)
 
@@ -388,9 +389,11 @@ func TestRuntimeObjectsInserted(t *testing.T) {
 			thread.BasePtr().SchedSN() != 0 || thread.BasePtr().SchedBlock() != prologue {
 			t.Fatal("both mappings must be stamped SN 0 / prologue")
 		}
-		// Operands per P-3: [kernel_info, ndim, portions...].
-		checkMappingOperands(t, grid, ki, []int{-1}, "grid")
-		checkMappingOperands(t, thread, ki, []int{tiling.AutoWarpPortion, -1}, "thread")
+		// Operands per P-3 (fix4 §3.2): [kernel_info, ndim, shapes...] —
+		// the crafted record carries one CTA dim (LoC 100) and no WARP
+		// dim, so grid [100] and thread [].
+		checkMappingOperands(t, grid, ki, []int{100}, "grid")
+		checkMappingOperands(t, thread, ki, []int{}, "thread")
 		// Both mappings' operand 0 is THE KernelInfo (explicit SSA).
 		if op := ir.OperandsOf(grid)[0]; op.BasePtr() != ki.BasePtr() {
 			t.Fatal("the grid mapping must consume the KernelInfo")
@@ -747,8 +750,8 @@ func TestReducerBracketPlacement(t *testing.T) {
 		t.Fatalf("operand 3 must be the staging SMEM-class MemNew (R1), got %s", ops[3].KindOf())
 	}
 	staging := ops[3]
-	if v, ok := ir.ConstValueOf(ir.OperandsOf(staging)[0]); !ok || v != 64 {
-		t.Fatalf("the staging row must be 64 B (16 warps x f32 at 512 threads), got %v", v)
+	if v, ok := ir.ConstValueOf(ir.OperandsOf(staging)[0]); !ok || v != 32 {
+		t.Fatalf("the staging row must be 32 B (8 warps x f32 at 256 threads — K=8 WARP dim → blockDim=256), got %v", v)
 	}
 	if got := len(liveOfKind(g, ir.KindRuntimeThreadMapping)); got != 1 {
 		t.Fatalf("exactly one ThreadMapping (the staging/mapping operand), got %d", got)

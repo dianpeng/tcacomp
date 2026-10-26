@@ -74,27 +74,25 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //     every re-derived NON-CANDIDATE (R4: cross-LNT INS, empty INS, no
 //     forest member) has its explicit record entry — fail-closed, a
 //     silently dropped load is corruption.
-//   - FEASIBILITY (per LNT, the final model): the Params re-validation at
-//     the top re-checks the assert-and-trap divisibility (MaxCTA a
-//     PortionCTA multiple, warps a PortionWarp multiple); at least one
-//     CTA entry; the v0 policy (at most one CTA and one independent WARP
-//     entry); the CTA LoC == MaxCTA (portion -1/full); the warp LoC is a
-//     warp-portion multiple (LoC/quantum in [1, PortionWarp]); the
-//     COUPLED-PORTION FLOOR (F2): an LNT carrying a CTA dim and a WARP dim
-//     must leave >= 1 warp portion for the coupled inside walk; the CTA
-//     dim's TileSize must not exceed the coupled inside-walk thread count
-//     (HI-03 gate 2 — tile > coupledThreads is a double-writer race);
-//     sequential entries carry LoC 1; every LoC >= 1 and every TileSize
-//     >= 2 (the compiler never generates a non-tiling schedule, the
-//     2026-10-24 ruling); every SoC known.
+//   - FEASIBILITY (per LNT, the fix4 §2.7 model): the Params
+//     re-validation at the top re-checks the hyperparameter surface;
+//     every iter's LoC belongs to its SoC's preset list (CTA ->
+//     CtaLoCPresets, WARP -> WarpLoCPresets, SEQ -> the implicit 1); the
+//     per-LNT CTA factorization product stays within MaxCTA and the warp
+//     product within MaxWarpsPerCTA; every LNT carries at least one CTA
+//     dim; every LoC >= 1 and every TileSize >= 2 (the compiler never
+//     generates a non-tiling schedule, the 2026-10-24 ruling); every SoC
+//     known.
 //   - SITE well-formedness: a promoted site's Tie is a live iter of the
 //     site's LNT or nil; its class is SMEM or FRAG; and the site decision
 //     MATCHES the promotion judge re-run over the record's own schedule
-//     (promotion flag, class, Reuse, Bytes — a divergence is corruption).
-//   - KERNEL-WIDE BUDGETS (R3 + F6): the recomputed SMEM window-bytes sum
-//     and the per-thread FRAG sum, accumulated over ALL LNTs' promoted
-//     sites, stay within MaxCache / MaxFragPerThread — the SAME sums the
-//     decide feasibility and the lower's budget resolution gate.
+//     under the per-LNT blockDim context (promotion flag, class, Reuse,
+//     Bytes — a divergence is corruption).
+//   - KERNEL-WIDE BUDGETS (the fix4 §2.3 MASRAM gates): the recomputed
+//     SMEM window-bytes sum and the per-thread FRAG sum, accumulated
+//     over ALL LNTs' promoted sites, stay within MaxCache /
+//     MaxFragPerThread — the SAME sums the decide feasibility and the
+//     lower's budget resolution gate.
 //   - FORLOOP STEP: every live ForLoop's dimvar step is a positive const
 //     (a zero/negative stride is an infinite/empty loop — the IR-verifier
 //     version of this invariant lands with T4; tiling-verify enforces it
@@ -172,16 +170,12 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		}
 	}
 
-	// FEASIBILITY, per LNT — the final portion-grammar model. The legacy
-	// CTA-product / warp-sum bounds are subsumed: the single CTA dim must
-	// exhaust MaxCTA exactly (portion -1/full), and a warp LoC that is a
-	// portion multiple with portion in [1, PortionWarp] cannot exceed the
-	// warp space.
-	warpsPerPortion := (v.Params.MaxThreadsPerCTA / 32) / PortionWarp
+	// FEASIBILITY, per LNT — the fix4 §2.7 re-check set, re-derived with
+	// the SAME constraint helpers the search prunes with (constraints.go:
+	// single source — the products here are the completed-vector MALoC
+	// bounds).
 	for _, root := range f.Roots() {
-		ctaCount, warpCount, warpPortion := 0, 0, 0
-		var ctaIter ir.Node
-		ctaTile := 0
+		st := initialPartState()
 		for _, it := range treeItersOf(root) {
 			biv, err := bivOf(it)
 			if err != nil {
@@ -192,71 +186,29 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d / TileSize %d (LoC must be >= 1 and TileSize >= 2 — the compiler never generates a non-tiling schedule, the 2026-10-24 ruling)",
 					it.BasePtr().ID(), d.LoC, d.TileSize)
 			}
+			if !locPresetOK(d.SoC, d.LoC, v.Params) {
+				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d outside its SoC %s preset list (fix4 2.7)",
+					it.BasePtr().ID(), d.LoC, d.SoC)
+			}
 			switch d.SoC {
-			case SoCSequential:
-				if d.LoC != 1 {
-					return fmt.Errorf("tiling-verify: sequential iter node %d carries LoC %d (must be 1)",
-						it.BasePtr().ID(), d.LoC)
-				}
-			case SoCTA:
-				ctaCount++
-				ctaIter, ctaTile = it, d.TileSize
-				if d.LoC != v.Params.MaxCTA {
-					return fmt.Errorf("tiling-verify: iter node %d carries CTA LoC %d, want MaxCTA %d (portion -1/full exhausts the CTA space)",
-						it.BasePtr().ID(), d.LoC, v.Params.MaxCTA)
-				}
-			case SoCWARP:
-				warpCount++
-				portion := d.LoC / warpsPerPortion
-				if d.LoC%warpsPerPortion != 0 || portion < 1 || portion > PortionWarp {
-					return fmt.Errorf("tiling-verify: iter node %d carries warp LoC %d, not a warp-portion multiple (quantum %d warps, portion in [1, %d])",
-						it.BasePtr().ID(), d.LoC, warpsPerPortion, PortionWarp)
-				}
-				warpPortion = portion
+			case SoCSequential, SoCTA, SoCWARP:
+				st = st.place(d.SoC, d.LoC)
 			default:
 				return fmt.Errorf("tiling-verify: iter node %d carries unknown SoC %d",
 					it.BasePtr().ID(), int(d.SoC))
 			}
 		}
-		if ctaCount < 1 {
+		if !st.cumapOK() {
 			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d has no CTA assignment",
 				root.Iter.BasePtr().ID())
 		}
-		if ctaCount > 1 {
-			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries %d CTA dims, violating the v0 policy (at most one)",
-				root.Iter.BasePtr().ID(), ctaCount)
+		if st.ctaLoC > v.Params.MaxCTA {
+			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries a CTA factorization product %d over MaxCTA %d",
+				root.Iter.BasePtr().ID(), st.ctaLoC, v.Params.MaxCTA)
 		}
-		if warpCount > 1 {
-			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries %d independent WARP dims, violating the v0 policy (at most one)",
-				root.Iter.BasePtr().ID(), warpCount)
-		}
-		// COUPLED-PORTION FLOOR (F2, ruled 2026-10-21): an LNT carrying a
-		// CTA dim must leave >= 1 warp portion for its coupled inside walk
-		// — WarpPortion <= PortionWarp-1 there. A violating record would
-		// lower into a zero-stride inside loop (an infinite loop).
-		if warpCount == 1 && warpPortion > PortionWarp-1 {
-			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries a CTA dim and warp portion %d — the coupled-portion floor (F2) demands WarpPortion <= PortionWarp-1 = %d so the coupled inside walk keeps >= 1 portion",
-				root.Iter.BasePtr().ID(), warpPortion, PortionWarp-1)
-		}
-		// HI-03 gate 2 (2026-10-24 ruling): the CTA dim's TileSize must not
-		// exceed the coupled inside walk's thread count — the flat-init
-		// walk is single-owner exact only while tile <= coupled, and a
-		// larger tile is a double-writer race, not a perf bug. The
-		// warpPortion resolution mirrors lower_rewrite.go coupledThreads()
-		// exactly (Params.WarpPortion first, else AutoWarpPortion — the LNT
-		// carries a CTA dim here by ctaCount == 1); the record's warp LoC
-		// is deliberately NOT used — the lower's provenance CoupledThreads
-		// derives from Params, and the three gates must agree. coupled == 0
-		// skips the comparison (the F2 machinery owns that configuration).
-		if ctaCount == 1 {
-			resolved := v.Params.WarpPortion
-			if resolved == 0 {
-				resolved = AutoWarpPortion
-			}
-			if coupled := (PortionWarp - resolved) * warpsPerPortion * 32; coupled > 0 && ctaTile > coupled {
-				return fmt.Errorf("tiling-verify: CTA iter node %d carries TileSize %d over the coupled inside walk's %d threads — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (HI-03 gate 2; Params.Validate is gate 1, the tile-lower rewrite backstop is gate 3)",
-					ctaIter.BasePtr().ID(), ctaTile, coupled)
-			}
+		if st.warpK > v.Params.MaxWarpsPerCTA {
+			return fmt.Errorf("tiling-verify: LNT rooted at iter node %d carries a warp factorization product %d over MaxWarpsPerCTA %d",
+				root.Iter.BasePtr().ID(), st.warpK, v.Params.MaxWarpsPerCTA)
 		}
 	}
 
@@ -278,33 +230,18 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 	for i := range op.Trees {
 		lf := &op.Trees[i]
 		dec := make(map[ir.Node]IterDecision, len(lf.Levels))
-		hasCTA := false
 		for _, it := range treeItersOf(lf.Tree) {
 			biv, err := bivOf(it)
 			if err != nil {
 				return fmt.Errorf("tiling-verify: %w", err)
 			}
 			dec[it] = rec.Iters[biv]
-			if dec[it].SoC == SoCTA {
-				hasCTA = true
-			}
 		}
-		// Rebuild the judge's portion context from the record + Params,
-		// mirroring evalSchedule's resolution (explicit WarpPortion, else
-		// auto: AutoWarpPortion when the LNT carries a CTA dim).
-		warpPortion := v.Params.WarpPortion
-		if warpPortion == 0 {
-			if hasCTA {
-				warpPortion = AutoWarpPortion
-			} else {
-				warpPortion = PortionWarp
-			}
-		}
-		ctxSchedule := schedCtx{
-			warpsPerPortion: warpsPerPortion,
-			warpPortion:     warpPortion,
-			coupledThreads:  (PortionWarp - warpPortion) * warpsPerPortion * 32,
-		}
+		// The judge's per-LNT launch context, re-derived from the RECORD's
+		// own decisions (fix4 §1.2): blockDim = (Π warp K) × 32 — the
+		// coupled inside walk's stride and the reuse divisor. The judge
+		// cross-check therefore runs the same model the decide pass did.
+		ctxSchedule := blockDimCtx{blockDim: blockDimOf(dec)}
 		for _, sf := range lf.CS {
 			id := sf.Load.BasePtr().ID()
 			sd, ok := rec.Sites[id]
@@ -371,8 +308,8 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 
 // checkForLoopSteps asserts every live ForLoop's dimvar carries a POSITIVE
 // CONST step: ops = [dim, init, step] on the KindDimVar (node_dimvar.go).
-// A zero stride is an infinite loop (exactly the F2 failure mode), a
-// negative or symbolic stride is not a strided round enumeration at all.
+// A zero stride is an infinite loop, a negative or symbolic stride is not
+// a strided round enumeration at all.
 func checkForLoopSteps(g *ir.Graph) error {
 	for _, n := range g.AllocatedNodes() {
 		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindForLoop {

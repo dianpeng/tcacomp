@@ -98,6 +98,14 @@ func (p Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 	f := loopforest.Analyze(g)
 	se := sideeffect.Analyze(g)
 	op := analyzeOverlap(g, f, se, p.Params)
+	// R-REDUCED: the reducer-consuming iter set prunes WARP digits from
+	// the feasible area while ReducedDimWarp is closed (fix4 §2.2/§3.6).
+	// Populated here — after analyzeOverlap — so the discovery logic
+	// itself stays untouched.
+	reduced := reducedIters(g)
+	for i := range op.Trees {
+		op.Trees[i].reduced = reduced
+	}
 	record := &Record{
 		Iters: make(map[ir.Node]IterDecision),
 		Sites: make(map[uint64]SiteDecision, len(op.NonCandidates)),

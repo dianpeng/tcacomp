@@ -1,20 +1,20 @@
-// Package tiling implements the DECIDE half of the loop-tiling pair per
-// doc/optana/loop_tiling.md (final model, as patched by 261021-gca) plus
-// the record interface of doc/optana/loop_tile_lower.md §1: the MemLoad
-// overlap analysis, the parallelization-schedule (PSched) search, the
+// Package tiling implements the DECIDE half of the loop-tiling pair plus
+// the record interface of doc/optana/loop_tile_lower.md §1, under the
+// FACTORIZATION model of doc/fix/fix4.md §1-§2 (which supersedes the
+// portion-grammar model of loop_tiling.md wherever they disagree): the
+// MemLoad overlap analysis, the feasible-area schedule search, the
 // SMEM/FRAG cache-promotion decisions, and the decision-record side table
-// the future loop-tile-lower pass consumes.
+// the loop-tile-lower pass consumes.
 //
-// The FINAL constraint/objective model (loop_tiling.md "LoC concurrency
-// bounds, the FINAL MODEL" + "Objective Function: for a specific PSched,
-// SINGLE-TERM"): the constraints are the PORTION GRAMMAR — the named
-// PortionCTA/PortionWarp constants, per-LNT exhaustion of the launch
-// totals, and the runtime assert-and-trap divisibility pre-conditions —
-// while the objective is single-term traffic avoided: parallelism is
-// CONSTANT under mandatory per-LNT exhaustion, so it carries no ranking
-// signal. The searcher additionally obeys the v0 POLICY ("Composition
-// Semantics, CTA x WARP"): at most one CTA dim and at most one independent
-// WARP dim per LNT.
+// The fix4 constraint/objective model: per window dim an SoC ∈
+// {SEQ, CTA, WARP} with an ABSOLUTE LoC (CTAs / warps) and a per-dim tile;
+// composition is a factorization (gridDim = Π CTA LoC, blockDim = Π warp
+// K × 32 — launch what you factorize); the constraints are MAPM/MALoC/
+// CuMAP/MASRAM (§2.3) checked INCREMENTALLY over partial vectors; the
+// objective is traffic avoided (K_d×T_d window bytes × lane-aware reuse
+// with cross-warp sharing) with a partition-count tiebreak and the
+// LoC-descending enumeration bias; budget overflow evicts by value
+// density instead of failing.
 //
 // Ruling D2 (2026-10-20, overriding the stale "Cache Mark" section of
 // loop_tiling.md): the pass NEVER mutates the IR graph — no MemLoad.ctaCache
@@ -98,9 +98,13 @@ func (c CacheClass) String() string {
 	}
 }
 
-// IterDecision is one per-Iter schedule entry (loop_tile_lower.md §1a):
-// the space of concurrency, its level of concurrency, and the tile size.
-// Sequential forces LoC 1.
+// IterDecision is one per-Iter schedule entry (fix4 §2.7; the
+// loop_tile_lower.md §1a interface): the space of concurrency, its level
+// of concurrency, and the tile size. LoC is the ABSOLUTE count under the
+// fix4 factorization model: CTA → the number of CTAs factorizing this dim
+// (gridDim.x = Π CTA LoC over the LNT), WARP → the number of warps
+// factorizing it (Π warp K ≤ MaxWarpsPerCTA, blockDim = Π K × 32), SEQ →
+// 1 implicit.
 type IterDecision struct {
 	SoC      SoCType
 	LoC      int
@@ -136,8 +140,9 @@ type SiteDecision struct {
 }
 
 // The decline reasons (R2 tier rule, F4 drop-rule gate, F6 frag budget,
-// the per-thread reuse gate, and the R4 non-candidate declarations).
-// Stable strings: the record, tiling-verify, and the tests pin them.
+// the per-thread reuse gate, the R4 non-candidate declarations, and the
+// fix4 §2.6 greedy-eviction demotion). Stable strings: the record,
+// tiling-verify, and the tests pin them.
 const (
 	// ReasonCTACovered: a covered dim is CTA-assigned — no coherent fill
 	// variant exists under the v0 mechanics (R2 tier rule, refusal).
@@ -148,6 +153,12 @@ const (
 	// ReasonLowReuse: per-thread reuse < 2 — the cached bytes are not
 	// re-traversed by the owning thread, so no traffic is avoided.
 	ReasonLowReuse = "per-thread reuse < 2: no traffic avoided"
+	// ReasonEvicted: the site WAS promotion-eligible but the kernel-wide
+	// MASRAM gates overflowed and the greedy value-density spill (fix4
+	// §2.6) demoted it to GMEM — the loops stay tiled, only the cache is
+	// lost. Class/Reuse/Bytes are retained on the entry so tiling-verify
+	// can still cross-check the judge.
+	ReasonEvicted = "kernel-wide budget overflow: evicted by value density (fix4 2.6)"
 	// ReasonCrossLNT: the load's INS spans >= 2 LNTs — not a v0
 	// candidate (R4 fail-closed; the union judge is future work).
 	ReasonCrossLNT = "cross-LNT INS: not a v0 candidate (R4)"
@@ -178,11 +189,12 @@ const (
 // Verified is the tiling-verify stamp (F7, ruled 2026-10-21): tiling-verify
 // sets it on a record that passed its consistency sweep, and tile-lower
 // refuses an unstamped record fail-closed — the per-iter feasibility
-// re-checks (CTA LoC == MaxCTA, warp-portion multiples, the F2 floor, the
-// v0 policy) live in tiling-verify, and a corrupted record must NOT reach
-// the rewrite unvalidated. It is the one field tiling-verify mutates on the
-// published record (261021-o61 T3; the decide-half surface is otherwise
-// untouched).
+// re-checks of the fix4 model (LoC preset membership, the per-LNT
+// factorization product bounds, the CTA-dim presence, the tile floor, the
+// kernel-wide budget sums, and the judge cross-check) live in
+// tiling-verify, and a corrupted record must NOT reach the rewrite
+// unvalidated. It is the one field tiling-verify mutates on the published
+// record (261021-o61 T3; the decide-half surface is otherwise untouched).
 type Record struct {
 	Iters map[ir.Node]IterDecision
 	Sites map[uint64]SiteDecision
@@ -258,17 +270,20 @@ type DimProvenance struct {
 	// (-1 = the dim is not CTA-assigned).
 	CoupledDoSoC int
 	// CoupledThreads is the coupled inside-walk thread count (0 = not
-	// CTA-assigned): the flat-init walk's step and the ownership-gate
+	// CTA-assigned): under the fix4 model it is the LNT's blockDim =
+	// (Π warp K) × 32 — the flat-init walk's step and the ownership-gate
 	// walk's step.
 	CoupledThreads int
 }
 
-// MappingPlan is one LNT's runtime mapping construction data (LR-11/P-3):
-// the GridMapping and ThreadMapping portion vectors. v0 policy: grid is
-// always [-1] (every rewritten LNT carries >= 1 CTA dim by the searcher's
-// CTA-carrying fallback, and the whole PortionCTA=10 space goes to it);
-// thread is [warpPortion, -1] (the independent warp dim's portion, the
-// remainder left to the CTA dim's coupled tile-inside walk).
+// MappingPlan is one LNT's runtime mapping construction data (LR-11/P-3;
+// fix4 §3.2/§4.1): the GridMapping and ThreadMapping SHAPE vectors — the
+// field NAMES survive from the portion grammar, the semantics are the
+// absolute factorization extents. GridPortions holds the per-CTA-dim
+// absolute LoC_d (in DoSoC order — gridDim.x = Π LoC); ThreadPortions holds
+// the per-WARP-dim warp counts K_d (in DoSoC order — warp coordinates in
+// warp units, blockDim = Π K × 32). The CTA dim's coupled inside walk uses
+// the NO-ARG flat thread rank and needs no ThreadMap slot (§1.3).
 type MappingPlan struct {
 	GridPortions   []int
 	ThreadPortions []int
@@ -281,10 +296,13 @@ type MappingPlan struct {
 type Provenance struct {
 	Dims map[ir.Node]DimProvenance
 	LNTs map[ir.Node]MappingPlan
-	// MaxThreadsPerCTA is the launch thread budget the pass rewrote against:
-	// final-lower's reducer staging extent (#warps = MaxThreadsPerCTA/32,
-	// ruling D8 2026-10-23) reads it from here so the staging allocation can
-	// never disagree with the launch grammar the maps assert against.
+	// MaxThreadsPerCTA is the DERIVED launch blockDim under the fix4
+	// factorization model: max over LNTs of (Π warp K × 32). The field name
+	// survives (final-lower's reducer staging extent reads #warps =
+	// MaxThreadsPerCTA/32 from here, ruling D8 2026-10-23) — it is NOT the
+	// retired portion-grammar Params knob of the same name; with zero WARP
+	// dims the product is the empty product 1 and the launch is one warp
+	// (blockDim 32).
 	MaxThreadsPerCTA int
 }
 
@@ -295,53 +313,52 @@ func (Provenance) Name() string { return ProvenanceName }
 
 // ---------------------------------------------------------------------------
 // Params: the externally provided thresholds (doc: "the thresholds are
-// EXTERNALLY PROVIDED to the pass").
+// EXTERNALLY PROVIDED to the pass") — the fix4 §2.1 factorization-model
+// hyperparameter surface. The portion grammar (the named CTA/warp share
+// constants, the per-LNT launch-total exhaustion knobs, and the tile-vs-
+// coupled-walk gate) is RETIRED with fix4 §2.1: composition is a
+// factorization now (absolute LoC/K per dim), the launch is derived from
+// the factorization, and the flat-init coupled walk (init = the flat
+// thread rank, step = blockDim) is single-owner exact for ANY tile_max —
+// fix4 R-HI03 deletes all three gates the old grammar carried.
 // ---------------------------------------------------------------------------
 
-// The named portion constants of loop_tiling.md ("Named portion constants,
-// future adaptation points"): the grammar the launch totals are divided
-// into, and the compiler-side mirror of the runtime assert-and-trap
-// pre-conditions.
-const (
-	// PortionCTA is PORTION_CTA: the CTA space is sharded into 10 portions,
-	// and the runtime ASSERT-AND-TRAP pre-condition demands the provided CTA
-	// count be a multiple of it.
-	PortionCTA = 10
-	// PortionWarp is PORTION_WARP: the warp space is sharded into 8
-	// portions. It is NOT itself a warp count — at the minimum config each
-	// portion is exactly ONE warp (the 8-warp / 256-thread minimum).
-	PortionWarp = 8
-	// AutoWarpPortion is the auto-selected WarpPortion when the LNT's
-	// vector carries a CTA dim: the independent warp dim takes half the
-	// warp portions (4 of 8) and the CTA dim's coupled tile-inside walk
-	// implicitly consumes the remaining 4 — per-LNT exhaustion holds either
-	// way (loop_tiling.md "Portion grammar").
-	AutoWarpPortion = 4
-)
-
-// Params carries the pass thresholds with the final-design defaults
-// (loop_tiling.md "LoC concurrency bounds, the FINAL MODEL"). Every field
-// is validated by Validate before any computation — external input is
-// never trusted (fail-fast at the boundary).
+// Params carries the pass thresholds with the fix4 §2.1 defaults. Every
+// field is validated by Validate before any computation — external input
+// is never trusted (fail-fast at the boundary).
 type Params struct {
-	// MaxCTA is the total CTA allocation (gridDim.x), a multiple of
-	// PortionCTA per the runtime assert-and-trap contract.
+	// WindowK is the innermost window depth (fix4 §2.1: 4, was 5).
+	WindowK int
+	// TileSizes is the per-dim tile preset set. Every entry must be >= 2:
+	// the compiler never generates a non-tiling schedule (the 2026-10-24
+	// tile-disable ruling), so tile 1 is not a legal schedule.
+	TileSizes []int
+	// CtaLoCPresets are the absolute CTA counts searched per CTA dim
+	// (fix4 §1.1). Entries >= 2; subject to the extent cap at search time.
+	CtaLoCPresets []int
+	// WarpLoCPresets are the absolute warp counts searched per WARP dim.
+	// Entries >= 2 — a WARP dim with K = 1 is SEQ and pruned from the
+	// feasible area (dominated, fix4 §1.2).
+	WarpLoCPresets []int
+	// MaxPartitionCta is the MAPM cap on CTA dims per LNT (expanded
+	// instances, fix4 §2.3).
+	MaxPartitionCta int
+	// MaxPartitionThr is the MAPM cap on expanded THR instances per LNT
+	// (WARP dims + CTA dims).
+	MaxPartitionThr int
+	// MaxCTA is the gridDim policy cap (the MALoC CTA bound: per LNT,
+	// Π CTA LoC <= MaxCTA).
 	MaxCTA int
-	// MaxThreadsPerCTA is the per-CTA thread budget (blockDim.x); MUST be a
-	// multiple of WARP (32) whose warp count is a multiple of PortionWarp
-	// per the runtime assert-and-trap contract.
-	MaxThreadsPerCTA int
-	// WarpPortion is the independent warp dim's portion of the warp space;
-	// 0 = auto: AutoWarpPortion when the LNT's vector carries a CTA dim
-	// (the coupled tile-inside walk needs the remaining portions, >= 1),
-	// else PortionWarp (full).
-	WarpPortion int
+	// MaxWarpsPerCTA is the hardware warp bound (the MALoC warp bound:
+	// per LNT, Π warp K <= MaxWarpsPerCTA <= 32).
+	MaxWarpsPerCTA int
 	// MaxCache is the SMEM budget in bytes (the project's 64 KB SMEM
 	// budget; only promoted ClassSMEM sites count). The sum is
 	// KERNEL-WIDE (R3, ruled 2026-10-21): the decide feasibility, the
 	// tiling-verify gate, and the lower's budget resolution all gate the
 	// same sum accumulated over ALL LNTs' promoted sites — never a
-	// per-LNT one.
+	// per-LNT one. Under fix4 §2.6 an overflow evicts by value density
+	// (greedy spill); it is never a hard error.
 	MaxCache int
 	// MaxFragPerThread is the per-thread FRAG byte budget (F6, ruled
 	// 2026-10-21; default 256 bytes/thread): the SUM of promoted FRAG
@@ -349,8 +366,8 @@ type Params struct {
 	// unbounded register footprint spills to local memory (doc/tca.md
 	// §5.8), strictly worse than the GMEM load it replaced. It gates the
 	// judge (a single site over the cap is declined) and the schedule
-	// feasibility (the accumulated sum), and participates in the lower's
-	// halve/drop fallback.
+	// feasibility (the accumulated sum, spill-gated per fix4 §2.6), and
+	// backs the lower's halve/drop fallback.
 	MaxFragPerThread int
 	// CacheDims is the dimension-level reuse count: only the last
 	// CacheDims tensor dimensions may be promoted (hardcoded 2 in the doc).
@@ -358,66 +375,90 @@ type Params struct {
 	// MaxCS caps the candidate-set size ("do not consider too many MemLoad
 	// to be replaced by cache").
 	MaxCS int
-	// WindowK is the innermost-K search window depth (K default 5).
-	WindowK int
-	// TileSizes is the common tile-size search set. Every entry must be
-	// >= 2: the compiler never generates a non-tiling schedule (the
-	// 2026-10-24 tile-disable ruling), so tile 1 is not a legal schedule.
-	TileSizes []int
+	// ReducedDimWarp allows WARP-SoC on reduced (reducer-consuming) dims —
+	// the split-k capability gate (fix4 §3.6, Wave 2). Wave 1 keeps it
+	// false: the decide-side feasible area prunes WARP digits on reduced
+	// dims, and tile-lower fails closed on any that slip through.
+	ReducedDimWarp bool
 	// NominalExtent is the documented stand-in extent for a reuse
-	// dimension whose BIV max operand is NOT a constant. NOTE (2026-10-21
-	// amendment): reuse is PER-THREAD now — the product of the reuse dims'
-	// inside-walk trip counts, tile-derived — so extents no longer enter
-	// the objective and this knob is currently dormant; it stays on the
-	// surface for the future extent-aware ranking models.
+	// dimension whose BIV max operand is NOT a constant. Dormant: reuse is
+	// tile-derived under the fix4 model, so extents enter only the
+	// R-LOCCAP preset cap (const extents), never the objective; the knob
+	// stays on the surface for the future extent-aware ranking models.
 	NominalExtent int
 }
 
-// DefaultParams returns the final-design defaults (loop_tiling.md "LoC
-// concurrency bounds, the FINAL MODEL"): 100 CTAs (Ampere's 108 SMs
-// rounded DOWN to the PortionCTA multiple), 512 threads per CTA (= 16
-// warps), 64 KB SMEM, 256 bytes/thread FRAG (F6), CacheDims 2, MaxCS 16,
-// window K=5, tile sizes {32,64,128,256}, nominal extent 4096, WarpPortion
-// auto. The legacy LoC presets and objective weights are gone — the
-// portion grammar replaces them.
+// DefaultParams returns the fix4 §2.1 defaults: window K=4, tiles
+// {32,64,128,256}, CTA LoC presets {2,4,8,16,32,64}, warp K presets
+// {2,4,8,16,32}, MAPM caps 3/3, MaxCTA 512 (gridDim policy cap),
+// MaxWarpsPerCTA 32, 64 KB SMEM, 256 bytes/thread FRAG (F6), CacheDims 2,
+// MaxCS 16, ReducedDimWarp false (Wave 1), nominal extent 4096.
 func DefaultParams() Params {
 	return Params{
-		MaxCTA:           100,
-		MaxThreadsPerCTA: 512,
+		WindowK:          4,
+		TileSizes:        []int{32, 64, 128, 256},
+		CtaLoCPresets:    []int{2, 4, 8, 16, 32, 64},
+		WarpLoCPresets:   []int{2, 4, 8, 16, 32},
+		MaxPartitionCta:  3,
+		MaxPartitionThr:  3,
+		MaxCTA:           512,
+		MaxWarpsPerCTA:   32,
 		MaxCache:         65536,
 		MaxFragPerThread: 256,
 		CacheDims:        2,
 		MaxCS:            16,
-		WindowK:          5,
-		TileSizes:        []int{32, 64, 128, 256},
-		WarpPortion:      0,
+		ReducedDimWarp:   false,
 		NominalExtent:    4096,
 	}
 }
 
-// Validate fail-fasts on malformed thresholds. The first two checks are the
-// compiler-side mirror of the runtime ASSERT-AND-TRAP pre-conditions
-// (loop_tiling.md "Runtime hard pre-condition, ASSERT-AND-TRAP"): MaxCTA a
-// positive multiple of PortionCTA, and MaxThreadsPerCTA a multiple of WARP
-// (32) whose warp count is a multiple of PortionWarp (8 warps, i.e. the
-// 256-thread minimum). WarpPortion must be a legal portion ([0,
-// PortionWarp], 0 = auto); the remaining bounds must be positive; the tile
-// list must be non-empty with entries >= 2 (tile size 1 is not a legal
-// schedule — the compiler never generates a non-tiling schedule, the
-// 2026-10-24 ruling; a tile below 2 would
-// poison the arithmetic) and, when the auto warp portion leaves a coupled
-// inside walk, no entry may exceed that walk's thread count (HI-03 gate 1:
-// tile > coupledThreads turns the single-owner flat-init walk into a
-// double-writer race).
+// Validate fail-fasts on the fix4 §2.1 surface: the preset lists must be
+// non-empty with entries >= 2 (a K=1 warp digit is SEQ, pruned; a LoC < 2
+// dim is not a partition), the bounds positive, MaxPartitionCta/
+// MaxPartitionThr >= 1 (a zero MAPM cap leaves no legal factorization),
+// MaxWarpsPerCTA in [1, 32] (the hardware warp bound), and TileSizes
+// non-empty with entries >= 2 (tile size 1 is not a legal schedule — the
+// compiler never generates a non-tiling schedule, the 2026-10-24 ruling;
+// a tile below 2 would poison the arithmetic).
 func (p Params) Validate() error {
-	if p.MaxCTA <= 0 || p.MaxCTA%PortionCTA != 0 {
-		return fmt.Errorf("tiling: MaxCTA %d must be a positive multiple of PortionCTA %d (the runtime assert-and-trap pre-condition)", p.MaxCTA, PortionCTA)
+	if p.WindowK < 1 {
+		return fmt.Errorf("tiling: WindowK %d must be >= 1", p.WindowK)
 	}
-	if p.MaxThreadsPerCTA <= 0 || p.MaxThreadsPerCTA%32 != 0 || (p.MaxThreadsPerCTA/32)%PortionWarp != 0 {
-		return fmt.Errorf("tiling: MaxThreadsPerCTA %d must be a positive multiple of WARP (32) with a warp count that is a multiple of PortionWarp %d (the runtime assert-and-trap pre-condition, 256-thread minimum)", p.MaxThreadsPerCTA, PortionWarp)
+	if len(p.TileSizes) == 0 {
+		return fmt.Errorf("tiling: TileSizes must not be empty")
 	}
-	if p.WarpPortion < 0 || p.WarpPortion > PortionWarp {
-		return fmt.Errorf("tiling: WarpPortion %d must be within [0, PortionWarp %d] (0 = auto)", p.WarpPortion, PortionWarp)
+	for _, v := range p.TileSizes {
+		if v < 2 {
+			return fmt.Errorf("tiling: TileSizes entry %d is below 2 — tile size 1 is not a legal schedule: the compiler never generates a non-tiling schedule (2026-10-24 ruling); every entry must be >= 2", v)
+		}
+	}
+	if len(p.CtaLoCPresets) == 0 {
+		return fmt.Errorf("tiling: CtaLoCPresets must not be empty")
+	}
+	for _, v := range p.CtaLoCPresets {
+		if v < 2 {
+			return fmt.Errorf("tiling: CtaLoCPresets entry %d is below 2 (an absolute CTA count of 1 is not a partition)", v)
+		}
+	}
+	if len(p.WarpLoCPresets) == 0 {
+		return fmt.Errorf("tiling: WarpLoCPresets must not be empty")
+	}
+	for _, v := range p.WarpLoCPresets {
+		if v < 2 {
+			return fmt.Errorf("tiling: WarpLoCPresets entry %d is below 2 — a WARP dim with K = 1 is SEQ and pruned from the feasible area (fix4 1.2)", v)
+		}
+	}
+	if p.MaxPartitionCta < 1 {
+		return fmt.Errorf("tiling: MaxPartitionCta %d must be >= 1 (a zero MAPM cap leaves no legal factorization)", p.MaxPartitionCta)
+	}
+	if p.MaxPartitionThr < 1 {
+		return fmt.Errorf("tiling: MaxPartitionThr %d must be >= 1 (a zero MAPM cap leaves no legal factorization)", p.MaxPartitionThr)
+	}
+	if p.MaxCTA < 2 {
+		return fmt.Errorf("tiling: MaxCTA %d must be >= 2 (the gridDim policy cap, the MALoC CTA bound)", p.MaxCTA)
+	}
+	if p.MaxWarpsPerCTA < 1 || p.MaxWarpsPerCTA > 32 {
+		return fmt.Errorf("tiling: MaxWarpsPerCTA %d must be within [1, 32] (the hardware warp bound, the MALoC warp bound)", p.MaxWarpsPerCTA)
 	}
 	if p.MaxCache < 1 {
 		return fmt.Errorf("tiling: MaxCache %d must be >= 1", p.MaxCache)
@@ -431,43 +472,8 @@ func (p Params) Validate() error {
 	if p.MaxCS < 1 {
 		return fmt.Errorf("tiling: MaxCS %d must be >= 1", p.MaxCS)
 	}
-	if p.WindowK < 1 {
-		return fmt.Errorf("tiling: WindowK %d must be >= 1", p.WindowK)
-	}
 	if p.NominalExtent < 1 {
 		return fmt.Errorf("tiling: NominalExtent %d must be >= 1", p.NominalExtent)
-	}
-	if len(p.TileSizes) == 0 {
-		return fmt.Errorf("tiling: TileSizes must not be empty")
-	}
-	for _, v := range p.TileSizes {
-		if v < 2 {
-			return fmt.Errorf("tiling: TileSizes entry %d is below 2 — tile size 1 is not a legal schedule: the compiler never generates a non-tiling schedule (2026-10-24 ruling); every entry must be >= 2", v)
-		}
-	}
-	// HI-03 gate 1 (2026-10-24 ruling): a CTA dim's tile must not exceed the
-	// coupled inside walk's thread count — the flat-init coupled walk
-	// (init = the flat thread rank, step = coupledThreads) is single-owner
-	// exact only while tile <= coupled; any larger tile makes every element
-	// at rank >= coupled walked by TWO threads (a write-write race, not a
-	// perf bug). The resolution mirrors lower_rewrite.go coupledThreads():
-	// warpPortion auto = AutoWarpPortion, the binding case per the searcher's
-	// CTA-carrying fallback. When coupled == 0 (WarpPortion == PortionWarp)
-	// the tile comparison is skipped — the F2 floor owns that configuration's
-	// error with its clearer message. DefaultParams' max tile 256 == coupled
-	// 256 stays valid.
-	warpsPerPortion := (p.MaxThreadsPerCTA / 32) / PortionWarp
-	warpPortion := p.WarpPortion
-	if warpPortion == 0 {
-		warpPortion = AutoWarpPortion
-	}
-	if coupled := (PortionWarp - warpPortion) * warpsPerPortion * 32; coupled > 0 {
-		for _, v := range p.TileSizes {
-			if v > coupled {
-				return fmt.Errorf("tiling: TileSizes entry %d exceeds the CTA-coupled inside walk's thread count %d — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (the assert-and-trap family; tiling-verify and the tile-lower rewrite re-check this)",
-					v, coupled)
-			}
-		}
 	}
 	return nil
 }

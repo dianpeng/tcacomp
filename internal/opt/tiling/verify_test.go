@@ -1,6 +1,7 @@
 package tiling
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -101,9 +102,9 @@ func corruptVerifyError(t *testing.T, mutate func(fx fixture, rec *Record)) erro
 	return err
 }
 
-// TestVerifyFlagsCorruption pins each corruption class: a deleted BIV
-// entry, an inflated CTA LoC, a v0-policy violation (a second CTA dim), a
-// warp LoC that is not a portion multiple, a promoted site tied outside
+// TestVerifyFlagsCorruption pins each corruption class under the fix4
+// §2.7 re-check set: a deleted BIV entry, a CTA LoC outside the preset
+// list, a warp LoC outside the preset list, a promoted site tied outside
 // its LNT, and a record whose recomputed SMEM footprint exceeds the
 // budget.
 func TestVerifyFlagsCorruption(t *testing.T) {
@@ -117,56 +118,55 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 		}
 	})
 
-	t.Run("inflated cta loc", func(t *testing.T) {
+	t.Run("cta loc outside presets", func(t *testing.T) {
 		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
 			for biv, d := range rec.Iters {
 				if d.SoC == SoCTA {
-					d.LoC = DefaultParams().MaxCTA * 2
+					d.LoC = DefaultParams().MaxCTA * 2 // over the cap AND off-list
 					rec.Iters[biv] = d
 					return
 				}
 			}
 			t.Fatal("the matmul record must carry a CTA entry")
 		})
-		if !strings.Contains(err.Error(), "MaxCTA") {
-			t.Fatalf("inflated-LoC error must name MaxCTA, got %q", err.Error())
+		if !strings.Contains(err.Error(), "preset") {
+			t.Fatalf("off-list CTA LoC error must name the preset list, got %q", err.Error())
 		}
 	})
 
-	t.Run("v0 policy second cta dim", func(t *testing.T) {
+	t.Run("warp loc outside presets", func(t *testing.T) {
 		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
-			// Flip one sequential entry into a well-formed second CTA dim
-			// (LoC == MaxCTA), so only the policy count fires.
-			for biv, d := range rec.Iters {
-				if d.SoC == SoCSequential {
-					d.SoC = SoCTA
-					d.LoC = DefaultParams().MaxCTA
-					rec.Iters[biv] = d
-					return
-				}
-			}
-			t.Fatal("the matmul record must carry a sequential entry")
-		})
-		if !strings.Contains(err.Error(), "v0 policy") {
-			t.Fatalf("second-CTA error must name the v0 policy, got %q", err.Error())
-		}
-	})
-
-	t.Run("warp loc not portion multiple", func(t *testing.T) {
-		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
-			quantum := (DefaultParams().MaxThreadsPerCTA / 32) / PortionWarp
 			for biv, d := range rec.Iters {
 				if d.SoC != SoCTA {
 					d.SoC = SoCWARP
-					d.LoC = quantum + 1 // not a quantum multiple
+					d.LoC = 3 // not a WarpLoCPresets entry
 					rec.Iters[biv] = d
 					return
 				}
 			}
 			t.Fatal("the matmul record must carry a non-CTA entry")
 		})
-		if !strings.Contains(err.Error(), "portion") {
-			t.Fatalf("non-portion warp LoC error must name the portion quantum, got %q", err.Error())
+		if !strings.Contains(err.Error(), "preset") {
+			t.Fatalf("off-list warp LoC error must name the preset list, got %q", err.Error())
+		}
+	})
+
+	t.Run("sequential loc not one", func(t *testing.T) {
+		// SEQ dims carry LoC == 1 (one tile in the sequence dimension
+		// = the whole dim is one tile). A sequential LoC != 1 is
+		// off the implicit SEQ preset list = corruption.
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			for biv, d := range rec.Iters {
+				if d.SoC == SoCSequential {
+					d.LoC = 5 // not 1
+					rec.Iters[biv] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry at least one SEQ entry")
+		})
+		if !strings.Contains(err.Error(), "preset") {
+			t.Fatalf("SEQ LoC != 1 error must name the preset list, got %q", err.Error())
 		}
 	})
 
@@ -228,6 +228,46 @@ func TestVerifyFlagsCorruption(t *testing.T) {
 		})
 		if !strings.Contains(err.Error(), "TileSize >= 2") {
 			t.Fatalf("tile-1 error must name the TileSize >= 2 contract, got %q", err.Error())
+		}
+	})
+
+	t.Run("zero cta dims", func(t *testing.T) {
+		// CuMAP: every LNT must carry at least one CTA-assigned dim.
+		// Demote the sole CTA dim to SEQ so the LNT has zero CTA dims.
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			for biv, d := range rec.Iters {
+				if d.SoC == SoCTA {
+					d.SoC = SoCSequential
+					d.LoC = 1
+					d.TileSize = 32
+					rec.Iters[biv] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry at least one CTA entry")
+		})
+		if !strings.Contains(err.Error(), "no CTA assignment") {
+			t.Fatalf("zero-CTA error must name the missing CTA assignment, got %q", err.Error())
+		}
+	})
+
+	t.Run("judge disagreement", func(t *testing.T) {
+		// The re-derived judge must agree with the record's site
+		// decision on Promoted / Class / Reuse / Bytes. Corrupting a
+		// promoted site's reuse count trips the cross-check without
+		// changing the iter decisions (so feasibility stays green).
+		err := corruptVerifyError(t, func(fx fixture, rec *Record) {
+			for id, d := range rec.Sites {
+				if d.Promoted {
+					d.Reuse = d.Reuse + 777 // wrong on purpose
+					rec.Sites[id] = d
+					return
+				}
+			}
+			t.Fatal("the matmul record must carry at least one promoted site")
+		})
+		if !strings.Contains(err.Error(), "judge") {
+			t.Fatalf("judge-disagreement error must name the judge cross-check, got %q", err.Error())
 		}
 	})
 }
@@ -330,35 +370,125 @@ func TestVerifyKernelWideFragGate(t *testing.T) {
 	}
 }
 
-// TestVerifyCoupledTileGate pins HI-03 gate 2: a record whose CTA dim
-// carries a TileSize over the coupled inside-walk thread count (resolved
-// from Params exactly as the rewrite's coupledThreads does — never the
-// record's warp LoC) fails the per-LNT feasibility sweep with a named
-// error; a tile exactly at the bound verifies green.
-func TestVerifyCoupledTileGate(t *testing.T) {
-	fx := newChain32("ctagate", 4096)
-	bodyStore(fx)
-	mk := func(tile int) *Record {
-		return recordOf(t, fx, map[int]IterDecision{
-			0: {SoC: SoCTA, LoC: 100, TileSize: tile},
-		}, nil)
+// TestVerifyMultiCTAGreen pins the v0-policy deletion: a record carrying
+// TWO CTA dims (well-formed preset LoCs, products within bounds) now
+// VERIFIES GREEN — multi-dim parallel schedules are legal records under
+// the fix4 model (tile-lower's templates fail closed on them pending
+// fix4 T4, but the record side is sound).
+func TestVerifyMultiCTAGreen(t *testing.T) {
+	g := ir.NewGraph("multi-verify")
+	u32 := ir.InternScalar(ir.TU32)
+	var dims, iters []ir.Node
+	for i := 0; i < 2; i++ {
+		dims = append(dims, g.NewInputParam("ctor", ir.RoleDim, fmt.Sprintf("d%d", i), nil))
+	}
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}}))
+	var parent ir.Node
+	for i := 0; i < 2; i++ {
+		dv := g.NewDimVar("ctor", dims[i], g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", u32, 1024))
+		parent = g.NewIter("ctor", biv, parent)
+		iters = append(iters, parent)
+	}
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, nil, g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+
+	rec := &Record{Iters: make(map[ir.Node]IterDecision), Sites: map[uint64]SiteDecision{}}
+	for i, it := range iters {
+		biv := ir.DataDeps(it)[0]
+		rec.Iters[biv] = IterDecision{SoC: SoCTA, LoC: 2, TileSize: 32}
+		_ = i
 	}
 	cache := opt.NewCache()
-	cache.Put(mk(512))
-	err := verifyWith(fx.g, cache, DefaultParams())
+	cache.Put(rec)
+	if err := verifyWith(g, cache, DefaultParams()); err != nil {
+		t.Fatalf("a two-CTA-dim record must verify green under the fix4 re-check set, got %v", err)
+	}
+}
+
+// TestVerifyCTAProductOverMaxCTA pins the MALoCC CTA-product check: a
+// record carrying two CTA dims whose LoCs are each in the preset list
+// but whose product exceeds MaxCTA must fail verification. The two dims
+// use in-list LoCs (64, 16) so the preset-list check passes and the
+// product check is what fires (64 × 16 = 1024 > 512 = MaxCTA).
+func TestVerifyCTAProductOverMaxCTA(t *testing.T) {
+	g := ir.NewGraph("cta-prod-over")
+	u32 := ir.InternScalar(ir.TU32)
+	var dims, iters []ir.Node
+	for i := 0; i < 2; i++ {
+		dims = append(dims, g.NewInputParam("ctor", ir.RoleDim, fmt.Sprintf("d%d", i), nil))
+	}
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}}))
+	var parent ir.Node
+	for i := 0; i < 2; i++ {
+		dv := g.NewDimVar("ctor", dims[i], g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", u32, 1024))
+		parent = g.NewIter("ctor", biv, parent)
+		iters = append(iters, parent)
+	}
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, nil, g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+
+	p := DefaultParams()
+	rec := &Record{Iters: make(map[ir.Node]IterDecision), Sites: map[uint64]SiteDecision{}}
+	// Both dims CTA, LoCs both in CtaLoCPresets, product = 64 × 16 = 1024 > 512.
+	rec.Iters[ir.DataDeps(iters[0])[0]] = IterDecision{SoC: SoCTA, LoC: 64, TileSize: 32}
+	rec.Iters[ir.DataDeps(iters[1])[0]] = IterDecision{SoC: SoCTA, LoC: 16, TileSize: 32}
+	cache := opt.NewCache()
+	cache.Put(rec)
+	err := verifyWith(g, cache, p)
 	if err == nil {
-		t.Fatal("a CTA TileSize over the coupled thread count must fail the feasibility sweep")
+		t.Fatal("a two-CTA-dim record with product > MaxCTA must fail verification")
 	}
-	if !strings.Contains(err.Error(), "coupled") {
-		t.Fatalf("the gate-2 error must name the coupled walk, got %q", err.Error())
+	if !strings.Contains(err.Error(), "CTA factorization product") {
+		t.Fatalf("the error must name the CTA factorization product, got %q", err.Error())
 	}
-	if !strings.Contains(err.Error(), "512") || !strings.Contains(err.Error(), "256") {
-		t.Fatalf("the gate-2 error must name the tile and the coupled count, got %q", err.Error())
+}
+
+// TestVerifyWarpProductOverMaxWarps pins the MALoCC warp-product check:
+// a record carrying two WARP dims whose Ks are each in the preset list
+// but whose product exceeds MaxWarpsPerCTA must fail verification. Both
+// Ks are in WarpLoCPresets (16, 4) so the preset check passes and the
+// product check is what fires (16 × 4 = 64 > 32 = MaxWarpsPerCTA).
+func TestVerifyWarpProductOverMaxWarps(t *testing.T) {
+	g := ir.NewGraph("warp-prod-over")
+	u32 := ir.InternScalar(ir.TU32)
+	var dims, iters []ir.Node
+	for i := 0; i < 3; i++ {
+		dims = append(dims, g.NewInputParam("ctor", ir.RoleDim, fmt.Sprintf("d%d", i), nil))
 	}
-	cacheOK := opt.NewCache()
-	cacheOK.Put(mk(256))
-	if err := verifyWith(fx.g, cacheOK, DefaultParams()); err != nil {
-		t.Fatalf("a CTA TileSize exactly at the coupled count must verify green, got %v", err)
+	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}}))
+	var parent ir.Node
+	for i := 0; i < 3; i++ {
+		dv := g.NewDimVar("ctor", dims[i], g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
+		biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", u32, 1024))
+		parent = g.NewIter("ctor", biv, parent)
+		iters = append(iters, parent)
+	}
+	env := ir.NewEnv()
+	st := g.NewMemStoreChained("ctor", env, out, nil, g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+
+	p := DefaultParams()
+	rec := &Record{Iters: make(map[ir.Node]IterDecision), Sites: map[uint64]SiteDecision{}}
+	// One CTA dim (CuMAP: at least one) + two WARP dims.
+	// Warp product = 16 × 4 = 64 > 32 = MaxWarpsPerCTA.
+	rec.Iters[ir.DataDeps(iters[0])[0]] = IterDecision{SoC: SoCTA, LoC: 8, TileSize: 32}
+	rec.Iters[ir.DataDeps(iters[1])[0]] = IterDecision{SoC: SoCWARP, LoC: 16, TileSize: 32}
+	rec.Iters[ir.DataDeps(iters[2])[0]] = IterDecision{SoC: SoCWARP, LoC: 4, TileSize: 32}
+	cache := opt.NewCache()
+	cache.Put(rec)
+	err := verifyWith(g, cache, p)
+	if err == nil {
+		t.Fatal("a two-WARP-dim record with product > MaxWarpsPerCTA must fail verification")
+	}
+	if !strings.Contains(err.Error(), "warp factorization product") {
+		t.Fatalf("the error must name the warp factorization product, got %q", err.Error())
 	}
 }
 

@@ -43,6 +43,46 @@ import (
 	"tcacomp/internal/ir"
 )
 
+// INSSet returns the site's referenced-iter set as an O(1) membership map
+// (fix4 §2.4 "cross-warp sharing": the sharing factor is a product over
+// WARP-assigned dims NOT in the load's subscript set — the judge and the
+// tests need set semantics over sf.INS, which stays a slice for its
+// deterministic order). Pure addition over newSiteFacts' product; the
+// discovery logic itself is unchanged (fix4 §2.4 "Discovery: unchanged").
+func (sf SiteFacts) INSSet() map[ir.Node]bool {
+	out := make(map[ir.Node]bool, len(sf.INS))
+	for _, it := range sf.INS {
+		out[it] = true
+	}
+	return out
+}
+
+// constExtentOf resolves an iter's extent when it is a compile-time const
+// (the BIV's bound operand, read via ir.ConstValueOf — the same operand
+// lower_rewrite.go's extentOfBiv resolves for IR construction; this is the
+// ONE shared const-extent-VALUE reader, hoisted per fix4's R-LOCCAP: the
+// feasible-area preset cap needs extent values at search time). Non-const,
+// missing, or non-positive bounds report false (non-const extents enumerate
+// uncapped per R-LOCCAP).
+func constExtentOf(iter ir.Node) (int, bool) {
+	if iter == nil || iter.BasePtr() == nil || iter.BasePtr().Erased() {
+		return 0, false
+	}
+	deps := ir.DataDeps(iter)
+	if len(deps) == 0 || deps[0] == nil {
+		return 0, false
+	}
+	ops := ir.DataDeps(deps[0])
+	if len(ops) < 2 || ops[1] == nil {
+		return 0, false
+	}
+	v, ok := ir.ConstValueOf(ops[1])
+	if !ok || v < 1 {
+		return 0, false
+	}
+	return int(v), true
+}
+
 // SiteFacts is one admitted candidate site's overlap product — everything
 // the PSched search and the promotion judge need about the load.
 type SiteFacts struct {
@@ -87,6 +127,13 @@ type lntFacts struct {
 	// CS is the admitted candidate set (doc order: set-size, rank, MaxCS
 	// filters applied).
 	CS []SiteFacts
+	// reduced is the kernel-wide reducer-consuming iter set (R-REDUCED),
+	// populated by the DECIDE pass's Run AFTER analyzeOverlap returns —
+	// discovery itself stays pure (fix4 §2.4 "Discovery: unchanged"); the
+	// feasible-area search prunes WARP digits on these iters while
+	// Params.ReducedDimWarp is false. Consumers that do not search (the
+	// lower, verify's fact re-derivation) leave it nil.
+	reduced map[ir.Node]bool
 }
 
 // findINS returns every Iter node a MemLoad's subscripts reference

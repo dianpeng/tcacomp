@@ -127,6 +127,27 @@ func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 	if branchErr != nil {
 		return branchErr
 	}
+	// fix4 R-SEAM fail-closed guard: the decide side now ADMITS multi-dim
+	// parallel schedules (MAPM allows up to 3 CTA dims and 3 expanded THR
+	// instances per LNT), but the rewrite templates below still implement
+	// the single-CTA-dim / single-WARP-dim forms — the multi-dim loop
+	// templates land in fix4 T4 (§3.1). A record carrying more than one
+	// CTA dim or more than one WARP dim stops HERE, loudly, never as an
+	// undesigned lowering.
+	ctaDims, warpDims := 0, 0
+	for _, it := range iters {
+		switch lr.decisions[it].SoC {
+		case SoCTA:
+			ctaDims++
+		case SoCWARP:
+			warpDims++
+		}
+	}
+	if ctaDims > 1 || warpDims > 1 {
+		return fmt.Errorf(
+			"tile-lower: LNT rooted at iter node %d carries %d CTA dims and %d WARP dims — multi-dim parallel schedule: template rewrite lands in fix4 T4 (the single-dim templates below must never linearize it)",
+			root.Iter.BasePtr().ID(), ctaDims, warpDims)
+	}
 	dims, err := lr.numberDims(iters)
 	if err != nil {
 		return err
@@ -154,16 +175,17 @@ func (lr *lowerRun) rewriteLNT(root *loopforest.Tree) error {
 }
 
 // recordProvenance publishes this LNT's P-5 provenance entries
-// (quick-261022-l1o): one per-dim DimProvenance keyed by the DIM InputParam
-// (captured on the dimRewrite at expression-generation time — the iter
-// chains are ERASED by the time this runs, so the dim cannot be re-resolved
-// here) and one per-LNT MappingPlan keyed by the generated nest root. The
-// plan's portion vectors come from the pass's OWN Params at rewrite time
-// (the coupledThreads resolution rule): grid = [-1] always in v0 (every
-// rewritten LNT carries >= 1 CTA dim by the searcher's CTA-carrying
-// fallback); thread = [warpPortion, -1] with warpPortion =
-// Params.WarpPortion resolved — AutoWarpPortion=4 when a CTA dim exists,
-// else PortionWarp=8.
+// (quick-261022-l1o, fix4 §3.2): one per-dim DimProvenance keyed by the
+// DIM InputParam (captured on the dimRewrite at expression-generation
+// time — the iter chains are ERASED by the time this runs, so the dim
+// cannot be re-resolved here) and one per-LNT MappingPlan keyed by the
+// generated nest root. The plan's vectors are the ABSOLUTE
+// factorization shapes derived from the record's own decisions — no
+// share arithmetic: GridPortions = the per-CTA-dim absolute LoC_d in
+// DoSoC order, ThreadPortions = the per-WARP-dim warp counts K_d in
+// DoSoC order. The launch thread budget is the derived blockDim = (Π
+// warp K) × 32, carried as a MAX over LNTs (final-lower's reducer
+// staging extent reads #warps from it).
 func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 	for _, d := range lw.dims {
 		if d.dim == nil {
@@ -177,11 +199,11 @@ func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 			Tile:    d.tile,
 		}
 		// The CTA dim's coupled inside-walk facts (the flat-index ruling's
-		// materialization): the ThreadMap slot the coupled walk rides and its
-		// thread count. Final-lower's reducer redirect and any future
-		// ownership-gate walk read these instead of re-deriving the portion
-		// arithmetic (D3's counting invariant lives here, at the pass that
-		// built the walk).
+		// materialization): the ThreadMap slot the coupled walk rides and
+		// its thread count — the LNT's blockDim under the fix4 model.
+		// Final-lower's reducer redirect and any future ownership-gate
+		// walk read these instead of re-deriving launch arithmetic (D3's
+		// counting invariant lives here, at the pass that built the walk).
 		if d.soc == SoCTA {
 			lr.prov.Dims[d.dim] = DimProvenance{
 				Between:        d.between,
@@ -193,22 +215,24 @@ func (lr *lowerRun) recordProvenance(lw *lntRewrite) error {
 			}
 		}
 	}
-	// The launch thread budget rides the record for the same reason the
-	// portion plans do: final-lower's reducer staging extent (#warps =
-	// MaxThreadsPerCTA/32) must match the launch grammar the maps assert
-	// against — it is read from here, never re-derived.
-	lr.prov.MaxThreadsPerCTA = lr.params.MaxThreadsPerCTA
-	warpPortion := lr.params.WarpPortion
-	if warpPortion == 0 {
-		if hasCTADim(lw.dims) {
-			warpPortion = AutoWarpPortion
-		} else {
-			warpPortion = PortionWarp
+	grid := make([]int, 0, 1)
+	thread := make([]int, 0, 1)
+	warpProduct := 1
+	for _, d := range lw.dims {
+		switch d.soc {
+		case SoCTA:
+			grid = append(grid, d.loc)
+		case SoCWARP:
+			thread = append(thread, d.loc)
+			warpProduct *= d.loc
 		}
 	}
 	lr.prov.LNTs[lw.lntRoot] = MappingPlan{
-		GridPortions:   []int{-1},
-		ThreadPortions: []int{warpPortion, -1},
+		GridPortions:   grid,
+		ThreadPortions: thread,
+	}
+	if blockDim := warpProduct * 32; blockDim > lr.prov.MaxThreadsPerCTA {
+		lr.prov.MaxThreadsPerCTA = blockDim
 	}
 	return nil
 }
@@ -297,23 +321,11 @@ func extentOfBiv(biv ir.Node) (ir.Node, error) {
 	return extent, nil
 }
 
-// coupledThreads derives the CTA dim's coupled tile-inside walk thread
-// count: the remaining warp portions × quantum × 32, mirroring search.go's
-// WarpPortion auto logic (the independent warp dim's portion is the pass's
-// WarpPortion, or auto — AutoWarpPortion when the LNT carries a CTA dim,
-// else PortionWarp; the coupled walk implicitly consumes the rest).
-func (lr *lowerRun) coupledThreads(hasCTA bool) int {
-	quantum := (lr.params.MaxThreadsPerCTA / 32) / PortionWarp
-	warpPortion := lr.params.WarpPortion
-	if warpPortion == 0 {
-		if hasCTA {
-			warpPortion = AutoWarpPortion
-		} else {
-			warpPortion = PortionWarp
-		}
-	}
-	return (PortionWarp - warpPortion) * quantum * 32
-}
+// coupledThreads is DELETED with the share grammar (fix4 §1.2): the CTA
+// dim's coupled inside walk strides over the LNT's WHOLE blockDim =
+// (Π warp K) × 32 — see blockDimOf in judge.go and the per-LNT
+// derivation in generateDimExprs/recordProvenance. hasCTADim survives for
+// the MIRROR-GATE slot resolution.
 
 // hasCTADim reports whether any dim of the LNT carries a CTA assignment.
 func hasCTADim(dims []*dimRewrite) bool {
@@ -366,7 +378,8 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 	// saturate their tile max to zero trips — they hold the identity init
 	// under a uniform reduction bracket instead of double-counting. Pure
 	// offset arithmetic over the F1 tail-clamp machinery; no new query, no
-	// branch. At most one CTA dim exists per LNT (the v0 policy).
+	// branch. At most one CTA dim reaches the templates (the fix4 T4
+	// fail-closed guard in rewriteLNT pins the multi-dim forms to T4).
 	ctaThreadDim := -1
 	if cta {
 		for _, d := range lw.dims {
@@ -414,49 +427,33 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, d.betweenIV, d.insideIV)
 			d.roundBase = d.betweenIV
 		case SoCTA:
-			// between for (a = 0; a < A; a += LoC*T), LoC = MaxCTA; in-body
+			// between for (a = 0; a < A; a += LoC*T); in-body
 			// cta_rank = GridMap(dosoc,"index"); offset = rank*T + round.
-			// Inside = the COUPLED warp walk at ELEMENT stride — the
+			// Inside = the COUPLED walk at ELEMENT stride — the
 			// FLAT-INDEX FORM (ruling 2026-10-23): the IV's INIT is the
 			// no-arg flat thread query (the thread's absolute 1-D rank),
-			// step = the coupled thread count, bound = the materialized tile
+			// step = the LNT's blockDim, bound = the materialized tile
 			// max; indexExpr = offset + insideIV (Index() = flatRank +
-			// i*coupled) — the separate +index(threadDim) tuple-coordinate
+			// i*blockDim) — the separate +index(threadDim) tuple-coordinate
 			// add is DELETED (it supplies only the slowest-axis coordinate,
-			// never a 0..coupled-1 element rank — finding C1). Threads with
-			// flatRank >= tile_max take zero trips: single-owner exact while
-			// tile <= coupled.
+			// never a 0..blockDim-1 element rank — finding C1). Under the
+			// fix4 factorization model the coupled walk is single-owner
+			// exact for ANY tile_max (init = flat rank, step = blockDim:
+			// each element has exactly one owning rank), so the old
+			// tile-vs-coupled bound gate is DELETED (fix4 R-HI03) — the
+			// §3.3 pin itself requires T > blockDim.
 			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(d.loc*d.tile)))
 			d.betweenBound = extent
 			rank := lr.g.NewRuntimeGridQuery(lowerOrigin, "index", lr.u32c(float64(d.gridDim)))
 			offset := lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd,
 				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(t)), d.betweenIV)
 			d.insideBound = lr.tileMax(d.tile, extent, offset)
-			coupled := lr.coupledThreads(cta)
-			if coupled < 1 {
-				// F2 defensive floor (the decide pass's Validate/evalSchedule
-				// reject the configuration first; this is the rewrite-side
-				// backstop): a zero-portion coupled walk emits a zero-stride
-				// inside ForLoop — an infinite loop.
-				return fmt.Errorf("tile-lower: CTA dim (iter node %d) coupled inside walk computes %d threads — the coupled-portion floor (F2) demands >= 1",
-					d.iter.BasePtr().ID(), coupled)
-			}
-			if d.tile > coupled {
-				// HI-03 gate 3 (2026-10-24 ruling): the flat-init coupled
-				// walk is single-owner exact only while tile <= coupled —
-				// a larger tile makes every element at rank >= coupled
-				// walked by two threads (a write-write race). Params.Validate
-				// (gate 1) and tiling-verify (gate 2) reject this first; a
-				// crafted record that bypasses them fails HERE, never as a
-				// racy kernel.
-				return fmt.Errorf("tile-lower: CTA dim (iter node %d) carries TileSize %d over the coupled inside walk's %d threads — the flat-init coupled walk is single-owner exact only while tile <= coupledThreads (HI-03 gate 3; Params.Validate and tiling-verify are gates 1-2)",
-					d.iter.BasePtr().ID(), d.tile, coupled)
-			}
-			d.coupledThreads = coupled
+			blockDim := blockDimOf(lr.decisions)
+			d.coupledThreads = blockDim
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim,
-				lr.g.NewRuntimeThreadQueryFlat(lowerOrigin), lr.u32c(float64(coupled)))
+				lr.g.NewRuntimeThreadQueryFlat(lowerOrigin), lr.u32c(float64(blockDim)))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 1), lr.attr("dosoc", float64(d.gridDim)), lr.attr("loc", float64(d.loc)), lr.attr("tile", float64(d.tile))}
-			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(coupled)), lr.attr("tile", float64(d.tile))}
+			d.insideAttrs = []ir.Node{lr.attr("soc", 2), lr.attr("dosoc", float64(d.threadDim)), lr.attr("loc", float64(blockDim)), lr.attr("tile", float64(d.tile))}
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV)
 			d.roundBase = offset
 		case SoCWARP:
