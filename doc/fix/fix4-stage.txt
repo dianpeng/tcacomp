@@ -1,0 +1,49 @@
+fix4 refactor — staged launch commands (gsd-quick runbook)
+============================================================
+
+Spec: doc/fix/fix4.md (Wave 1 = T1-T7; Wave 2 = T8 split-k)
+Run stages IN ORDER. Start the next stage only after the previous one
+is green: build/vet/test pass, task commits landed, STATE.md row added.
+
+--- Wave 1 (staged) ------------------------------------------------------
+
+Stage 1 — decide pass + verify (the foundation; validate mode):
+  /gsd-quick --validate Implement doc/fix/fix4.md T1+T2 (decide pass + tiling-verify, §2)
+
+Stage 2 — runtime library:
+  /gsd-quick Implement doc/fix/fix4.md T3 (runtime maps/iterators/launch, §4)
+
+Stage 3 — tile-lower + codegen/final-lower (goldens regen):
+  /gsd-quick Implement doc/fix/fix4.md T4+T5 (tile-lower + codegen/final-lower + goldens regen, §3/§5/§6)
+
+Stage 4 — e2e + docs:
+  /gsd-quick Implement doc/fix/fix4.md T6+T7 (A6000 e2e + sanitizer + doc pointer stubs, §8/§9)
+  (T6 requires the GPU gate: TCACOMP_E2E=1; compute-sanitizer memcheck/racecheck must be clean)
+
+--- Wave 2 (split-k enablement) -----------------------------------------
+
+Stage 5 — split-k:
+  /gsd-quick --validate Implement doc/fix/fix4.md T8 (split-k per §3.5/§3.6: wiring behind
+  ReducedDimWarp=true, dedicated split-k matmul e2e, flip the default, goldens)
+
+--- Alternative: single run (less recommended) ---------------------------
+
+  /gsd-quick --validate Implement doc/fix/fix4.md Wave 1 (T1-T7)
+  - expect a context-warning pause; continue with:
+    /gsd-quick list                 (find the slug)
+    /gsd-quick resume <slug>
+
+--- Between-stage checkpoints -------------------------------------------
+
+1. Stage 1 gates: unit tests per module green; the §3.3 matmul worked
+   example pinned as a searcher expectation; determinism pins (fixed
+   enumeration order: SoC, LoC DESCENDING, tile ASCENDING;
+   first-strict-max) — do not let an executor "simplify" this.
+2. Stage 3 gates: goldens byte-re-pinned in-commit (sanctioned churn,
+   fix3 C11 precedent); expected signature: M=CTA / N=WARP / K=SEQ with
+   BOTH matmul sites promoted at their caps (rhs's old decline is gone).
+3. Stage 4 gates: numerical acceptance vs CPU reference on the A6000,
+   sanitizer zero errors, zero-cache fixture emits a warning (not an
+   error), doc pointer stubs committed.
+4. Any stage may stop for an author ruling (the R-D pattern): read the
+   SUMMARY.md, decide, then /gsd-quick resume <slug>.
