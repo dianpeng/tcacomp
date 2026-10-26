@@ -318,3 +318,66 @@ Model: C[M,N] = Σ_k A[M,K]·B[N,K], nest M→N→K, A refs (m,k), B refs (n,k),
 2. **Decide-half rewrite** — cost model (B) + searcher (A/C/D) in internal/opt/tiling with unit tests; verify checks updated (E1).
 3. **Lower-half rewrite** — residue-class forms + fill mechanics (E2) + runtime mapping contract (E3); goldens regen + re-pin (E5).
 4. **E2E** — numerical acceptance + compute-sanitizer (memcheck/racecheck) on the A6000.
+
+---
+
+# Round 7 (2026-10-26) — downstream cascade audit (author request)
+
+Question: are the designs for the cascaded changes (lowering, codegen, runtime iterators, kernel launcher) in place? **Answer: NO.** The finalized search doc identifies the touch points (§8.3) but four downstream specs are still written against the portion/shard model, plus three genuinely new design items exist nowhere. Doc-by-doc, with section/line evidence:
+
+## A. doc/optana/loop_tile_lower.md — the lower pass spec
+
+| # | Section (lines) | Current text | Required |
+|---|---|---|---|
+| A1 | §7bis portion grammar (597-601) | portions Σ10/8, −1 remainder, PORTION constants, 512 threads/16 warps, 108→100 | absolute counts, presets, MaxCTA=512 policy cap |
+| A2 | §7bis launch validation (620-624) | "Launch config is EXTERNAL and static per the portion grammar"; assert-and-trap (multiple of 10 CTAs, ≥256 threads) | record-derived launch (max-over-LNT Π); new pre-conditions (blockDim multiple of 32, warps ≤ 32, grid ≤ cap) |
+| A3 | §7 v0 policy (549-555) | "at most ONE CTA dim and ONE WARP dim… multi-dim is FUTURE" | REPEALED — multi-dim rewrite forms now REQUIRED |
+| A4 | §6bis PHASE 3 CTA form (373) | "LoC = MaxCTA (portion -1/full)" — single CTA dim | per-dim LoC_d; nested per-CTA-dim between loops; rank = grid_map.index(d); stride LoC_d×T_d |
+| A5 | §6bis PHASE 3 WARP form (393-397) | shard chunk form: `b += nThreads*T`, `thread_rank*T`, whole-chunk sequential inside | residue form: `b += K_d*T_d`, warp-coordinate rank, **lane-chunk inside walk** (⌈T_d/32⌉ per lane) |
+| A6 | coupled walk (382) + F2 (408-413) | "remaining warp portions × quantum × 32"; F2 floor | step = blockDim (Π K × 32); F2 DELETED |
+| A7 | §6 + §6bis R2 window sizing (239-241, 465-467) | "WARP dim → #threads_d × T_d (whole group's round window)" | **K_d × T_d per warp coordinate** (32× smaller — the change that lets rhs-class sites promote within 64 KB) |
+| A8 | C1b sizing (283-288) | "FRAG over a WARP-covered dim prices at T_d per thread" | ⌈T_d/32⌉ per lane under B1 chunks — re-pin |
+| A9 | §7bis counting invariant (591-596) | "ThreadMap dimensionality = m coupled + n independent dims" | coupled walk is flat-index (no dim slot) → ThreadMap = n warp dims? **NEEDS A RULING** |
+| A10 | worked example (497-510) | M CTA LoC=100, rhs declined (1 MB window) | recompute (rhs promotes at K_n·T_n·T_k ≤ 64 KB) |
+| A11 | §6 fallback (halve/drop) | active budget resolution | decide-side eviction makes it an UNREACHABLE backstop — keep as fail-closed defense, mark unreachable |
+
+Survives unchanged: §2 DoSoC (counters just go past 1), §4 guards/mask contract (lane-prefix property holds under consecutive chunks — chunk lengths are non-increasing in lane id), F1 saturating bounds, RAUW mechanics, F3 branched-LNT rejection, F7 record gating, runtime-owns-barriers.
+
+## B. doc/rt.md — the runtime library spec
+
+| # | Section | Required |
+|---|---|---|
+| B1 | §4.2 GridMapping/ThreadMapping (104-120) | portion constructors (−1 remainder, Q = total/kPortion, Σ=10/8) → **absolute-shape factorization** constructors: per-dim extents = LoC/K directly; warp index decomposes by the factorization |
+| B2 | §5 ValidateLaunch (88, 328-329) | pre-conditions → blockDim multiple of 32, warp count ≤ 32, gridDim ≤ policy cap; launch values record-derived |
+| B3 | §4.3 iterators (34, 80, 143-163) — the iterator objects | the Seq/Cta/ThrIterator DESIGN (Has/Next/Index, CTA-uniform round walk) survives; the coordinate/stride arithmetic changes: tuple-coordinate ranks, K_d×T_d strides, lane-chunk inside walks, coupled walk = flat index + blockDim step; constructor `loc` semantic = absolute count |
+| B4 | §4.6 reducers | SURVIVES as designed — staging at warp_index + syncthreads + replicated fold over warp_count is ALREADY a cross-warp combine, so split-k (round 6: reachable) is runtime-capable; add one confirming paragraph |
+| B5 | §12 test plan (358) | portion-decomposition CPU tests → factorization-decomposition tests |
+
+## C. doc/cg.md — the codegen spec
+
+| # | Item (lines) | Required |
+|---|---|---|
+| C1 | LR-15 (94-100) | "gridDim.x = Params.MaxCTA, blockDim.x = Params.MaxThreadsPerCTA" → **derived from the record**: walk the loops' soc/dosoc/loc/tile annotations per LNT, take max of Π(CTA LoC) and Π(warp K)×32, bake as constants (still NOT an IR node) |
+| C2 | §9 launcher (473-491) | `ValidateLaunch(dim3(MaxCTA), dim3(MaxThreadsPerCTA), …)` → derived values; specify the derivation walk |
+| C3 | D9 (32, 470) | `__launch_bounds__(MaxThreadsPerCTA)` → the derived per-kernel blockDim |
+| C4 | line 300 | `runtimegridmapping` "portions const args" → shape args |
+| C5 | D5 SMEM pool / D8 | survives (window extents shrink under factorization — numbers only) |
+
+## D. doc/optana/final_lower.md
+
+- 237-238: `RuntimeGridMapping(%kernel_info, <dims + portions …>)` → shape args.
+- 355, 367-395: worked example hard-wires the v0 policy + portions ("GridMapping never exceeds 1 dimension", `<1, -1>`, `<2, 4, -1>`, AutoWarpPortion) → rewrite for multi-dim + absolute shapes.
+
+## E. Verified unaffected
+
+schedule.md (form-agnostic LICM/effect-chain placement — the new loop shapes are ordinary ForLoops to it; regression-test only); opt.md pipeline order (unchanged); the Tensor launcher contract + per-dim validation (survives); smem pool/RA design (survives).
+
+## F. New design items that exist NOWHERE (the genuine gaps)
+
+1. **ThreadMap dimensionality under factorization** (A9): does the CTA dim's coupled walk still occupy m map slots, or is ThreadMap = n warp dims only (coupled walk uses the no-arg flat index)? Needs a ruling, then §7bis + rt.md §4.2.
+2. **Launch-derivation ownership in codegen** (C1/C2): the per-LNT Π walk over loop annotations + max + bake — a small new codegen step, currently unspecified anywhere.
+3. **Split-k reducer wiring in tile-lower**: a WARP-assigned REDUCED dim (reachable since round 6 rejected the v0 policy) has no §6bis emission pattern — the walk is the warp dim's residue TBL + lane-chunk TIL, and Combine must fold across the K_k warp coordinates. The runtime side is capable (B4); the compiler-side wiring (Init/walk/Combine placement + ownership masks for this shape) needs a new §6bis paragraph.
+
+## Recommendation
+
+Fold A–D as a **step 0 (downstream spec revisions)** in the refactor sequencing — parallel with the decide-half rewrite (which needs only the finalized search doc); the lower-half rewrite then consumes updated specs. F1 needs the author's ruling; F2/F3 are mechanical once F1 is ruled.

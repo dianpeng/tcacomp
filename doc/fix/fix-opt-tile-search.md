@@ -131,6 +131,7 @@ Exhaustive search with greedy cache eviction:
 
 ### 8.4 Sequencing
 
+0. **Downstream spec revisions** (audit: doc/review/fix-opt-tile-search.md round 7) — loop_tile_lower.md (§6bis PHASE 3 forms, §7 v0-policy inheritance, §7bis portion grammar + launch validation + counting invariant, R2 window sizing, C1b sizing, worked example), rt.md (§4.2 map constructors, §4.3 iterator arithmetic, §5 ValidateLaunch, §12 tests), cg.md (LR-15 + §9 launcher derivation, D9 launch bounds, mapping emission args), final_lower.md (mapping emission + worked example). Three new design items must be written: ThreadMap dimensionality under factorization (ruling needed), launch-derivation ownership in codegen, split-k reducer wiring in tile-lower (WARP-assigned reduced dims are reachable — no v0 policy). Runs in PARALLEL with step 1.
 1. Decide-half rewrite (cost model §5 + searcher §6 + verify §8.3) with unit tests.
-2. Lower-half rewrite (rewrite forms, fills, runtime mapping contract); goldens regen + re-pin.
+2. Lower-half rewrite (rewrite forms, fills, runtime mapping contract) — consumes the step-0-revised specs; goldens regen + re-pin.
 3. E2E: numerical acceptance + compute-sanitizer (memcheck/racecheck) on the A6000.
