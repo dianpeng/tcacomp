@@ -286,7 +286,16 @@ All three sound right. Two precision notes: (a) with −1 gone, the **preset lis
 
 **F. Doc mechanics** — delete the two stale "5" lines; rewrite the structural section in factorization terms; fix the GoC formula text + goc_max; launcher section names/units (blockDim = Π K × 32; `total_cta_thr` → warp-product name); typo pass; Params naming map (M6).
 
-## Recommended refactor sequencing
+## Round 4 addendum — decision triage (author request)
+
+Author will accept sane recommendations outright and wants only genuinely ambiguous items surfaced. Triage result:
+
+**GO WITH RECOMMENDATION (no ruling needed):** A1 reuse term = bytes×(reuse−1) (the only form satisfying the author's stated "actual reuse" intent); A2 no budget normalization; A4 determinism = fixed order + first-strict-max; B1 lane decomposition = consecutive ⌈T/32⌉ chunks (per-lane contiguous windows, vec128-loader-compatible, fully coalesced at ≥8-elem lanes, prefix-mask contract intact — the strided alternative only wins for scalar loads); B2-B4 derived cost formulas (FRAG ⌈T/32⌉×elem×factors; residue-group window bytes; cross-warp served reads); B5 keep CTA-covered refusal for THIS refactor (revisit after the model lands); B6 gate = traffic avoided > 0 (total view, incl. cross-warp); C1 warp presets {2,4,8,16,32}; C2 CTA presets {2,4,8,16,32,64}; C3 tiles {32,64,128,256}; C5 gridDim Params cap default 512; C6 incremental pruning + memoized judgments; D1 eviction pop = least traffic-value-per-byte; D2 post-eviction scoring; GoC counts expanded instances like MAPM; E1-E5 contract items (verify re-checks, launch derivation in codegen, runtime contract replacement, kernel-wide floors, sanctioned golden regen); F doc mechanics.
+
+**NEEDS AUTHOR RULING (3 items — genuine tradeoffs, no derivable answer):**
+- R1. **FRAG per-thread ceiling (C4):** keep MaxFragPerThread = 256 B as a hard gate alongside the 64 KB pool? Author's "both cost L1" defense addressed: only SPILLED registers cost L1 (local memory); unspilled FRAG lives in the separate 256 KB register file. Without the ceiling, 60 KB/thread passes the pool and spills — the cache becomes slower than GMEM.
+- R2. **GoC's authority (A3):** may granularity ever override real traffic differences? (a) tiebreak-only — traffic strictly primary, GoC breaks exact ties [rec: hypothetical utilization should never beat measurable bytes]; or (b) α-blend (α≈0.75) — but then the traffic term needs a defined per-LNT normalization for the blend to be meaningful.
+- R3. **Zero-cache outcome (D3):** when the budget forces evicting ALL sites: (a) allow the tiled-uncached schedule + emit a warning [rec: the whole point of eviction is graceful degradation; erroring at zero makes eviction useless for tight budgets]; or (b) hard error, fail-loud (matches project culture + the 2026-10-24 ruling's spirit, changes observable compiler behavior).
 
 1. **Doc finalization** — fold A/B/C/D answers into fix-opt-tile-search.md (+ the tier/cost formulas of B); author or a quick task.
 2. **Decide-half rewrite** — cost model (B) + searcher (A/C/D) in internal/opt/tiling with unit tests; verify checks updated (E1).
