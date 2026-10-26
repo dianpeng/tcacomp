@@ -183,25 +183,12 @@ func TestMatmulWorkedRecord(t *testing.T) {
 	}
 }
 
-// TestFix33WorkedExample pins the searched record over the fix4 §3.3
-// worked-example SHAPE (M=4096, N=2048, K=512, lhs[m][k], rhs[n][k],
-// DefaultParams).
-//
-// ⚠ §3.3 PIN DIVERGENCE (flagged for author ratification): the doc's
-// worked example names M=CTA/16/256, N=WARP/4/64, K=SEQ/64 (rhs SMEM
-// 4·64·64·4 = 65536 at cap, lhs FRAG 64·4 = 256 at cap, blockDim 128).
-// Under the implementer rulings AS WRITTEN (R-TRIPS' CTA trip
-// ceil(T/blockDim) × R-SHARING over the R-C1B bytes), that vector is NOT
-// the traffic maximum: the K=WARP factorization (window on K, N plain
-// sequential) yields a smaller blockDim (64), a 4-trip M walk, and
-// traffic 65536×3 + 128×255 = 229248 vs the §3.3 vector's 65792 — and it
-// wins at EVERY budget-feasible preset, so no tiebreak ever reaches the
-// §3.3 vector. The bytes signature still matches (rhs SMEM window at the
-// 64 KB cap; both sites promoted); the SoC assignment and the lhs bytes
-// differ. This test pins the implemented-model outcome; the divergence is
-// documented in the plan SUMMARY as the R-TRIPS-vs-§3.3 conflict.
-func TestFix33WorkedExample(t *testing.T) {
-	g := ir.NewGraph("fix33")
+// fix33Graph builds the fix4 §3.3 worked-example SHAPE (M=4096, N=2048,
+// K=512, lhs[m][k], rhs[n][k], out[m][n][k], fp32) — the shared fixture
+// of the two §3.3 pins: the searched record (TestFix33WorkedExample) and
+// the one-currency equality guard (TestFix33OneCurrencyEquality).
+func fix33Graph() (g *ir.Graph, lhs, rhs ir.Node, iters []ir.Node) {
+	g = ir.NewGraph("fix33")
 	u32 := ir.InternScalar(ir.TU32)
 	dims := []ir.Node{
 		g.NewInputParam("ctor", ir.RoleDim, "d0", nil),
@@ -215,7 +202,7 @@ func TestFix33WorkedExample(t *testing.T) {
 	out := g.NewInputParam("ctor", ir.RoleTensor, "out",
 		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}, {Name: "d1"}, {Name: "d2"}}))
 	var parent ir.Node
-	iters := make([]ir.Node, 3)
+	iters = make([]ir.Node, 3)
 	for i, e := range []float64{4096, 2048, 512} {
 		dv := g.NewDimVar("ctor", dims[i], g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
 		biv := g.NewBoundedDimVar("ctor", dv, g.NewConst("ctor", u32, e))
@@ -223,12 +210,32 @@ func TestFix33WorkedExample(t *testing.T) {
 		iters[i] = parent
 	}
 	iv := func(i int) ir.Node { return g.NewInductionVariable("ctor", iters[i]) }
-	lhs := g.NewMemLoad("ctor", lhsP, []ir.Node{iv(0), iv(2)})
-	rhs := g.NewMemLoad("ctor", rhsP, []ir.Node{iv(1), iv(2)})
+	lhs = g.NewMemLoad("ctor", lhsP, []ir.Node{iv(0), iv(2)})
+	rhs = g.NewMemLoad("ctor", rhsP, []ir.Node{iv(1), iv(2)})
 	prod := g.NewBinOp("ctor", ir.BinOpMul, lhs, rhs)
 	env := ir.NewEnv()
 	st := g.NewMemStoreChained("ctor", env, out, []ir.Node{iv(0), iv(1), iv(2)}, prod)
 	g.NewReturnChained("ctor", env, []ir.Node{out}, st)
+	return g, lhs, rhs, iters
+}
+
+// TestFix33WorkedExample pins the searched record over the fix4 §3.3
+// worked-example SHAPE (M=4096, N=2048, K=512, lhs[m][k], rhs[n][k],
+// DefaultParams) under the 2026-10-26 one-currency reuse amendment
+// (fix4 §2.4/§3.3 re-pin, amendment commit 85c7791).
+//
+// RESOLVED (the 261026-ky1 pin divergence, ratified by the amendment):
+// the pre-amendment reuse model mixed per-window bytes with per-thread
+// trips, so the doc's original N=WARP/K=SEQ vector and the implemented
+// winner disagreed on which warp-splits paid off. Under the amendment the
+// winner is exactly the §3.3 re-pin: M=CTA/16/256 (the R-LOCCAP cap
+// ceil(4096/256) = 16), N=SEQ/1/256, K=WARP/2/32, blockDim 64 — rhs SMEM
+// window 2·32·256·4 = 65536 at the MaxCache cap with COLLECTIVE reuse
+// T_M = 256 (was 4 under the per-thread model), lhs a 4 B lane-chunk
+// FRAG with per-thread reuse T_N = 256 (§2.7: FRAG record semantics stay
+// per-thread; the holders scaling lives only in the objective).
+func TestFix33WorkedExample(t *testing.T) {
+	g, lhs, rhs, iters := fix33Graph()
 
 	p := DefaultParams()
 	rec := runPass(t, g, p)
@@ -252,9 +259,101 @@ func TestFix33WorkedExample(t *testing.T) {
 			sl.Promoted, sl.Class, sl.Reuse, sl.Bytes)
 	}
 	sr, _ := rec.SiteDecisionOf(rhs)
-	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 4 {
-		t.Fatalf("rhs = (%v, %s, reuse %d, bytes %d), want promoted smem reuse 4 bytes 65536 (window K_k×T_k × T_n = 2·32·256·4 at the MaxCache cap; reuse = the M coupled walk ceil(256/64) = 4)",
+	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 256 {
+		t.Fatalf("rhs = (%v, %s, reuse %d, bytes %d), want promoted smem reuse 256 bytes 65536 (window K_k×T_k × T_n = 2·32·256·4 at the MaxCache cap; §2.4 collective reuse on ReuseDims {M}: CTA trips T_M = 256 — the old per-thread ceil(256/64) = 4 trips × 64 readers = the same collective 256)",
 			sr.Promoted, sr.Class, sr.Reuse, sr.Bytes)
+	}
+}
+
+// TestFix33OneCurrencyEquality is the fix4 §3.3 unit-consistency
+// regression guard (the amendment's acceptance clause, §9(2)): judged at
+// the window's OWN granularity, the rhs site of the §3.3 winner
+// (M=CTA/16/256, N=SEQ/1/256, K=WARP/2/32, blockDim 64) and of the
+// PRE-AMENDMENT example vector (M=CTA/16/256, N=WARP/4/64, K=SEQ/1/64,
+// blockDim 128) score EXACTLY equal — 65536 B windows, collective reuse
+// T_M = 256, sharing 1 (N and K are both in rhs's subscript set) —
+// traffic 65536×255 = 16711680 in both. The pre-amendment model broke
+// this equality (per-thread trips 4 vs 2), rewarding the warp-split for
+// shrinking blockDim without moving any wire bytes. The lhs then decides
+// HONESTLY between the tied vectors: the winner's 4 B lane-chunk FRAG
+// (per-thread reuse T_N = 256, holders 64) avoids 4×255×64 = 65280 B per
+// fill epoch vs the pre-amendment vector's 256 B FRAG (reuse
+// ceil(64/32) = 2, holders 128) at 256×1×128 = 32768 — the genuine
+// fill-cost difference invisible to the old model.
+func TestFix33OneCurrencyEquality(t *testing.T) {
+	g, lhs, rhs, iters := fix33Graph()
+	p := DefaultParams()
+
+	// rhs SiteFacts via the decide pass's own overlap stack.
+	se := sideeffect.Analyze(g)
+	forest := loopforest.Analyze(g)
+	allFacts := analyzeOverlap(g, forest, se, p)
+	if len(allFacts.Trees) != 1 {
+		t.Fatalf("the fix33 fixture must yield one LNT, got %d", len(allFacts.Trees))
+	}
+	facts := allFacts.Trees[0]
+	sfLhs := siteOf(t, facts, lhs)
+	sfRhs := siteOf(t, facts, rhs)
+
+	winner := map[ir.Node]IterDecision{
+		iters[0]: {SoC: SoCTA, LoC: 16, TileSize: 256},
+		iters[1]: {SoC: SoCSequential, LoC: 1, TileSize: 256},
+		iters[2]: {SoC: SoCWARP, LoC: 2, TileSize: 32},
+	}
+	preAmend := map[ir.Node]IterDecision{
+		iters[0]: {SoC: SoCTA, LoC: 16, TileSize: 256},
+		iters[1]: {SoC: SoCWARP, LoC: 4, TileSize: 64},
+		iters[2]: {SoC: SoCSequential, LoC: 1, TileSize: 64},
+	}
+	ctxWinner := blockDimCtx{blockDim: 64} // Π warp K × 32 = 2×32
+	ctxPre := blockDimCtx{blockDim: 128}   // 4×32
+	if bd := blockDimOf(winner); bd != ctxWinner.blockDim {
+		t.Fatalf("winner blockDim = %d, want 64", bd)
+	}
+	if bd := blockDimOf(preAmend); bd != ctxPre.blockDim {
+		t.Fatalf("pre-amendment blockDim = %d, want 128", bd)
+	}
+
+	// The rhs equality: both vectors promote the same 65536 B SMEM window
+	// at collective reuse 256 — traffic 16711680 EXACTLY (SMEM holders 1).
+	for _, tc := range []struct {
+		name  string
+		iters map[ir.Node]IterDecision
+		ctx   blockDimCtx
+	}{
+		{"winner", winner, ctxWinner},
+		{"pre-amendment", preAmend, ctxPre},
+	} {
+		j := judgeSite(sfRhs, tc.iters, tc.ctx, p)
+		if !j.promoted || j.class != ClassSMEM || j.bytes != 65536 || j.reuse != 256 {
+			t.Fatalf("%s rhs = (%v, %s, reuse %d, bytes %d), want promoted smem reuse 256 bytes 65536",
+				tc.name, j.promoted, j.class, j.reuse, j.bytes)
+		}
+		if got := j.bytes * (j.reuse - 1); got != 16711680 {
+			t.Fatalf("%s rhs traffic = %d, want exactly 16711680 (65536 × 255)", tc.name, got)
+		}
+	}
+
+	// The lhs margin: the honest fill-cost difference that decides between
+	// the rhs-tied vectors (FRAG traffic is holders-scaled to the same
+	// CTA-wide currency — per-thread bytes × trips × blockDim readers).
+	jw := judgeSite(sfLhs, winner, ctxWinner, p)
+	if !jw.promoted || jw.class != ClassFRAG || jw.bytes != 4 || jw.reuse != 256 {
+		t.Fatalf("winner lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 256 bytes 4",
+			jw.promoted, jw.class, jw.reuse, jw.bytes)
+	}
+	jp := judgeSite(sfLhs, preAmend, ctxPre, p)
+	if !jp.promoted || jp.class != ClassFRAG || jp.bytes != 256 || jp.reuse != 2 {
+		t.Fatalf("pre-amendment lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 2 (ceil(64/32)) bytes 256",
+			jp.promoted, jp.class, jp.reuse, jp.bytes)
+	}
+	tw := jw.bytes * (jw.reuse - 1) * ctxWinner.blockDim
+	tp := jp.bytes * (jp.reuse - 1) * ctxPre.blockDim
+	if tw != 65280 || tp != 32768 {
+		t.Fatalf("lhs traffic = (%d, %d), want (65280 = 4×255×64, 32768 = 256×1×128)", tw, tp)
+	}
+	if tw <= tp {
+		t.Fatalf("the winner's lhs must beat the pre-amendment lhs on honest fill cost: %d vs %d", tw, tp)
 	}
 }
 
@@ -728,14 +827,33 @@ func TestPromotionJudge(t *testing.T) {
 		t.Fatalf("a covered iter at tile 1 must fail closed with ReasonUnknownIter, got (%v, %q)", j.promoted, j.reason)
 	}
 
-	// Reuse < 2 declines: rhs's only reuse dim is M; with M the CTA dim at
-	// T=64 over blockDim 256 the coupled walk gives ceil(64/256) = 1 trip.
+	// Low-reuse decline under the §2.4 one-currency gate — (a) the FRAG
+	// shape: lhs (covered {K}) under M=cta/16/32, N=warp/8/32, K=seq/1/32
+	// is C1b-forced FRAG (M is a thread-varying non-covered coordinate) at
+	// 32×4 = 128 B with per-thread reuse ceil(32/32) = 1 on ReuseDims {N}
+	// — no traffic avoided in ANY currency. (The old rhs shape — M-CTA
+	// reuse 1 — can no longer fire: SMEM collective trips on a CTA dim
+	// are T_d itself, blockDim-independent, always >= 2.)
+	iters, ctx = soc(
+		IterDecision{SoCTA, 16, 32}, IterDecision{SoCWARP, 8, 32}, IterDecision{SoCSequential, 1, 32})
+	j = judgeSite(sl, iters, ctx, p)
+	if j.promoted || j.reason != ReasonLowReuse || j.reuse != 1 || j.bytes != 128 {
+		t.Fatalf("lhs must decline with per-thread reuse 1 (128 B FRAG, the N lane chunk is a single trip), got (%v, %q, reuse %d, bytes %d)",
+			j.promoted, j.reason, j.reuse, j.bytes)
+	}
+	// (b) The OLD rhs vector (M=cta/16/64, N=warp/8/64, K=seq/64,
+	// blockDim 256) now PROMOTES: SMEM collective trips on the M CTA dim
+	// are T_M = 64 — the per-thread ceil(64/256) = 1 × 256 readers cancel,
+	// documenting that collective reuse is blockDim-independent (the
+	// phantom warp-split reward died with the amendment). Judge-level
+	// promotion only — the 131072 B window is schedule-level budget
+	// business (eviction), not the judge's.
 	iters, ctx = soc(
 		IterDecision{SoCTA, 16, 64}, IterDecision{SoCWARP, 8, 64}, IterDecision{SoCSequential, 1, 64})
 	j = judgeSite(sr, iters, ctx, p)
-	if j.promoted || j.reason != ReasonLowReuse || j.reuse != 1 {
-		t.Fatalf("rhs must decline with reuse 1 when the M coupled walk is a single trip, got (%v, %q, reuse %d)",
-			j.promoted, j.reason, j.reuse)
+	if !j.promoted || j.class != ClassSMEM || j.reuse != 64 || j.bytes != 8*64*64*4 {
+		t.Fatalf("the old rhs vector must promote at collective reuse 64 (CTA trips = T_M, blockDim-independent), got (%v, %s, reuse %d, bytes %d)",
+			j.promoted, j.class, j.reuse, j.bytes)
 	}
 }
 
@@ -750,6 +868,14 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	rec := runPass(t, fx.g, p)
 
 	facts := overlapOf(fx, p)
+	// blockDim is the one-currency FRAG holders scale (§2.4: threads that
+	// fill a window per epoch = the LNT's (Π warp K) × 32).
+	blockDim := 32
+	for _, d := range rec.Iters {
+		if d.SoC == SoCWARP {
+			blockDim *= d.LoC
+		}
+	}
 	// Independent class + bytes + reuse over the record's own schedule.
 	classAndBytes := func(sf SiteFacts) (CacheClass, int, int, bool) {
 		coveredSet := make(map[ir.Node]bool, len(sf.Covered))
@@ -794,10 +920,22 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 			}
 			bytes *= perDim
 		}
-		blockDim := 32
-		for _, d := range rec.Iters {
-			if d.SoC == SoCWARP {
-				blockDim *= d.LoC
+		// §2.4 one-currency reuse: SMEM counts COLLECTIVE per-window
+		// trips (CTA/WARP -> T_d — the per-thread trip count and the
+		// reader count cancel; SEQ -> T_d × readers, readers 32 for a
+		// warp-sliced window); FRAG keeps the PER-THREAD trips (the
+		// holders scaling to the CTA-wide currency lives in the traffic
+		// arithmetic, not the reuse count).
+		readers := 32
+		if class == ClassSMEM {
+			warpSliced := false
+			for _, c := range sf.Covered {
+				if decisionOf(t, rec, c).SoC == SoCWARP {
+					warpSliced = true
+				}
+			}
+			if !warpSliced {
+				readers = blockDim // defensive: CTA-shared window
 			}
 		}
 		reuse := 1
@@ -806,9 +944,21 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 			tr := d.TileSize
 			switch d.SoC {
 			case SoCTA:
-				tr = ceilDiv(d.TileSize, blockDim)
+				if class == ClassSMEM {
+					tr = d.TileSize
+				} else {
+					tr = ceilDiv(d.TileSize, blockDim)
+				}
 			case SoCWARP:
-				tr = ceilDiv(d.TileSize, 32)
+				if class == ClassSMEM {
+					tr = d.TileSize
+				} else {
+					tr = ceilDiv(d.TileSize, 32)
+				}
+			case SoCSequential:
+				if class == ClassSMEM {
+					tr = d.TileSize * readers
+				}
 			}
 			reuse *= tr
 		}
@@ -838,9 +988,24 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 		}
 	}
 
+	// One-currency traffic (§2.4/§2.5): bytes × (reuse − 1) × holders with
+	// holders = 1 for SMEM sites (the window is filled collectively once)
+	// and the LNT blockDim for FRAG sites (each holder thread fills its own
+	// private window) — every site class in the same CTA-wide GMEM-byte
+	// currency.
+	trafficOf := func(sd SiteDecision) int {
+		if !sd.Promoted {
+			return 0
+		}
+		holders := 1
+		if sd.Class == ClassFRAG {
+			holders = blockDim
+		}
+		return sd.Bytes * (sd.Reuse - 1) * holders
+	}
 	traffic, smem, frag := 0, 0, 0
 	if sl.Promoted {
-		traffic += sl.Bytes * (sl.Reuse - 1)
+		traffic += trafficOf(sl)
 		if sl.Class == ClassSMEM {
 			smem += sl.Bytes
 		} else {
@@ -848,7 +1013,7 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 		}
 	}
 	if sr.Promoted {
-		traffic += sr.Bytes * (sr.Reuse - 1)
+		traffic += trafficOf(sr)
 		if sr.Class == ClassSMEM {
 			smem += sr.Bytes
 		} else {
@@ -964,15 +1129,39 @@ func enumerateBest(t *testing.T, fx fixture, p Params) int {
 					}
 					bytes *= perDim
 				}
+				// §2.4 one-currency reuse: SMEM = collective per-window
+				// trips (CTA/WARP -> T_d; SEQ -> T_d × readers, readers 32
+				// warp-sliced / blockDim defensively); FRAG = per-thread
+				// trips; SMEM keeps the cross-warp sharing tail.
+				readers := 32
+				if class == ClassSMEM {
+					warpSliced := false
+					for _, c := range sf.Covered {
+						if iters[c].SoC == SoCWARP {
+							warpSliced = true
+						}
+					}
+					if !warpSliced {
+						readers = blockDim
+					}
+				}
 				reuse := 1
 				for _, rd := range sf.ReuseDims {
 					d := iters[rd]
 					tr := d.TileSize
 					switch d.SoC {
 					case SoCTA:
-						tr = ceilDiv(d.TileSize, blockDim)
+						if class != ClassSMEM {
+							tr = ceilDiv(d.TileSize, blockDim)
+						}
 					case SoCWARP:
-						tr = ceilDiv(d.TileSize, 32)
+						if class != ClassSMEM {
+							tr = ceilDiv(d.TileSize, 32)
+						}
+					case SoCSequential:
+						if class == ClassSMEM {
+							tr = d.TileSize * readers
+						}
 					}
 					reuse *= tr
 				}
@@ -984,12 +1173,16 @@ func enumerateBest(t *testing.T, fx fixture, p Params) int {
 						}
 					}
 				}
+				holders := 1
+				if class == ClassFRAG {
+					holders = blockDim
+				}
 				ok2 := true
 				if class == ClassFRAG && bytes > p.MaxFragPerThread {
 					ok2 = false
 				}
-				if reuse < 2 {
-					ok2 = false
+				if bytes*(reuse-1)*holders <= 0 {
+					ok2 = false // one-currency gate: no traffic avoided
 				}
 				sites = append(sites, site{bytes: bytes, reuse: reuse, class: class, ok: ok2})
 			}
@@ -1038,7 +1231,11 @@ func enumerateBest(t *testing.T, fx fixture, p Params) int {
 			score := 0
 			for _, s := range sites {
 				if s.ok {
-					score += s.bytes * (s.reuse - 1)
+					holders := 1
+					if s.class == ClassFRAG {
+						holders = blockDim
+					}
+					score += s.bytes * (s.reuse - 1) * holders
 				}
 			}
 			if score > best {

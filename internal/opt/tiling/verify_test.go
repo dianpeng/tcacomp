@@ -337,13 +337,39 @@ func TestVerifyForLoopStep(t *testing.T) {
 }
 
 // TestVerifyKernelWideFragGate pins the F6 kernel-wide gate at the verify
-// side: a genuine FRAG-promoting record (32 B at tile 8) verifies green
-// under the mirrored params, and the recomputed kernel-wide FRAG sum is
-// gated against THIS pass's MaxFragPerThread — a 31-byte budget flags it.
+// side: a genuine FRAG-promoting record verifies green under the mirrored
+// params, and the recomputed kernel-wide FRAG sum is gated against THIS
+// pass's MaxFragPerThread — a 31-byte budget flags it.
+//
+// §2.4 sweep (2026-10-26 amendment) — the pin STAYS at 32 B, and here is
+// the full hand derivation why (the plan's round-2 draft expected a flip
+// to a 4 B K=WARP winner; that draft forgot the §2.6 eviction collateral,
+// see the SUMMARY deviation note):
+//
+//   - The K=WARP vector (M=CTA/…/8, N=SEQ/1/8, K=WARP/K_d/8) judges lhs
+//     as a 4 B lane-chunk FRAG, reuse 8, holders K_d·32 — traffic
+//     4×7×(K_d·32) = 896·K_d (28672 at K_d=32), and rhs as an
+//     8×(K_d·8)×4 = 256·K_d B SMEM window (≥ 512 B > MaxCache 100).
+//     BUT eviction is part of the score: density = reuse − 1 ties at 7
+//     (lhs per-thread 8, rhs collective T_M = 8), and the UNCHANGED
+//     §2.6 tie-break (smaller bytes first) drops the 4 B lhs BEFORE the
+//     8192 B rhs — the vector evacuates BOTH sites and scores 0.
+//   - The all-SEQ-covered vector (M=CTA/64/8, N=SEQ/1/8, K=SEQ/1/8,
+//     blockDim 32) judges lhs as a 32 B FRAG at reuse 8 (the N walk),
+//     traffic 32×7×32 = 7168; rhs is a 256 B FRAG (≤ MaxFragPerThread —
+//     ReasonFragBytes cannot fire) that declines ReasonLowReuse on the M
+//     CTA dim (per-thread ceil(8/32) = 1 trip). No SMEM exists, nothing
+//     evicts, score 7168 > 0 — TRAFFIC decides; the partitionCount
+//     tiebreak never comes into play.
+//
+// So the searched winner keeps exactly one 32 B promoted FRAG site, and
+// the 31-byte tight budget still fires (32 > 31). The amendment DID move
+// this fixture's arithmetic (rhs now declines for low reuse instead of
+// pricing out; K=WARP vectors now die in eviction) — but not the sum.
 func TestVerifyKernelWideFragGate(t *testing.T) {
 	fx, _, _ := matmul()
 	decideP := DefaultParams()
-	decideP.TileSizes = []int{8} // FRAG-friendly: lhs = 4·8 = 32 B, reuse 8
+	decideP.TileSizes = []int{8} // single tile preset: every dim tiles at 8
 	decideP.MaxCache = 100       // SMEM windows never fit: the FRAG tier wins
 
 	cache, rec := runDecide(t, fx.g, decideP)
@@ -354,7 +380,7 @@ func TestVerifyKernelWideFragGate(t *testing.T) {
 		}
 	}
 	if promotedFrag != 32 {
-		t.Fatalf("the fixture must promote exactly one 32 B FRAG site, got %d B", promotedFrag)
+		t.Fatalf("the fixture must promote exactly one 32 B FRAG site (the K=WARP challenger scores 0 after §2.6 eviction — see the derivation above), got %d B", promotedFrag)
 	}
 	if err := verifyWith(fx.g, cache, decideP); err != nil {
 		t.Fatalf("verify must be green under the mirrored params: %v", err)

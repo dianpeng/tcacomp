@@ -251,7 +251,11 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 	for _, s := range sites {
 		if s.j.promoted {
 			promoted++
-			res.score += s.j.bytes * (s.j.reuse - 1)
+			// One CTA-wide currency (fix4 §2.4 amendment / §2.5): SMEM
+			// windows are filled collectively (holders 1), FRAG windows
+			// by each of the blockDim holder threads — bytes × (reuse − 1)
+			// × holders is CTA-wide GMEM bytes avoided for every class.
+			res.score += s.j.bytes * (s.j.reuse - 1) * s.j.holders
 		}
 		res.sites[s.sf.Load.BasePtr().ID()] = SiteDecision{
 			Promoted: s.j.promoted, Tie: s.sf.Tie, Class: s.j.class,
