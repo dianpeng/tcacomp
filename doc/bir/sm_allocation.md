@@ -1,0 +1,97 @@
+# Perform a Register Allocation for all **SMEM**
+
+- Perform a simple RA to calculate **maximum needed bytes for whole program's SMEM usage**
+  - SMEM is inserted as cache during the loop tiling
+
+- This pass runs after all optimization are done
+  - It is in **AST/CFG**
+  - Setup a specific name for AST/CFG ir node, call it bir (block ir)
+    - internal/bir/opt/ => BLOCKIR related optimization pass
+  - Refactory internal/ir/ BIR related code to show the concept of bir
+  
+# Overview
+
+- Liveness Analysis
+  - 1) Put into internal/bir/opt/ folder
+  - 2) Works on **AST Graph**
+    - AFTER final lowering
+  - 3) Algorithm
+    - 3.1) Linearize all BBs in ASTGraph with **RPO number**
+      - [1] Visiting the BB **forward -> backward**
+      - [2] Using **POST ORDER** method and record the order
+        - For each BB, setup a 2 dimension array uint64 order[2][]
+        - This is number_map
+        - Setup a counter uint64 = 0
+        - For each currently visited BB
+          - order[0] = append <BB's ID>
+          - order[1] = append <BB's corresponding visiting counter>
+      - [3] Reverse the visiting counter to obtain **RPO number, ie reverse post-order**
+      - [4] Now we have a IR NODES -> RPO number mapping
+    - 3.2) Liveness Analysis
+      - [1] Visiting the BB ascendingly based on **RPO NUMBER**
+        - RPO number 0 -> 1 -> 2 ....
+        - RPO repsect dominance relationship, hence no need to **the backwards visiting**
+      - [2] Visiting all statements in BB following RPO just setup
+        - Notes: SSAUse can be used for dedup, hence we will not have alias for SMEM
+        - If the statement
+          - 1) It is a NewSMem
+            - Notes, since all NewSMem is hoisted, DO NOT UPDATE START TIMESTAMP when we meet NewSMem
+              - Otherwise ALL SMem always have a interval from very early to the last of its use
+              - This is invalid
+            - U can setup a entry in ur tracking record, but this is not the **Start**
+          - 2) It is an expression that **Reference NewSMem**
+            - If NewSMem's start timestamp is unset
+              - set it to timestamp for now
+              - THIS IS acurate **first use/start**
+            - Otherwise
+              - It is a reference/use
+              - Update its last USE timestamp
+          - 3) Otherwise ignore, not interested
+        - 2.0) Timestamp is a **ordered tuple**
+          - (<rpo-number>, <statement-ts>)
+            - statement-ts:
+              - index of the current statement starting from 0
+              - NOTES: given <statement-ts>, denoted as I
+                - it means the statement I's **input state**, ie state before execution
+                - I + 1 means **statement I has been executed** and it is the same as **next statement, ie I + 1 before execution**
+        - 2.1) If it is not seen before, insert it into the record with **defined timestamp**
+          - Also record the storage/shape for this SMEM, we need to calculate total bytes
+        - 2.2) Otherwise update its **last use timestamp**
+      - [3] Once all BBs are done, we are ending up with all SMEM liveness interval information
+        - 1) interval: [start, end]
+        - 2) storage: shape/dtype/byte size
+
+
+- Register Allocation via **Linear Scan**
+  - The problem we want to resolve is
+    - Figure out the **maximum needed SMEM for all SMEM cache**
+      - Obviously each SMEM cache, as long as their liveness interval allowed, can reuse
+    - No need to do color graph
+      - We do not spill
+      - We just measure, with current instruction scheduling, upper bound of the SMEM usage
+  - Algorithm
+    - 1) Building a priority queue with start of all SMEM sites
+      - min heap
+    - 2) Before loop
+      - Setup a queue to represent each NewSMem's status, denoted as AllocQueue
+        - Alive/Dead
+        - The initial assignment of SMEM
+          - Notes assuming SMEM is a flatten 1D memory pool
+          - The assignment must show offset from base and allowed size in SMEM
+          - The View at runtime will map it into multi-dim tensor
+      - Maximum SMEM bound up to now
+        - Described later
+      - A global timestamp, representing the current visiting timestamp
+    - 3) Visiting each NewSMem in queue
+      - NOTES: each NewSMem means a **new SMEM instance**
+      - 3.1) Get its start timestamp, and update it to be current timestamp
+      - 3.2) For all NewSMem in the queue, if its end timestamp is less than current timestamp
+        - Remove it from the AllocQueue, ie dead slot removed
+      - 3.3) Adding the current NewSMem into the queue
+        - Setup its assignment etc ...
+      - 3.4) Calculate the current queue's **maximum needed bytes**
+        - If this value is larger than the tracked upper bound, update it
+
+    - 4) After the RA, we end up with
+      - 4.1) For each NewSMem's specific allocation, ie (offset, size)
+      - 4.2) Total needed SMEM upper bound
