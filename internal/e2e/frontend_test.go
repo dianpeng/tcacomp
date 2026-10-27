@@ -226,43 +226,54 @@ func feLineContains(src, want string) bool {
 	return false
 }
 
-// fePinScheduleSignature pins the fix4 §5.1 launch derivation on the emitted
-// frontend fixture (quick-261027-iq6 T6a, fix4 §8/§9(1)). The feM=64,
-// feN=128, feQ=64 kernel's selected schedule class is the ZERO-WARP
-// admission + ZERO-CACHE outcome:
+// fePinScheduleSignature pins the fix4 §3.5 SPLIT-K schedule class on the
+// emitted frontend fixture (quick-261027-kzv T8a: the Wave-2 flip makes the
+// feM=64, feN=128, feQ=64 matmul_scale the dedicated split-k kernel — the
+// fix4 §8 staged item). The selected schedule is the §3.5 vector
+// M=CTA(T=256,LoC=64) × N(reduced)=WARP(K=2,T=32) × Q=SEQ(T=256):
 //
-//   - gridDim 64 = Π CTA LoC over the LNT's CTA dims (M=CTA at its
-//     extent-capped LoC; every other window dim SEQ), emitted as a literal
-//     dim3 in both the launch and ValidateLaunch;
-//   - blockDim 32 = (Π warp K)×32 floored at 32 with NO WARP-assigned dim —
-//     the zero-warp admission class (one physical warp);
-//   - smem 0u — the zero-cache outcome fix4 §2.6 allows with a warning
-//     (both sites declined/evicted: every covered dim SEQ ⇒ FRAG at 4 B, or
-//     refused C1b), so no dynamic SMEM is requested;
+//   - gridDim 64 = Π CTA LoC over the LNT's CTA dims (M=CTA/64), emitted
+//     as a literal dim3 in both the launch and ValidateLaunch;
+//   - blockDim 64 = (Π warp K=2)×32 — two physical warps split the reduced
+//     N dim (the split-k vector);
+//   - smem 65544u = 65536 B rhs SMEM window (the MaxCache cap) + 8 B
+//     reducer staging row (`tca_smem + 65536u`, extent 2u = #warps) at a
+//     disjoint offset — the v0 pool never overlaps;
 //   - 512u — the MaxCTAPolicy constant (cg.Options), the 4th ValidateLaunch
 //     arg of the 4-arg contract (fix4 §4.3);
-//   - __launch_bounds__(32) — the derived blockDim (fix4 §5.1 replaces the
-//     retired MaxThreadsPerCTA).
+//   - __launch_bounds__(64) — the derived blockDim (fix4 §5.1);
+//   - the WarpReducer bracket: construction with the combine function +
+//     thread map + staging view, per-element [Init() → N tile-between
+//     ThrIterator rounds (K_d·T_d = 2×32 = 64 stride) with lane-chunk
+//     inside walks → Reduce(value) per element → Combine()], and the
+//     single-owner store gated on is_first_in_cta().
 //
 // Hermetic by design: the pin catches schedule-class drift in every
 // `go test` pass, no GPU required; the numerical acceptance of this exact
-// schedule runs in TestFrontendMatmulScale on the A6000. If a legitimate
-// defect fix changes the emission, re-derive from the freshly emitted .cu
-// and re-pin in the same commit — never force a schedule to match a pin.
+// schedule runs in TestFrontendMatmulScale on the A6000 (the dedicated
+// fix4 §3.5 split-k matmul e2e). If a legitimate defect fix changes the
+// emission, re-derive from the freshly emitted .cu and re-pin in the same
+// commit — never force a schedule to match a pin.
 func fePinScheduleSignature(t *testing.T, files map[string][]byte) {
 	t.Helper()
 	pins := []struct{ name, want string }{
-		{"derived __launch_bounds__ (blockDim floor 32)", "__launch_bounds__(32)"},
-		{"4-arg ValidateLaunch (literal derived dim3 grid/block, smem 0u, MaxCTAPolicy 512u)",
-			"ValidateLaunch(dim3(64u, 1u, 1u), dim3(32u, 1u, 1u), 0u, 512u)"},
-		{"literal dim3 kernel launch", "<<<dim3(64u, 1u, 1u), dim3(32u, 1u, 1u)"},
+		{"derived __launch_bounds__ (blockDim 64 = 2 warps)", "__launch_bounds__(64)"},
+		{"4-arg ValidateLaunch (literal derived dim3 grid/block, smem 65544u, MaxCTAPolicy 512u)",
+			"ValidateLaunch(dim3(64u, 1u, 1u), dim3(64u, 1u, 1u), 65544u, 512u)"},
+		{"literal dim3 kernel launch", "<<<dim3(64u, 1u, 1u), dim3(64u, 1u, 1u), 65544u"},
+		{"§3.5 WarpReducer construction (combine fn, thread map, disjoint staging row at 65536)",
+			"tca::rt::WarpReducer<float> reducer0("},
+		{"§3.5 reducer staging row: #warps x sizeof(T) at tca_smem + 65536, extent 2",
+			"tca_smem + 65536u), 2u)"},
+		{"§3.5 reduced-dim N tile-between rounds, K_d*T_d = 64 stride",
+			"ThrIterator(thread_map1, 0u, 2u, 0u, 64u,"},
 	}
 	for name, content := range files {
 		src := string(content)
 		for _, pin := range pins {
 			if !feLineContains(src, pin.want) {
-				t.Fatalf("e2e: emitted %s lost the fix4 §5.1 schedule signature — %s: no line matches %q\n"+
-					"zero-warp admission (blockDim floor 32), zero-cache (smem 0u, §2.6 allowed outcome), MaxCTAPolicy 512",
+				t.Fatalf("e2e: emitted %s lost the fix4 §3.5 split-k schedule signature — %s: no line matches %q\n"+
+					"M=CTA/64 x N(reduced)=WARP/2 x Q=SEQ; smem 65544 = 65536 rhs window + 8 reducer staging",
 					name, pin.name, pin.want)
 			}
 		}
@@ -275,8 +286,8 @@ func fePinScheduleSignature(t *testing.T, files map[string][]byte) {
 // included, the gate the pre-fix1 body model failed on this exact shape —
 // and emit a non-empty .cu. No GPU and no nvcc: the assertion ends at the
 // emitted files, so this runs in every hermetic `go test` pass. The written
-// variant additionally pins the fix4 §5.1 launch-signature class
-// (fePinScheduleSignature). The GPU numerical acceptance lives in
+// variant additionally pins the fix4 §3.5 split-k launch/reducer signature
+// class (fePinScheduleSignature). The GPU numerical acceptance lives in
 // TestFrontendMatmulScale (fix3 D-p: green, no skip — both variants within
 // reduceTol, canary 0).
 func TestFrontendMatmulScalePipeline(t *testing.T) {

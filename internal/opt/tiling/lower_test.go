@@ -1033,11 +1033,13 @@ func warpReduceFx(t *testing.T) fixture {
 }
 
 // TestLowerWarpReducedDimRejected pins the fix4 §3.5 Wave-1 defense in
-// depth: while Params.ReducedDimWarp is false, a WARP-assigned dim whose
-// IV data-dep closure feeds a Reduce FAILS CLOSED with a named error —
-// the split-k reducer wiring is Wave 2, and the pipeline must stop loudly
-// rather than emit an undesigned lowering. The decide-side feasible-area
-// gate prunes these; this is the lower's backstop over crafted records.
+// depth, now the EXPLICIT-false opt-out mode: while Params.ReducedDimWarp
+// is explicitly false, a WARP-assigned dim whose IV data-dep closure feeds
+// a Reduce FAILS CLOSED with a named error — the pipeline must stop loudly
+// rather than emit a lowering outside the policy. The decide-side
+// feasible-area gate prunes these under the same flag; this is the lower's
+// backstop over crafted records. Under DefaultParams (Wave 2) the defense
+// stands down: the default admits §3.5 split-k lowering.
 func TestLowerWarpReducedDimRejected(t *testing.T) {
 	fx := warpReduceFx(t)
 	rec := recordOf(t, fx, map[int]IterDecision{
@@ -1046,16 +1048,18 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	}, nil)
 	cache := opt.NewCache()
 	cache.Put(rec)
-	err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
+	p := DefaultParams()
+	p.ReducedDimWarp = false
+	err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
 	if err == nil || !strings.Contains(err.Error(), "fix4 3.5") {
-		t.Fatalf("a WARP-assigned reduced dim must fail closed naming fix4 3.5 (Wave-1 defense), got %v", err)
+		t.Fatalf("a WARP-assigned reduced dim must fail closed naming fix4 3.5 (explicit-false opt-out), got %v", err)
 	}
 	if !strings.Contains(err.Error(), "ReducedDimWarp") {
 		t.Fatalf("the defense error must name the ReducedDimWarp capability gate, got %v", err)
 	}
 
 	// Positive control: the same shape with the reduced dim SEQ lowers
-	// clean (Wave 1's legal schedule — the zero-WARP LNT).
+	// clean under the explicit-false policy (the zero-WARP LNT).
 	fx2 := warpReduceFx(t)
 	rec2 := recordOf(t, fx2, map[int]IterDecision{
 		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
@@ -1064,9 +1068,12 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	runLower(t, fx2.g, rec2)
 	assertVerifyAndRootReachable(t, fx2.g)
 
-	// The capability gate owns the defense: with ReducedDimWarp true (the
-	// Wave-2 flag) the defense stands down — the lower no longer rejects
-	// the shape (Wave-2 lowering itself is future work, out of scope here).
+	// Default-admits policy: with DefaultParams (ReducedDimWarp true — the
+	// Wave-2 default) the defense must NOT fire on the same WARP-reduced
+	// record — §3.5 split-k lowering is legal under the default.
+	if !DefaultParams().ReducedDimWarp {
+		t.Fatal("DefaultParams().ReducedDimWarp must be true (Wave 2) for the default-admits policy")
+	}
 	fx3 := warpReduceFx(t)
 	rec3 := recordOf(t, fx3, map[int]IterDecision{
 		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
@@ -1074,10 +1081,8 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	}, nil)
 	cache3 := opt.NewCache()
 	cache3.Put(rec3)
-	p := DefaultParams()
-	p.ReducedDimWarp = true
-	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
-		t.Fatalf("with ReducedDimWarp=true the Wave-1 defense stands down, got %v", err)
+	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
+		t.Fatalf("with DefaultParams (ReducedDimWarp=true) the Wave-1 opt-out defense stands down, got %v", err)
 	}
 }
 

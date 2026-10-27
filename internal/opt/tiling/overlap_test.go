@@ -389,7 +389,8 @@ func TestSiteFactsReaders(t *testing.T) {
 // TestDefaultParams pins the fix4 §2.1 defaults: window K=4, tiles
 // {32,64,128,256}, CTA LoC presets {2,4,8,16,32,64}, warp presets
 // {2,4,8,16,32}, MAPM caps 3/3, MaxCTA 512, MaxWarpsPerCTA 32, 64 KB
-// SMEM, 256 B/thread FRAG, CacheDims 2, MaxCS 16, ReducedDimWarp false.
+// SMEM, 256 B/thread FRAG, CacheDims 2, MaxCS 16, ReducedDimWarp true
+// (Wave 2, fix4 §3.5 split-k enabled).
 func TestDefaultParams(t *testing.T) {
 	p := DefaultParams()
 	if p.WindowK != 4 {
@@ -404,8 +405,8 @@ func TestDefaultParams(t *testing.T) {
 	if p.MaxPartitionCta != 3 || p.MaxPartitionThr != 3 {
 		t.Fatalf("MAPM caps must be 3/3, got %d/%d", p.MaxPartitionCta, p.MaxPartitionThr)
 	}
-	if p.ReducedDimWarp {
-		t.Fatal("ReducedDimWarp default must be false (Wave 1)")
+	if !p.ReducedDimWarp {
+		t.Fatal("ReducedDimWarp default must be true (Wave 2, fix4 3.5 split-k enabled)")
 	}
 	if p.MaxCache != 65536 || p.MaxFragPerThread != 256 || p.CacheDims != 2 || p.MaxCS != 16 || p.NominalExtent != 4096 {
 		t.Fatalf("secondary defaults changed: %+v", p)
