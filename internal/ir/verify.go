@@ -177,8 +177,9 @@ func checkNodeUseDef(n Node, vs *[]Violation) {
 // fill annotation convention, LO-01/quick-261021-o61 T5) are pinned
 // well-formed — at most one per key, each with a const value; a runtime map
 // query holds either exactly one const-u32 DoSoC operand and a field in
-// {index, dimension}, or the zero-operand FLAT form (field "index" only —
-// the flat-index() ruling 2026-10-23) (§5 companion 3); the
+// {index, dimension}, or the zero-operand FLAT form (fields "index" and
+// "lane_id" — the flat-index() ruling 2026-10-23, the lane vocabulary of
+// fix4 §3.1) (§5 companion 3); the
 // runtime-object family's P-3 shape cross-checks (KernelInfo operand-free,
 // mapping portion grammar, reducer (init, lambda) pair, closed method/
 // attribute vocabularies with their object domains); an
@@ -298,18 +299,27 @@ func checkNodeShape(n Node, vs *[]Violation) {
 		}
 	case *runtimeQueryNode:
 		// §5 companion 3 (quick-261021-jay, renamed LR-6), extended by the
-		// flat-index() ruling (2026-10-23): EITHER exactly one operand — the
-		// DoSoC const u32 — OR the ZERO-OPERAND flat form, legal ONLY for
-		// field "index" (the absolute flattened 1-D rank). The field payload
-		// must be a known query selector.
+		// flat-index() ruling (2026-10-23) and the lane vocabulary (fix4
+		// §3.1, T4): EITHER exactly one operand — the DoSoC const u32 — OR
+		// the ZERO-OPERAND flat form, legal for field "index" (the absolute
+		// flattened 1-D rank) and "lane_id" (the lane within the warp — a
+		// pure function of the flat rank, no map dimension). The field
+		// payload must be a known query selector.
 		switch {
 		case len(OperandsOf(t)) == 0:
-			// The flat form: index-only ("dimension" demands the DoSoC).
-			if t.field != "index" {
+			// The flat family: index/lane_id only ("dimension" demands the
+			// DoSoC; "lane_id" has no map dimension at all).
+			if t.field != "index" && t.field != "lane_id" {
 				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("runtime map query field %q carries no DoSoC operand — the zero-operand flat form is legal only for field \"index\"", t.field)))
+					fmt.Sprintf("runtime map query field %q carries no DoSoC operand — the zero-operand flat form is legal only for fields \"index\" and \"lane_id\"", t.field)))
 			}
 		case len(OperandsOf(t)) == 1:
+			// The DoSoC form is dimension-addressed: "lane_id" is the
+			// ZERO-OPERAND pure-rank form and must never carry one.
+			if t.field == "lane_id" {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					"runtime map query field \"lane_id\" carries a DoSoC operand — the lane is a pure function of the flat rank and takes the zero-operand form"))
+			}
 			if d := operandAt(t, 0); d != nil {
 				c, ok := d.(*constNode)
 				if !ok {
@@ -322,13 +332,13 @@ func checkNodeShape(n Node, vs *[]Violation) {
 			}
 		default:
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				"runtime map query must hold exactly one operand (the DoSoC const) or none (the flat index form)"))
+				"runtime map query must hold exactly one operand (the DoSoC const) or none (the flat index/lane_id form)"))
 		}
 		switch t.field {
-		case "index", "dimension":
+		case "index", "dimension", "lane_id":
 		default:
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("runtime map query field %q must be \"index\" or \"dimension\"", t.field)))
+				fmt.Sprintf("runtime map query field %q must be \"index\", \"dimension\", or \"lane_id\"", t.field)))
 		}
 	case *runtimeKernelInfoNode:
 		// LR-4 (quick-261022-l1o): the kernel information object carries NO
@@ -412,7 +422,9 @@ func checkNodeShape(n Node, vs *[]Violation) {
 	case *runtimeGetAttributeNode:
 		// P-3: the attribute vocabulary is closed; "total_*" applies to a
 		// KernelInfo object with NO extra args; "index"/"dimension" to a
-		// mapping object with EXACTLY ONE const-u32 arg.
+		// mapping object with EXACTLY ONE const-u32 arg; "lane_id" (fix4
+		// §3.1, T4) to a mapping object with ZERO args (the lane is a pure
+		// function of the flat rank — no map dimension).
 		switch t.attribute {
 		case "total_cta", "total_thread_per_cta":
 			if obj := operandAt(t, 0); obj != nil && obj.KindOf() != KindRuntimeKernelInfo {
@@ -449,9 +461,18 @@ func checkNodeShape(n Node, vs *[]Violation) {
 						fmt.Sprintf("runtimegetattribute %q arg must be a const-u32 DoSoC", t.attribute)))
 				}
 			}
+		case "lane_id":
+			if obj := operandAt(t, 0); obj != nil && !isRuntimeMappingKind(obj.KindOf()) {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q requires a mapping object, got %s", t.attribute, obj.KindOf())))
+			}
+			if extra := len(OperandsOf(t)) - 1; extra != 0 {
+				*vs = append(*vs, nodeViolation(n, invUseDef,
+					fmt.Sprintf("runtimegetattribute %q carries %d extra args, want 0 (the lane has no map dimension)", t.attribute, extra)))
+			}
 		default:
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("runtimegetattribute payload %q must be one of \"total_cta\", \"total_thread_per_cta\", \"index\", \"dimension\"", t.attribute)))
+				fmt.Sprintf("runtimegetattribute payload %q must be one of \"total_cta\", \"total_thread_per_cta\", \"index\", \"dimension\", \"lane_id\"", t.attribute)))
 		}
 	case *iterClusterProjectNode:
 		if cl := operandAt(t, 0); cl != nil {
@@ -557,13 +578,16 @@ func checkStoreAnnotations(n Node, vs *[]Violation) {
 }
 
 // checkRuntimeMappingShape pins the P-3 mapping constructor encoding
-// (quick-261022-l1o, fix4 §3.2): ops = [kernel_info, ndim const TI32,
-// shape consts TI32 ...] with len(shapes) == ndim. Grid mappings always
-// carry ndim >= 1 (CuMAP: every LNT has at least one CTA dim). Thread
-// mappings allow ndim == 0 (an LNT with zero WARP-assigned dims launches
-// one warp — the empty product of warp K_d = 1, blockDim = 32). Each
-// shape value is >= 1; -1 (the D3 remainder) is allowed ONLY as the
-// last entry on grid mappings (legacy sentinel — fix4 T5 retires it).
+// (quick-261022-l1o, fix4 §3.2/§4.1 as amended by T5): ops =
+// [kernel_info, ndim const TI32, shape consts TI32 ...] with len(shapes)
+// == ndim. Grid mappings always carry ndim >= 1 (CuMAP: every LNT has at
+// least one CTA dim). Thread mappings allow ndim == 0 (an LNT with zero
+// WARP-assigned dims launches one warp — the empty product of warp K_d =
+// 1, blockDim = 32; the T5 zero-extent admission). Each shape value is
+// the dim's ABSOLUTE extent and must be >= 2 (fix4 §4.1: "no portions, no
+// −1" — a K=1 warp dim is SEQ and pruned upstream, the LoC/K presets
+// start at 2; the D3 −1-remainder rule is retired with the portion
+// grammar).
 // The dedicated kind is what makes this verifier-pinnable (LR-4).
 func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 	ops := OperandsOf(t)
@@ -598,34 +622,27 @@ func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 			fmt.Sprintf("%s ndim must be >= %d, got %v", n.KindOf(), minNdim, nd)))
 		return
 	}
-	portions := ops[2:]
-	if float64(len(portions)) != nd {
+	shapes := ops[2:]
+	if float64(len(shapes)) != nd {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			fmt.Sprintf("%s lists %d portions but declares ndim %v", n.KindOf(), len(portions), nd)))
+			fmt.Sprintf("%s lists %d shapes but declares ndim %v", n.KindOf(), len(shapes), nd)))
 		return
 	}
-	for i, p := range portions {
+	for i, p := range shapes {
 		v, ok := ConstValueOf(p)
 		if !ok {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be a const", n.KindOf(), i)))
+				fmt.Sprintf("%s shape %d must be a const", n.KindOf(), i)))
 			continue
 		}
 		if ct := ConstTypeOf(p); ct == nil || !ct.Equal(InternScalar(TI32)) {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be a const-i32", n.KindOf(), i)))
+				fmt.Sprintf("%s shape %d must be a const-i32", n.KindOf(), i)))
 			continue
 		}
-		if v == -1 {
-			if i != len(portions)-1 {
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("%s portion %d is -1 (the remainder): only the LAST portion may be -1 (the D3 remainder rule)", n.KindOf(), i)))
-			}
-			continue // the legal last-position remainder
-		}
-		if v < 1 {
+		if v < 2 {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be >= 1 (or -1 as the last portion), got %v", n.KindOf(), i, v)))
+				fmt.Sprintf("%s shape %d must be >= 2 (an absolute extent; K=1 dims are pruned, presets start at 2, and the -1 remainder is retired with the portion grammar), got %v", n.KindOf(), i, v)))
 		}
 	}
 }

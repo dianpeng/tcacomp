@@ -92,12 +92,20 @@ struct Decomposition {
   unsigned extents[kMaxMapDims] = {};  // ABSOLUTE per-dim extents, verbatim
   unsigned strides[kMaxMapDims] = {};  // row-major strides over the extents
 
+  // n == 0 is LEGAL (fix4 T5, the zero-extent ThreadMapping admission): a
+  // schedule with zero WARP dims launches ONE warp and still needs the map
+  // object (the flat query, lane_id, is_first_in_cta, ThrIterator) — with
+  // ndim 0 no coord(d) call is possible and warp_count()/total() are
+  // kinfo-derived, so the stride loop is skipped entirely.
   __host__ __device__ void build(const unsigned* shape, unsigned n) {
-    assert(n >= 1u && n <= kMaxMapDims);
+    assert(n <= kMaxMapDims);
     ndim = n;
     for (unsigned d = 0u; d < n; ++d) {
       assert(shape[d] >= 2u);  // fix4 §4.1: all extents >= 2 by construction
       extents[d] = shape[d];
+    }
+    if (n == 0u) {
+      return;  // no strides to derive; coord() is uncallable by construction
     }
     // Row-major strides over the extents (last dim stride 1).
     strides[n - 1u] = 1u;
@@ -161,21 +169,35 @@ class GridMapping {
 
 // ThreadMapping — the per-CTA thread-space map (warp allocations never span
 // CTAs; ranks are CTA-relative). Each constructor extent is its dim's K_d —
-// an ABSOLUTE warp count (all >= 2), in WARP units. ThreadMap carries WARP
-// dims ONLY (fix4 §1.3 dimensionality ruling): the CTA dim's coupled inside
-// walk uses the no-arg flat thread rank and needs NO map slot. index(d)
-// decomposes the WARP RANK (index()/32) row-major over the warp extents —
-// WARP units, not threads; lane_id() resolves the lane inside the warp.
+// an ABSOLUTE warp count (all >= 2 when present), in WARP units. ThreadMap
+// carries WARP dims ONLY (fix4 §1.3 dimensionality ruling): the CTA dim's
+// coupled inside walk uses the no-arg flat thread rank and needs NO map
+// slot. index(d) decomposes the WARP RANK (index()/32) row-major over the
+// warp extents — WARP units, not threads; lane_id() resolves the lane
+// inside the warp.
+//
+// The ZERO-EXTENT form (ndim 0, no extents) is LEGAL (fix4 T5): a legal
+// schedule with zero WARP dims — e.g. a reduced dim forced CTA/SEQ while
+// ReducedDimWarp=false — launches ONE warp (the empty product of warp
+// K_d = 1) and still needs the map object: the flat index() query,
+// lane_id(), is_first_in_cta(), and the coupled ThrIterator all read it.
+// No coord(d) call is possible at ndim 0 (there is no d), and
+// warp_count()/total() are kinfo-DERIVED launch values, unaffected.
 class ThreadMapping {
  public:
-  // ndim explicit, then ndim ABSOLUTE extents (warp counts per dim).
+  // ndim explicit, then ndim ABSOLUTE extents (warp counts per dim); the
+  // empty pack (ndim 0) is the one-warp admission above.
   template <typename... E>
   __host__ __device__ ThreadMapping(const KernelInfo& kinfo, unsigned ndim, E... warpsPerDim)
       : kinfo_(kinfo) {
-    static_assert(sizeof...(E) >= 1, "ThreadMapping needs at least one extent");
-    const unsigned shape[] = {static_cast<unsigned>(warpsPerDim)...};
+    static_assert(sizeof...(E) >= 0, "ThreadMapping admits the zero-extent form");
     assert(ndim == static_cast<unsigned>(sizeof...(E)));
-    dec_.build(shape, ndim);
+    if constexpr (sizeof...(E) > 0) {
+      const unsigned shape[] = {static_cast<unsigned>(warpsPerDim)...};
+      dec_.build(shape, ndim);
+    } else {
+      dec_.build(nullptr, 0u);
+    }
   }
 
   __host__ __device__ unsigned dimension(unsigned d) const { return dec_.extents[d]; }

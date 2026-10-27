@@ -5,29 +5,25 @@
 // ASTKernel; it never mutates the graph.
 package cg
 
-// Options configures one backend emission. The launch totals are supplied
-// by the driver (doc/cg.md §1.3); in the fix4 factorization model they
-// should match the tiling provenance's derived launch dimensions — the
-// driver reads them from the tiling record when it builds the pipeline
-// and passes them here (the launch config is not an IR node, LR-15).
-//
-// NOTE (fix4 T5): cg.Options will be redesigned in T5 to read launch
-// dimensions from the graph's tiling provenance directly; for now these
-// fields are passed in by the driver / test harness and must match what
-// the tiling pass decided.
+// Options configures one backend emission. The launch dimensions are NOT
+// driver-supplied anymore (fix4 §5.1, T5 — supersedes cg.md LR-15): the
+// backend DERIVES gridDim.x and blockDim.x from the emitted loops'
+// soc/dosoc/loc annotations over the ASTKernel's LNTs — gridDim = max
+// over LNTs of Π CTA LoC (CuMAP guarantees ≥ 1 CTA dim), blockDim = (max
+// over LNTs of Π warp K) × 32, floor 32 — and bakes them as literal
+// dim3(...) values in the launcher and __launch_bounds__. The launch
+// config is still not an IR node (LR-15); it is annotation-derived at
+// Emit time.
 type Options struct {
 	// KernelName overrides the emitted kernel symbol base name; empty uses
 	// the graph's name (the KindKernelMeta node, when present, takes
 	// precedence over both — quick-261023-cgq).
 	KernelName string
-	// MaxCTA is gridDim.x (positive). In the fix4 model this is the
-	// product of CTA-assigned dims' LoC values; the driver supplies it
-	// from the tiling provenance.
-	MaxCTA int
-	// MaxThreadsPerCTA is blockDim.x (a whole-warp multiple, i.e. a
-	// multiple of 32). In the fix4 model this is (Π warp K_d) × 32
-	// derived from the tiling record; the driver supplies it.
-	MaxThreadsPerCTA int
+	// MaxCTAPolicy is the §4.3 compiler-emitted POLICY constant — the
+	// gridDim cap ValidateLaunch checks against (the MALoC CTA bound,
+	// never a launch total). Zero resolves to 512 (= tiling
+	// DefaultParams.MaxCTA).
+	MaxCTAPolicy int
 	// TargetSM is the targeted compute capability major-minor packed as
 	// major*100+minor (86 = sm_86, the A6000). Pins the generated
 	// CMakeLists CUDA_ARCHITECTURES — never "native".

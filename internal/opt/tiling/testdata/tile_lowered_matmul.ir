@@ -1,11 +1,11 @@
-statement #158:
-  memstore(%out[runtimegridquery(index, 0) * 256 + @d0(init=0, step=1024) + @d0(init=runtimethreadquery(index), step=64)][@d1(init=0, step=256) + @d1(init=0, step=1)][runtimethreadquery(index, 1) * 32 + @d2(init=0, step=2048) + runtimethreadquery(index, 0) * 512 + @d2(init=0, step=1)], %2 * %9)
-
 statement #159:
-  return %out
+  memstore(%out[runtimegridquery(index, 0) * 256 + @d0(init=0, step=1024) + @d0(init=runtimethreadquery(index), step=64)][@d1(init=0, step=256) + @d1(init=0, step=1)][runtimethreadquery(index, 0) * 32 + @d2(init=0, step=64) + @d2(init=runtimethreadquery(lane_id) * 1, step=1)], %2 * %11)
 
 statement #160:
-  memstore[frag](%3, %55)
+  return %out
 
 statement #161:
-  memstore[smem](%10[@d1(init=0, step=256)][@d2(init=0, step=2048)], %58)
+  memstore[frag](%3, %52)
+
+statement #162:
+  memstore[smem](%12[@d1(init=0, step=256)][@d2(init=0, step=64)], %55)

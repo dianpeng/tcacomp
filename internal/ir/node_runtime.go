@@ -95,6 +95,19 @@ func (g *Graph) NewRuntimeThreadQueryFlat(origin string) Node {
 	return n
 }
 
+// NewRuntimeThreadQueryLane creates the ZERO-OPERAND lane query — the fix4
+// §3.1 WARP lane-chunk walks (T4): field is pinned "lane_id" (the
+// querying thread's lane within its warp — a pure function of the flat
+// rank; the lane has NO map dimension, hence no DoSoC operand). The
+// verifier's shape case admits the zero-operand form for field "lane_id"
+// exactly as for "index"; final-lower rewrites it to the zero-arg
+// lane_id attribute read on the LNT's ThreadMapping.
+func (g *Graph) NewRuntimeThreadQueryLane(origin string) Node {
+	n := g.allocNode(KindRuntimeThreadQuery, origin, 0).(*runtimeQueryNode)
+	n.field = "lane_id"
+	return n
+}
+
 // runtimeKernelInfoNode: the one-per-kernel runtime information object —
 // zero operands, zero payload (LR-4: a dedicated construction node, no
 // generic RuntimeConstruct). final-lower prepends it as the FIRST item of
@@ -112,10 +125,11 @@ func (g *Graph) NewRuntimeKernelInfo(origin string) Node {
 }
 
 // runtimeMappingNode: one per-LNT mapping object construction; ops =
-// [%kernel_info, ndim const (TI32), portion consts (TI32) ...] with
-// len(portions) == ndim, each portion >= 1, and -1 (the remainder) allowed
-// ONLY as the LAST portion (the D3 remainder rule, P-3). Shared by
-// RuntimeGridMapping and RuntimeThreadMapping — the kind discriminates.
+// [%kernel_info, ndim const (TI32), shape consts (TI32) ...] with
+// len(shapes) == ndim, each shape the dim's ABSOLUTE extent >= 2 (fix4
+// §4.1: no portions, no −1 — the D3 remainder rule is retired; the T5
+// verifier rule). Shared by RuntimeGridMapping and RuntimeThreadMapping —
+// the kind discriminates.
 type runtimeMappingNode struct {
 	*Base
 	operandList

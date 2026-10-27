@@ -113,11 +113,23 @@ func (e *emitter) walkLoop(blk *ir.ASTBlock) error {
 		if e.curThread == "" {
 			return fmt.Errorf("cxx: thr loop %d has no ThreadMapping in scope (the LNT prologue must construct it first)", loop.BasePtr().ID())
 		}
-		if blk.DoSoC() < 0 {
-			return fmt.Errorf("cxx: thr loop %d carries no dosoc", loop.BasePtr().ID())
+		dosoc := blk.DoSoC()
+		if dosoc < 0 {
+			// fix4 §3.1/§3.2 (T4): the CTA dim's coupled INSIDE walk carries
+			// NO dosoc — it rides the NO-ARG flat thread rank (init = the
+			// flat index expression, hence NON-CONST; a WARP between's init
+			// is always a const). Admit exactly that form, passing dosoc 0u
+			// and loc = the loop's own loc annotation (the LAUNCH blockDim)
+			// to the iterator — both v0-IGNORED per iterator.h: the coupled
+			// walk's rank comes from its init/step pair, never the map
+			// decomposition (the §4.2 coupled-walk convention).
+			if _, isConst := ir.ConstValueOf(ivOps[1]); isConst {
+				return fmt.Errorf("cxx: thr loop %d carries no dosoc but a const init — only the CTA-coupled flat walk (non-const init) may omit dosoc (fix4 3.2)", loop.BasePtr().ID())
+			}
+			dosoc = 0
 		}
 		ctor = fmt.Sprintf("tca::rt::ThrIterator(%s, %du, %du, %s, %s, %s)",
-			e.curThread, uint(blk.DoSoC()), uint(blk.LoC()), initLit, stepLit, maxExpr)
+			e.curThread, uint(dosoc), uint(blk.LoC()), initLit, stepLit, maxExpr)
 	}
 
 	e.line(fmt.Sprintf("for (auto %s = %s; %s.Has(); %s.Next()) {", it, ctor, it, it))

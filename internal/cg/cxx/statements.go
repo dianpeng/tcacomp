@@ -163,12 +163,12 @@ func (e *emitter) stmtMemStore(n ir.Node) error {
 		e.c("single-owner store — the element's owner thread writes (R2/R3)")
 		e.line("if (" + e.curThread + ".is_first_in_cta()) {")
 		e.deep++
-		e.line(view + ".Set(" + val + ", " + join(coords) + ");")
+		e.line(view + ".Set(" + setArgs(val, coords) + ");")
 		e.deep--
 		e.line("}")
 		return nil
 	}
-	e.line(view + ".Set(" + val + ", " + join(coords) + ");")
+	e.line(view + ".Set(" + setArgs(val, coords) + ");")
 	return nil
 }
 
@@ -239,7 +239,7 @@ func (e *emitter) stmtBufStore(n ir.Node) error {
 	if err != nil {
 		return err
 	}
-	e.line(view + ".Set(" + val + ", " + join(coords) + ");")
+	e.line(view + ".Set(" + setArgs(val, coords) + ");")
 	return nil
 }
 
@@ -253,4 +253,16 @@ func (e *emitter) bufferView(buf ir.Node) (string, error) {
 		return v, nil
 	}
 	return "", fmt.Errorf("cxx: buffer %d has no view (not a live allocation?)", buf.BasePtr().ID())
+}
+
+// setArgs builds a view Set() argument list: the value plus the
+// coordinates, with NO trailing separator when the coordinate list is
+// empty — a C1b forced-FRAG fill whose only covered dim is WARP-covered
+// carries ZERO trailing round bases (the chunk origin rides the source
+// axes, fix4 3.3) and must render Set(v), never Set(v, ).
+func setArgs(val string, coords []string) string {
+	if len(coords) == 0 {
+		return val
+	}
+	return val + ", " + join(coords)
 }

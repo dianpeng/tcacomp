@@ -107,9 +107,16 @@ type siteFill struct {
 // would land below 2 is DROPPED to GMEM instead (a site that cannot fit
 // at tile >= 2 is dropped, never demoted to a non-tiling schedule — tile
 // 1 is not a legal schedule). Terminates by construction — halving
-// reaches the floor, dropping empties the set. With Params mirroring the
-// decide pass's this is a NO-OP: tiling-verify already asserted both sums
-// within budget.
+// reaches the floor, dropping empties the set.
+//
+// UNREACHABLE FAIL-CLOSED BACKSTOP (fix4 §3.3): under the fix4 model the
+// record is FEASIBLE BY CONSTRUCTION — the decide side's §2.6 greedy
+// eviction already brought both kernel-wide sums within budget before the
+// record was stamped, and tiling-verify re-asserted them (F7) — so with
+// Params mirroring the decide pass's this resolution is a NO-OP. The code
+// stays as defense-in-depth over hand-stamped/corrupted records and over
+// Params mismatches (the §3.3 ruling: keep the halve-then-drop machinery,
+// never delete it); TestBudgetFallback exercises it on crafted records.
 func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir.Node]IterDecision) (map[ir.Node]int, map[uint64]bool, error) {
 	overrides := make(map[ir.Node]int)
 	dropped := make(map[uint64]bool)

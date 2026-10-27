@@ -214,6 +214,14 @@ func (e *emitter) emitGetAttr(n ir.Node) (string, error) {
 			return "", fmt.Errorf("cxx: getattr %s carries extra operands", attr)
 		}
 		return obj + "." + attr + "()", nil
+	case "lane_id":
+		// fix4 §3.1 lane chunks (T4): the lane within the warp — a pure
+		// function of the flat rank on the mapping object, ZERO args (the
+		// lane has no map dimension).
+		if len(ops) != 1 {
+			return "", fmt.Errorf("cxx: getattr %s carries extra operands", attr)
+		}
+		return obj + ".lane_id()", nil
 	case "index", "dimension":
 		// The flat-index() ruling (2026-10-23): attribute "index" with NO
 		// extra args renders <obj>.index() — the flattened 1-D rank.

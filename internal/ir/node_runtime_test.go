@@ -38,7 +38,7 @@ func combinerOf(g *Graph) Node {
 // then the reducer over (init, lambda, mapping, staging).
 func warpReducerOf(g *Graph) Node {
 	ki := g.NewRuntimeKernelInfo("ctor")
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	staging := g.NewMemNewSMem("ctor", u32const(g, 64))
 	return g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g), tm, staging)
 }
@@ -105,7 +105,10 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 		g.NewReturn("ctor", gq)
 		return g
 	}
-	if vs := Verify(badField()); len(vs) != 1 || !strings.Contains(vs[0].Msg, "index\" or \"dimension") {
+	// fix4 §3.1 (T4): an unknown field on the one-operand form is doubly
+	// illegal — it is not a DoSoC-addressed field AND not a known selector;
+	// either violation names the field.
+	if vs := Verify(badField()); len(vs) == 0 || !strings.Contains(vs[0].Msg, "\"rank\"") {
 		t.Fatalf("bad field must be a shape violation, got %v", vs)
 	}
 
@@ -138,8 +141,8 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 	raw := multiOperand.NewNode(KindRuntimeThreadQuery, "ctor", u32const(multiOperand, 0), u32const(multiOperand, 1))
 	multiOperand.NewReturn("ctor", raw)
 	vs := Verify(multiOperand)
-	if len(vs) != 2 || !strings.Contains(vs[0].Msg, "surplus") || !strings.Contains(vs[1].Msg, "index\" or \"dimension") {
-		t.Fatalf("multi-operand query must fail closed on surplus + field, got %v", vs)
+	if len(vs) != 2 || !strings.Contains(vs[0].Msg, "surplus") || !strings.Contains(vs[1].Msg, "\"lane_id\"") {
+		t.Fatalf("multi-operand query must fail closed on surplus + the vocabulary (index/dimension/lane_id), got %v", vs)
 	}
 }
 
@@ -150,8 +153,8 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 func runtimeFx() (*Graph, Node, Node, Node, Node, Node, Node, Node) {
 	g := NewGraph("runtimefx")
 	ki := g.NewRuntimeKernelInfo("ctor")
-	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	red := warpReducerOf(g)
 	init := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combine := g.NewRuntimeCallMethod("ctor", "Combine", red)
@@ -193,10 +196,11 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 		g.NewReturn("ctor", ki)
 	}, "operands")
 
-	// Mappings: wrong object, non-const portion, portion count != ndim,
-	// ndim < 1, -1 not last.
+	// Mappings: wrong object, non-const shape, shape count != ndim,
+	// ndim < 1, extent 1 (K=1 dims are pruned — the absolute-extent rule
+	// of fix4 §4.1 that retired the -1 remainder).
 	expect("map-badobj", func(g *Graph) {
-		gm := g.NewRuntimeGridMapping("ctor", u32const(g, 0), []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", u32const(g, 0), []int{4})
 		g.NewReturn("ctor", gm)
 	}, "RuntimeKernelInfo")
 	expect("map-nonconst", func(g *Graph) {
@@ -209,25 +213,28 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	expect("map-count", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{2, 4})
-		// Hand-corrupt: declare ndim 2 but the constructor wired portions
+		// Hand-corrupt: declare ndim 2 but the constructor wired shapes
 		// [2,4] — instead probe the mismatch through the raw node path.
 		_ = gm
 		raw := g.NewNode(KindRuntimeGridMapping, "ctor", ki,
 			g.NewConst("ctor", InternScalar(TI32), 3),
 			g.NewConst("ctor", InternScalar(TI32), 2))
 		g.NewReturn("ctor", raw)
-	}, "portions")
+	}, "shapes")
 	expect("map-ndim0", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		raw := g.NewNode(KindRuntimeGridMapping, "ctor", ki,
 			g.NewConst("ctor", InternScalar(TI32), 0))
 		g.NewReturn("ctor", raw)
 	}, "ndim")
-	expect("map-remainder", func(g *Graph) {
+	// The -1 remainder rule is RETIRED with the portion grammar (fix4
+	// §4.1): every shape is an ABSOLUTE extent >= 2 — a K=1 warp dim is
+	// SEQ and pruned upstream, and 1 is not a partition.
+	expect("map-extent1", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{-1, 4})
+		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{1, 4})
 		g.NewReturn("ctor", gm)
-	}, "LAST portion")
+	}, ">= 2")
 
 	// Reducers: swapped and missing operands.
 	expect("red-swapped", func(g *Graph) {
@@ -267,7 +274,7 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	}, "\"total_cta\"")
 	expect("get-total-on-mapping", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "total_cta", gm)
 		g.NewReturn("ctor", ga)
 	}, "KernelInfo object")
@@ -281,19 +288,19 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	// zero-arg DIMENSION getattr still fails wanting exactly 1.
 	expect("get-dimension-noargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm)
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-twoargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm, u32const(g, 0), u32const(g, 1))
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-nonconst-arg", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		m := g.NewInputParam("ctor", RoleDim, "m", nil)
 		ga := g.NewRuntimeGetAttribute("ctor", "index", gm, m)
 		g.NewReturn("ctor", ga)
@@ -395,17 +402,73 @@ func TestRuntimeFlatQueryVerifyShape(t *testing.T) {
 	// (the flat form); "dimension" keeps exactly one.
 	ga1 := NewGraph("flatgetattr")
 	ki1 := ga1.NewRuntimeKernelInfo("ctor")
-	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, -1})
+	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, 2})
 	ga1.NewReturn("ctor", ga1.NewRuntimeGetAttribute("ctor", "index", tm1))
 	if vs := Verify(ga1); len(vs) != 0 {
 		t.Fatalf("zero-arg index getattr must verify clean, got %v", vs)
 	}
 	g2 := NewGraph("flatgetattrdim")
 	ki2 := g2.NewRuntimeKernelInfo("ctor")
-	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, -1})
+	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, 2})
 	g2.NewReturn("ctor", g2.NewRuntimeGetAttribute("ctor", "dimension", tm2))
 	if vs := Verify(g2); len(vs) != 1 || !strings.Contains(vs[0].Msg, "exactly 1") {
 		t.Fatalf("zero-arg dimension getattr must fail wanting exactly 1 arg, got %v", vs)
+	}
+}
+
+// TestRuntimeLaneQueryVerifyShape pins the fix4 §3.1 lane vocabulary (T4):
+// the ZERO-OPERAND thread query with field "lane_id" (the WARP lane-chunk
+// walks' lane identity — a pure function of the flat rank, no DoSoC slot)
+// and the ZERO-ARG "lane_id" attribute read on a MAPPING object are
+// verifier-legal. The vocabulary stays closed everywhere else: a
+// one-operand lane query (the lane has no map dimension), "lane_id" on a
+// KernelInfo object, an unknown zero-operand field, and an unknown getattr
+// payload all fail closed.
+func TestRuntimeLaneQueryVerifyShape(t *testing.T) {
+	g := NewGraph("lane")
+	lane := g.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	lane.field = "lane_id"
+	ki := g.NewRuntimeKernelInfo("ctor")
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
+	ga := g.NewRuntimeGetAttribute("ctor", "lane_id", tm)
+	g.NewReturn("ctor", lane, ga)
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("the zero-operand lane query + zero-arg lane_id getattr must verify clean, got %v", vs)
+	}
+
+	// One-operand lane query: the lane has no map dimension — the DoSoC form
+	// stays index/dimension-only.
+	g2 := NewGraph("laneops")
+	lane2 := g2.NewRuntimeThreadQuery("ctor", "lane_id", u32const(g2, 0)).(*runtimeQueryNode)
+	g2.NewReturn("ctor", lane2)
+	if vs := Verify(g2); len(vs) == 0 {
+		t.Fatal("a one-operand lane_id query must be a shape violation (the lane carries no DoSoC)")
+	}
+
+	// "lane_id" on a KernelInfo object: the attribute applies to a mapping.
+	g3 := NewGraph("laneki")
+	ki3 := g3.NewRuntimeKernelInfo("ctor")
+	g3.NewReturn("ctor", g3.NewRuntimeGetAttribute("ctor", "lane_id", ki3))
+	if vs := Verify(g3); len(vs) == 0 {
+		t.Fatal("lane_id on a KernelInfo object must be a shape violation (mappings only)")
+	}
+
+	// Unknown zero-operand field: the flat family is index/lane_id only.
+	g4 := NewGraph("lanebad")
+	bad := g4.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	bad.field = "warp_chunk"
+	g4.NewReturn("ctor", bad)
+	if vs := Verify(g4); len(vs) == 0 {
+		t.Fatal("an unknown zero-operand query field must fail closed")
+	}
+
+	// Unknown getattr payload.
+	g5 := NewGraph("lanega")
+	ki5 := g5.NewRuntimeKernelInfo("ctor")
+	tm5 := g5.NewRuntimeThreadMapping("ctor", ki5, []int{4})
+	g5.NewReturn("ctor", g5.NewRuntimeGetAttribute("ctor", "warp_chunk", tm5))
+	if vs := Verify(g5); len(vs) == 0 {
+		t.Fatal("an unknown getattr payload must fail closed")
 	}
 }
 
@@ -483,7 +546,7 @@ func TestRuntimeObjectValueNumbering(t *testing.T) {
 	g := NewGraph("objvn")
 	se := pureAll{}
 	ki := g.NewRuntimeKernelInfo("ctor")
-	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 	dosoc := u32const(g, 0) // ONE shared const def: DoSoC operands are identity-keyed
 
 	i1 := asValue(t, g.NewRuntimeGetAttribute("ctor", "index", gm, dosoc))

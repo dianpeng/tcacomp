@@ -92,8 +92,30 @@ func (fakeAnalysis) Name() string { return tiling.ProvenanceName }
 
 // runTileLowerSchedule runs the REAL tile-lower + schedule passes over g
 // with a crafted verified record (one decision per chain iter, by index),
-// returning the cache that now holds the published provenance.
+// returning the cache that now holds the published provenance. The WARP-
+// reduced reducer fixtures route through runTileLowerScheduleSplitK — the
+// fix4 §3.5 Wave-1 defense fails the shape closed under the default
+// ReducedDimWarp=false, and the capability flag is what admits it.
 func runTileLowerSchedule(t *testing.T, f *fx, decisions []tiling.IterDecision) *opt.Cache {
+	t.Helper()
+	return runTileLowerScheduleP(t, f, decisions, tiling.DefaultParams())
+}
+
+// runTileLowerScheduleSplitK runs the pair with ReducedDimWarp=true — the
+// fix4 §3.5 capability gate that admits WARP-assigned reduced dims. The
+// reducer-lowering fixtures that pin the WarpReducer face (LR-7/R1/R2/R3
+// machinery) run under it: the machinery is flag-independent, and the
+// default-flag policy is pinned on the tiling side
+// (tiling.TestLowerWarpReducedDimRejected).
+func runTileLowerScheduleSplitK(t *testing.T, f *fx, decisions []tiling.IterDecision) *opt.Cache {
+	t.Helper()
+	p := tiling.DefaultParams()
+	p.ReducedDimWarp = true
+	return runTileLowerScheduleP(t, f, decisions, p)
+}
+
+// runTileLowerScheduleP is the params-carrying core of the pair above.
+func runTileLowerScheduleP(t *testing.T, f *fx, decisions []tiling.IterDecision, p tiling.Params) *opt.Cache {
 	t.Helper()
 	rec := &tiling.Record{Iters: make(map[ir.Node]tiling.IterDecision), Sites: map[uint64]tiling.SiteDecision{}, Verified: true}
 	for i, it := range f.iters {
@@ -105,7 +127,7 @@ func runTileLowerSchedule(t *testing.T, f *fx, decisions []tiling.IterDecision) 
 	}
 	cache := opt.NewCache()
 	cache.Put(rec)
-	if err := (tiling.LowerPass{Params: tiling.DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, f.g); err != nil {
+	if err := (tiling.LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("tile-lower: %v", err)
 	}
 	if err := (schedule.Scheduler{}).Run(nil, f.g); err != nil {
@@ -363,7 +385,7 @@ func TestRuntimeObjectsInserted(t *testing.T) {
 	}
 
 	// Per-LNT mappings: the prologue Group's first two items, grid before
-	// thread, portions per the provenance plan.
+	// thread, absolute shapes (LoC / K) per the provenance plan.
 	if len(k.LNTs) == 0 {
 		t.Fatal("the fixture must schedule at least one LNT")
 	}
@@ -402,7 +424,7 @@ func TestRuntimeObjectsInserted(t *testing.T) {
 }
 
 // checkMappingOperands pins the P-3 encoding: [kernel_info, TI32 ndim,
-// TI32 portions...] with the given portion values.
+// TI32 shapes...] with the given absolute-extent values.
 func checkMappingOperands(t *testing.T, m, ki ir.Node, want []int, what string) {
 	t.Helper()
 	ops := ir.OperandsOf(m)
@@ -670,7 +692,7 @@ func newRedFx(t *testing.T, extraDim, poison bool) *redFx {
 // with m strictly between X and home), then final-lower, failing on error.
 func runRedFx(t *testing.T, fx *redFx) *opt.Cache {
 	t.Helper()
-	cache := runTileLowerSchedule(t, fx.f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, fx.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -704,7 +726,7 @@ func provenanceOf(t *testing.T, cache *opt.Cache) *tiling.Provenance {
 func TestReducerBracketPlacement(t *testing.T) {
 	rx := newRedFx(t, false, false)
 	mDim, kDim := rx.f.dims[0], rx.f.dims[1]
-	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, rx.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -929,7 +951,7 @@ func TestReducerCombineRAUW(t *testing.T) {
 // consumer references a reduced-dim dimvar.
 func TestReducerElementLoopConsumers(t *testing.T) {
 	rx := newRedFx(t, false, false)
-	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, rx.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -1013,7 +1035,7 @@ func TestReducerElementLoopConsumers(t *testing.T) {
 func TestReducerNegativeProbes(t *testing.T) {
 	// (a) No provenance entry: the Map's as carries a foreign third dim.
 	rx := newRedFx(t, true, false)
-	cache := runTileLowerSchedule(t, rx.f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, rx.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -1030,7 +1052,7 @@ func TestReducerNegativeProbes(t *testing.T) {
 	if err := mctx.SetType(rx2.init, ir.InternScalar(ir.TF16)); err != nil {
 		t.Fatalf("fixture setup: %v", err)
 	}
-	cache2 := runTileLowerSchedule(t, rx2.f, []tiling.IterDecision{
+	cache2 := runTileLowerScheduleSplitK(t, rx2.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -1041,7 +1063,7 @@ func TestReducerNegativeProbes(t *testing.T) {
 
 	// (c) A moved consumer referencing a reduced-dim dimvar.
 	rx3 := newRedFx(t, false, true)
-	cache3 := runTileLowerSchedule(t, rx3.f, []tiling.IterDecision{
+	cache3 := runTileLowerScheduleSplitK(t, rx3.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})
@@ -1330,7 +1352,7 @@ func newRed3Fx(t *testing.T, name string) (*fx, ir.Node) {
 // dimvars, and no reduced-dim dimvar leaks into its closure.
 func TestReducerBracketMultiBetween(t *testing.T) {
 	f, store := newRed3Fx(t, "red3")
-	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
@@ -1432,7 +1454,7 @@ func TestReducerBracketMultiBetween(t *testing.T) {
 
 	// Twin-run determinism.
 	f2, _ := newRed3Fx(t, "red3")
-	cache2 := runTileLowerSchedule(t, f2, []tiling.IterDecision{
+	cache2 := runTileLowerScheduleSplitK(t, f2, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
@@ -1457,7 +1479,7 @@ func TestReducerBracketMultiBetween(t *testing.T) {
 // share one C++ scope).
 func TestReducerBracketMinTile(t *testing.T) {
 	f, store := newRed2Fx(t, "redt1") // identifier kept (R6: fixture names stay)
-	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
 	})
@@ -1593,7 +1615,7 @@ func newSeveredRedFx(t *testing.T) *redFx {
 // anchor's semantic predicate rejects it).
 func TestReduceAnchorSeveredChainFailsClosed(t *testing.T) {
 	sx := newSeveredRedFx(t)
-	cache := runTileLowerSchedule(t, sx.f, []tiling.IterDecision{
+	cache := runTileLowerScheduleSplitK(t, sx.f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
 	})

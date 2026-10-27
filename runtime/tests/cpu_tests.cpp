@@ -120,6 +120,36 @@ void test_flat_rank_identities() {
   }
 }
 
+// (d-bis) The ZERO-EXTENT ThreadMapping (fix4 T5 admission): a schedule
+// with zero WARP dims — e.g. a reduced dim forced CTA/SEQ while
+// ReducedDimWarp=false — launches ONE warp and still constructs the map
+// (the flat query, lane_id, is_first_in_cta, ThrIterator read it). ndim 0:
+// no coord() call is possible by construction; warp_count()/total() are
+// kinfo-DERIVED and unaffected; the flat-rank identities hold verbatim.
+void test_zero_extent_thread_mapping() {
+  auto kinfo = host_info(16u, 32u);  // the one-warp launch
+  tca::rt::ThreadMapping tm(kinfo, 0u);
+  CHECK(tm.warp_count() == 1u);  // kinfo-derived: 32 threads / 32
+  CHECK(tm.total() == 32u);
+  for (unsigned tid = 0u; tid < 32u; ++tid) {
+    tm.set_linear_id(tid);
+    CHECK(tm.index() == tid);  // the flat rank — the only coordinate space
+    CHECK(tm.warp_index() == 0u);
+    CHECK(tm.lane_id() == tid);
+    CHECK(tm.is_first_in_warp() == (tid == 0u));
+    CHECK(tm.is_first_in_cta() == (tid == 0u));
+  }
+  // A zero-extent map under a WIDER launch (surplus warps coordinate
+  // through the guards; the map itself stays inert).
+  auto big = host_info(16u, 512u);
+  tca::rt::ThreadMapping tm2(big, 0u);
+  CHECK(tm2.warp_count() == 16u);
+  CHECK(tm2.total() == 512u);
+  tm2.set_linear_id(257u);
+  CHECK(tm2.index() == 257u);
+  CHECK(tm2.lane_id() == 1u);
+}
+
 // (d) Surplus-rank coordinate totality (§3.2): a multi-LNT launch runs the
 // max-over-LNT totals, so an LNT's shape product can be SMALLER than the
 // launch. warp_count()/total() answer the LAUNCH (kinfo-derived: 16 warps,
@@ -718,6 +748,7 @@ int main() {
   test_grid_mapping_factorization();
   test_thread_mapping_factorization();
   test_flat_rank_identities();
+  test_zero_extent_thread_mapping();
   test_surplus_ranks_totality();
   test_seq_iterator();
   test_map_iterators();

@@ -244,7 +244,7 @@ func TestRuntimeObjectRules(t *testing.T) {
 	g := ir.NewGraph("runtime-types")
 	ki := g.NewRuntimeKernelInfo("t")
 	gm := g.NewRuntimeGridMapping("t", ki, []int{-1})
-	tm := g.NewRuntimeThreadMapping("t", ki, []int{4, -1})
+	tm := g.NewRuntimeThreadMapping("t", ki, []int{4, 2})
 	idx := g.NewRuntimeGetAttribute("t", "index", gm, g.NewConst("t", u32T(), 0))
 	total := g.NewRuntimeGetAttribute("t", "total_cta", ki)
 
@@ -255,7 +255,7 @@ func TestRuntimeObjectRules(t *testing.T) {
 	now := g.NewLambdaInputParam("t", "now", f32T())
 	comb := g.NewBinOp("t", ir.BinOpAdd, g.NewParamRef("t", acc), g.NewParamRef("t", now))
 	red := g.NewRuntimeWarpReducer("t", init, g.NewLambdaNode("t", []ir.Node{acc, now}, comb),
-		g.NewRuntimeThreadMapping("t", g.NewRuntimeKernelInfo("t"), []int{4, -1}),
+		g.NewRuntimeThreadMapping("t", g.NewRuntimeKernelInfo("t"), []int{4, 2}),
 		g.NewMemNewSMem("t", g.NewConst("t", ir.InternScalar(ir.TU32), 64)))
 	callInit := g.NewRuntimeCallMethod("t", "Init", red)
 	callReduce := g.NewRuntimeCallMethod("t", "Reduce", red, init)

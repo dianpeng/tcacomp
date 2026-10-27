@@ -151,7 +151,7 @@ func TestRuntimeFamilyBaseVerdicts(t *testing.T) {
 	now := g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
 	comb := g.NewBinOp("ctor", ir.BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))
 	lam := g.NewLambdaNode("ctor", []ir.Node{acc, now}, comb)
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	staging := g.NewMemNewSMem("ctor", g.NewConst("ctor", ir.InternScalar(ir.TU32), 64))
 	red := g.NewRuntimeWarpReducer("ctor", init, lam, tm, staging)
 	getattr := g.NewRuntimeGetAttribute("ctor", "index", gm, g.NewConst("ctor", ir.InternScalar(ir.TU32), 0))
