@@ -183,6 +183,45 @@ func reduceWarpGraph(t *testing.T) *ir.Graph {
 	return f.g
 }
 
+// reduceSplitKGraph builds the fix4 §3.5 split-k capability shape (Wave 2,
+// T8 landed): the redwarp chain re-targeted to a WARP-assigned reduced dim —
+// m CTA T=32 / k WARP K=2 T=32 — the §3.5 vector the Wave-2 default admits
+// (the finallower runTileLowerSchedule split-k idiom: the capability gate in
+// tiling.DefaultParams is now true, so the crafted record lowers through the
+// WarpReducer bracket). lhs[m][k] load → map (as=[m,k]) → reduce(0.0f, +) →
+// out[m] store. Its golden exercises the WarpReducer construction with the
+// #warps × sizeof(T) staging row, the Init/Reduce/Combine bracket over k's
+// warp-split tile-between loop, and the two-warp ThreadMapping — the most
+// intricate emission in the refactor (fix4 §3.5 risk note); the numerical
+// backing is the frontend split-k e2e (TestFrontendMatmulScale).
+func reduceSplitKGraph(t *testing.T) *ir.Graph {
+	t.Helper()
+	f := newChain("redsplitk", 1024, 512)
+	lhs := f.tensor("lhs", 0, 1)
+	out := f.tensor("out", 0)
+	env := ir.NewEnv()
+	load := f.g.NewMemLoadChained("ctor", env, lhs, []ir.Node{f.iv(0), f.iv(1)})
+	mp := f.g.NewMap("ctor", []ir.Node{load}, ir.NewLambda(nil, load), append([]ir.Node(nil), f.dims...))
+	acc := f.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := f.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := f.g.NewBinOp("ctor", ir.BinOpAdd, f.g.NewParamRef("ctor", acc), f.g.NewParamRef("ctor", now))
+	red := f.g.NewReduce("ctor", f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	store := f.g.NewMemStoreChained("ctor", env, out, []ir.Node{f.iv(0)}, red)
+	f.g.NewReturnChained("ctor", env, []ir.Node{out, lhs}, store)
+	if err := (typeinfer.Pass{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture typeinfer: %v", err)
+	}
+	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCWARP, LoC: 2, TileSize: 32},
+	})
+	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
+		t.Fatalf("final-lower: %v", err)
+	}
+	return f.g
+}
+
 // reduce3Graph builds the rank-3 last-axis reduce (the HI-01 proof shape,
 // Wave-1-legal per fix4 §3.5 — the reduced dim is SEQ): u32 extents
 // 64/32/512, lhs[d0,d1,d2] load → map (as=[d0,d1,d2]) → reduce(0.0f, +) →
@@ -293,6 +332,24 @@ func TestGoldenReduceWarp(t *testing.T) {
 	golden.Assert(t, "testdata/reduce_warp.cu", res.Files["redwarp.cu"])
 	if err := ScanBracketLaw(string(res.Files["redwarp.cu"])); err != nil {
 		t.Fatalf("the committed reduce golden must satisfy the R-A bracket law mechanically: %v", err)
+	}
+}
+
+// TestGoldenReduceSplitK pins the fix4 §3.5 split-k emission (Wave 2, T8):
+// the WarpReducer construction with the #warps × sizeof(T) staging row, the
+// Init/Reduce/Combine bracket over the WARP-assigned reduced dim's
+// tile-between loop with lane-chunk inside walks, and the uniform
+// surviving-dim element walk. ScanBracketLaw re-proves the bracket law
+// mechanically over the emitted text (== the golden bytes).
+func TestGoldenReduceSplitK(t *testing.T) {
+	g := reduceSplitKGraph(t)
+	res, err := Emit(g, emitOptions())
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	golden.Assert(t, "testdata/reduce_splitk.cu", res.Files["redsplitk.cu"])
+	if err := ScanBracketLaw(string(res.Files["redsplitk.cu"])); err != nil {
+		t.Fatalf("the committed split-k golden must satisfy the R-A bracket law mechanically: %v", err)
 	}
 }
 
