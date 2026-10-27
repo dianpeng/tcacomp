@@ -5,11 +5,24 @@
 //
 //	Shape A (HI-01): the rank-3 last-axis reduce out[i,j] = sum_k
 //	a[i,j,k] with TWO T>1 non-reduced dims — the >=2-between-dims R-A
-//	bracket shape (decisions {CTA,100,32}/{SEQ,1,64}/{WARP,8,64}).
+//	bracket shape (decisions {CTA,100,32}/{SEQ,1,64}/{SEQ,1,64}).
 //	Shape B (HI-02): the minimal-legal-tile endpoint (the redwarp graph at
-//	{CTA,100,2}/{WARP,8,2} — the 2026-10-24 tile-disable ruling's floor; the
+//	{CTA,100,2}/{SEQ,1,2} — the 2026-10-24 tile-disable ruling's floor; the
 //	identifier stays historical) — the flat bracket's Combine local and the
 //	moved store share one C++ lexical scope at the smallest legal schedule.
+//
+// WAVE-1 RE-TARGET (quick-261027-iq6, the T5 deviation class): both
+// fixtures originally crafted WARP onto their REDUCED dims
+// ({SEQ,1,64}/{WARP,8,64} and {WARP,8,2}) — records the decide pass can no
+// longer produce under ReducedDimWarp=false (fix4 2.2), and which
+// tile-lower now FAILS CLOSED on (the fix4 3.5 Wave-1 defense). The
+// reduced dims re-target to SEQ; the WARP lane-chunk walk itself is NOT
+// GPU-runnable in Wave 1 anywhere (a surviving-WARP dim alongside the
+// mandatory CTA dim leaves the output cross product uncovered — see the
+// 261027-iq6 SUMMARY design-gap handoff), so the fixtures pin the
+// ≥2-between bracket law, SeqReducer numerics, and the minimal-legal-tile
+// floor instead; the WarpReducer face stays pinned by
+// runtime/tests/conformance_new_api.cu.
 //
 // R-C discipline: reduce comparisons are tolerance-based ONLY (canary 0,
 // max abs diff <= 2e-3); the fold order is irrelevant to correctness and
@@ -247,7 +260,7 @@ func buildReduce3Fixture(t *testing.T) string {
 	cu := runReduce3Pipeline(t, "red3", []float64{64, 32, 512}, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
 	}, "Reduce3", "Reduce3Launch")
 	files := map[string][]byte{
 		"red3.cu":        cu,
@@ -261,7 +274,7 @@ func buildReduceT1Fixture(t *testing.T) string {
 	t.Helper()
 	cu := runReduce3Pipeline(t, "redt1", []float64{1024, 512}, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	}, "ReduceT1", "ReduceT1Launch")
 	files := map[string][]byte{
 		"redt1.cu":       cu,
@@ -324,10 +337,10 @@ func TestReduce3E2E(t *testing.T) {
 }
 
 // TestReduceT1E2E is the HI-02 proof at the minimal-legal-tile endpoint
-// ({CTA,100,2}/{WARP,8,2}, the 2026-10-24 tile-disable ruling's floor —
-// the T==1 endpoint it replaced is not a legal schedule): the kernel
-// compiles under nvcc (the same-scope Combine local/store) and matches the
-// sequential reference within tolerance.
+// ({CTA,100,2}/{SEQ,1,2} after the Wave-1 re-target, the 2026-10-24
+// tile-disable ruling's floor — the T==1 endpoint it replaced is not a
+// legal schedule): the kernel compiles under nvcc (the same-scope Combine
+// local/store) and matches the sequential reference within tolerance.
 func TestReduceT1E2E(t *testing.T) {
 	skipUnlessE2E(t)
 	bin := buildReduceT1Fixture(t)
