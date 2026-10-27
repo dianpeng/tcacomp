@@ -318,6 +318,11 @@ func TestFrontendMatmulScalePipeline(t *testing.T) {
 	}
 }
 
+// TestFrontendMatmulScale is the DEDICATED fix4 §3.5 split-k matmul e2e
+// (quick-261027-kzv T8): post-flip the real pipeline selects the §3.5
+// vector M=CTA × N(reduced)=WARP/2 × Q=SEQ, so this frontend test IS the
+// split-k numerical battery — the WarpReducer staging fold and cross-warp
+// Combine protocol end-to-end on the A6000.
 func TestFrontendMatmulScale(t *testing.T) {
 	skipUnlessE2E(t)
 	variants := []struct {
@@ -366,6 +371,8 @@ func TestFrontendMatmulScale(t *testing.T) {
 				t.Errorf("e2e: frontend matmul max abs diff = %g > tolerance %g at flat %d: got %g, want %g",
 					maxAbs, reduceTol, worst, full[worst], ref[worst])
 			}
+			t.Logf("e2e: frontend matmul (%s) canary %d, max abs diff %g (tolerance %g)",
+				v.name, canary, maxAbs, reduceTol)
 		})
 	}
 }
