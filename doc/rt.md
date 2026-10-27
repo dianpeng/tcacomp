@@ -72,6 +72,16 @@ constraints)
 
 ## 3. The conformance table — every call the goldens make
 
+> **PARTIALLY SUPERSEDED by doc/fix/fix4.md §4.1/§4.3:** the mapping-ctor
+> and ValidateLaunch rows below are pre-fix4 shapes. The regenerated
+> goldens (internal/cg/cxx/testdata) and
+> runtime/tests/conformance_new_api.cu are the live conformance pins:
+> `GridMapping(kinfo, ndim, <absolute LoC...>)` /
+> `ThreadMapping(kinfo, ndim, <absolute K_d...>)` (zero-extent ndim 0
+> admitted), the 4-arg `ValidateLaunch(dim3, dim3, smemBytes, maxCTA)`,
+> and the flat `index()` / `index(d)` / `lane_id()` queries. The stale
+> rows survive for history.
+
 | Generated call (verbatim shape) | Implementation |
 |---|---|
 | `tca::rt::KernelInfo kinfo;` | §4.1 |
@@ -100,6 +110,21 @@ struct KernelInfo {
 ```
 
 ### 4.2 GridMapping / ThreadMapping — the portion decomposition
+
+> **SUPERSEDED by doc/fix/fix4.md §4.1** (absolute-shape maps): the
+> constructors are `GridMapping(const KernelInfo&, unsigned ndim,
+> /*unsigned loC...*/)` and `ThreadMapping(const KernelInfo&, unsigned
+> ndim, /*unsigned warpsPerDim...*/)` — each arg the dim's ABSOLUTE extent
+> (CTA count / warp count), all ≥ 2 by construction, **no portions, no −1,
+> no Q = total/kPortion division**; `index(d)` = the tuple coordinate via
+> reverse stride-shape over the ctor shape (ThreadMapping in **WARP
+> units**), the no-arg `index()` = the flat rank,
+> `lane_id()`/`warp_index()`/`is_first_*` survive as pure functions of it;
+> the ZERO-EXTENT ThreadMapping (ndim 0) is admitted for one-warp
+> launches; `warp_count()`/`total_cta()`/`total_thread_per_cta()` return
+> the launch-DERIVED values (gridDim.x/blockDim.x via KernelInfo), not
+> shape products. The portion decomposition below survives for history;
+> where it disagrees with fix4, fix4 wins.
 
 Both are the same math over different spaces: the CTA space (gridDim.x,
 portion grammar Σ=**PortionCTA=10**) and the per-CTA thread space
@@ -141,6 +166,16 @@ struct ThreadMapping { /* same face over threadIdx.x */ };
   branch-free — the queries never appear as compiler-emitted conditionals.
 
 ### 4.3 Iterators — the uniform round walk
+
+> **AMENDED by doc/fix/fix4.md §4.2** (loc semantics; the walk mechanics
+> below survive): `CtaIterator`'s `loc` = the dim's **ABSOLUTE LoC** (the
+> CTA count owning it) and the caller supplies step = LoC×T_d;
+> `ThrIterator` over a WARP dim: `loc` = **K_d in warp units** (never a
+> thread count), step = K_d×T_d, rank = `thread_map.index(d)` in warp
+> units; `ThrIterator` as the CTA dim's COUPLED inside walk: init = the
+> no-arg flat rank `thread_map.index()`, **step = blockDim** (both
+> caller-supplied), loc = the owning dim's extent. `Has()/Next()/Index()`
+> faces unchanged. The pre-fix4 loc text below survives for history.
 
 ```c++
 struct SeqIterator { __device__ SeqIterator(unsigned init, unsigned step, unsigned bound);
@@ -323,6 +358,16 @@ template <typename T, unsigned Rank> struct Tensor {
 
 void ValidateLaunch(dim3 grid, dim3 block, unsigned smemBytes);
 ```
+
+> **SUPERSEDED by doc/fix/fix4.md §4.3:** `ValidateLaunch` is 4-arg —
+> `void ValidateLaunch(dim3 grid, dim3 block, unsigned smemBytes, unsigned
+> maxCTA)` (runtime/tca/launch.h) — and its pre-conditions are
+> `blockDim.x % 32 == 0 && blockDim.x/32 <= 32`, `gridDim.x <= maxCTA`
+> (the compiler-emitted MaxCTAPolicy constant), and
+> `smemBytes + reserved <= the QUERIED device opt-in max`. The launch
+> VALUES are compiler-derived constants (fix4 §5.1: literal dim3 from the
+> loop annotations) — validation is defense-in-depth. The portion-multiple
+> pre-conditions below survive for history.
 
 - `ValidateLaunch` asserts the tiling grammar (gridDim.x a positive
   multiple of PortionCTA=10; blockDim.x a whole-warp multiple with warp

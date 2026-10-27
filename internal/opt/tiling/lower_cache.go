@@ -527,21 +527,35 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// dims' in-tile coordinates (M4) — R2 rank-in-index: a WARP-covered
 	// dim's index is thread_map.index(d)·T_d + i (d = the dim's ThreadMap
 	// slot — one map per LNT, tuple coordinates, §7bis — NOT a hardcoded 0
-	// and NOT the bare inside coordinate) for the SMEM window class; a C1b
-	// forced-FRAG site is a per-thread window — every covered dim indexes
-	// by its plain inside coordinate (the thread identity is implicit in
-	// the fragment's registers). SEQ dims index by their plain inside
-	// coordinate either way. The accesses chain after the fill on the
-	// buffer's own effect chain — the ORDINARY memory chain (C7, fix3 D-i:
-	// no special fill-edge reading) — so the fill dominates its readers in
-	// the sea's explicit effect order and stays reachable through them.
+	// and NOT the bare inside coordinate) for the SMEM window class. A C1b
+	// forced-FRAG site is a per-thread window of the LANE'S CHUNK — the
+	// buffer extent on a WARP-covered dim is ceil(T_d/32) (§3.3), while the
+	// lane-chunk walk IV ranges [lane·c, (lane+1)·c): the access must be
+	// CHUNK-LOCAL, insideIV − lane·c — the raw walk IV indexes lanes past
+	// the fragment's extent (GPU-proven 2026-10-27: memcheck "Invalid
+	// __local__ read" on the golden matmul, every lane ≥ 1). SEQ dims index
+	// by their plain inside coordinate either way (a SEQ walk starts at 0 —
+	// already local). The accesses chain after the fill on the buffer's own
+	// effect chain — the ORDINARY memory chain (C7, fix3 D-i: no special
+	// fill-edge reading) — so the fill dominates its readers in the sea's
+	// explicit effect order and stays reachable through them.
 	coords := make([]ir.Node, 0, len(covered))
 	for _, d := range covered {
-		if d.soc == SoCWARP && class == ClassSMEM {
+		switch {
+		case d.soc == SoCWARP && class == ClassSMEM:
 			rank := lr.g.NewRuntimeThreadQuery(lowerOrigin, "index", lr.u32c(float64(d.threadDim)))
 			shifted := lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, rank, lr.u32c(float64(d.tile)))
 			coords = append(coords, lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, shifted, d.insideIV))
-		} else {
+		case d.soc == SoCWARP && class == ClassFRAG:
+			// C1b chunk-local: the fragment holds only this lane's chunk,
+			// so subtract the chunk origin lane·ceil(T_d/32) (the same
+			// lane·c term the walk IV's init carries — fix4 §3.1's chunk
+			// arithmetic).
+			c := ceilDiv(d.tile, 32)
+			lane := lr.g.NewRuntimeThreadQueryLane(lowerOrigin)
+			origin := lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, lane, lr.u32c(float64(c)))
+			coords = append(coords, lr.g.NewBinOp(lowerOrigin, ir.BinOpSub, d.insideIV, origin))
+		default:
 			coords = append(coords, d.insideIV)
 		}
 	}

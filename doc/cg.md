@@ -35,6 +35,17 @@
 | D10 | Comment instrumentation | `cg.Options.Comments` (none/sections/verbose, default sections): section comments synthesized from facts the IR already carries — the LNT header (per-loop dim/soc/tile/LoC from the soc/dosoc/loc/**tile** annotations, the tile annotation added quick-261023-cgq on the same KeyedAttribute channel), loop lines (tile-between rounds vs inside walk), fill loader contracts, reducer bracket lines, the launch header. Verbose additionally stamps hoisted locals with their minting pass (node PassOrigin). No new IR kinds for comments |
 | D7 | ~~Slot-IV Combine~~ (DELETED by R1/R3, 2026-10-23) | The slot-indexed accumulator protocol is gone: `Reduce(value)` folds one element per call, `Combine()` returns `T`, and the former slot/re-iteration machinery (LR-13 slot args, the `.Get(slotIVs)` per-use reads) no longer exists. The per-element consumption reads the scalar Combine local directly; the per-element output store is single-owner gated (R2/R3: `thread_map<N>.is_first_in_cta()`) |
 
+> **Rows resting on MaxThreadsPerCTA are RETIRED by doc/fix/fix4.md §2.1
+> and §5.1:** D9's `__launch_bounds__(MaxThreadsPerCTA)` is now
+> `__launch_bounds__(<derived blockDim>)` — the launch dims are DERIVED
+> from the loop annotations (gridDim.x = max over LNTs of Π CTA LoC,
+> blockDim.x = (max Π warp K)×32, floored at 32), and D11's staging-row
+> `#warps = MaxThreadsPerCTA/32` is the launch-DERIVED
+> `warp_count()`/`kinfo.total_thread_per_cta()/32`. MaxCTA-as-exhaustion
+> and MaxThreadsPerCTA are retired off the tiling Params (fix4 §2.1);
+> MaxCTAPolicy (default 512) is the gridDim cap constant ValidateLaunch
+> checks. The table text above survives for history.
+
 - The provided IR has following shape
   - 1) For IRNodes that has corresponding low level IRNode, already lowered
   - 2) Verb, map/reduce has been lowered into low level runtime primitive call
@@ -292,7 +303,21 @@ internal/cg/cxx/        // the CUDA C++ backend (this document)
 | `memstoresmem` / `fragstore` (the FILL, `loadtile` attr) | variant call: `loadtile=1` → `tca::rt::LoadTileCta(tca_s0, lhs_v, <src base coords...>);` `loadtile=2` → `tca::rt::LoadTileThread(tca_f0, lhs_v, <src base coords...>);` — src coords = the fill's value `memload` axes (above-tie in-scope coords) PLUS the covered dims' round-base bivs, in TENSOR DIM ORDER (covered dim → its trailing biv operand; above-tie dim → its axis expr). The loader enumerates the window internally, bounds-clamps, and synchronizes (cooperative variant) — runtime_objects.md §6.4/6.5 |
 | `memloadsmem` / `fragload` | `T tca_v<N> = tca_s0.Get(<coord exprs...>);` — coords per covered dim (WARP dim: `threadmap index·T + i` already lowered into `RuntimeGetAttribute` + dimvar exprs; SEQ dim: plain dimvar) |
 
+> **C1b amendment (doc/fix/fix4.md §3.3):** under a C1b forced-FRAG site the
+> WARP-covered dim's coord is CHUNK-LOCAL — `i − lane·⌈T_d/32⌉` (the
+> fragment holds only the lane's chunk; GPU-proven 2026-10-27 — the raw
+> `i` form read past the 1-element fragment under memcheck).
+
 ### Runtime objects (final-lower product, `internal/ir/node_runtime.go`)
+
+> **AMENDED by doc/fix/fix4.md §5.1 (mapping-ctor emission args):** the
+> `runtimegridmapping`/`runtimethreadmapping` rows below emit portion
+> args; the landed form is `tca::rt::GridMapping tca_gm<N>(tca_ki,
+> <ndim, absolute LoC... const args>)` / `tca::rt::ThreadMapping
+> tca_tm<N>(tca_ki, <ndim, absolute K_d... const args>)` — shape args,
+> all ≥ 2, with the zero-extent `tca_tm(kinfo, 0u)` admitted for one-warp
+> launches (final-lower's verifier rule strikes any −1 remainder). The
+> stale portion-arg text survives for history.
 
 | Kind | Emission |
 |------|----------|
@@ -458,6 +483,18 @@ reducers, a slot-addressable value with `Get(ivs...)` when the reducer was
 lowered with slot IVs (D7).
 
 ## 9. Host launcher + build (per kernel) — the Tensor contract protocol
+
+> **LAUNCH DERIVATION SUPERSEDED by doc/fix/fix4.md §5.1:** the launch
+> dims are NO LONGER baked `MaxCTA`/`MaxThreadsPerCTA` Params — they are
+> DERIVED at emit time from the loop annotations: `gridDim.x =` max over
+> LNTs of Π CTA LoC (fail-closed CuMAP on CTA-less kernels),
+> `blockDim.x =` (max over LNTs of Π warp K)×32, floored at 32 (the
+> zero-warp admission). LoCs are compile-time constants, so the launcher
+> bakes **literal `dim3(...)` values** into `__launch_bounds__(<derived
+> blockDim>)`, the kernel header, `ValidateLaunch(dim3(<grid>),
+> dim3(<block>), <smemBytes>, 512u)` (4-arg, the MaxCTAPolicy constant),
+> and the `<<<...>>>` launch itself. The retired-constant text below
+> survives for history; where it disagrees with fix4, fix4 wins.
 
 The kernel lives in the ANONYMOUS namespace (quick-261023-ten): the
 launcher is the translation unit's only exported symbol (the scalfold

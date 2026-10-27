@@ -207,14 +207,78 @@ func frontendMatmulScaleReference(m, n, q int, scale float32) []float32 {
 	return out
 }
 
+// feCollapseLine collapses whitespace runs to single spaces and trims —
+// whitespace-tolerant line matching so pure formatting drift cannot dodge a
+// pin (split lines, collapse, strings.Contains).
+func feCollapseLine(line string) string {
+	return strings.Join(strings.Fields(line), " ")
+}
+
+// feLineContains reports whether any collapsed line of src contains the
+// collapsed want.
+func feLineContains(src, want string) bool {
+	want = feCollapseLine(want)
+	for _, line := range strings.Split(src, "\n") {
+		if strings.Contains(feCollapseLine(line), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// fePinScheduleSignature pins the fix4 §5.1 launch derivation on the emitted
+// frontend fixture (quick-261027-iq6 T6a, fix4 §8/§9(1)). The feM=64,
+// feN=128, feQ=64 kernel's selected schedule class is the ZERO-WARP
+// admission + ZERO-CACHE outcome:
+//
+//   - gridDim 64 = Π CTA LoC over the LNT's CTA dims (M=CTA at its
+//     extent-capped LoC; every other window dim SEQ), emitted as a literal
+//     dim3 in both the launch and ValidateLaunch;
+//   - blockDim 32 = (Π warp K)×32 floored at 32 with NO WARP-assigned dim —
+//     the zero-warp admission class (one physical warp);
+//   - smem 0u — the zero-cache outcome fix4 §2.6 allows with a warning
+//     (both sites declined/evicted: every covered dim SEQ ⇒ FRAG at 4 B, or
+//     refused C1b), so no dynamic SMEM is requested;
+//   - 512u — the MaxCTAPolicy constant (cg.Options), the 4th ValidateLaunch
+//     arg of the 4-arg contract (fix4 §4.3);
+//   - __launch_bounds__(32) — the derived blockDim (fix4 §5.1 replaces the
+//     retired MaxThreadsPerCTA).
+//
+// Hermetic by design: the pin catches schedule-class drift in every
+// `go test` pass, no GPU required; the numerical acceptance of this exact
+// schedule runs in TestFrontendMatmulScale on the A6000. If a legitimate
+// defect fix changes the emission, re-derive from the freshly emitted .cu
+// and re-pin in the same commit — never force a schedule to match a pin.
+func fePinScheduleSignature(t *testing.T, files map[string][]byte) {
+	t.Helper()
+	pins := []struct{ name, want string }{
+		{"derived __launch_bounds__ (blockDim floor 32)", "__launch_bounds__(32)"},
+		{"4-arg ValidateLaunch (literal derived dim3 grid/block, smem 0u, MaxCTAPolicy 512u)",
+			"ValidateLaunch(dim3(64u, 1u, 1u), dim3(32u, 1u, 1u), 0u, 512u)"},
+		{"literal dim3 kernel launch", "<<<dim3(64u, 1u, 1u), dim3(32u, 1u, 1u)"},
+	}
+	for name, content := range files {
+		src := string(content)
+		for _, pin := range pins {
+			if !feLineContains(src, pin.want) {
+				t.Fatalf("e2e: emitted %s lost the fix4 §5.1 schedule signature — %s: no line matches %q\n"+
+					"zero-warp admission (blockDim floor 32), zero-cache (smem 0u, §2.6 allowed outcome), MaxCTAPolicy 512",
+					name, pin.name, pin.want)
+			}
+		}
+	}
+}
+
 // TestFrontendMatmulScalePipeline is the HERMETIC positive pin of
 // quick-261024-sdk Step 7.1: both Appendix A variants compile through the
 // real pipeline — tile-lower's recast §8 fill checks (ORDERING + LAYERING-IV)
 // included, the gate the pre-fix1 body model failed on this exact shape —
 // and emit a non-empty .cu. No GPU and no nvcc: the assertion ends at the
-// emitted files, so this runs in every hermetic `go test` pass. The GPU
-// numerical acceptance lives in TestFrontendMatmulScale (fix3 D-p: green,
-// no skip — both variants within reduceTol, canary 0).
+// emitted files, so this runs in every hermetic `go test` pass. The written
+// variant additionally pins the fix4 §5.1 launch-signature class
+// (fePinScheduleSignature). The GPU numerical acceptance lives in
+// TestFrontendMatmulScale (fix3 D-p: green, no skip — both variants within
+// reduceTol, canary 0).
 func TestFrontendMatmulScalePipeline(t *testing.T) {
 	variants := []struct {
 		name string
@@ -235,6 +299,9 @@ func TestFrontendMatmulScalePipeline(t *testing.T) {
 				if err := cxx.ScanBracketLaw(string(content)); err != nil {
 					t.Fatalf("e2e: bracket law violated by emitted %s: %v", name, err)
 				}
+			}
+			if v.name == "written" {
+				fePinScheduleSignature(t, files)
 			}
 		})
 	}

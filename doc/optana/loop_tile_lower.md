@@ -66,6 +66,16 @@
 
 ## §3 Canonical Lowered Loop Forms
 
+> **SUPERSEDED by doc/fix/fix4.md §3.1** (loop templates) and §1.2 (F2
+> deleted): the CTA dim's inside walk is the COUPLED walk with init = the
+> no-arg flat thread rank and **step = blockDim** (not "remaining warp
+> portions × quantum × 32"); the WARP dim's inside is **LANE CHUNKS** of
+> ⌈T_d/32⌉ consecutive elements per lane over the zero-operand `lane_id()`
+> query (not "each thread owns a whole T-chunk", not shard windows); the
+> between strides are LoC_d×T_d (CTA) and K_d×T_d (WARP) with LoC/K
+> ABSOLUTE; the multi-dim forms nest per dim. This section's text survives
+> for history; where it disagrees with fix4, fix4 wins.
+
 - The normative loop FORMS are the revised templates of doc/optana/loop_tiling.md
   ("Mechanical rewrite for tiling"): 0-BASED round enumeration in the between
   loops (induction starts at 0, stride LoC × T, NO map index in any induction
@@ -236,6 +246,12 @@
   - Extents per covered dim AFTER demotion (the Cache.dims trailing
     dimensions, per the decide pass's cache-tie semantics), sized by
     the R2 WINDOW rule (ruled 2026-10-21)
+    - **SUPERSEDED sizing by doc/fix/fix4.md §3.3 / §2.4:** a WARP-covered
+      dim's window factor is its **K_d** (warp count), one K_d×T_d slab per
+      warp coordinate — 32× smaller than the `#threads_d × T_d` group
+      window below; a WARP-covered dim under a C1b forced-FRAG site prices
+      and sizes at **⌈T_d/32⌉** (the lane's chunk). The text below survives
+      for history.
     - WARP dim d -> #threads_d x T_d (the whole group's round window,
       NOT the single-thread chunk)
     - SEQ dim -> T_d
@@ -280,6 +296,10 @@
     per-thread coupled/striped walk makes that coordinate vary by
     thread at the fill point, and R1's CTA-uniform-coordinates-only
     rule makes the cooperative SMEM fill incoherent for such sites).
+    **SUPERSEDED sizing by doc/fix/fix4.md §3.3:** FRAG over a WARP-covered
+    dim prices and sizes at ⌈T_d/32⌉ per LANE (the lane's consecutive chunk)
+    — never T_d per thread, never the group window. The sentence below
+    survives for history.
     FRAG over a WARP-covered dim prices and sizes at T_d per thread
     (the per-thread window — NEVER the LoC x 32 group window), the
     access is the plain inside coordinate for EVERY covered dim, and
@@ -361,6 +381,18 @@ introduces a new decision.
   - Per tree, walk outer -> inner; two counters (CTA dims, warp dims),
     both restarting per LNT; sequential iters get no dimension
 - PHASE 3 — loop rewrite (per dim, original order)
+  - **SUPERSEDED templates by doc/fix/fix4.md §3.1** (and §1.2 for F2): the
+    CTA between loop strides LoC_d×T_d with LoC the dim's ABSOLUTE CTA count
+    (never "LoC = MaxCTA (portion −1/full)"); the CTA inside walk is the
+    flat-index coupled form with **step = blockDim** (not
+    `nThreads_coupled = remaining warp portions × quantum × 32`); the WARP
+    dim's between stride is **K_d×T_d** (warp units, never nThreads×T) and
+    its inside is **LANE CHUNKS** (`i = lane·⌈T_d/32⌉`, bound
+    `umin((lane+1)·⌈T_d/32⌉, tile_max)`) — not a whole-T-chunk-per-thread
+    sequential walk; the **F2 coupled-portion floor is DELETED** (no
+    "remaining warp portions" exist under the factorization; F2 was deleted
+    by fix4 §1.2). PHASE 0/1/2 and the F1 saturating bounds below SURVIVE
+    per fix4 §3.4; this phase's text survives for history.
   - Every dim becomes between-round + inside loops; ALL between
     loops nest in dim order, ALL inside loops nest inside them, also in
     dim order (the loop_tiling.md template layout). The former
@@ -462,6 +494,16 @@ introduces a new decision.
     thread_map.index(d) to obtain the thread index mapping for that
     dimension; a SEQ-assigned dim is a sequential tile loop.
     Rank-in-index => window-in-shape)
+    - **SUPERSEDED sizing by doc/fix/fix4.md §3.3:** the buffer extent on a
+      WARP-covered dim is **K_d × T_d** (one slab per warp coordinate — the
+      factorization's cross-warp shared window), NOT `#threads_d × T_d`;
+      a WARP-covered dim under a C1b forced-FRAG site buffers its lane
+      chunk ⌈T_d/32⌉ and its ACCESS is chunk-local
+      (`insideIV − lane·⌈T_d/32⌉`). The §6 halve-then-drop budget
+      resolution is now an **unreachable fail-closed backstop** (fix4 §3.3:
+      the record is feasible by construction — decide-side eviction; keep
+      the code as defense, marked unreachable). The bullets below survive
+      for history.
     - Buffer extent per covered dim: WARP dim -> #threads_d x T_d (the
       whole group's round window, NOT the single-thread chunk); SEQ
       dim -> T_d; total buffer bytes = product over covered dims x
@@ -548,6 +590,12 @@ introduces a new decision.
     preset ordering are inherited; this pass ADDS NO SEARCH of its own
 - Inherited v0 default searcher policy (from the decide pass,
   doc/optana/loop_tiling.md composition semantics)
+  - **SUPERSEDED by doc/fix/fix4.md §2.2:** the ≤1 CTA + ≤1 WARP per-LNT
+    policy is deleted — the decide pass searches the full multi-dim
+    same-category factorizations (CTA+CTA, WARP+WARP) under the MAPM/MALoC/
+    CuMAP constraint set; the portion grammar this policy rode
+    (PORTION_CTA/PORTION_WARP, −1 remainder) is deleted by fix4 §1.2/§2.1.
+    The text below survives for history.
   - At most ONE CTA-assigned dim and at most ONE independent WARP dim per LNT
     - A POLICY within the constraint set, NOT a model rule
   - Same-category multi-dim composition (CTA+CTA, independent WARP+WARP) is
@@ -589,12 +637,26 @@ introduces a new decision.
       index(); runtime-internal control flow for warp-specialized reduce;
       generated code never emits them as conditionals)
   - Counting invariant (author-ruled)
+    - **SUPERSEDED by doc/fix/fix4.md §1.3 (ThreadMap dimensionality
+      ruling):** ThreadMapping carries ONE slot per **WARP dim only** (n
+      slots, coordinate in WARP units; `lane_id()` for the lane); the CTA
+      dim's coupled walk uses the NO-ARG flat thread rank and takes NO map
+      slot. GridMapping carries one slot per CTA dim (m slots). The m+n
+      coupled+warp counting below survives for history.
     - p = m: CTA assignments = CTA dims
     - q = n: independent warp assignments
     - A CTA dim's coupled inside-warp is part of its CTA assignment, NOT
       double-counted
     - ThreadMap dimensionality = m coupled + n independent dims
   - Portion/exhaustion grammar, from doc/optana/loop_tiling.md
+    - **SUPERSEDED by doc/fix/fix4.md §4.1 (map constructors) and §2.1
+      (Params):** the runtime maps take `(KernelInfo, unsigned ndim,
+      /*absolute extents...*/)` — each arg the dim's ABSOLUTE LoC / warp
+      count K_d, all ≥ 2, **no portions, no −1 remainder, no
+      total-division grammar**; ThreadMapping admits the ZERO-EXTENT form
+      (ndim 0, one-warp launches); `warp_count()`/`total()` are
+      launch-DERIVED kinfo reads, not shape products. The portion text
+      below survives for history.
     - Portion sums 10 (CTA) / 8 (warp), -1 = derived remainder
     - PORTION_CTA / PORTION_WARP constants, assert-and-trap pre-conditions
     - Defaults: Ampere, no green context, 512 threads per CTA = 16 warps, CTA
@@ -618,6 +680,16 @@ introduces a new decision.
 - Sync ownership (RULED)
   - The runtime owns ALL synchronization/barriers; this pass never emits them
 - Launch/budget validation at runtime
+  - **SUPERSEDED by doc/fix/fix4.md §4.3 and §5.1:** launch values are
+    COMPILER-DERIVED from the loop annotations (gridDim = max over LNTs of
+    Π CTA LoC, blockDim = (max Π warp K)×32 floor 32 — literal dim3 in the
+    launcher, `__launch_bounds__` derived); the runtime's 4-arg
+    `ValidateLaunch(dim3 grid, dim3 block, unsigned smemBytes, unsigned
+    maxCTA)` checks `block%32==0 && block/32≤32`, `grid ≤ maxCTA` (the
+    compiler-emitted MaxCTAPolicy constant), and the QUERIED smem ceiling —
+    the portion multiples/≥256-threads assert-and-trap pre-conditions are
+    deleted. Loop-rank guarding (§4) survives. The text below survives for
+    history.
   - Launch config is EXTERNAL and static at compile time, per the portion
     grammar of doc/optana/loop_tiling.md; the runtime ASSERT-AND-TRAPs the
     pre-conditions (#CTAs multiple of 10, threads per CTA multiple of 8 warps)

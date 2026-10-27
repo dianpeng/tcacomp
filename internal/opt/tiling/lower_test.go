@@ -1660,6 +1660,65 @@ func TestLowerMatmulSiteSurgery(t *testing.T) {
 	assertReachable(t, fx.g, ir.KindMemStore, 1)
 }
 
+// TestLowerC1bFragChunkLocalAccess pins the C1b forced-FRAG ACCESS index on
+// a WARP-covered dim (fix4 §3.3: the fragment holds the LANE'S CHUNK of
+// ceil(T_d/32) elements, so the access coordinate must be CHUNK-LOCAL —
+// insideIV − lane·ceil(T_d/32) — never the raw lane-chunk walk IV, whose
+// values START at lane·c and run past the fragment's extent). The raw form
+// read out of bounds on the GPU (quick-261027-iq6 probe: compute-sanitizer
+// memcheck on the golden matmul reported "Invalid __local__ read of size 4"
+// for every lane ≥ 1 — lanes indexed the 1-element Frag past its extent).
+func TestLowerC1bFragChunkLocalAccess(t *testing.T) {
+	fx, lhs, rhs, store := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec) // lhs is the C1b forced-FRAG site (K WARP-covered)
+
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 4)
+	var fragAccess ir.Node
+	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
+		if n.KindOf() != ir.KindMemLoad {
+			continue
+		}
+		sc, _ := ir.StorageClassOf(n)
+		if sc == ir.StorageFrag {
+			fragAccess = n
+			if src := ir.OperandsOf(n)[0]; src.BasePtr() != lbuf.BasePtr() {
+				t.Fatalf("FRAG access node %d reads a foreign buffer %d", n.BasePtr().ID(), src.BasePtr().ID())
+			}
+		}
+	}
+	if fragAccess == nil {
+		t.Fatal("the C1b lhs access (FragLoad of the 4 B lane-chunk buffer) must exist")
+	}
+	coords := ir.OperandsOf(fragAccess)[1:]
+	if len(coords) != 1 {
+		t.Fatalf("the lhs FRAG access carries %d coords, want 1 (the WARP-covered K dim)", len(coords))
+	}
+	coord := coords[0]
+	if coord.KindOf() != ir.KindBinOp {
+		t.Fatalf("the C1b FRAG access coord must be the chunk-local subtraction insideIV − lane·c, got %s", kindOf(coord))
+	}
+	if code, _ := ir.BinOpCodeOf(coord); code != ir.BinOpSub {
+		t.Fatalf("the C1b FRAG access coord must SUBTRACT the chunk origin lane·c, got binop %v", code)
+	}
+	subOps := ir.OperandsOf(coord)
+	if subOps[0] == nil || subOps[0].KindOf() != ir.KindDimVar {
+		t.Fatalf("the subtraction's minuend must be the lane-chunk inside DimVar, got %s", kindOf(subOps[0]))
+	}
+	if code, _ := ir.BinOpCodeOf(subOps[1]); code != ir.BinOpMul {
+		t.Fatalf("the subtraction's subtrahend must be the chunk origin mul lane·c, got %s", kindOf(subOps[1]))
+	}
+	mulOps := ir.OperandsOf(subOps[1])
+	if lane := mulOps[0]; lane == nil || lane.KindOf() != ir.KindRuntimeThreadQuery ||
+		len(ir.OperandsOf(lane)) != 0 || ir.RuntimeAttributeOf(lane) != "lane_id" {
+		t.Fatalf("the chunk origin must carry the zero-operand lane_id query, got %v", lane)
+	}
+	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
+		t.Fatalf("the chunk size operand = %v, want ceil(T_k/32) = ceil(32/32) = 1", mulOps[1])
+	}
+	assertVerifyAndRootReachable(t, fx.g)
+}
+
 // TestMatmulWorkedCheck pins the R1 worked example at the §3.3 signature:
 // the lhs C1b FRAG fill sits structurally INSIDE M.inside (the fill-key
 // epoch — the m element changes invalidate the fragment) — its m axis is
