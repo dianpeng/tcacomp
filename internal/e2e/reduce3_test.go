@@ -130,7 +130,7 @@ func runReduce3Pipeline(t *testing.T, name string, extents []float64, decisions 
 	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("final-lower: %v", err)
 	}
-	res, err := cxx.Emit(f.g, cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86})
+	res, err := cxx.Emit(f.g, cg.Options{MaxCTAPolicy: 512, TargetSM: 86})
 	if err != nil {
 		t.Fatalf("Emit: %v", err)
 	}

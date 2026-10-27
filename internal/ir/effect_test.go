@@ -125,7 +125,7 @@ func TestEffectVerdictsRuntimeFamily(t *testing.T) {
 	f32 := InternScalar(TF32)
 	ki := g.NewRuntimeKernelInfo("ctor")
 	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	acc := g.NewLambdaInputParam("ctor", "acc", f32)
 	now := g.NewLambdaInputParam("ctor", "now", f32)
 	comb := g.NewBinOp("ctor", BinOpAdd, g.NewParamRef("ctor", acc), g.NewParamRef("ctor", now))

@@ -38,7 +38,7 @@ func combinerOf(g *Graph) Node {
 // then the reducer over (init, lambda, mapping, staging).
 func warpReducerOf(g *Graph) Node {
 	ki := g.NewRuntimeKernelInfo("ctor")
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	staging := g.NewMemNewSMem("ctor", u32const(g, 64))
 	return g.NewRuntimeWarpReducer("ctor", f32const(g, 0), combinerOf(g), tm, staging)
 }
@@ -153,8 +153,8 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 func runtimeFx() (*Graph, Node, Node, Node, Node, Node, Node, Node) {
 	g := NewGraph("runtimefx")
 	ki := g.NewRuntimeKernelInfo("ctor")
-	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
-	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, -1})
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
 	red := warpReducerOf(g)
 	init := g.NewRuntimeCallMethod("ctor", "Init", red)
 	combine := g.NewRuntimeCallMethod("ctor", "Combine", red)
@@ -196,10 +196,11 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 		g.NewReturn("ctor", ki)
 	}, "operands")
 
-	// Mappings: wrong object, non-const portion, portion count != ndim,
-	// ndim < 1, -1 not last.
+	// Mappings: wrong object, non-const shape, shape count != ndim,
+	// ndim < 1, extent 1 (K=1 dims are pruned — the absolute-extent rule
+	// of fix4 §4.1 that retired the -1 remainder).
 	expect("map-badobj", func(g *Graph) {
-		gm := g.NewRuntimeGridMapping("ctor", u32const(g, 0), []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", u32const(g, 0), []int{4})
 		g.NewReturn("ctor", gm)
 	}, "RuntimeKernelInfo")
 	expect("map-nonconst", func(g *Graph) {
@@ -212,25 +213,28 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	expect("map-count", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{2, 4})
-		// Hand-corrupt: declare ndim 2 but the constructor wired portions
+		// Hand-corrupt: declare ndim 2 but the constructor wired shapes
 		// [2,4] — instead probe the mismatch through the raw node path.
 		_ = gm
 		raw := g.NewNode(KindRuntimeGridMapping, "ctor", ki,
 			g.NewConst("ctor", InternScalar(TI32), 3),
 			g.NewConst("ctor", InternScalar(TI32), 2))
 		g.NewReturn("ctor", raw)
-	}, "portions")
+	}, "shapes")
 	expect("map-ndim0", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
 		raw := g.NewNode(KindRuntimeGridMapping, "ctor", ki,
 			g.NewConst("ctor", InternScalar(TI32), 0))
 		g.NewReturn("ctor", raw)
 	}, "ndim")
-	expect("map-remainder", func(g *Graph) {
+	// The -1 remainder rule is RETIRED with the portion grammar (fix4
+	// §4.1): every shape is an ABSOLUTE extent >= 2 — a K=1 warp dim is
+	// SEQ and pruned upstream, and 1 is not a partition.
+	expect("map-extent1", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{-1, 4})
+		gm := g.NewRuntimeThreadMapping("ctor", ki, []int{1, 4})
 		g.NewReturn("ctor", gm)
-	}, "LAST portion")
+	}, ">= 2")
 
 	// Reducers: swapped and missing operands.
 	expect("red-swapped", func(g *Graph) {
@@ -270,7 +274,7 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	}, "\"total_cta\"")
 	expect("get-total-on-mapping", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "total_cta", gm)
 		g.NewReturn("ctor", ga)
 	}, "KernelInfo object")
@@ -284,19 +288,19 @@ func TestRuntimeObjectVerifyShape(t *testing.T) {
 	// zero-arg DIMENSION getattr still fails wanting exactly 1.
 	expect("get-dimension-noargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm)
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-twoargs", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		ga := g.NewRuntimeGetAttribute("ctor", "dimension", gm, u32const(g, 0), u32const(g, 1))
 		g.NewReturn("ctor", ga)
 	}, "exactly 1")
 	expect("get-index-nonconst-arg", func(g *Graph) {
 		ki := g.NewRuntimeKernelInfo("ctor")
-		gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+		gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 		m := g.NewInputParam("ctor", RoleDim, "m", nil)
 		ga := g.NewRuntimeGetAttribute("ctor", "index", gm, m)
 		g.NewReturn("ctor", ga)
@@ -398,14 +402,14 @@ func TestRuntimeFlatQueryVerifyShape(t *testing.T) {
 	// (the flat form); "dimension" keeps exactly one.
 	ga1 := NewGraph("flatgetattr")
 	ki1 := ga1.NewRuntimeKernelInfo("ctor")
-	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, -1})
+	tm1 := ga1.NewRuntimeThreadMapping("ctor", ki1, []int{4, 2})
 	ga1.NewReturn("ctor", ga1.NewRuntimeGetAttribute("ctor", "index", tm1))
 	if vs := Verify(ga1); len(vs) != 0 {
 		t.Fatalf("zero-arg index getattr must verify clean, got %v", vs)
 	}
 	g2 := NewGraph("flatgetattrdim")
 	ki2 := g2.NewRuntimeKernelInfo("ctor")
-	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, -1})
+	tm2 := g2.NewRuntimeThreadMapping("ctor", ki2, []int{4, 2})
 	g2.NewReturn("ctor", g2.NewRuntimeGetAttribute("ctor", "dimension", tm2))
 	if vs := Verify(g2); len(vs) != 1 || !strings.Contains(vs[0].Msg, "exactly 1") {
 		t.Fatalf("zero-arg dimension getattr must fail wanting exactly 1 arg, got %v", vs)
@@ -542,7 +546,7 @@ func TestRuntimeObjectValueNumbering(t *testing.T) {
 	g := NewGraph("objvn")
 	se := pureAll{}
 	ki := g.NewRuntimeKernelInfo("ctor")
-	gm := g.NewRuntimeGridMapping("ctor", ki, []int{-1})
+	gm := g.NewRuntimeGridMapping("ctor", ki, []int{4})
 	dosoc := u32const(g, 0) // ONE shared const def: DoSoC operands are identity-keyed
 
 	i1 := asValue(t, g.NewRuntimeGetAttribute("ctor", "index", gm, dosoc))

@@ -125,10 +125,11 @@ func (g *Graph) NewRuntimeKernelInfo(origin string) Node {
 }
 
 // runtimeMappingNode: one per-LNT mapping object construction; ops =
-// [%kernel_info, ndim const (TI32), portion consts (TI32) ...] with
-// len(portions) == ndim, each portion >= 1, and -1 (the remainder) allowed
-// ONLY as the LAST portion (the D3 remainder rule, P-3). Shared by
-// RuntimeGridMapping and RuntimeThreadMapping — the kind discriminates.
+// [%kernel_info, ndim const (TI32), shape consts (TI32) ...] with
+// len(shapes) == ndim, each shape the dim's ABSOLUTE extent >= 2 (fix4
+// §4.1: no portions, no −1 — the D3 remainder rule is retired; the T5
+// verifier rule). Shared by RuntimeGridMapping and RuntimeThreadMapping —
+// the kind discriminates.
 type runtimeMappingNode struct {
 	*Base
 	operandList

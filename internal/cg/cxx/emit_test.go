@@ -252,10 +252,11 @@ func reduceT1Graph(t *testing.T) *ir.Graph {
 	return f.g
 }
 
-// emitOptions mirrors tiling.DefaultParams — the same totals the pipeline
-// ran under (doc/cg.md §1.3: the driver passes them explicitly).
+// emitOptions mirrors tiling.DefaultParams' §4.3 policy constant (the
+// MaxCTA cap ValidateLaunch checks); the launch DIMENSIONS themselves are
+// annotation-derived inside Emit (fix4 §5.1) — nothing to pass here.
 func emitOptions() cg.Options {
-	return cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86}
+	return cg.Options{MaxCTAPolicy: 512, TargetSM: 86}
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +384,9 @@ func TestKernelMetaNames(t *testing.T) {
 	// launcher is the exported surface (quick-261023-ten).
 	for _, want := range []string{
 		"namespace {",
-		"__global__ void __launch_bounds__(512) MatmulScale(",
+		// fix4 §5.1: __launch_bounds__ carries the ANNOTATION-DERIVED
+		// blockDim — the matmul schedule's warp product K=2 → 64.
+		"__global__ void __launch_bounds__(64) MatmulScale(",
 		"void MatmulScaleLaunch(",
 		"const tca::Tensor<float, 2u>& lhs",
 		"tca::Tensor<float, 3u>& out",
@@ -422,11 +425,31 @@ func TestGates(t *testing.T) {
 	if _, err := Emit(g, emitOptions()); err == nil || !strings.Contains(err.Error(), "no attached ASTKernel") {
 		t.Fatalf("an unscheduled graph must fail closed naming the AST, got %v", err)
 	}
-	g2 := matmulStoreGraph("mm")
-	runPipeline(t, g2)
-	bad := emitOptions()
-	bad.MaxCTA = 0
-	if _, err := Emit(g2, bad); err == nil || !strings.Contains(err.Error(), "launch totals") {
-		t.Fatalf("zero CTAs must fail closed, got %v", err)
+	// fix4 §5.1 (T5): the launch dimensions DERIVE from the loop
+	// annotations — a schedule whose NO LNT carries a CTA dim violates
+	// CuMAP and fails closed at the derivation (the old zero-MaxCTA probe
+	// is retired with the driver-supplied totals).
+	f := newChain("nocta", 512)
+	f.bodyStore(out1D(f), f.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0))
+	rec := &tiling.Record{Iters: map[ir.Node]tiling.IterDecision{}, Sites: map[uint64]tiling.SiteDecision{}, Verified: true}
+	biv := ir.DataDeps(f.iters[0])[0]
+	rec.Iters[biv] = tiling.IterDecision{SoC: tiling.SoCSequential, LoC: 1, TileSize: 32}
+	cache := opt.NewCache()
+	cache.Put(rec)
+	if err := (tiling.LowerPass{Params: tiling.DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, f.g); err != nil {
+		t.Fatalf("fixture tile-lower: %v", err)
 	}
+	if err := (schedule.Scheduler{}).Run(nil, f.g); err != nil {
+		t.Fatalf("fixture schedule: %v", err)
+	}
+	if _, err := Emit(f.g, emitOptions()); err == nil || !strings.Contains(err.Error(), "CuMAP") {
+		t.Fatalf("a CTA-less schedule must fail closed naming CuMAP at the launch derivation, got %v", err)
+	}
+}
+
+// out1D builds a rank-1 output tensor param over the chain's first dim
+// (the TestGates no-CTA fixture's store target).
+func out1D(f *chainFx) ir.Node {
+	return f.g.NewInputParam("ctor", ir.RoleTensor, "out",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}}))
 }

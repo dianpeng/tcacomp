@@ -9,8 +9,10 @@ package finallower
 //   - per LNT (one pair, ALWAYS): RuntimeGridMapping + RuntimeThreadMapping
 //     prepended to the OWNING LNT's prologue Group — never the kernel's
 //     first Group — grid before thread, both stamped SN 0/prologue, their
-//     portion vectors from the provenance record's per-LNT MappingPlan
-//     (P-3's encoding: kernel_info operand, TI32 ndim + portions);
+//     ABSOLUTE SHAPE vectors from the provenance record's per-LNT
+//     MappingPlan (P-3's encoding: kernel_info operand, TI32 ndim + the
+//     per-dim absolute extents — LoC_d / K_d, never portions; a zero-WARP
+//     LNT carries ndim 0, legal since T5);
 //   - every pre-final-lower launch-map query (RuntimeGridQuery/
 //     RuntimeThreadQuery) rewritten into RuntimeGetAttribute(%<owning
 //     LNT's mapping object>, field, dosoc): the binding becomes EXPLICIT
@@ -87,13 +89,13 @@ func (lr *lowering) prologueOf(lnt *ir.ASTLNT) (*ir.ASTBlock, error) {
 
 // prependMapping builds one mapping construction and prepends it to the
 // prologue Group, stamped SN 0/prologue (P-10).
-func (lr *lowering) prependMapping(kind ir.Kind, prologue *ir.ASTBlock, ki ir.Node, portions []int) (ir.Node, error) {
+func (lr *lowering) prependMapping(kind ir.Kind, prologue *ir.ASTBlock, ki ir.Node, shapes []int) (ir.Node, error) {
 	var obj ir.Node
 	switch kind {
 	case ir.KindRuntimeGridMapping:
-		obj = lr.g.NewRuntimeGridMapping(lowerOrigin, ki, portions)
+		obj = lr.g.NewRuntimeGridMapping(lowerOrigin, ki, shapes)
 	case ir.KindRuntimeThreadMapping:
-		obj = lr.g.NewRuntimeThreadMapping(lowerOrigin, ki, portions)
+		obj = lr.g.NewRuntimeThreadMapping(lowerOrigin, ki, shapes)
 	default:
 		return nil, fmt.Errorf("final-lower: unknown mapping kind %s", kind)
 	}

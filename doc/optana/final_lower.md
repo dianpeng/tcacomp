@@ -234,8 +234,8 @@ per-dim provenance entry {
   - 1) Every runtime object gets its own DEDICATED construction node (no
     generic RuntimeConstruct) — arity and operand types are verifier-pinnable:
     - RuntimeKernelInfo()
-    - RuntimeGridMapping(%kernel_info, <dims + portions ...>)
-    - RuntimeThreadMapping(%kernel_info, <dims + portions ...>)
+    - RuntimeGridMapping(%kernel_info, <dims + shapes ...>)
+    - RuntimeThreadMapping(%kernel_info, <dims + shapes ...>)
     - RuntimeSequentialReducer(%init_value, %lambda)
     - RuntimeWarpReducer(%init_value, %lambda)
     - RuntimeGlobalReducer(%init_value, %lambda)
@@ -349,10 +349,12 @@ __global__ void CompiledKernel(...) {
 ```
 
 - Notes, the HOST-side launch configuration (gridDim/blockDim) is NOT an IR
-  node: it derives from the tiling Params carried in the kernel metadata and
-  is consumed by the host launch wrapper + the runtime's launch-validation
+  node: under the fix4 factorization model (doc/fix/fix4.md §5.1, T5) it
+  DERIVES from the emitted loops' soc/dosoc/loc annotations — gridDim = max
+  over LNTs of the CTA LoC products, blockDim = (max warp-K product) × 32 —
+  and is consumed by the host launch wrapper + the runtime's launch-validation
   object (doc/runtime_objects.md §1). The IR carries it only implicitly via
-  the mapping objects' portion constants
+  the mapping objects' absolute shape constants and the loop annotations
 
 ### Per LNT's Mapping Object Construction
 
@@ -363,19 +365,25 @@ __global__ void CompiledKernel(...) {
 
 ```
 
-// Conceptual code — v0 policy: at most ONE CTA dim and at most one
-// independent warp dim per LNT, so GridMapping never exceeds 1 dimension
+// Conceptual code — the fix4 factorization model (doc/fix/fix4.md §3.2/
+// §4.1): the constructor carries an EXPLICIT ndim followed by the per-dim
+// ABSOLUTE shapes — LoC_d (CTA counts) for GridMapping, K_d (warp counts)
+// for ThreadMapping. No portions, no -1 remainder, no share arithmetic:
+// the launch IS what you factorize. Multi-dim schedules nest one slot per
+// parallel dim (GridMap = CTA dims only, ThreadMap = WARP dims only — the
+// CTA dim's coupled inside walk rides the no-arg flat rank and takes NO
+// thread slot). A zero-WARP LNT constructs the ZERO-EXTENT ThreadMapping
+// (ndim 0 — one launched warp; the flat query/lane_id/is_first_in_cta/
+// ThrIterator still read the object).
 __global__ void CompiledKernel(...) {
   KernelInfo kernel_info; // always inserted
 
-  // ONE LNT
+  // ONE LNT: 2 CTA dims (LoC 4 and 16 -> 64 CTAs) + 2 WARP dims
+  // (K 2 and 8 -> 16 warps = 512 threads)
   {
-    GridMapping<1, -1> grid_mapping(kernel_info); // -1: takes all PortionCTA=10 portions
+    GridMapping grid_mapping(kernel_info, 2u, 4u, 16u);
 
-    ThreadMapping<2, 4, -1> thread_mapping(kernel_info); // 4 of PortionWarp=8 portions
-                                                          // (AutoWarpPortion), the CTA dim's
-                                                          // coupled tile-inside walk takes
-                                                          // the rest
+    ThreadMapping thread_mapping(kernel_info, 2u, 2u, 8u);
   }
 }
 
@@ -385,16 +393,21 @@ __global__ void CompiledKernel(...) {
 
 %grid_mapping = RuntimeGridMapping(
   %kernel_info, // SSAUse to kernel info
-  1,            // # of dimension
-  -1            // takes all PortionCTA portions
+  2,            // # of dimensions (explicit)
+  4, 16         // the CTA dims' ABSOLUTE LoC (CTA counts)
 );
 
 %thread_mapping = RuntimeThreadMapping(
   %kernel_info, // SSAUse to kernel info
-  2,            // # of dimension
-  4,            // 4/8 warp portions (AutoWarpPortion)
-  -1            // the CTA dim's coupled walk takes the rest
+  2,            // # of dimensions (explicit; 0 for a zero-WARP LNT)
+  2, 8          // the WARP dims' ABSOLUTE warp counts K_d
 );
+
+// The launcher derives the launch from the loop annotations and bakes
+// literals (max over LNTs of the CTA-LoC products / (warp-K products) x 32):
+
+tca::rt::ValidateLaunch(dim3(64u, 1u, 1u), dim3(512u, 1u, 1u), smemBytes, maxCTA);
+CompiledKernel<<<dim3(64u, 1u, 1u), dim3(512u, 1u, 1u), smemBytes, stream>>>(...);
 
 ```
 
@@ -406,6 +419,10 @@ __global__ void CompiledKernel(...) {
       exactly ONE GridMapping and ONE ThreadMapping)
     - ie the query ("index", @d) becomes
       RuntimeGetAttribute(%grid_mapping, "index", @d)
+    - the ZERO-OPERAND forms rewrite to ZERO-ARG attribute reads: the flat
+      ("index") ruling of 2026-10-23 and the lane query ("lane_id", fix4
+      §3.1's lane-chunk walks) become .index() / .lane_id() on the
+      ThreadMapping
   - this makes the binding EXPLICIT in SSA for both backends — MLIR has no
     lexical runtime scope to recover it from
   - after the rewrite the standalone query kinds vanish from the graph (they

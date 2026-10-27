@@ -578,13 +578,16 @@ func checkStoreAnnotations(n Node, vs *[]Violation) {
 }
 
 // checkRuntimeMappingShape pins the P-3 mapping constructor encoding
-// (quick-261022-l1o, fix4 §3.2): ops = [kernel_info, ndim const TI32,
-// shape consts TI32 ...] with len(shapes) == ndim. Grid mappings always
-// carry ndim >= 1 (CuMAP: every LNT has at least one CTA dim). Thread
-// mappings allow ndim == 0 (an LNT with zero WARP-assigned dims launches
-// one warp — the empty product of warp K_d = 1, blockDim = 32). Each
-// shape value is >= 1; -1 (the D3 remainder) is allowed ONLY as the
-// last entry on grid mappings (legacy sentinel — fix4 T5 retires it).
+// (quick-261022-l1o, fix4 §3.2/§4.1 as amended by T5): ops =
+// [kernel_info, ndim const TI32, shape consts TI32 ...] with len(shapes)
+// == ndim. Grid mappings always carry ndim >= 1 (CuMAP: every LNT has at
+// least one CTA dim). Thread mappings allow ndim == 0 (an LNT with zero
+// WARP-assigned dims launches one warp — the empty product of warp K_d =
+// 1, blockDim = 32; the T5 zero-extent admission). Each shape value is
+// the dim's ABSOLUTE extent and must be >= 2 (fix4 §4.1: "no portions, no
+// −1" — a K=1 warp dim is SEQ and pruned upstream, the LoC/K presets
+// start at 2; the D3 −1-remainder rule is retired with the portion
+// grammar).
 // The dedicated kind is what makes this verifier-pinnable (LR-4).
 func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 	ops := OperandsOf(t)
@@ -619,34 +622,27 @@ func checkRuntimeMappingShape(n Node, t *runtimeMappingNode, vs *[]Violation) {
 			fmt.Sprintf("%s ndim must be >= %d, got %v", n.KindOf(), minNdim, nd)))
 		return
 	}
-	portions := ops[2:]
-	if float64(len(portions)) != nd {
+	shapes := ops[2:]
+	if float64(len(shapes)) != nd {
 		*vs = append(*vs, nodeViolation(n, invUseDef,
-			fmt.Sprintf("%s lists %d portions but declares ndim %v", n.KindOf(), len(portions), nd)))
+			fmt.Sprintf("%s lists %d shapes but declares ndim %v", n.KindOf(), len(shapes), nd)))
 		return
 	}
-	for i, p := range portions {
+	for i, p := range shapes {
 		v, ok := ConstValueOf(p)
 		if !ok {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be a const", n.KindOf(), i)))
+				fmt.Sprintf("%s shape %d must be a const", n.KindOf(), i)))
 			continue
 		}
 		if ct := ConstTypeOf(p); ct == nil || !ct.Equal(InternScalar(TI32)) {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be a const-i32", n.KindOf(), i)))
+				fmt.Sprintf("%s shape %d must be a const-i32", n.KindOf(), i)))
 			continue
 		}
-		if v == -1 {
-			if i != len(portions)-1 {
-				*vs = append(*vs, nodeViolation(n, invUseDef,
-					fmt.Sprintf("%s portion %d is -1 (the remainder): only the LAST portion may be -1 (the D3 remainder rule)", n.KindOf(), i)))
-			}
-			continue // the legal last-position remainder
-		}
-		if v < 1 {
+		if v < 2 {
 			*vs = append(*vs, nodeViolation(n, invUseDef,
-				fmt.Sprintf("%s portion %d must be >= 1 (or -1 as the last portion), got %v", n.KindOf(), i, v)))
+				fmt.Sprintf("%s shape %d must be >= 2 (an absolute extent; K=1 dims are pruned, presets start at 2, and the -1 remainder is retired with the portion grammar), got %v", n.KindOf(), i, v)))
 		}
 	}
 }

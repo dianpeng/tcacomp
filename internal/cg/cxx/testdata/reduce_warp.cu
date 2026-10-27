@@ -6,20 +6,20 @@ __device__ static __forceinline__ T RedwarpCombine0(T p0, T p1) {
   return (p0 + p1);
 }
 
-// Redwarp: launch 100 CTAs x 512 threads (tiling Params; the runtime asserts divisibility)
+// Redwarp: launch 100 CTAs x 32 threads (derived from the loop annotations: gridDim = max over LNTs of CTA LoC products, blockDim = (max warp-K product) x 32 — the runtime validates)
 namespace {
 
-__global__ void __launch_bounds__(512) Redwarp(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out) {
+__global__ void __launch_bounds__(32) Redwarp(uint32_t d0, uint32_t d1, const float* __restrict__ lhs, float* __restrict__ out) {
   tca::rt::TensorView<const float, 2u> lhs_v(lhs, d0, d1);
   tca::rt::TensorView<float, 1u> out_v(out, d0);
 
   tca::rt::KernelInfo kinfo;
   // LNT #0: d0=CTA(T=32,LoC=100) d1=sequential(T=64,LoC=1) dim=thread/warp(LoC=32) d1=sequential(T=64,LoC=1)
   {
-    // CTA-space mapping (portions 100 — the launch grammar this nest remaps)
-    tca::rt::GridMapping grid_map0(kinfo, 100);
-    // per-CTA thread-space mapping (portions )
-    tca::rt::ThreadMapping thread_map1(kinfo, );
+    // CTA-space mapping (absolute LoC per dim: 100u — the factorization this nest remaps)
+    tca::rt::GridMapping grid_map0(kinfo, 1u, 100u);
+    // per-CTA thread-space mapping (absolute warp counts K per dim: )
+    tca::rt::ThreadMapping thread_map1(kinfo, 0u);
     auto c0 = 1024u;
     auto c1 = 512u;
     auto c2 = 0.0f;
@@ -70,7 +70,7 @@ void RedwarpLaunch(const tca::Tensor<float, 2u>& lhs, tca::Tensor<float, 1u>& ou
   const uint32_t d0 = lhs.Dim(0u);
   const uint32_t d1 = lhs.Dim(1u);
   TCA_REQUIRE(out.Dim(0u) == d0, "out.Dim(0) must equal d0 (dim d0)");
-  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u);
-  Redwarp<<<dim3(100u, 1u, 1u), dim3(512u, 1u, 1u), 0u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
+  tca::rt::ValidateLaunch(dim3(100u, 1u, 1u), dim3(32u, 1u, 1u), 0u, 512u);
+  Redwarp<<<dim3(100u, 1u, 1u), dim3(32u, 1u, 1u), 0u, tca_stream>>>(d0, d1, lhs.Data(), out.Data());
   TCA_CUDA_CHECK(cudaGetLastError());
 }

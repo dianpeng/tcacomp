@@ -13,11 +13,13 @@ import (
 // kernel's dim parameters are DERIVED from the tensors and cross-validated
 // (the mutually understood contract: every occurrence of a dim name must
 // agree), scalars pass through, and a dim no tensor carries stays an
-// explicit uint32_t argument. Launch totals are baked from the tiling
-// Params (LR-15), the runtime validates divisibility, the dynamic-smem
-// opt-in rides the > 48 KB path (D5), and a CUDA_CHECK follows the launch.
-// The kernel itself lives in the anonymous namespace — the launcher is the
-// TU's only exported symbol (the scalfold engine precedent).
+// explicit uint32_t argument. Launch dimensions are the ANNOTATION-DERIVED
+// constants of fix4 §5.1 (T5 — LR-15's driver-supplied totals retired):
+// literal dim3s in both the 4-arg ValidateLaunch and the <<<>>> launch,
+// the dynamic-smem opt-in rides the > 48 KB path (D5), and a CUDA_CHECK
+// follows the launch. The kernel itself lives in the anonymous namespace —
+// the launcher is the TU's only exported symbol (the scalfold engine
+// precedent).
 func (e *emitter) launcher() (string, error) {
 	// dimSuppliers: every (tensor param index, axis) a dim name appears at,
 	// in signature order — the first supplies the value, the rest are
@@ -133,14 +135,21 @@ func (e *emitter) launcher() (string, error) {
 	for _, l := range body {
 		b.WriteString(l + "\n")
 	}
-	fmt.Fprintf(&b, "  tca::rt::ValidateLaunch(dim3(%du, 1u, 1u), dim3(%du, 1u, 1u), %du);\n",
-		uint(e.opts.MaxCTA), uint(e.opts.MaxThreadsPerCTA), uint(e.smemCap))
+	// fix4 §5.1/§4.3 (T5): the launch VALUES are compiler-derived constants
+	// (the annotation products deriveLaunch computed at Emit start) baked
+	// as literal dim3s; the
+	// 4-arg ValidateLaunch carries them plus the smem bytes and the
+	// compiler-emitted MaxCTA POLICY constant (no default argument — the
+	// launcher must pass it; validation is defense-in-depth over constants
+	// the compiler itself derived).
+	fmt.Fprintf(&b, "  tca::rt::ValidateLaunch(dim3(%du, 1u, 1u), dim3(%du, 1u, 1u), %du, %du);\n",
+		uint(e.gridDim), uint(e.blockDim), uint(e.smemCap), uint(e.maxCTAPolicy()))
 	if e.smemCap > 48*1024 {
 		fmt.Fprintf(&b, "  cudaFuncSetAttribute(%s, cudaFuncAttributeMaxDynamicSharedMemorySize, %du);\n",
 			e.kernelSym, uint(e.smemCap))
 	}
 	fmt.Fprintf(&b, "  %s<<<dim3(%du, 1u, 1u), dim3(%du, 1u, 1u), %du, tca_stream>>>(%s);\n",
-		e.kernelSym, uint(e.opts.MaxCTA), uint(e.opts.MaxThreadsPerCTA), uint(e.smemCap), strings.Join(callArgs, ", "))
+		e.kernelSym, uint(e.gridDim), uint(e.blockDim), uint(e.smemCap), strings.Join(callArgs, ", "))
 	fmt.Fprintf(&b, "  TCA_CUDA_CHECK(cudaGetLastError());\n")
 	fmt.Fprintf(&b, "}\n")
 	return b.String(), nil

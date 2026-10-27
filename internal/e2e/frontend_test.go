@@ -173,7 +173,7 @@ func compileFrontendKernel(t *testing.T, src string) map[string][]byte {
 	if len(mod.Kernels) != 1 {
 		t.Fatalf("e2e: want 1 kernel, got %d", len(mod.Kernels))
 	}
-	res, err := compiler.CompileKernel(mod.Kernels[0], cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86})
+	res, err := compiler.CompileKernel(mod.Kernels[0], cg.Options{MaxCTAPolicy: 512, TargetSM: 86})
 	if err != nil {
 		t.Fatalf("e2e: compile through the facade failed: %v", err)
 	}

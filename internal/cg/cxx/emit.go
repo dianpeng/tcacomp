@@ -47,6 +47,16 @@ type emitter struct {
 	curGrid      string               // the enclosing LNT's GridMapping local
 	curThread    string               // the enclosing LNT's ThreadMapping local
 
+	// the ANNOTATION-DERIVED launch dimensions (fix4 §5.1, T5): gridDim =
+	// max over LNTs of Π CTA LoC (the CTA betweens' loc annotations),
+	// blockDim = (max over LNTs of Π warp K) × 32 with floor 32 (the WARP
+	// betweens' loc annotations; the coupled insides carry dosoc -1 and are
+	// excluded). Derived once at Emit start; every consumer (the kernel
+	// header comment, __launch_bounds__, the launcher's literal dim3s and
+	// the 4-arg ValidateLaunch) reads these — no driver-supplied totals.
+	gridDim  int
+	blockDim int
+
 	// symbol derivation (quick-261023-cgq): the KindKernelMeta payloads or
 	// the Google-style PascalCase fallback; collision-safe local naming.
 	kernelSym   string
@@ -108,6 +118,9 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 	}
 	e.out = &e.sb
 	e.comments = opts.Comments.Resolved()
+	if err := e.deriveLaunch(); err != nil {
+		return nil, err
+	}
 	if err := e.gates(); err != nil {
 		return nil, err
 	}
@@ -147,8 +160,8 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 	fmt.Fprintf(&cu, "#include \"tca/runtime.h\"\n\n")
 	cu.WriteString(lamText)
 	if e.comments >= cg.CommentSections {
-		fmt.Fprintf(&cu, "// %s: launch %d CTAs x %d threads (tiling Params; the runtime asserts divisibility)\n",
-			e.kernelSym, e.opts.MaxCTA, e.opts.MaxThreadsPerCTA)
+		fmt.Fprintf(&cu, "// %s: launch %d CTAs x %d threads (derived from the loop annotations: gridDim = max over LNTs of CTA LoC products, blockDim = (max warp-K product) x 32 — the runtime validates)\n",
+			e.kernelSym, e.gridDim, e.blockDim)
 		if e.smemCap > 0 {
 			fmt.Fprintf(&cu, "// dynamic SMEM pool: %d B (v0: disjoint offsets, zero reuse)\n", e.smemCap)
 		}
@@ -157,7 +170,7 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 	// TU's only exported symbol (quick-261023-ten, the scalfold engine
 	// precedent: kernels are internal, wrappers are the surface).
 	fmt.Fprintf(&cu, "namespace {\n\n")
-	fmt.Fprintf(&cu, "__global__ void __launch_bounds__(%d) %s(%s) {\n", e.opts.MaxThreadsPerCTA, e.kernelSym, sig)
+	fmt.Fprintf(&cu, "__global__ void __launch_bounds__(%d) %s(%s) {\n", e.blockDim, e.kernelSym, sig)
 	cu.WriteString(top)
 	cu.WriteString(e.sb.String())
 	cu.WriteString("}\n\n")
@@ -172,6 +185,64 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 		e.name + ".cu":   []byte(cu.String()),
 		"CMakeLists.txt": []byte(cmake),
 	}}, nil
+}
+
+// deriveLaunch computes the launch dimensions from the emitted loops'
+// annotations (fix4 §5.1, T5 — replacing cg.md LR-15's driver-supplied
+// totals): per LNT, gridProd = Π of ASTLoopMeta.Loc over Soc==CTA loops
+// (exactly the CTA betweens) and warpProd = Π of Loc over Soc==Thr loops
+// WITH Dosoc >= 0 (the WARP betweens — the CTA-coupled insides carry
+// Dosoc -1 by the tile-lower §3.2 convention and contribute nothing);
+// then gridDim = max over LNTs of gridProd and blockDim = max over LNTs
+// of warpProd × 32 (floor 32 — the empty product launches one warp).
+// Fail-closed: a contributing Loc < 1 is annotation corruption, and a
+// kernel whose NO LNT carries a CTA dim violates CuMAP (every legal fix4
+// schedule partitions at least one dim across CTAs).
+func (e *emitter) deriveLaunch() error {
+	grid, block := 0, 32
+	sawCTA := false
+	for _, lnt := range e.k.LNTs {
+		gridProd, warpProd := 1, 1
+		for _, m := range lnt.Loops {
+			switch m.Soc {
+			case 1: // the CTA betweens
+				if m.Loc < 1 {
+					return fmt.Errorf("cxx: LNT loop node %d carries loc %d on a CTA dim — the grid product needs a positive absolute LoC (annotation corruption?)",
+						m.Loop.BasePtr().ID(), m.Loc)
+				}
+				gridProd *= m.Loc
+				sawCTA = true
+			case 2: // the WARP betweens only (the coupled insides carry dosoc -1)
+				if m.Dosoc >= 0 {
+					if m.Loc < 1 {
+						return fmt.Errorf("cxx: LNT loop node %d carries loc %d on a WARP dim — the warp product needs a positive absolute K_d (annotation corruption?)",
+							m.Loop.BasePtr().ID(), m.Loc)
+					}
+					warpProd *= m.Loc
+				}
+			}
+		}
+		if gridProd > grid {
+			grid = gridProd
+		}
+		if warpProd*32 > block {
+			block = warpProd * 32
+		}
+	}
+	if !sawCTA {
+		return fmt.Errorf("cxx: no LNT carries a CTA-assigned dim — CuMAP requires at least one (structural infeasibility; the launch has no grid decomposition)")
+	}
+	e.gridDim, e.blockDim = grid, block
+	return nil
+}
+
+// maxCTAPolicy resolves the §4.3 compiler-emitted policy constant (zero →
+// 512 = tiling DefaultParams.MaxCTA).
+func (e *emitter) maxCTAPolicy() int {
+	if e.opts.MaxCTAPolicy > 0 {
+		return e.opts.MaxCTAPolicy
+	}
+	return 512
 }
 
 // gates is the fail-closed entry surface (doc/cg.md §4): the whitelist of
@@ -201,8 +272,8 @@ func (e *emitter) gates() error {
 	if len(e.k.Gmem) > 0 {
 		return fmt.Errorf("cxx: %d GMEM temporaries (KindMemNew) — v0 emission supports none (no fixture, no launcher contract)", len(e.k.Gmem))
 	}
-	if e.opts.MaxCTA <= 0 || e.opts.MaxThreadsPerCTA <= 0 {
-		return fmt.Errorf("cxx: launch totals must be positive (got %d CTAs / %d threads)", e.opts.MaxCTA, e.opts.MaxThreadsPerCTA)
+	if e.gridDim <= 0 || e.blockDim <= 0 || e.blockDim%32 != 0 {
+		return fmt.Errorf("cxx: derived launch dimensions must be a positive grid and a whole-warp block (got %d CTAs / %d threads)", e.gridDim, e.blockDim)
 	}
 	return nil
 }
@@ -475,7 +546,11 @@ func (e *emitter) byteExtent(n ir.Node) (int, error) {
 // the retired v0-era loader annotation left the IR; selection is DERIVED
 // at codegen from the storage class per R-H/R-J — SMEM window fills take
 // the cooperative LoadTileCta, FRAG fills the per-thread LoadTileThread,
-// the same tier rule the attribute recorded).
+// the same tier rule the attribute recorded). The biv list may be EMPTY:
+// a C1b forced-FRAG site whose only covered dim is WARP-covered carries
+// its chunk origin on the source AXES (fix4 3.3), so the store is exactly
+// (value, buffer) — still a fill, never a raw Set (a raw Set could not
+// enumerate the tile).
 func isFillStore(n ir.Node) bool {
 	if n == nil || n.KindOf() != ir.KindMemStore {
 		return false
@@ -484,7 +559,7 @@ func isFillStore(n ir.Node) bool {
 		return false
 	}
 	ops := ir.OperandsOf(n)
-	if len(ops) < 3 || ops[0] == nil || ops[0].KindOf() != ir.KindMemLoad {
+	if len(ops) < 2 || ops[0] == nil || ops[0].KindOf() != ir.KindMemLoad {
 		return false
 	}
 	sc, ok := ir.StorageClassOf(ops[0])

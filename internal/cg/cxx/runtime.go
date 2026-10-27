@@ -2,7 +2,6 @@ package cxx
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"tcacomp/internal/ir"
@@ -30,15 +29,24 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		if !ok {
 			return fmt.Errorf("cxx: mapping %d references an unconstructed KernelInfo", n.BasePtr().ID())
 		}
-		// Portions are TI32 consts (−1 = the remainder tail) rendered as
-		// plain integers; ndim is implied by the count (verifier-pinned).
-		var ports []string
+		// fix4 §3.2/§4.1 (T5): the ctor renders with an EXPLICIT ndim
+		// followed by the ABSOLUTE per-dim shapes (LoC_d / K_d), all as u
+		// literals — matching the T3 runtime ctor GridMapping(kinfo, ndim,
+		// loC...) / ThreadMapping(kinfo, ndim, warpsPerDim...) and the
+		// conformance pins of runtime/tests/conformance_new_api.cu. ndim 0
+		// (a zero-WARP LNT) renders "(kinfo, 0u)" — legal since T5's
+		// zero-extent admission.
+		nd, ok := ir.ConstValueOf(ops[1])
+		if !ok {
+			return fmt.Errorf("cxx: mapping %d ndim is not a constant", n.BasePtr().ID())
+		}
+		args := []string{fmt.Sprintf("%du", uint(nd))}
 		for _, p := range ops[2:] {
 			v, ok := ir.ConstValueOf(p)
 			if !ok {
-				return fmt.Errorf("cxx: mapping %d portion is not a constant", n.BasePtr().ID())
+				return fmt.Errorf("cxx: mapping %d shape operand is not a constant", n.BasePtr().ID())
 			}
-			ports = append(ports, strconv.FormatInt(int64(v), 10))
+			args = append(args, fmt.Sprintf("%du", uint(v)))
 		}
 		cls, base := "GridMapping", "grid_map"
 		if n.KindOf() == ir.KindRuntimeThreadMapping {
@@ -46,10 +54,11 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		}
 		local := e.local(fmt.Sprintf("%s%d", base, e.mapN))
 		e.mapN++
+		shapes := strings.Join(args[1:], ", ")
 		if cls == "GridMapping" {
-			e.c("CTA-space mapping (portions %s — the launch grammar this nest remaps)", strings.Join(ports, ", "))
+			e.c("CTA-space mapping (absolute LoC per dim: %s — the factorization this nest remaps)", shapes)
 		} else {
-			e.c("per-CTA thread-space mapping (portions %s)", strings.Join(ports, ", "))
+			e.c("per-CTA thread-space mapping (absolute warp counts K per dim: %s)", shapes)
 		}
 		e.objName[n] = local
 		if cls == "GridMapping" {
@@ -57,7 +66,7 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 		} else {
 			e.curThread = local
 		}
-		e.line(fmt.Sprintf("tca::rt::%s %s(%s, %s);", cls, local, ki, strings.Join(ports, ", ")))
+		e.line(fmt.Sprintf("tca::rt::%s %s(%s, %s);", cls, local, ki, strings.Join(args, ", ")))
 		return nil
 
 	default: // the three reducer specializations (R1/R2 ctor faces)
@@ -131,13 +140,12 @@ func (e *emitter) stmtRuntimeObject(n ir.Node) error {
 // stagingCount resolves the staging row's ELEMENT count (R1: #warps = the
 // CTA's warp count): the byte extent final-lower allocated divided by the
 // element size. The staging row size is the source of truth (sized by
-// final-lower from the tiling provenance's MaxThreadsPerCTA).
-//
-// NOTE (fix4 T5 debt): the old cross-check against opts.MaxThreadsPerCTA
-// is retired here because the launch dimensions now derive from the tiling
-// provenance, not from cg.Options. T5 will rewire the emitter to read
-// launch dimensions from the provenance record and re-add a cross-check
-// against the actual kernel launch config.
+// final-lower from the tiling provenance's MaxThreadsPerCTA — the same
+// launch blockDim the emitter now derives from the loop annotations), so
+// the T5-debt cross-check is RESTORED: the row's element count must equal
+// the derived blockDim / 32 (one slot per launched warp); a divergence
+// means the annotations and the provenance disagree — fail closed, never
+// emit a short staging row.
 func (e *emitter) stagingCount(staging ir.Node, ts string, owner ir.Node) (uint, error) {
 	ext, err := e.byteExtent(staging)
 	if err != nil {
@@ -151,7 +159,12 @@ func (e *emitter) stagingCount(staging ir.Node, ts string, owner ir.Node) (uint,
 		return 0, fmt.Errorf("cxx: reducer %d staging row of %d B is not a whole multiple of %s (%d B)",
 			owner.BasePtr().ID(), ext, ts, size)
 	}
-	return uint(ext / size), nil
+	count := uint(ext / size)
+	if want := uint(e.blockDim) / 32; count != want {
+		return 0, fmt.Errorf("cxx: reducer %d staging row of %d slots disagrees with the derived launch blockDim %d (%d warps) — the loop annotations and the tiling provenance diverge",
+			owner.BasePtr().ID(), count, e.blockDim, want)
+	}
+	return count, nil
 }
 
 // initType resolves a reducer construction's element type T from its init

@@ -18,8 +18,10 @@ import (
 )
 
 // sm86Options are the A6000 target's emission constraints (cg.Options):
-// 100 CTAs of 512 threads, compute capability 8.6.
-var sm86Options = cg.Options{MaxCTA: 100, MaxThreadsPerCTA: 512, TargetSM: 86}
+// compute capability 8.6 and the §4.3 MaxCTA policy constant 512 (the
+// gridDim cap ValidateLaunch checks — the launch DIMENSIONS themselves
+// are annotation-derived per fix4 §5.1, never supplied here).
+var sm86Options = cg.Options{MaxCTAPolicy: 512, TargetSM: 86}
 
 func main() {
 	os.Exit(run(os.Args[1:]))

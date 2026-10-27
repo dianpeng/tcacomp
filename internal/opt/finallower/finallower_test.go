@@ -385,7 +385,7 @@ func TestRuntimeObjectsInserted(t *testing.T) {
 	}
 
 	// Per-LNT mappings: the prologue Group's first two items, grid before
-	// thread, portions per the provenance plan.
+	// thread, absolute shapes (LoC / K) per the provenance plan.
 	if len(k.LNTs) == 0 {
 		t.Fatal("the fixture must schedule at least one LNT")
 	}
@@ -424,7 +424,7 @@ func TestRuntimeObjectsInserted(t *testing.T) {
 }
 
 // checkMappingOperands pins the P-3 encoding: [kernel_info, TI32 ndim,
-// TI32 portions...] with the given portion values.
+// TI32 shapes...] with the given absolute-extent values.
 func checkMappingOperands(t *testing.T, m, ki ir.Node, want []int, what string) {
 	t.Helper()
 	ops := ir.OperandsOf(m)

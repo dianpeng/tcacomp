@@ -39,8 +39,8 @@ import (
 //     search policy does not produce it).
 func (e *emitter) stmtFill(n ir.Node) error {
 	ops := ir.OperandsOf(n)
-	if len(ops) < 3 {
-		return fmt.Errorf("cxx: fill %d malformed (want value, dst, bivs...)", n.BasePtr().ID())
+	if len(ops) < 2 {
+		return fmt.Errorf("cxx: fill %d malformed (want value, dst[, bivs...])", n.BasePtr().ID())
 	}
 	src, dst, bivs := ops[0], ops[1], ops[2:]
 	if src == nil || dst == nil || src.KindOf() != ir.KindMemLoad {
