@@ -99,7 +99,8 @@ func (p Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 	se := sideeffect.Analyze(g)
 	op := analyzeOverlap(g, f, se, p.Params)
 	// R-REDUCED: the reducer-consuming iter set prunes WARP digits from
-	// the feasible area while ReducedDimWarp is closed (fix4 §2.2/§3.6).
+	// the feasible area when ReducedDimWarp is false (the Wave-1 policy,
+	// now the explicit opt-out; fix4 §2.2/§3.5).
 	// Populated here — after analyzeOverlap — so the discovery logic
 	// itself stays untouched.
 	reduced := reducedIters(g)

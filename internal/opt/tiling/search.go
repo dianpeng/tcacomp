@@ -273,8 +273,9 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 // tiles ascending] ++ [WARP × K descending × tiles ascending]. The
 // R-LOCCAP preset cap applies per (dim, tile): a preset is feasible for
 // a CONST extent only when preset <= max(2, ceil(extent/T)) — non-const
-// extents enumerate uncapped. R-REDUCED: while ReducedDimWarp is false,
-// a reducer-consuming dim carries no WARP digits at all.
+// extents enumerate uncapped. R-REDUCED: when ReducedDimWarp is false (the
+// Wave-1 policy, now the explicit opt-out), a reducer-consuming dim carries
+// no WARP digits at all.
 func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit {
 	tiles := tileCandidates(p) // deduped, ascending (entries >= 2 by Validate)
 	out := make([]schedDigit, 0, len(tiles)*(1+len(p.CtaLoCPresets)+len(p.WarpLoCPresets)))
@@ -302,7 +303,8 @@ func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit 
 	}
 	if reduced[iter] && !p.ReducedDimWarp {
 		// R-REDUCED: WARP on a reducer-consuming dim is pruned from the
-		// feasible area while the split-k capability gate is closed.
+		// feasible area while the split-k capability gate is closed
+		// (explicit ReducedDimWarp=false — the Wave-1 policy).
 		return out
 	}
 	for _, k := range presetDesc(p.WarpLoCPresets) {
@@ -352,8 +354,9 @@ func maxTileOf(p Params) int {
 // union over live KindReduce nodes of the iters referenced by the
 // reduce's piped value input (operand 0), chased with the same Input-list
 // walk the overlap analysis uses (findAxisIters). A WARP-SoC digit on
-// any of these dims is a split-k schedule — out of the feasible area
-// until Params.ReducedDimWarp opens (fix4 §3.6, Wave 2).
+// any of these dims is a split-k schedule; under explicit
+// Params.ReducedDimWarp=false such digits are pruned from the feasible
+// area (the Wave-1 policy; fix4 §3.5, Wave 2 landed with the default true).
 func reducedIters(g *ir.Graph) map[ir.Node]bool {
 	out := make(map[ir.Node]bool)
 	for _, n := range g.AllocatedNodes() {

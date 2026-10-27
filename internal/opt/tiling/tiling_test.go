@@ -577,12 +577,15 @@ func TestMultiCTADimAdmitted(t *testing.T) {
 	}
 }
 
-// TestReducedDimWarpPruning pins R-REDUCED: with ReducedDimWarp closed,
-// a reducer-consuming dim never takes WARP — the same chain WITHOUT the
+// TestReducedDimWarpPruning pins R-REDUCED both ways. With ReducedDimWarp
+// explicitly false (the Wave-1 policy, now the opt-out mode), a
+// reducer-consuming dim never takes WARP — the same chain WITHOUT the
 // reduce puts WARP on the reduced dim's position, so the pin is a true
-// contrast.
+// contrast. Under DefaultParams (Wave 2) the same reduce fixture
+// deterministically selects the split-k winner — M=CTA, K(reduced)=WARP —
+// with the cache promotions the probe measured.
 func TestReducedDimWarpPruning(t *testing.T) {
-	build := func(withReduce bool) *ir.Graph {
+	build := func(withReduce bool) (*ir.Graph, ir.Node, ir.Node) {
 		g := ir.NewGraph("red")
 		u32 := ir.InternScalar(ir.TU32)
 		var dims, iters []ir.Node
@@ -618,28 +621,59 @@ func TestReducedDimWarpPruning(t *testing.T) {
 		env := ir.NewEnv()
 		st := g.NewMemStoreChained("ctor", env, out, []ir.Node{iv(0), iv(1)}, val)
 		g.NewReturnChained("ctor", env, []ir.Node{out}, st)
-		return g
+		return g, lhs, rhs
 	}
 
 	// Without the reduce, the model's winner puts WARP on K (the probe's
 	// outcome); with the reduce, K feeds the reducer and WARP is pruned.
-	plainG := build(false)
+	plainG, _, _ := build(false)
 	plain := runPass(t, plainG, DefaultParams())
 	plainTree := mustTreeOf(t, plainG)
 	if plainK, _ := plain.IterDecisionOf(mustIterOf(t, plainTree, 2)); plainK.SoC != SoCWARP {
 		t.Fatalf("the plain fixture must put WARP on K for the contrast pin, got %s", plainK.SoC)
 	}
-	redG := build(true)
-	red := runPass(t, redG, DefaultParams())
+	redG, _, _ := build(true)
+	noWarp := DefaultParams()
+	noWarp.ReducedDimWarp = false
+	red := runPass(t, redG, noWarp)
 	redTree := mustTreeOf(t, redG)
 	for i := 0; i < 3; i++ {
 		if d, _ := red.IterDecisionOf(mustIterOf(t, redTree, i)); d.SoC == SoCWARP {
-			t.Fatalf("reduced dim %d took WARP despite ReducedDimWarp=false (R-REDUCED prune broken)", i)
+			t.Fatalf("reduced dim %d took WARP despite explicit ReducedDimWarp=false (R-REDUCED prune broken)", i)
 		}
 	}
 	// The reduced set itself: K is referenced by the reduce's piped input.
 	if !reducedIters(redG)[mustIterOf(t, redTree, 2)] {
 		t.Fatal("reducedIters must contain the reduce's piped-input iters")
+	}
+
+	// Wave-2 contrast: under DefaultParams the same reduce fixture selects
+	// the deterministic split-k winner (probe-verified, fixed enumeration):
+	// M=cta/4/256, N=seq/1/256, K(reduced)=warp/2/32, with lhs promoted
+	// FRAG 4 B (reuse 256) and rhs promoted SMEM 65536 B (reuse 256).
+	redG2, lhs2, rhs2 := build(true)
+	def := runPass(t, redG2, DefaultParams())
+	defTree := mustTreeOf(t, redG2)
+	want := []IterDecision{
+		{SoC: SoCTA, LoC: 4, TileSize: 256},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
+		{SoC: SoCWARP, LoC: 2, TileSize: 32},
+	}
+	for i, w := range want {
+		if d, _ := def.IterDecisionOf(mustIterOf(t, defTree, i)); d != w {
+			t.Fatalf("Wave-2 split-k winner: iter %d must be %+v, got %+v", i, w, d)
+		}
+	}
+	if d, _ := def.IterDecisionOf(mustIterOf(t, defTree, 2)); d.SoC != SoCWARP {
+		t.Fatalf("Wave-2 split-k winner must put WARP on the reduced K dim, got %s", d.SoC)
+	}
+	sl, ok := def.SiteDecisionOf(lhs2)
+	if !ok || !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4 || sl.Reuse != 256 {
+		t.Fatalf("Wave-2 split-k winner: lhs must promote FRAG 4 B reuse 256, got %+v (ok=%v)", sl, ok)
+	}
+	sr, ok := def.SiteDecisionOf(rhs2)
+	if !ok || !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 256 {
+		t.Fatalf("Wave-2 split-k winner: rhs must promote SMEM 65536 B reuse 256, got %+v (ok=%v)", sr, ok)
 	}
 }
 

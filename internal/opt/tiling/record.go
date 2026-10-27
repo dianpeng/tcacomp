@@ -386,9 +386,12 @@ type Params struct {
 	// to be replaced by cache").
 	MaxCS int
 	// ReducedDimWarp allows WARP-SoC on reduced (reducer-consuming) dims —
-	// the split-k capability gate (fix4 §3.6, Wave 2). Wave 1 keeps it
-	// false: the decide-side feasible area prunes WARP digits on reduced
-	// dims, and tile-lower fails closed on any that slip through.
+	// the split-k capability gate (fix4 §3.5, Wave 2 landed). The Wave-2
+	// default is TRUE: §3.5 is live — the decide-side feasible area admits
+	// WARP digits on reduced dims and tile-lower lowers them into the
+	// WarpReducer bracket. An explicit false selects the Wave-1 policy:
+	// WARP digits on reduced dims are pruned, and tile-lower fails closed on
+	// any that slip through.
 	ReducedDimWarp bool
 	// NominalExtent is the documented stand-in extent for a reuse
 	// dimension whose BIV max operand is NOT a constant. Dormant: reuse is
@@ -402,7 +405,8 @@ type Params struct {
 // {32,64,128,256}, CTA LoC presets {2,4,8,16,32,64}, warp K presets
 // {2,4,8,16,32}, MAPM caps 3/3, MaxCTA 512 (gridDim policy cap),
 // MaxWarpsPerCTA 32, 64 KB SMEM, 256 bytes/thread FRAG (F6), CacheDims 2,
-// MaxCS 16, ReducedDimWarp false (Wave 1), nominal extent 4096.
+// MaxCS 16, ReducedDimWarp true (Wave 2, fix4 §3.5 split-k enabled),
+// nominal extent 4096.
 func DefaultParams() Params {
 	return Params{
 		WindowK:          4,
@@ -417,7 +421,7 @@ func DefaultParams() Params {
 		MaxFragPerThread: 256,
 		CacheDims:        2,
 		MaxCS:            16,
-		ReducedDimWarp:   false,
+		ReducedDimWarp:   true,
 		NominalExtent:    4096,
 	}
 }

@@ -1033,11 +1033,13 @@ func warpReduceFx(t *testing.T) fixture {
 }
 
 // TestLowerWarpReducedDimRejected pins the fix4 §3.5 Wave-1 defense in
-// depth: while Params.ReducedDimWarp is false, a WARP-assigned dim whose
-// IV data-dep closure feeds a Reduce FAILS CLOSED with a named error —
-// the split-k reducer wiring is Wave 2, and the pipeline must stop loudly
-// rather than emit an undesigned lowering. The decide-side feasible-area
-// gate prunes these; this is the lower's backstop over crafted records.
+// depth, now the EXPLICIT-false opt-out mode: while Params.ReducedDimWarp
+// is explicitly false, a WARP-assigned dim whose IV data-dep closure feeds
+// a Reduce FAILS CLOSED with a named error — the pipeline must stop loudly
+// rather than emit a lowering outside the policy. The decide-side
+// feasible-area gate prunes these under the same flag; this is the lower's
+// backstop over crafted records. Under DefaultParams (Wave 2) the defense
+// stands down: the default admits §3.5 split-k lowering.
 func TestLowerWarpReducedDimRejected(t *testing.T) {
 	fx := warpReduceFx(t)
 	rec := recordOf(t, fx, map[int]IterDecision{
@@ -1046,16 +1048,18 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	}, nil)
 	cache := opt.NewCache()
 	cache.Put(rec)
-	err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
+	p := DefaultParams()
+	p.ReducedDimWarp = false
+	err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
 	if err == nil || !strings.Contains(err.Error(), "fix4 3.5") {
-		t.Fatalf("a WARP-assigned reduced dim must fail closed naming fix4 3.5 (Wave-1 defense), got %v", err)
+		t.Fatalf("a WARP-assigned reduced dim must fail closed naming fix4 3.5 (explicit-false opt-out), got %v", err)
 	}
 	if !strings.Contains(err.Error(), "ReducedDimWarp") {
 		t.Fatalf("the defense error must name the ReducedDimWarp capability gate, got %v", err)
 	}
 
 	// Positive control: the same shape with the reduced dim SEQ lowers
-	// clean (Wave 1's legal schedule — the zero-WARP LNT).
+	// clean under the explicit-false policy (the zero-WARP LNT).
 	fx2 := warpReduceFx(t)
 	rec2 := recordOf(t, fx2, map[int]IterDecision{
 		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
@@ -1064,9 +1068,12 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	runLower(t, fx2.g, rec2)
 	assertVerifyAndRootReachable(t, fx2.g)
 
-	// The capability gate owns the defense: with ReducedDimWarp true (the
-	// Wave-2 flag) the defense stands down — the lower no longer rejects
-	// the shape (Wave-2 lowering itself is future work, out of scope here).
+	// Default-admits policy: with DefaultParams (ReducedDimWarp true — the
+	// Wave-2 default) the defense must NOT fire on the same WARP-reduced
+	// record — §3.5 split-k lowering is legal under the default.
+	if !DefaultParams().ReducedDimWarp {
+		t.Fatal("DefaultParams().ReducedDimWarp must be true (Wave 2) for the default-admits policy")
+	}
 	fx3 := warpReduceFx(t)
 	rec3 := recordOf(t, fx3, map[int]IterDecision{
 		0: {SoC: SoCTA, LoC: 100, TileSize: 32},
@@ -1074,10 +1081,8 @@ func TestLowerWarpReducedDimRejected(t *testing.T) {
 	}, nil)
 	cache3 := opt.NewCache()
 	cache3.Put(rec3)
-	p := DefaultParams()
-	p.ReducedDimWarp = true
-	if err := (LowerPass{Params: p}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
-		t.Fatalf("with ReducedDimWarp=true the Wave-1 defense stands down, got %v", err)
+	if err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache3}, fx3.g); err != nil {
+		t.Fatalf("with DefaultParams (ReducedDimWarp=true) the Wave-1 opt-out defense stands down, got %v", err)
 	}
 }
 
@@ -1715,6 +1720,73 @@ func TestLowerC1bFragChunkLocalAccess(t *testing.T) {
 	}
 	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
 		t.Fatalf("the chunk size operand = %v, want ceil(T_k/32) = ceil(32/32) = 1", mulOps[1])
+	}
+	assertVerifyAndRootReachable(t, fx.g)
+}
+
+// TestLowerC1bFragChunkOriginWindow pins the C1b forced-FRAG FILL WINDOW
+// base on a WARP-covered dim (fix4 §3.3): the per-thread LoadTileThread
+// loads THIS LANE'S CHUNK — ceil(T_d/32) consecutive elements starting at
+// the lane's chunk origin (rank·T_d + round) + lane·ceil(T_d/32) — so the
+// fill source's covered-dim axis must ADD the lane chunk term to the warp
+// window origin. The chunk-LOCAL access (insideIV − lane·c, pinned by
+// TestLowerC1bFragChunkLocalAccess) then indexes the fragment the window
+// actually filled. A window base of rank·T_d + round alone loads element
+// rank·T_d + round for EVERY lane — all 32 lanes of a warp read the same
+// GMEM element while their lane-chunk walks consume 32 DISTINCT elements
+// (quick-261027-kzv T8b: the split-k matmul e2e failed on the A6000 with
+// max abs diff 28.99 — the first cross-warp NUMERICAL exercise of this
+// path; every prior pin was structural only).
+func TestLowerC1bFragChunkOriginWindow(t *testing.T) {
+	fx, lhs, rhs, _ := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec) // lhs is the C1b forced-FRAG site (K WARP-covered)
+
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 4)
+	lhsFill := findFillOf(t, fx.g, lbuf)
+	src := ir.OperandsOf(lhsFill)[0] // the tile-shaped source MemLoad
+	axes := ir.OperandsOf(src)[1:]
+	if len(axes) != 2 {
+		t.Fatalf("lhs fill source must be the 2-axis deref lhs[m][k], got %d axes", len(axes))
+	}
+	kAxis := axes[1]
+	// The window base must carry the warp window origin (the ThreadMap rank
+	// query — rank·T_d) AND the lane chunk term (the zero-operand lane_id
+	// query multiplied by ceil(T_d/32)) ADDITIVELY: base = (rank·T + round)
+	// + lane·c.
+	if !subtreeHasKind(t, fx.g, kAxis, ir.KindRuntimeThreadQuery) {
+		t.Fatal("the lhs fill's k window base must carry the warp rank query (rank·T + round)")
+	}
+	var laneMul ir.Node
+	var walk func(n ir.Node)
+	walk = func(n ir.Node) {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+			return
+		}
+		if n.KindOf() == ir.KindBinOp {
+			if code, _ := ir.BinOpCodeOf(n); code == ir.BinOpMul {
+				if ops := ir.OperandsOf(n); len(ops) == 2 && ops[0] != nil &&
+					ops[0].KindOf() == ir.KindRuntimeThreadQuery &&
+					len(ir.OperandsOf(ops[0])) == 0 &&
+					ir.RuntimeAttributeOf(ops[0]) == "lane_id" {
+					laneMul = n
+				}
+			}
+		}
+		for _, op := range ir.OperandsOf(n) {
+			walk(op)
+		}
+	}
+	walk(kAxis)
+	if laneMul == nil {
+		t.Fatal("the lhs fill's k window base must ADD the lane chunk origin lane·ceil(T_d/32) to rank·T + round — the window loads this lane's chunk (quick-261027-kzv T8b GPU defect)")
+	}
+	mulOps := ir.OperandsOf(laneMul)
+	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
+		t.Fatalf("the window's lane chunk size = %v, want ceil(T_k/32) = ceil(32/32) = 1", mulOps[1])
+	}
+	if code, _ := ir.BinOpCodeOf(kAxis); code != ir.BinOpAdd {
+		t.Fatalf("the k window base must be (rank·T + round) + lane·c as an additive chain rooted at Add, got binop %v", code)
 	}
 	assertVerifyAndRootReachable(t, fx.g)
 }

@@ -59,6 +59,13 @@ type dimRewrite struct {
 
 	indexExpr ir.Node // the dim's rewritten global index expression
 	roundBase ir.Node // the fill's coordinate for this dim
+	// chunkBase is the C1b forced-FRAG window base on a WARP-covered dim:
+	// roundBase + lane·ceil(T_d/32) — the LANE's chunk origin within the
+	// warp's T_d window. roundBase alone (rank·T + round) names the warp's
+	// first element: a per-thread fill over it loads that one element for
+	// EVERY lane while the lane-chunk walks consume 32 distinct elements
+	// (quick-261027-kzv T8b GPU defect). Nil for non-WARP dims.
+	chunkBase ir.Node
 }
 
 // lntRewrite records one rewritten loop-nest tree: its dims in original
@@ -463,6 +470,12 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
 			d.indexExpr = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset, d.insideIV)
 			d.roundBase = offset
+			// The C1b forced-FRAG window base: the lane's chunk origin —
+			// the warp window origin PLUS lane·c (c = ceil(T_d/32)). The
+			// per-thread loader fills this lane's c-element chunk starting
+			// HERE; the bare roundBase names the warp's first element.
+			d.chunkBase = lr.g.NewBinOp(lowerOrigin, ir.BinOpAdd, offset,
+				lr.g.NewBinOp(lowerOrigin, ir.BinOpMul, lane, lr.u32c(float64(c))))
 		}
 	}
 	return nil

@@ -4,7 +4,7 @@
 - **Amendment 2026-10-26 (post-T1/T2 verification)**: §2.4 reuse re-defined to ONE CTA-wide currency — collective per-window reuse for SMEM sites, holders-scaled per-thread reuse for FRAG sites. The pre-amendment form multiplied per-window bytes by per-thread trips, rewarding warp-splits that shrink blockDim without moving any wire bytes (the §3.3 pin divergence was this artifact). §3.3 worked example re-pinned; §9(2) signature updated; Wave-1 task **T1.1** (§8) lands the judge.go correction. Search/eviction/verify machinery unchanged.
 - **Conflict rule: where this doc disagrees with `doc/optana/loop_tile_lower.md`, `doc/rt.md`, `doc/cg.md`, or `doc/optana/final_lower.md`, THIS DOC WINS.** Those docs get pointer-stub updates (task T8) — the smem_insertion.md precedent.
 - Superseded by this refactor, explicitly: the disjoint-shard warp model; the portion grammar (PORTION_CTA/PORTION_WARP, −1 remainder, AutoWarpPortion, WarpPortion); the v0 searcher policy (≤1 CTA dim + ≤1 WARP dim per LNT); `MaxThreadsPerCTA`/`MaxCTA`-as-exhaustion; the runtime assert-and-trap pre-conditions; the F2 coupled-portion floor; the CTA `LoC == MaxCTA` verify check.
-- Staging: **Wave 1** = everything in this doc, with split-k excluded from the feasible area via `Params.ReducedDimWarp = false` (a CAPABILITY gate on the feasible area, NOT the rejected permanent policy — flip to true in Wave 2 when §3.6 lands). **Wave 2** = split-k enablement + its goldens.
+- Staging: **Wave 1** = everything in this doc, with split-k excluded from the feasible area via `Params.ReducedDimWarp = false` (a CAPABILITY gate on the feasible area, NOT the rejected permanent policy). **Wave 2** = split-k enablement + its goldens — **LANDED (T8, quick-261027-kzv)**: the default flipped to `true` with the dedicated split-k matmul e2e green on the A6000 (§3.5); explicit `false` remains as the Wave-1 policy opt-out.
 
 ## §1 The factorization model
 
@@ -56,7 +56,7 @@ Lane-prefix masks hold under consecutive chunks: chunk lengths are non-increasin
 | `MaxFragPerThread` | 256 | per-thread FRAG budget, kernel-wide |
 | `CacheDims` | 2 | trailing cached dims |
 | `MaxCS` | 16 | candidate-set cap |
-| `ReducedDimWarp` | false (Wave 1) | allow WARP-SoC on reduced dims (split-k) — §3.6 |
+| `ReducedDimWarp` | true (Wave 2 — T8 landed; explicit false = the Wave-1 policy) | allow WARP-SoC on reduced dims (split-k) — §3.5 |
 
 Retired: `PortionCTA`, `PortionWarp`, `AutoWarpPortion`, `WarpPortion`, `MaxThreadsPerCTA`, old `MaxCTA`-as-exhaustion. `Validate` fail-fasts on the new fields.
 

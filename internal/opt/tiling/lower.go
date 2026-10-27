@@ -164,12 +164,13 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		}
 	}
 
-	// Wave-1 defense in depth (fix4 §3.5): while ReducedDimWarp is false,
-	// a WARP-assigned dim whose walk feeds a Reducer FAILS CLOSED — the
-	// split-k reducer wiring is Wave 2, and the pipeline must stop loudly
-	// rather than emit an undesigned lowering. The decide-side feasible
-	// area prunes these; this backstop catches hand-stamped or corrupted
-	// records the way the tile-floor gate 3 backstop catches tile 1.
+	// Opt-out backstop (fix4 §3.5, Wave 1): when ReducedDimWarp is explicitly
+	// false (the Wave-1 policy, now the opt-out mode — the Wave-2 default is
+	// true), a WARP-assigned dim whose walk feeds a Reducer FAILS CLOSED —
+	// the pipeline must stop loudly rather than emit a lowering outside the
+	// policy. The decide-side feasible area prunes these under the same
+	// flag; this backstop catches hand-stamped or corrupted records the way
+	// the tile-floor gate 3 backstop catches tile 1.
 	if !p.Params.ReducedDimWarp {
 		if err := rejectWarpReducedDims(g, decisions); err != nil {
 			return err
