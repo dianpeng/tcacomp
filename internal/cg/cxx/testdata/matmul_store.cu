@@ -51,25 +51,26 @@ __global__ void __launch_bounds__(64) Mm(uint32_t d0, uint32_t d1, uint32_t d2, 
           auto v17 = (c0 - v16);
           auto v18 = tca::rt::umin(c2, v17);
           auto v19 = tca::rt::umin(v6, v18);
+          auto v20 = (v15 + v7);
           // cooperative tile fill of rhs (LoadTileCta) — the runtime owns the copy, the barriers, and tail clamping
           tca::rt::LoadTileCta(thread_map1, rhs_tile, tca::rt::TensorWindow(rhs_v, d1_it1.Index(), d2_it2.Index()));
           // @d0 tile-between rounds — thread/warp, T=256, LoC=64
           for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 64u, thread_map1.index(), 64u, v11); d0_it3.Has(); d0_it3.Next()) {
-            auto v20 = (v8 + d0_it3.Index());
+            auto v21 = (v8 + d0_it3.Index());
             // per-thread tile fill of lhs (LoadTileThread) — no synchronization
-            tca::rt::LoadTileThread(thread_map1, tca_f0, tca::rt::TensorWindow(lhs_v, v20, v15));
+            tca::rt::LoadTileThread(thread_map1, tca_f0, tca::rt::TensorWindow(lhs_v, v21, v20));
             // @d1 inside walk (tile elements) — T=256
             for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v14); d1_it4.Has(); d1_it4.Next()) {
-              auto v21 = (d1_it1.Index() + d1_it4.Index());
+              auto v22 = (d1_it1.Index() + d1_it4.Index());
               // @d2 inside walk (tile elements) — T=32
               for (auto d2_it5 = tca::rt::SeqIterator((v4 * c3), 1u, v19); d2_it5.Has(); d2_it5.Next()) {
-                auto v22 = (v15 + d2_it5.Index());
-                auto v23 = (d2_it5.Index() - v7);
-                auto v24 = tca_f0.Get(v23);
-                auto v25 = (v3 + d2_it5.Index());
-                auto v26 = rhs_tile.Get(d1_it4.Index(), v25);
-                auto v27 = (v24 * v26);
-                out_v.Set(v27, v20, v21, v22);
+                auto v23 = (v15 + d2_it5.Index());
+                auto v24 = (d2_it5.Index() - v7);
+                auto v25 = tca_f0.Get(v24);
+                auto v26 = (v3 + d2_it5.Index());
+                auto v27 = rhs_tile.Get(d1_it4.Index(), v26);
+                auto v28 = (v25 * v27);
+                out_v.Set(v28, v21, v22, v23);
               }
             }
           }

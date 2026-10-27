@@ -425,11 +425,13 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// with their round bases; unreferenced positions stay absent (the
 	// partial deref keeps them as the slice's trailing dims).
 	//
-	// C1b (2026-10-23): a FRAG fill whose covered set includes a WARP dim
-	// rides that position's coordinate on the AXES path as the dim's round
-	// base (rank*T + round) — the chunk ORIGIN moves with the thread, and
-	// the biv path cannot carry it (stmtFill's bivDim demands a dimvar).
-	// A SEQ-covered dim keeps the biv path (its round base IS a dimvar).
+	// C1b (2026-10-23, corrected quick-261027-kzv): a FRAG fill whose covered
+	// set includes a WARP dim rides that position's coordinate on the AXES
+	// path as the dim's LANE-CHUNK window base — (rank·T + round) +
+	// lane·ceil(T_d/32) — so the per-thread loader fills THIS LANE's chunk
+	// (the biv path cannot carry the per-thread terms; stmtFill's bivDim
+	// demands a dimvar). A SEQ-covered dim keeps the biv path (its round
+	// base IS a dimvar).
 	origAxes := ir.OperandsOf(sf.Load)[1:]
 	fillAxes := make([]ir.Node, 0, len(origAxes))
 	for pos, axis := range origAxes {
@@ -474,7 +476,7 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 			// a mixed position keeps the above-tie dims' full index
 			// expressions — the fill key dim's inside coordinate
 			// re-executes the fill per epoch).
-			rebuilt, n := lr.rebuildAxis(axis, lr.coveredBaseSubs(covered))
+			rebuilt, n := lr.rebuildAxis(axis, lr.coveredBaseSubs(covered, class))
 			if n == 0 {
 				return fmt.Errorf("tile-lower: site %d axis %d mixes covered and above-tie iters but holds no covered index expression (corrupted rewrite?)", id, pos)
 			}
@@ -502,9 +504,10 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	// class (R-H/R-J; the retired v0-era loader attribute left the IR). The
 	// covered round bases ride the store's trailing biv operands:
 	// between dimvars only — uniform for the cooperative loader (R1/R2). A
-	// C1b forced-FRAG site's WARP-covered dim is EXCLUDED — its chunk
-	// origin (rank*T + round) carries the per-thread term and already rides
-	// the fill's axes path (stmtFill's bivDim demands dimvars).
+	// C1b forced-FRAG site's WARP-covered dim is EXCLUDED — its lane-chunk
+	// window base ((rank·T + round) + lane·c) carries the per-thread terms
+	// and already rides the fill's axes path (stmtFill's bivDim demands
+	// dimvars).
 	variant := loadTileThread
 	if class == ClassSMEM {
 		variant = loadTileCta
@@ -665,11 +668,19 @@ func (lr *lowerRun) fillHost(lw *lntRewrite, sf SiteFacts, covered []*dimRewrite
 }
 
 // coveredBaseSubs maps every covered dim's rewritten index expression to
-// its round base (the fill holds the whole tile: covered dims enumerate at
-// round bases; the loader walks the tile interior at runtime).
-func (lr *lowerRun) coveredBaseSubs(covered []*dimRewrite) map[*ir.Base]ir.Node {
+// its fill coordinate. A covered WARP dim under the FRAG class (C1b) rides
+// its LANE-CHUNK window base — roundBase + lane·ceil(T_d/32): the per-
+// thread loader fills this lane's chunk, and the bare warp origin would
+// name the warp's first element for every lane (quick-261027-kzv T8b GPU
+// defect). Every other dim rides its round base (the fill holds the whole
+// tile; the loader walks the tile interior at runtime).
+func (lr *lowerRun) coveredBaseSubs(covered []*dimRewrite, class CacheClass) map[*ir.Base]ir.Node {
 	subs := make(map[*ir.Base]ir.Node, len(covered))
 	for _, d := range covered {
+		if class == ClassFRAG && d.soc == SoCWARP && d.chunkBase != nil {
+			subs[d.indexExpr.BasePtr()] = d.chunkBase
+			continue
+		}
 		subs[d.indexExpr.BasePtr()] = d.roundBase
 	}
 	return subs
