@@ -1724,6 +1724,73 @@ func TestLowerC1bFragChunkLocalAccess(t *testing.T) {
 	assertVerifyAndRootReachable(t, fx.g)
 }
 
+// TestLowerC1bFragChunkOriginWindow pins the C1b forced-FRAG FILL WINDOW
+// base on a WARP-covered dim (fix4 §3.3): the per-thread LoadTileThread
+// loads THIS LANE'S CHUNK — ceil(T_d/32) consecutive elements starting at
+// the lane's chunk origin (rank·T_d + round) + lane·ceil(T_d/32) — so the
+// fill source's covered-dim axis must ADD the lane chunk term to the warp
+// window origin. The chunk-LOCAL access (insideIV − lane·c, pinned by
+// TestLowerC1bFragChunkLocalAccess) then indexes the fragment the window
+// actually filled. A window base of rank·T_d + round alone loads element
+// rank·T_d + round for EVERY lane — all 32 lanes of a warp read the same
+// GMEM element while their lane-chunk walks consume 32 DISTINCT elements
+// (quick-261027-kzv T8b: the split-k matmul e2e failed on the A6000 with
+// max abs diff 28.99 — the first cross-warp NUMERICAL exercise of this
+// path; every prior pin was structural only).
+func TestLowerC1bFragChunkOriginWindow(t *testing.T) {
+	fx, lhs, rhs, _ := matmulUsed()
+	rec := matmulRecord(t, fx, lhs, rhs)
+	runLower(t, fx.g, rec) // lhs is the C1b forced-FRAG site (K WARP-covered)
+
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 4)
+	lhsFill := findFillOf(t, fx.g, lbuf)
+	src := ir.OperandsOf(lhsFill)[0] // the tile-shaped source MemLoad
+	axes := ir.OperandsOf(src)[1:]
+	if len(axes) != 2 {
+		t.Fatalf("lhs fill source must be the 2-axis deref lhs[m][k], got %d axes", len(axes))
+	}
+	kAxis := axes[1]
+	// The window base must carry the warp window origin (the ThreadMap rank
+	// query — rank·T_d) AND the lane chunk term (the zero-operand lane_id
+	// query multiplied by ceil(T_d/32)) ADDITIVELY: base = (rank·T + round)
+	// + lane·c.
+	if !subtreeHasKind(t, fx.g, kAxis, ir.KindRuntimeThreadQuery) {
+		t.Fatal("the lhs fill's k window base must carry the warp rank query (rank·T + round)")
+	}
+	var laneMul ir.Node
+	var walk func(n ir.Node)
+	walk = func(n ir.Node) {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+			return
+		}
+		if n.KindOf() == ir.KindBinOp {
+			if code, _ := ir.BinOpCodeOf(n); code == ir.BinOpMul {
+				if ops := ir.OperandsOf(n); len(ops) == 2 && ops[0] != nil &&
+					ops[0].KindOf() == ir.KindRuntimeThreadQuery &&
+					len(ir.OperandsOf(ops[0])) == 0 &&
+					ir.RuntimeAttributeOf(ops[0]) == "lane_id" {
+					laneMul = n
+				}
+			}
+		}
+		for _, op := range ir.OperandsOf(n) {
+			walk(op)
+		}
+	}
+	walk(kAxis)
+	if laneMul == nil {
+		t.Fatal("the lhs fill's k window base must ADD the lane chunk origin lane·ceil(T_d/32) to rank·T + round — the window loads this lane's chunk (quick-261027-kzv T8b GPU defect)")
+	}
+	mulOps := ir.OperandsOf(laneMul)
+	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
+		t.Fatalf("the window's lane chunk size = %v, want ceil(T_k/32) = ceil(32/32) = 1", mulOps[1])
+	}
+	if code, _ := ir.BinOpCodeOf(kAxis); code != ir.BinOpAdd {
+		t.Fatalf("the k window base must be (rank·T + round) + lane·c as an additive chain rooted at Add, got binop %v", code)
+	}
+	assertVerifyAndRootReachable(t, fx.g)
+}
+
 // TestMatmulWorkedCheck pins the R1 worked example at the §3.3 signature:
 // the lhs C1b FRAG fill sits structurally INSIDE M.inside (the fill-key
 // epoch — the m element changes invalidate the fragment) — its m axis is
