@@ -598,14 +598,21 @@ func TestRewriteTailSaturatingGuard(t *testing.T) {
 	}
 	mB, nB, mI, nI := loops[0], loops[1], loops[2], loops[3]
 	assertSaturatingBound(t, fx.g, boundOf(t, mI), 32, mExtent, mB)
-	assertSaturatingBound(t, fx.g, boundOf(t, nI), 32, nExtent, nB)
+	// The WARP inside bound is the LANE-CHUNK wrapper: umin((lane+1)*c,
+	// F1-tileMax) — unwrap the chunk end, then assert the F1 form.
+	nBound := boundOf(t, nI)
+	if nBound.KindOf() != ir.KindCall || ir.CallNameOf(nBound) != "umin" {
+		t.Fatalf("WARP inside bound must be the lane-chunk umin, got %s", kindOf(nBound))
+	}
+	f1 := ir.OperandsOf(nBound)[1]
+	assertSaturatingBound(t, fx.g, f1, 32, nExtent, nB)
 	// The clamped offsets are the RANK forms: the M inside bound's clamp
 	// references the GridMap rank, the N inside bound's the ThreadMap rank.
 	mClamp := ir.OperandsOf(ir.OperandsOf(boundOf(t, mI))[1])[1]
 	if !subtreeHasKind(t, fx.g, mClamp, ir.KindRuntimeGridQuery) {
 		t.Fatal("the CTA inside bound must clamp the grid-rank offset form")
 	}
-	nClamp := ir.OperandsOf(ir.OperandsOf(boundOf(t, nI))[1])[1]
+	nClamp := ir.OperandsOf(ir.OperandsOf(f1)[1])[1]
 	if !subtreeHasKind(t, fx.g, nClamp, ir.KindRuntimeThreadQuery) {
 		t.Fatal("the WARP inside bound must clamp the thread-rank offset form")
 	}
@@ -923,22 +930,25 @@ func TestLowerMultiDimTemplates(t *testing.T) {
 	// The rewritten index carries each CTA dim's OWN GridMap slot (0 and 2's
 	// slot 1) and each WARP dim's OWN ThreadMap slot (1's slot 0 and 3's
 	// slot 1) — the slot counters go past 1 and stay WARP-only on the thread
-	// side.
+	// side. Every axis of the store participates (each dim's index
+	// expression queries its own slots).
 	axes := ir.OperandsOf(store)[2:]
 	gridSlots := map[float64]bool{}
 	threadSlots := map[float64]bool{}
-	for _, x := range flattenSubtree(axes[0]) {
-		if x.KindOf() != ir.KindRuntimeGridQuery && x.KindOf() != ir.KindRuntimeThreadQuery {
-			continue
-		}
-		if len(ir.OperandsOf(x)) == 0 {
-			continue // the flat/lane forms
-		}
-		v, _ := ir.ConstValueOf(ir.OperandsOf(x)[0])
-		if x.KindOf() == ir.KindRuntimeGridQuery {
-			gridSlots[v] = true
-		} else {
-			threadSlots[v] = true
+	for _, axis := range axes {
+		for _, x := range flattenSubtree(axis) {
+			if x.KindOf() != ir.KindRuntimeGridQuery && x.KindOf() != ir.KindRuntimeThreadQuery {
+				continue
+			}
+			if len(ir.OperandsOf(x)) == 0 {
+				continue // the flat/lane forms
+			}
+			v, _ := ir.ConstValueOf(ir.OperandsOf(x)[0])
+			if x.KindOf() == ir.KindRuntimeGridQuery {
+				gridSlots[v] = true
+			} else {
+				threadSlots[v] = true
+			}
 		}
 	}
 	if !gridSlots[0] || !gridSlots[1] {
@@ -1843,11 +1853,16 @@ func TestLowerSMEMWindow(t *testing.T) {
 	var dosoc float64
 	var haveRank bool
 	for _, n := range flattenSubtree(nCoord) {
-		if n.KindOf() == ir.KindRuntimeThreadQuery {
-			haveRank = true
-			if v, ok := ir.ConstValueOf(ir.OperandsOf(n)[0]); ok {
-				dosoc = v
-			}
+		if n.KindOf() != ir.KindRuntimeThreadQuery {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 {
+			continue // the lane query of the chunk walk (zero-operand form)
+		}
+		haveRank = true
+		if v, ok := ir.ConstValueOf(ops[0]); ok {
+			dosoc = v
 		}
 	}
 	if !haveRank || dosoc != 0 {

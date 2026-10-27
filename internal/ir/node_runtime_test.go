@@ -105,7 +105,10 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 		g.NewReturn("ctor", gq)
 		return g
 	}
-	if vs := Verify(badField()); len(vs) != 1 || !strings.Contains(vs[0].Msg, "index\" or \"dimension") {
+	// fix4 §3.1 (T4): an unknown field on the one-operand form is doubly
+	// illegal — it is not a DoSoC-addressed field AND not a known selector;
+	// either violation names the field.
+	if vs := Verify(badField()); len(vs) == 0 || !strings.Contains(vs[0].Msg, "\"rank\"") {
 		t.Fatalf("bad field must be a shape violation, got %v", vs)
 	}
 
@@ -138,8 +141,8 @@ func TestRuntimeQueryVerifyShape(t *testing.T) {
 	raw := multiOperand.NewNode(KindRuntimeThreadQuery, "ctor", u32const(multiOperand, 0), u32const(multiOperand, 1))
 	multiOperand.NewReturn("ctor", raw)
 	vs := Verify(multiOperand)
-	if len(vs) != 2 || !strings.Contains(vs[0].Msg, "surplus") || !strings.Contains(vs[1].Msg, "index\" or \"dimension") {
-		t.Fatalf("multi-operand query must fail closed on surplus + field, got %v", vs)
+	if len(vs) != 2 || !strings.Contains(vs[0].Msg, "surplus") || !strings.Contains(vs[1].Msg, "\"lane_id\"") {
+		t.Fatalf("multi-operand query must fail closed on surplus + the vocabulary (index/dimension/lane_id), got %v", vs)
 	}
 }
 

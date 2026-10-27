@@ -148,10 +148,13 @@ func runTileLowerSchedule(t *testing.T, f *chainFx, decisions []tiling.IterDecis
 }
 
 // reduceWarpGraph builds the tiled reduce chain (the final-lower test's
-// proven shape): a 2-dim chain with m CTA T=32 / k WARP T=64, lhs[m][k]
-// load → map (as=[m,k]) → reduce(init=0.0f, +) → out[m] store. Its golden
-// exercises the WarpReducer, the D7 slot reads, the hoisted combiner
-// lambda, and the epilogue re-iteration.
+// proven shape, re-targeted to the fix4 §3.5 Wave-1-legal schedule): a
+// 2-dim chain with m CTA T=32 / k SEQ T=64 (the reduced dim must NOT be
+// WARP-assigned while ReducedDimWarp=false — the split-k shape fails
+// closed at tile-lower; the name is historical), lhs[m][k] load → map
+// (as=[m,k]) → reduce(init=0.0f, +) → out[m] store. Its golden exercises
+// the SeqReducer bracket, the hoisted combiner lambda, the epilogue
+// re-iteration, and the zero-WARP ThreadMapping (ndim 0 — one warp).
 func reduceWarpGraph(t *testing.T) *ir.Graph {
 	t.Helper()
 	f := newChain("redwarp", 1024, 512)
@@ -172,7 +175,7 @@ func reduceWarpGraph(t *testing.T) *ir.Graph {
 	}
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
 	})
 	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("final-lower: %v", err)
@@ -180,10 +183,11 @@ func reduceWarpGraph(t *testing.T) *ir.Graph {
 	return f.g
 }
 
-// reduce3Graph builds the rank-3 last-axis reduce (the HI-01 proof shape):
-// u32 extents 64/32/512, lhs[d0,d1,d2] load → map (as=[d0,d1,d2]) →
-// reduce(0.0f, +) → out[d0,d1] store, decisions {CTA,100,32}/{SEQ,1,64}/
-// {WARP,8,64} — TWO between dims (the >=2-between-dims R-A case).
+// reduce3Graph builds the rank-3 last-axis reduce (the HI-01 proof shape,
+// Wave-1-legal per fix4 §3.5 — the reduced dim is SEQ): u32 extents
+// 64/32/512, lhs[d0,d1,d2] load → map (as=[d0,d1,d2]) → reduce(0.0f, +) →
+// out[d0,d1] store, decisions {CTA,100,32}/{SEQ,1,64}/{SEQ,1,64} — TWO
+// between dims (the >=2-between-dims R-A case).
 func reduce3Graph(t *testing.T) *ir.Graph {
 	t.Helper()
 	f := newChain("red3", 64, 32, 512)
@@ -205,7 +209,7 @@ func reduce3Graph(t *testing.T) *ir.Graph {
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
 		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 64},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64},
 	})
 	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("final-lower: %v", err)
@@ -214,11 +218,12 @@ func reduce3Graph(t *testing.T) *ir.Graph {
 }
 
 // reduceT1Graph builds the minimal-legal-tile endpoint (the HI-02 proof
-// shape, retargeted by the 2026-10-24 tile-disable ruling; the identifier
-// is historical): the redwarp graph at {CTA,100,2}/{WARP,8,2} — the floor
-// tile 2 everywhere, the compiler's flat endpoint — X is the reduced dim's
-// tile-between loop; the Combine local and the moved store must share the
-// element loop's lexical scope.
+// shape, retargeted by the 2026-10-24 tile-disable ruling and again by
+// fix4 §3.5's Wave-1 defense; the identifier is historical): the redwarp
+// graph at {CTA,100,2}/{SEQ,1,2} — the floor tile 2 everywhere, the
+// compiler's flat endpoint — X is the reduced dim's tile-between loop; the
+// Combine local and the moved store must share the element loop's lexical
+// scope.
 func reduceT1Graph(t *testing.T) *ir.Graph {
 	t.Helper()
 	f := newChain("redt1", 1024, 512)
@@ -239,7 +244,7 @@ func reduceT1Graph(t *testing.T) *ir.Graph {
 	}
 	cache := runTileLowerSchedule(t, f, []tiling.IterDecision{
 		{SoC: tiling.SoCTA, LoC: 100, TileSize: 2},
-		{SoC: tiling.SoCWARP, LoC: 8, TileSize: 2},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 2},
 	})
 	if err := (finallower.Pass{}).Run(&opt.Context{Pass: "final-lower", Cache: cache}, f.g); err != nil {
 		t.Fatalf("final-lower: %v", err)
@@ -322,16 +327,15 @@ func TestReduceShapesEmit(t *testing.T) {
 	})
 }
 
-// assertReducerSurface pins the common reducer emission facts: the
-// WarpReducer ctor with the 4-operand face, exactly one Init call site,
-// and exactly one Combine local.
+// assertReducerSurface pins the common reducer emission facts (Wave-1
+// retarget, fix4 §3.5: the reduced dim is SEQ — the bracket lowers through
+// the SeqReducer; the WarpReducer face stays pinned at the runtime level by
+// runtime/tests/conformance_new_api.cu): exactly one reducer construction,
+// exactly one Init call site, and exactly one Combine local.
 func assertReducerSurface(t *testing.T, cu string) {
 	t.Helper()
-	if !strings.Contains(cu, "tca::rt::WarpReducer<float> reducer0(") {
-		t.Fatal("the .cu must construct the WarpReducer")
-	}
-	if !strings.Contains(cu, "SmemView<float, 1u>(reinterpret_cast<float*>(tca_smem") {
-		t.Fatal("the ctor face must carry the staging SmemView operand")
+	if !strings.Contains(cu, "tca::rt::SeqReducer<float> reducer0(") {
+		t.Fatal("the .cu must construct the SeqReducer (the reduced dim is SEQ under Wave 1)")
 	}
 	if got := strings.Count(cu, "reducer0.Init();"); got != 1 {
 		t.Fatalf("exactly one Init call site expected, got %d", got)

@@ -164,6 +164,40 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		}
 	}
 
+	// Wave-1 defense in depth (fix4 §3.5): while ReducedDimWarp is false,
+	// a WARP-assigned dim whose walk feeds a Reducer FAILS CLOSED — the
+	// split-k reducer wiring is Wave 2, and the pipeline must stop loudly
+	// rather than emit an undesigned lowering. The decide-side feasible
+	// area prunes these; this backstop catches hand-stamped or corrupted
+	// records the way the tile-floor gate 3 backstop catches tile 1.
+	if !p.Params.ReducedDimWarp {
+		if err := rejectWarpReducedDims(g, decisions); err != nil {
+			return err
+		}
+	}
+
+	// Launch-blockDim pre-pass (fix4 §3.2/§5.1): the launch blockDim is
+	// the MAX over the forest's LNTs of (Π warp K_d) × 32 — never the
+	// kernel-wide PRODUCT of every WARP LoC (two LNTs of K=2 and K=4
+	// launch 128 threads, not 256). This REPLACES the per-call
+	// blockDimOf(lr.decisions) the templates used to inline (the
+	// kernel-wide product is wrong for multi-LNT graphs per §5.1);
+	// blockDimOf itself stays in judge.go — the DECIDE side prices
+	// per-LNT. The empty product is 1 → every LNT contributes at least 32
+	// (a zero-WARP LNT launches one warp).
+	launchBlockDim := 32
+	for _, root := range f.Roots() {
+		prod := 1
+		for _, it := range treeItersOf(root) {
+			if d := decisions[it]; d.SoC == SoCWARP {
+				prod *= d.LoC
+			}
+		}
+		if bd := prod * 32; bd > launchBlockDim {
+			launchBlockDim = bd
+		}
+	}
+
 	overrides, dropped, err := p.resolveBudget(rec, facts, decisions)
 	if err != nil {
 		return err
@@ -171,17 +205,19 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 
 	mctx := &ir.MutContext{Pass: lowerOrigin}
 	lr := &lowerRun{
-		g:         g,
-		params:    p.Params,
-		mctx:      mctx,
-		decisions: decisions,
-		overrides: overrides,
-		byIter:    make(map[ir.Node]*dimRewrite),
+		g:              g,
+		params:         p.Params,
+		mctx:           mctx,
+		decisions:      decisions,
+		overrides:      overrides,
+		byIter:         make(map[ir.Node]*dimRewrite),
+		launchBlockDim: launchBlockDim,
 		prov: &Provenance{
 			Dims: make(map[ir.Node]DimProvenance),
 			LNTs: make(map[ir.Node]MappingPlan),
 		},
 	}
+	lr.prov.MaxThreadsPerCTA = launchBlockDim
 	for _, root := range f.Roots() {
 		if err := lr.rewriteLNT(root); err != nil {
 			return err
@@ -206,19 +242,64 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 
 // lowerRun carries one Run's rewrite state: the pass thresholds, the
 // choke-point context, the effective per-iter decisions (record decision
-// plus any budget override), and the per-dim rewrite products PHASE 4
+// plus any budget override), the derived LAUNCH blockDim (fix4 §5.1: max
+// over LNTs of (Π warp K) × 32 — the coupled walks' stride and the
+// provenance's MaxThreadsPerCTA), the per-dim rewrite products PHASE 4
 // consumes (filled by rewriteLNT), and the provenance record under
 // construction (P-5).
 type lowerRun struct {
-	g         *ir.Graph
-	params    Params
-	mctx      *ir.MutContext
-	decisions map[ir.Node]IterDecision
-	overrides map[ir.Node]int // budget tile overrides, keyed by iter
-	byIter    map[ir.Node]*dimRewrite
-	rewrites  []*lntRewrite // per-root products, Roots() order
-	fills     []*siteFill   // PHASE 4 products, for the §8 placement/scope checks
-	prov      *Provenance   // the P-5 provenance under construction
+	g              *ir.Graph
+	params         Params
+	mctx           *ir.MutContext
+	decisions      map[ir.Node]IterDecision
+	overrides      map[ir.Node]int // budget tile overrides, keyed by iter
+	launchBlockDim int             // max over LNTs of (Π warp K) × 32, floor 32
+	byIter         map[ir.Node]*dimRewrite
+	rewrites       []*lntRewrite // per-root products, Roots() order
+	fills          []*siteFill   // PHASE 4 products, for the §8 placement/scope checks
+	prov           *Provenance   // the P-5 provenance under construction
+}
+
+// rejectWarpReducedDims is the fix4 §3.5 Wave-1 defense: every
+// WARP-assigned iter whose InductionVariable users' forward data-dep
+// closure reaches a live KindReduce fails closed with a named error. The
+// walk is over USES (forward): the IV feeds a load, the load the piped
+// Map, the Map the Reduce — the dim's walk demonstrably accumulates into
+// a reducer, which under WARP factorization is the undesigned split-k
+// shape (Wave 2, behind ReducedDimWarp=true).
+func rejectWarpReducedDims(g *ir.Graph, decisions map[ir.Node]IterDecision) error {
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindIter {
+			continue
+		}
+		if d, ok := decisions[n]; !ok || d.SoC != SoCWARP {
+			continue
+		}
+		seen := make(map[*ir.Base]bool)
+		stack := make([]ir.Node, 0, 8)
+		for _, iv := range ivsOf(n) {
+			stack = append(stack, iv)
+		}
+		for len(stack) > 0 {
+			x := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if x == nil || x.BasePtr() == nil || x.BasePtr().Erased() || seen[x.BasePtr()] {
+				continue
+			}
+			seen[x.BasePtr()] = true
+			if x.KindOf() == ir.KindReduce {
+				return fmt.Errorf(
+					"tile-lower: WARP-assigned iter node %d feeds Reduce node %d — a WARP-factorized reduced dim is the split-k shape, undesigned in Wave 1 (fix4 3.5): the decide-side feasible-area gate prunes these while ReducedDimWarp=false, and this lower must stop loudly rather than emit an undesigned lowering",
+					n.BasePtr().ID(), x.BasePtr().ID())
+			}
+			for _, u := range ir.UsesOf(x) {
+				if usr := u.User(); usr != nil {
+					stack = append(stack, usr)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // effectiveTile returns the iter's tile size after budget overrides.
@@ -273,18 +354,20 @@ func (lr *lowerRun) checkRetiredIters() error {
 	return nil
 }
 
-// checkLoopAnnotations pins "every parallel-inside loop carries the
+// checkLoopAnnotations pins "every parallel loop carries the
 // materialization annotation (thr/cta)": every generated loop's annotation
 // set is re-read from the dimRewrite products and asserted well-formed —
-// soc present; dosoc present exactly when soc != 0; loc present.
+// soc and loc present; dosoc present exactly where the fix4 §3.1/§3.2
+// conventions demand it: on EVERY between loop of a parallel dim
+// (soc != 0), but EXEMPT on the CTA dim's coupled INSIDE walk (soc 2, no
+// dosoc — the flat-rank walk rides the NO-ARG thread index and needs no
+// ThreadMap slot, the §3.2 dimensionality ruling). The pass knows each
+// loop's role from its dimRewrite (between vs inside), so the exemption
+// is precise, never a blanket soc-based skip.
 func (lr *lowerRun) checkLoopAnnotations() error {
 	for _, lw := range lr.rewrites {
 		for _, d := range lw.dims {
-			loops := []ir.Node{d.between}
-			if d.inside != nil {
-				loops = append(loops, d.inside)
-			}
-			for _, loop := range loops {
+			check := func(loop ir.Node, isBetween bool) error {
 				attrs := loopAnnotations(loop)
 				soc, ok := attrs["soc"]
 				if !ok {
@@ -293,11 +376,22 @@ func (lr *lowerRun) checkLoopAnnotations() error {
 				if _, ok := attrs["loc"]; !ok {
 					return fmt.Errorf("tile-lower: generated loop node %d carries no loc annotation", loop.BasePtr().ID())
 				}
-				if soc != 0 {
-					if _, ok := attrs["dosoc"]; !ok {
-						return fmt.Errorf("tile-lower: generated parallel loop node %d carries no dosoc annotation",
-							loop.BasePtr().ID())
-					}
+				// dosoc: required on soc!=0 BETWEEN loops and on any soc==1
+				// loop; exempt on the soc==2 coupled INSIDE walk and on
+				// every sequential loop.
+				needDosoc := (isBetween && soc != 0) || soc == 1
+				if _, has := attrs["dosoc"]; needDosoc && !has {
+					return fmt.Errorf("tile-lower: generated parallel loop node %d carries no dosoc annotation",
+						loop.BasePtr().ID())
+				}
+				return nil
+			}
+			if err := check(d.between, true); err != nil {
+				return err
+			}
+			if d.inside != nil {
+				if err := check(d.inside, false); err != nil {
+					return err
 				}
 			}
 		}

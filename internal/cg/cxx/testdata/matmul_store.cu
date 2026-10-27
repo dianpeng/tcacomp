@@ -15,7 +15,7 @@ __global__ void __launch_bounds__(512) Mm(uint32_t d0, uint32_t d1, uint32_t d2,
   tca::rt::Frag<float, 1u, 1u> tca_f0;
 
   tca::rt::KernelInfo kinfo;
-  // LNT #0: d0=CTA(T=256,LoC=4) d1=sequential(T=256,LoC=1) d2=thread/warp(T=32,LoC=64) d0=thread/warp(T=256,LoC=64) d1=sequential(T=256,LoC=1) d2=sequential(T=32,LoC=1)
+  // LNT #0: d0=CTA(T=256,LoC=4) d1=sequential(T=256,LoC=1) d2=thread/warp(T=32,LoC=2) d0=thread/warp(T=256,LoC=64) d1=sequential(T=256,LoC=1) d2=sequential(T=32,LoC=1)
   {
     // CTA-space mapping (portions 4 — the launch grammar this nest remaps)
     tca::rt::GridMapping grid_map0(kinfo, 4);
@@ -25,47 +25,49 @@ __global__ void __launch_bounds__(512) Mm(uint32_t d0, uint32_t d1, uint32_t d2,
     auto v0 = grid_map0.index(0u);
     auto c1 = 256u;
     auto v1 = (v0 * c1);
-    auto v2 = thread_map1.index(1u);
+    auto v2 = thread_map1.index(0u);
     auto c2 = 32u;
     auto v3 = (v2 * c2);
-    auto v4 = thread_map1.index(0u);
-    auto v5 = (v4 * c0);
+    auto v4 = thread_map1.lane_id();
+    auto c3 = 1u;
+    auto v5 = (v4 + c3);
+    auto v6 = (v5 * c3);
     // @d0 tile-between rounds — CTA, T=256, LoC=4 (map dim 0)
     for (auto d0_it0 = tca::rt::CtaIterator(grid_map0, 0u, 4u, 0u, 1024u, c0); d0_it0.Has(); d0_it0.Next()) {
-      auto v6 = (v1 + d0_it0.Index());
-      auto v7 = tca::rt::umin(v6, c0);
-      auto v8 = (c0 - v7);
-      auto v9 = tca::rt::umin(c1, v8);
+      auto v7 = (v1 + d0_it0.Index());
+      auto v8 = tca::rt::umin(v7, c0);
+      auto v9 = (c0 - v8);
+      auto v10 = tca::rt::umin(c1, v9);
       // @d1 tile-between rounds — sequential, T=256, LoC=1
       for (auto d1_it1 = tca::rt::SeqIterator(0u, 256u, c0); d1_it1.Has(); d1_it1.Next()) {
-        auto v10 = tca::rt::umin(d1_it1.Index(), c0);
-        auto v11 = (c0 - v10);
-        auto v12 = tca::rt::umin(c1, v11);
-        // @d2 tile-between rounds — thread/warp, T=32, LoC=64 (map dim 1)
-        for (auto d2_it2 = tca::rt::ThrIterator(thread_map1, 1u, 64u, 0u, 2048u, c0); d2_it2.Has(); d2_it2.Next()) {
-          auto v13 = (v3 + d2_it2.Index());
-          auto v14 = (v13 + v5);
+        auto v11 = tca::rt::umin(d1_it1.Index(), c0);
+        auto v12 = (c0 - v11);
+        auto v13 = tca::rt::umin(c1, v12);
+        // @d2 tile-between rounds — thread/warp, T=32, LoC=2 (map dim 0)
+        for (auto d2_it2 = tca::rt::ThrIterator(thread_map1, 0u, 2u, 0u, 64u, c0); d2_it2.Has(); d2_it2.Next()) {
+          auto v14 = (v3 + d2_it2.Index());
           auto v15 = tca::rt::umin(v14, c0);
           auto v16 = (c0 - v15);
           auto v17 = tca::rt::umin(c2, v16);
+          auto v18 = tca::rt::umin(v6, v17);
           // cooperative tile fill of rhs (LoadTileCta) — the runtime owns the copy, the barriers, and tail clamping
           tca::rt::LoadTileCta(thread_map1, rhs_tile, tca::rt::TensorWindow(rhs_v, d1_it1.Index(), d2_it2.Index()));
-          // @d0 tile-between rounds — thread/warp, T=256, LoC=64 (map dim 0)
-          for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 64u, thread_map1.index(), 64u, v9); d0_it3.Has(); d0_it3.Next()) {
-            auto v18 = (v6 + d0_it3.Index());
-            auto v19 = lhs_v.Get(v18, v14);
-            tca_f0.Set(v19, );
+          // @d0 tile-between rounds — thread/warp, T=256, LoC=64
+          for (auto d0_it3 = tca::rt::ThrIterator(thread_map1, 0u, 64u, thread_map1.index(), 64u, v10); d0_it3.Has(); d0_it3.Next()) {
+            auto v19 = (v7 + d0_it3.Index());
+            auto v20 = lhs_v.Get(v19, v14);
+            tca_f0.Set(v20, );
             // @d1 inside walk (tile elements) — T=256
-            for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v12); d1_it4.Has(); d1_it4.Next()) {
-              auto v20 = (d1_it1.Index() + d1_it4.Index());
+            for (auto d1_it4 = tca::rt::SeqIterator(0u, 1u, v13); d1_it4.Has(); d1_it4.Next()) {
+              auto v21 = (d1_it1.Index() + d1_it4.Index());
               // @d2 inside walk (tile elements) — T=32
-              for (auto d2_it5 = tca::rt::SeqIterator(0u, 1u, v17); d2_it5.Has(); d2_it5.Next()) {
-                auto v21 = (v14 + d2_it5.Index());
-                auto v22 = tca_f0.Get(d2_it5.Index());
-                auto v23 = (v3 + d2_it5.Index());
-                auto v24 = rhs_tile.Get(d1_it4.Index(), v23);
-                auto v25 = (v22 * v24);
-                out_v.Set(v25, v18, v20, v21);
+              for (auto d2_it5 = tca::rt::SeqIterator((v4 * c3), 1u, v18); d2_it5.Has(); d2_it5.Next()) {
+                auto v22 = (v14 + d2_it5.Index());
+                auto v23 = tca_f0.Get(d2_it5.Index());
+                auto v24 = (v3 + d2_it5.Index());
+                auto v25 = rhs_tile.Get(d1_it4.Index(), v24);
+                auto v26 = (v23 * v25);
+                out_v.Set(v26, v19, v21, v22);
               }
             }
           }

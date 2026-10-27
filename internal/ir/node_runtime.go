@@ -95,6 +95,19 @@ func (g *Graph) NewRuntimeThreadQueryFlat(origin string) Node {
 	return n
 }
 
+// NewRuntimeThreadQueryLane creates the ZERO-OPERAND lane query — the fix4
+// §3.1 WARP lane-chunk walks (T4): field is pinned "lane_id" (the
+// querying thread's lane within its warp — a pure function of the flat
+// rank; the lane has NO map dimension, hence no DoSoC operand). The
+// verifier's shape case admits the zero-operand form for field "lane_id"
+// exactly as for "index"; final-lower rewrites it to the zero-arg
+// lane_id attribute read on the LNT's ThreadMapping.
+func (g *Graph) NewRuntimeThreadQueryLane(origin string) Node {
+	n := g.allocNode(KindRuntimeThreadQuery, origin, 0).(*runtimeQueryNode)
+	n.field = "lane_id"
+	return n
+}
+
 // runtimeKernelInfoNode: the one-per-kernel runtime information object —
 // zero operands, zero payload (LR-4: a dedicated construction node, no
 // generic RuntimeConstruct). final-lower prepends it as the FIRST item of

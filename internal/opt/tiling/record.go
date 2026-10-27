@@ -266,22 +266,23 @@ const ProvenanceName = "tiling-provenance"
 // tile-disable ruling), the effective SoC (mirrors ASTLoopMeta — LR-7's
 // specialization input), and the effective tile size. For SoCTA dims the
 // entry additionally carries
-// the COUPLED tile-inside walk's materialization facts (its ThreadMap slot
-// and thread count) — final-lower's per-element ownership-gate walk over a
-// reduce's output dims mirrors exactly this form (the 2026-10-23 reducer
-// redirect).
+// the COUPLED tile-inside walk's materialization facts — under the fix4
+// §3.2 dimensionality ruling the walk rides the NO-ARG flat thread rank,
+// so its "slot" is -1 (WARP dims are the ThreadMap's only dimensions).
 type DimProvenance struct {
 	Between ir.Node
 	Inside  ir.Node // always populated (every dim is tiled, T >= 2)
 	Soc     SoCType
 	Tile    int
-	// CoupledDoSoC is the CTA dim's coupled inside-walk ThreadMap slot
-	// (-1 = the dim is not CTA-assigned).
+	// CoupledDoSoC is the CTA dim's coupled inside-walk ThreadMap slot:
+	// ALWAYS -1 under the fix4 §3.2 dimensionality ruling (the flat-rank
+	// walk takes no slot; the field survives as the explicit "no slot"
+	// marker for final-lower's reducer walk).
 	CoupledDoSoC int
 	// CoupledThreads is the coupled inside-walk thread count (0 = not
-	// CTA-assigned): under the fix4 model it is the LNT's blockDim =
-	// (Π warp K) × 32 — the flat-init walk's step and the ownership-gate
-	// walk's step.
+	// CTA-assigned): under the fix4 model it is the LAUNCH blockDim =
+	// max over LNTs of (Π warp K) × 32 — the flat-init walk's step and
+	// the ownership-gate walk's step.
 	CoupledThreads int
 }
 
