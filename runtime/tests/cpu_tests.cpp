@@ -31,6 +31,120 @@ namespace {
 
 tca::rt::KernelInfo host_info(unsigned ctas, unsigned threads) { return tca::rt::KernelInfo(ctas, threads); }
 
+// ---------------------------------------------------------------------------
+// fix4 §4.5 factorization decomposition tests (doc/fix/fix4.md §4.1/§3.2):
+// reverse stride-shape over the constructor shape, WARP-unit thread
+// coordinates, flat-rank identities, kinfo-derived counts under surplus
+// launches, and absolute-loc iterator walks.
+// ---------------------------------------------------------------------------
+
+// (a) GridMapping factorization over the 2-dim shape (4, 16): dimension()
+// returns the extents VERBATIM; index(d) is the reverse stride-shape
+// decomposition of the flat CTA rank; the decomposition is a BIJECTION on
+// [0, Π shape) — reconstruction index(0)*16 + index(1) == id for ALL ids.
+void test_grid_mapping_factorization() {
+  auto kinfo = host_info(64u, 512u);
+  tca::rt::GridMapping gm(kinfo, 2u, 4u, 16u);
+  CHECK(gm.dimension(0u) == 4u);   // LoC_0 verbatim (the CTA count)
+  CHECK(gm.dimension(1u) == 16u);  // LoC_1 verbatim
+  for (unsigned id : {0u, 15u, 16u, 63u}) {
+    gm.set_linear_id(id);
+    CHECK(gm.index(0u) == (id / 16u) % 4u);  // row-major: last dim stride 1
+    CHECK(gm.index(1u) == id % 16u);
+  }
+  for (unsigned id = 0u; id < 64u; ++id) {  // the bijection on [0, 4*16)
+    gm.set_linear_id(id);
+    CHECK(gm.index(0u) * 16u + gm.index(1u) == id);
+  }
+}
+
+// (b) ThreadMapping factorization in WARP units (§4.1): index(d) decomposes
+// the WARP RANK (index()/32) over the K shape — never the raw thread id;
+// lane_id() resolves the lane inside the warp. Bijection over warps:
+// index(0)*8 + index(1) == tid/32 for EVERY tid. warp_count()/total() are
+// the kinfo-DERIVED launch values (here the shape product 2*8 happens to
+// equal the launch — the surplus case is (d) below).
+void test_thread_mapping_factorization() {
+  auto kinfo = host_info(64u, 512u);  // the launch: 16 warps
+  tca::rt::ThreadMapping tm(kinfo, 2u, 2u, 8u);
+  CHECK(tm.dimension(0u) == 2u);  // K_0 verbatim (the WARP count)
+  CHECK(tm.dimension(1u) == 8u);
+  for (unsigned tid : {0u, 31u, 32u, 63u, 255u, 256u, 511u}) {
+    tm.set_linear_id(tid);
+    const unsigned warp_rank = tid / 32u;
+    CHECK(tm.index(0u) == (warp_rank / 8u) % 2u);
+    CHECK(tm.index(1u) == warp_rank % 8u);
+    CHECK(tm.lane_id() == tid % 32u);
+    CHECK(tm.warp_index() == warp_rank);
+  }
+  for (unsigned tid = 0u; tid < 512u; ++tid) {  // the bijection over warps
+    tm.set_linear_id(tid);
+    CHECK(tm.index(0u) * 8u + tm.index(1u) == tid / 32u);
+  }
+  CHECK(tm.warp_count() == 16u);  // kinfo-derived: 512 threads / 32
+  CHECK(tm.total() == 512u);      // kinfo-derived: blockDim
+}
+
+// (c) Flat-rank identities (ruling 2026-10-23 restated under §4.1): no-arg
+// index() IS the injected flat rank; warp/lane/first queries are pure
+// functions of it. Plus the §3.3 canonical worked-example pair (gridDim 16,
+// blockDim 64 = 2 warps): every CTA id is its own single-dim coordinate,
+// and warp 0/1 own the even/odd tile ranks of the K=2 split.
+void test_flat_rank_identities() {
+  auto kinfo = host_info(64u, 512u);
+  tca::rt::GridMapping gm(kinfo, 2u, 4u, 16u);
+  for (unsigned id : {0u, 1u, 15u, 16u, 42u, 63u}) {
+    gm.set_linear_id(id);
+    CHECK(gm.index() == id);  // the flat CTA id — blockIdx.x
+  }
+  tca::rt::ThreadMapping tm(kinfo, 2u, 2u, 8u);
+  for (unsigned tid : {0u, 1u, 31u, 32u, 63u, 255u, 256u, 511u}) {
+    tm.set_linear_id(tid);
+    CHECK(tm.index() == tid);  // the flat thread id — threadIdx.x
+    CHECK(tm.warp_index() == tm.index() / 32u);
+    CHECK(tm.lane_id() == tm.index() % 32u);
+    CHECK(tm.is_first_in_warp() == (tm.lane_id() == 0u));
+    CHECK(tm.is_first_in_cta() == (tm.index() == 0u));
+  }
+  auto wk = host_info(16u, 64u);  // the §3.3 worked-example launch
+  tca::rt::GridMapping wgm(wk, 1u, 16u);
+  CHECK(wgm.dimension(0u) == 16u);
+  for (unsigned id = 0u; id < 16u; ++id) {
+    wgm.set_linear_id(id);
+    CHECK(wgm.index(0u) == id);  // 1-D shape: the coordinate IS the rank
+  }
+  tca::rt::ThreadMapping wtm(wk, 1u, 2u);
+  for (unsigned tid = 0u; tid < 64u; ++tid) {
+    wtm.set_linear_id(tid);
+    CHECK(wtm.index(0u) == tid / 32u);  // warp 0 even tile ranks, warp 1 odd
+  }
+}
+
+// (d) Surplus-rank coordinate totality (§3.2): a multi-LNT launch runs the
+// max-over-LNT totals, so an LNT's shape product can be SMALLER than the
+// launch. warp_count()/total() answer the LAUNCH (kinfo-derived: 16 warps,
+// 512 threads — NOT the shape product 2); surplus ranks' coordinates wrap
+// in-shape via the modulo (always < extent — total, no UB); their bodies
+// whole-body-skip via the compiler's loop guards. Deliberately no assert
+// ties the shape product to the launch total.
+void test_surplus_ranks_totality() {
+  auto kinfo = host_info(100u, 512u);        // the launch: 16 warps
+  tca::rt::ThreadMapping tm(kinfo, 1u, 2u);  // an LNT factoring only 2 warps
+  CHECK(tm.warp_count() == 16u);             // kinfo-DERIVED, not the shape 2
+  CHECK(tm.total() == 512u);
+  for (unsigned tid = 0u; tid < 512u; ++tid) {
+    tm.set_linear_id(tid);
+    CHECK(tm.index(0u) < 2u);  // coordinate totality on surplus ranks
+  }
+  auto gkinfo = host_info(64u, 512u);
+  tca::rt::GridMapping gm(gkinfo, 1u, 4u);  // 4 of the launch's 64 CTAs
+  CHECK(gm.dimension(0u) == 4u);
+  for (unsigned id = 0u; id < 64u; ++id) {
+    gm.set_linear_id(id);
+    CHECK(gm.index(0u) < 4u);
+  }
+}
+
 // (e) The uniform round walk: base < bound; base += step; Index() = base.
 void test_seq_iterator() {
   // 16 trips, Index = 0, 64, ..., 960.
@@ -84,6 +198,63 @@ void test_map_iterators() {
     ++trips;
   }
   CHECK(trips == 16u);
+}
+
+// (e, §4.5) Absolute-loc iterator walks (§3.1 caller arithmetic, §4.2 loc
+// semantics): the CTA round walk strides LoC×T; the WARP-dim round walk
+// strides K×T; the COUPLED inside walk takes init = the flat thread rank,
+// step = blockDim, and partitions the tile MAX with per-thread trip-count
+// single ownership. (The plan's example prose — "tid 0..511 take one trip"
+// — is imprecise: under step 512 / bound 600, tids < 88 take a SECOND trip
+// since tid + 512 < 600; the exact trip formula and the single-ownership
+// partition are pinned here instead.)
+void test_iterator_absolute_loc_walks() {
+  auto kinfo = host_info(16u, 512u);
+  tca::rt::GridMapping gm(kinfo, 1u, 4u);    // LoC = 4
+  tca::rt::ThreadMapping tm(kinfo, 1u, 2u);  // K = 2
+
+  // CTA round walk: step = LoC × T = 4 × 64 = 256 over 4096 -> 16 rounds.
+  unsigned trips = 0u;
+  for (tca::rt::CtaIterator it(gm, 0u, 4u, 0u, 4u * 64u, 4096u); it.Has(); it.Next()) {
+    CHECK(it.Index() == trips * 256u);
+    ++trips;
+  }
+  CHECK(trips == 16u);
+
+  // WARP-dim round walk: step = K × T = 2 × 32 = 64 over 1024 -> 16 rounds.
+  trips = 0u;
+  for (tca::rt::ThrIterator it(tm, 0u, 2u, 0u, 2u * 32u, 1024u); it.Has(); it.Next()) {
+    CHECK(it.Index() == trips * 64u);
+    ++trips;
+  }
+  CHECK(trips == 16u);
+
+  // The coupled inside walk on a 1024-thread launch shape (tids past the
+  // 512-thread block boundary injectable through set_linear_id):
+  // trips(tid) = #{k >= 0 : tid + k*512 < 600} — 2 for tid < 88, 1 for
+  // 88 <= tid < 600, 0 for tid >= 600.
+  auto big = host_info(16u, 1024u);
+  tca::rt::ThreadMapping btm(big, 1u, 2u);
+  for (unsigned tid = 0u; tid < 1024u; ++tid) {
+    btm.set_linear_id(tid);
+    const unsigned expected = (tid < 600u ? 1u : 0u) + (tid + 512u < 600u ? 1u : 0u);
+    unsigned n = 0u;
+    for (tca::rt::ThrIterator it(btm, 0u, 2u, btm.index(), 512u, 600u); it.Has(); it.Next()) {
+      ++n;
+    }
+    CHECK(n == expected);
+  }
+  // The REAL 512-thread block partitions [0, 600) exactly once per element
+  // (element e -> thread e%512, trip e/512) — single ownership (§4.2).
+  unsigned cover[600] = {};
+  for (unsigned tid = 0u; tid < 512u; ++tid) {
+    btm.set_linear_id(tid);
+    for (tca::rt::ThrIterator it(btm, 0u, 2u, btm.index(), 512u, 600u); it.Has(); it.Next()) {
+      CHECK(it.Index() < 600u);
+      ++cover[it.Index()];
+    }
+  }
+  for (unsigned e = 0u; e < 600u; ++e) CHECK(cover[e] == 1u);
 }
 
 // (f) Views: row-major stride math, Get/Set roundtrip, OOB suppression.
@@ -544,8 +715,13 @@ void test_mask_derivation_arithmetic() {
 }  // namespace
 
 int main() {
+  test_grid_mapping_factorization();
+  test_thread_mapping_factorization();
+  test_flat_rank_identities();
+  test_surplus_ranks_totality();
   test_seq_iterator();
   test_map_iterators();
+  test_iterator_absolute_loc_walks();
   test_tensor_view();
   test_smem_view();
   test_umin_umax();
