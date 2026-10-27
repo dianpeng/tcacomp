@@ -1,9 +1,23 @@
-// tca/mapping.h — KernelInfo + the portion-decomposition maps (doc/rt.md §4.1–4.2).
+// tca/mapping.h — KernelInfo + the factorization maps (doc/fix/fix4.md §4.1;
+// supersedes the pre-fix4 grammar of doc/rt.md §4.2).
 //
-// The maps are OPAQUE: they own the portion grammar (PortionCTA=10 over the
-// CTA space, PortionWarp=8 over the per-CTA warp space); the compiler never
-// inlines linearization arithmetic. Pure arithmetic — no CUDA intrinsics — so
-// the whole header is CPU-testable.
+// The maps are OPAQUE: they own the ABSOLUTE-EXTENT factorization — each CTA
+// dim's extent is that dim's absolute LoC (the number of CTAs sharing the
+// dim), each WARP dim's extent is that dim's K_d (the number of warps), all
+// extents >= 2 by construction (K=1 dims are pruned upstream; the LoC
+// presets start at 2). No share-of-total grammar, no -1 remainder, no total
+// division: the launch IS what you factorize (fix4 §1.2).
+//
+// Multi-LNT launches run the max-over-LNT CTA/warp totals, so an individual
+// LNT's shape product can be SMALLER than the launch (fix4 §3.2): surplus
+// ranks' coordinates wrap in-shape via the modulo (the decomposition is
+// total for ANY flat rank the launch can produce), and their bodies
+// whole-body-skip via the compiler's loop guards. Deliberately NO assert
+// ties a shape product to the launch total — warp_count()/total() answer
+// the DERIVED launch values through KernelInfo instead.
+//
+// Pure arithmetic — no CUDA intrinsics — so the whole header is
+// CPU-testable.
 #ifndef TCA_RT_MAPPING_H_
 #define TCA_RT_MAPPING_H_
 
@@ -20,13 +34,6 @@
 namespace tca {
 namespace rt {
 
-// Portion grammar constants (runtime_objects.md §1.2): CTA dim portions sum
-// to 10; warp dim portions sum to 8. The launch assert (launch.h) and both
-// map decompositions consume these.
-inline constexpr unsigned kPortionCTA = 10u;
-inline constexpr unsigned kPortionWarp = 8u;
-inline constexpr unsigned kWarpsPerWarpPortionMin = 8u;  // minimum config = 8 warps (256 threads)
-
 // u32 pair (doc/rt.md §4.7) — index-arithmetic family lives with the maps.
 __host__ __device__ inline unsigned umin(unsigned a, unsigned b) { return a < b ? a : b; }
 __host__ __device__ inline unsigned umax(unsigned a, unsigned b) { return a > b ? a : b; }
@@ -34,7 +41,10 @@ __host__ __device__ inline unsigned umax(unsigned a, unsigned b) { return a > b 
 // KernelInfo — dual-compile pattern so the mapping math is CPU-testable.
 // Device: stateless, reads gridDim.x / blockDim.x. Host (plain g++ CPU tests
 // or the nvcc host pass): members ctas_/threads_, set by the host-only
-// explicit ctor; the host default ctor zeroes them.
+// explicit ctor; the host default ctor zeroes them. total_cta() /
+// total_thread_per_cta() return the DERIVED launch values (fix4 §4.1) — the
+// launch the compiler picked, which multi-LNT launches size at the
+// max-over-LNT totals.
 struct KernelInfo {
   // Defaulted functions are implicitly __host__ __device__ under nvcc (and
   // the shim no-ops the annotations for plain g++), so no annotation here:
@@ -71,78 +81,63 @@ struct KernelInfo {
 namespace detail {
 
 inline constexpr unsigned kMaxMapDims = 8u;
-// The `-1` remainder portion, as it appears after the unsigned cast.
-inline constexpr unsigned kPortionRemainder = 0xFFFFFFFFu;
 
-// Portion decomposition shared by both maps (doc/rt.md §4.2). `units` are
-// CTAs (GridMapping) or warps (ThreadMapping); the exposed extents carry a
-// unit multiplier (CTA: 1; warp: 32 threads).
+// Factorization decomposition shared by both maps (fix4 §4.1). `extents` are
+// the constructor's ABSOLUTE per-dim extents (CTAs for GridMapping, WARPS
+// for ThreadMapping), copied VERBATIM — no total division, no remainder
+// branch, no unit multiplier. Strides are row-major over the extents (last
+// dim stride 1).
 struct Decomposition {
   unsigned ndim = 0u;
-  unsigned unit_extents[kMaxMapDims] = {};   // extents in units (CTAs / warps)
-  unsigned exposed[kMaxMapDims] = {};        // what dimension() reports
-  unsigned strides[kMaxMapDims] = {};        // row-major strides over exposed
+  unsigned extents[kMaxMapDims] = {};  // ABSOLUTE per-dim extents, verbatim
+  unsigned strides[kMaxMapDims] = {};  // row-major strides over the extents
 
-  __host__ __device__ void build(unsigned total_units, unsigned portion_const,
-                                 unsigned unit_multiplier, const unsigned* portions,
-                                 unsigned n) {
-    // Grammar: each portion >= 1 or exactly -1; -1 only last; at least one dim.
+  __host__ __device__ void build(const unsigned* shape, unsigned n) {
     assert(n >= 1u && n <= kMaxMapDims);
     ndim = n;
-    const unsigned quantum = total_units / portion_const;
-    unsigned concrete_sum = 0u;
     for (unsigned d = 0u; d < n; ++d) {
-      const unsigned p = portions[d];
-      assert(p >= 1u || p == kPortionRemainder);
-      assert(p != kPortionRemainder || d + 1u == n);
-      if (p == kPortionRemainder) {
-        unit_extents[d] = total_units - concrete_sum;  // the remainder tail
-      } else {
-        unit_extents[d] = p * quantum;
-        concrete_sum += unit_extents[d];
-      }
-      exposed[d] = unit_extents[d] * unit_multiplier;
+      assert(shape[d] >= 2u);  // fix4 §4.1: all extents >= 2 by construction
+      extents[d] = shape[d];
     }
-    // Row-major strides over the exposed extents (last dim stride 1).
+    // Row-major strides over the extents (last dim stride 1).
     strides[n - 1u] = 1u;
     for (unsigned d = n - 1u; d-- > 0u;) {
-      strides[d] = strides[d + 1u] * exposed[d + 1u];
+      strides[d] = strides[d + 1u] * extents[d + 1u];
     }
   }
 
-  // Row-major coordinate of `id` over the exposed extents.
+  // Row-major coordinate of `id` over the extents. Total for ANY u32 rank:
+  // the modulo wraps surplus ranks in-shape (fix4 §3.2), and extents >= 2
+  // keep every divide well-defined.
   __host__ __device__ unsigned coord(unsigned d, unsigned id) const {
-    return (id / strides[d]) % exposed[d];
-  }
-
-  // Sum of the unit extents (CTAs for GridMapping, WARPS for ThreadMapping)
-  // — the total the map decomposes. ThreadMapping::warp_count() is this.
-  __host__ __device__ unsigned unit_sum() const {
-    unsigned n = 0u;
-    for (unsigned d = 0u; d < ndim; ++d) n += unit_extents[d];
-    return n;
+    return (id / strides[d]) % extents[d];
   }
 };
 
 }  // namespace detail
 
-// GridMapping — the CTA-space map. total = kinfo.total_cta(); extents in CTAs
-// are portion_d * (total / kPortionCTA), the -1 tail taking the remainder.
-// index(d) = this CTA's rank in dim d (CTA-uniform); dimension(d) = dim d's
-// CTA LoC.
+// GridMapping — the CTA-space map. Each constructor extent is its dim's
+// ABSOLUTE LoC (the CTA count owning that dim; all >= 2); the flat rank is
+// the CTA's blockIdx.x. index(d) = this CTA's rank in dim d (CTA-uniform);
+// dimension(d) = the extent verbatim; index() (no-arg) = the flat CTA rank
+// (blockIdx.x analog, ruling 2026-10-23).
 class GridMapping {
  public:
-  template <typename... P>
-  __host__ __device__ GridMapping(const KernelInfo& kinfo, P... portions) {
-    static_assert(sizeof...(P) >= 1, "GridMapping needs at least one portion");
-    const unsigned prts[] = {static_cast<unsigned>(portions)...};
-    dec_.build(kinfo.total_cta(), kPortionCTA, 1u, prts, static_cast<unsigned>(sizeof...(P)));
+  // ndim explicit, then ndim ABSOLUTE extents (CTA counts per dim).
+  template <typename... E>
+  __host__ __device__ GridMapping(const KernelInfo& kinfo, unsigned ndim, E... loC)
+      : kinfo_(kinfo) {
+    static_assert(sizeof...(E) >= 1, "GridMapping needs at least one extent");
+    const unsigned shape[] = {static_cast<unsigned>(loC)...};
+    assert(ndim == static_cast<unsigned>(sizeof...(E)));
+    dec_.build(shape, ndim);
   }
 
-  __host__ __device__ unsigned dimension(unsigned d) const { return dec_.exposed[d]; }
+  __host__ __device__ unsigned dimension(unsigned d) const { return dec_.extents[d]; }
   __host__ __device__ unsigned index(unsigned d) const { return dec_.coord(d, linear_id()); }
   // The FLAT form (ruling 2026-10-23): no-arg index() is this CTA's absolute
-  // 1-D id — the blockIdx.x analog. index(d) (the tuple coordinate) unchanged.
+  // 1-D id — the blockIdx.x analog. index(d) (the tuple coordinate) is the
+  // reverse stride-shape decomposition of it.
   __host__ __device__ unsigned index() const { return linear_id(); }
 
 #ifndef __CUDACC__
@@ -159,26 +154,34 @@ class GridMapping {
 #endif
   }
 
+  KernelInfo kinfo_{};  // the derived launch values (gridDim), kept for map-side queries
   detail::Decomposition dec_{};
   unsigned id_ = 0u;
 };
 
 // ThreadMapping — the per-CTA thread-space map (warp allocations never span
-// CTAs; ranks are CTA-relative). Warp extents are portion_d * (warps /
-// kPortionWarp); exposed in threads (x32). index(d) decomposes threadIdx.x
-// row-major over the thread-granular extents.
+// CTAs; ranks are CTA-relative). Each constructor extent is its dim's K_d —
+// an ABSOLUTE warp count (all >= 2), in WARP units. ThreadMap carries WARP
+// dims ONLY (fix4 §1.3 dimensionality ruling): the CTA dim's coupled inside
+// walk uses the no-arg flat thread rank and needs NO map slot. index(d)
+// decomposes the WARP RANK (index()/32) row-major over the warp extents —
+// WARP units, not threads; lane_id() resolves the lane inside the warp.
 class ThreadMapping {
  public:
-  template <typename... P>
-  __host__ __device__ ThreadMapping(const KernelInfo& kinfo, P... portions) {
-    static_assert(sizeof...(P) >= 1, "ThreadMapping needs at least one portion");
-    const unsigned prts[] = {static_cast<unsigned>(portions)...};
-    dec_.build(kinfo.total_thread_per_cta() / 32u, kPortionWarp, 32u, prts,
-               static_cast<unsigned>(sizeof...(P)));
+  // ndim explicit, then ndim ABSOLUTE extents (warp counts per dim).
+  template <typename... E>
+  __host__ __device__ ThreadMapping(const KernelInfo& kinfo, unsigned ndim, E... warpsPerDim)
+      : kinfo_(kinfo) {
+    static_assert(sizeof...(E) >= 1, "ThreadMapping needs at least one extent");
+    const unsigned shape[] = {static_cast<unsigned>(warpsPerDim)...};
+    assert(ndim == static_cast<unsigned>(sizeof...(E)));
+    dec_.build(shape, ndim);
   }
 
-  __host__ __device__ unsigned dimension(unsigned d) const { return dec_.exposed[d]; }
-  __host__ __device__ unsigned index(unsigned d) const { return dec_.coord(d, linear_id()); }
+  __host__ __device__ unsigned dimension(unsigned d) const { return dec_.extents[d]; }
+  // WARP units: first divide the flat rank by 32 (the warp rank), THEN
+  // row-major-decompose it over the K shape.
+  __host__ __device__ unsigned index(unsigned d) const { return dec_.coord(d, warp_index()); }
   // The FLAT form (ruling 2026-10-23): no-arg index() is the thread's
   // absolute flattened 1-D id in the CTA — the threadIdx.x analog. lane/warp
   // identity DERIVES from it (index()%32, index()/32); the compiler never
@@ -193,14 +196,19 @@ class ThreadMapping {
   __host__ __device__ unsigned lane_id() const { return index() % 32u; }
   __host__ __device__ bool is_first_in_warp() const { return lane_id() == 0u; }
   __host__ __device__ bool is_first_in_cta() const { return index() == 0u; }
-  // The CTA's EXISTING warp count (total threads / 32), obtained THROUGH the
-  // map — the fold-existing-warps refinement's bound and the staging-extent
-  // cross-check read it here, never a magic constant.
-  __host__ __device__ unsigned warp_count() const { return dec_.unit_sum(); }
-  // The map's FLAT thread space (fix3 R-J/D-n: the coordination total the
-  // cooperative loader stripes rows over — every thread of the CTA, obtained
-  // THROUGH the map; the compiler never inlines blockDim arithmetic).
-  __host__ __device__ unsigned total() const { return dec_.unit_sum() * 32u; }
+  // DERIVED launch value (fix4 §4.1): the CTA's warp count = the launch's
+  // blockDim.x / 32 — NOT the shape product. Multi-LNT launches run surplus
+  // warps whose coordinates wrap in-shape and whose bodies the compiler's
+  // guards skip (§3.2); no assert ties the shape product to the launch
+  // total. The fold-existing-warps bound and the staging-extent cross-check
+  // read it here, never a magic constant.
+  __host__ __device__ unsigned warp_count() const { return kinfo_.total_thread_per_cta() / 32u; }
+  // DERIVED launch value (fix4 §4.1): the map's FLAT thread space (fix3
+  // R-J/D-n) — the coordination total the cooperative loader stripes rows
+  // over, every thread of the launch's blockDim (the compiler never inlines
+  // blockDim arithmetic). NOT the shape product: surplus threads coordinate
+  // through the guards, and the loader must still stripe over the whole CTA.
+  __host__ __device__ unsigned total() const { return kinfo_.total_thread_per_cta(); }
 
 #ifndef __CUDACC__
   // CPU unit-test hook: stand in for threadIdx.x.
@@ -216,6 +224,7 @@ class ThreadMapping {
 #endif
   }
 
+  KernelInfo kinfo_{};  // the derived launch values (blockDim), the warp_count/total source
   detail::Decomposition dec_{};
   unsigned id_ = 0u;
 };

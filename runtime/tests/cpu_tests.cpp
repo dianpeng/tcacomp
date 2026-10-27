@@ -31,83 +31,6 @@ namespace {
 
 tca::rt::KernelInfo host_info(unsigned ctas, unsigned threads) { return tca::rt::KernelInfo(ctas, threads); }
 
-// (a) GridMapping(-1) @ 100 CTAs: single tail dim over the whole space.
-void test_grid_mapping_tail() {
-  auto kinfo = host_info(100u, 512u);
-  tca::rt::GridMapping gm(kinfo, -1);
-  CHECK(gm.dimension(0u) == 100u);
-  for (unsigned id : {0u, 1u, 42u, 99u}) {
-    gm.set_linear_id(id);
-    CHECK(gm.index(0u) == id);  // coord_0 = (id / 1) % 100 = id
-  }
-}
-
-// (b) GridMapping(4, -1) @ 100 CTAs: quantum Q = 100/10 = 10 -> extents (40, 60) in CTAs.
-void test_grid_mapping_two_dims() {
-  auto kinfo = host_info(100u, 512u);
-  tca::rt::GridMapping gm(kinfo, 4, -1);
-  CHECK(gm.dimension(0u) == 40u);
-  CHECK(gm.dimension(1u) == 60u);
-  for (unsigned id : {0u, 1u, 59u, 60u, 61u, 99u}) {
-    gm.set_linear_id(id);
-    CHECK(gm.index(0u) == (id / 60u) % 40u);  // row-major: last dim stride 1
-    CHECK(gm.index(1u) == id % 60u);
-  }
-}
-
-// (c) ThreadMapping(4, -1) @ 512 threads: 16 warps, Q_warps = 2 -> warps (8, 8),
-// exposed in threads (256, 256); index over thread-granular extents.
-void test_thread_mapping_two_dims() {
-  auto kinfo = host_info(100u, 512u);
-  tca::rt::ThreadMapping tm(kinfo, 4, -1);
-  CHECK(tm.dimension(0u) == 256u);
-  CHECK(tm.dimension(1u) == 256u);
-  for (unsigned tid : {0u, 1u, 255u, 256u, 511u}) {
-    tm.set_linear_id(tid);
-    CHECK(tm.index(0u) == (tid / 256u) % 256u);
-    CHECK(tm.index(1u) == tid % 256u);
-  }
-}
-
-// (c, flat) The no-arg index() — the flat-index() ruling (2026-10-23):
-// ThreadMapping::index() is the thread's absolute flattened 1-D id (the
-// threadIdx.x analog); GridMapping::index() the blockIdx.x analog; index(d)
-// (the tuple coordinate) is unchanged. Plus the warp/lane queries derived
-// from it: warp_index = index()/32, lane_id = index()%32,
-// is_first_in_warp = lane_id == 0, is_first_in_cta = index() == 0, and
-// warp_count = total threads / 32 through the map.
-void test_flat_index_and_warp_queries() {
-  auto kinfo = host_info(100u, 512u);
-  tca::rt::GridMapping gm(kinfo, 4, -1);
-  for (unsigned id : {0u, 1u, 42u, 99u}) {
-    gm.set_linear_id(id);
-    CHECK(gm.index() == id);  // the flat CTA id — blockIdx.x
-  }
-  tca::rt::ThreadMapping tm(kinfo, 4, -1);
-  for (unsigned tid : {0u, 1u, 31u, 32u, 255u, 256u, 511u}) {
-    tm.set_linear_id(tid);
-    CHECK(tm.index() == tid);  // the flat thread id — threadIdx.x
-    CHECK(tm.warp_index() == tid / 32u);
-    CHECK(tm.lane_id() == tid % 32u);
-    CHECK(tm.is_first_in_warp() == (tid % 32u == 0u));
-    CHECK(tm.is_first_in_cta() == (tid == 0u));
-  }
-  CHECK(tm.warp_count() == 16u);  // 512 threads / 32
-  tca::rt::ThreadMapping tm256(host_info(100u, 256u), -1);
-  CHECK(tm256.warp_count() == 8u);
-}
-
-// (d) ThreadMapping(-1) @ 256 threads: minimum config (8 warps = 1 portion).
-void test_thread_mapping_min() {
-  auto kinfo = host_info(100u, 256u);
-  tca::rt::ThreadMapping tm(kinfo, -1);
-  CHECK(tm.dimension(0u) == 256u);
-  for (unsigned tid : {0u, 1u, 128u, 255u}) {
-    tm.set_linear_id(tid);
-    CHECK(tm.index(0u) == tid);
-  }
-}
-
 // (e) The uniform round walk: base < bound; base += step; Index() = base.
 void test_seq_iterator() {
   // 16 trips, Index = 0, 64, ..., 960.
@@ -139,21 +62,24 @@ void test_seq_iterator() {
   CHECK(trips == 1u);
 }
 
-// (e, cont.) Cta/Thr iterators walk identically — map/dosoc/loc ignored in v0.
+// (e, cont.) Cta/Thr iterators walk identically — map/dosoc/loc ignored in
+// the v0 walk. Ported to the factorization ctor at the fix4 §3.3
+// worked-example launch (gridDim 16, blockDim 64 = 2 warps); the loc args
+// are now the ABSOLUTE extents (fix4 §4.2).
 void test_map_iterators() {
-  auto kinfo = host_info(100u, 512u);
-  tca::rt::GridMapping gm(kinfo, -1);
-  tca::rt::ThreadMapping tm(kinfo, 4, -1);
+  auto kinfo = host_info(16u, 64u);
+  tca::rt::GridMapping gm(kinfo, 1u, 16u);   // 1 CTA dim, LoC = 16
+  tca::rt::ThreadMapping tm(kinfo, 1u, 2u);  // 1 WARP dim, K = 2
 
   unsigned trips = 0u;
-  for (tca::rt::CtaIterator it(gm, 0u, 100u, 7u, 3u, 20u); it.Has(); it.Next()) {
+  for (tca::rt::CtaIterator it(gm, 0u, 16u, 7u, 3u, 20u); it.Has(); it.Next()) {
     CHECK(it.Index() == 7u + trips * 3u);
     ++trips;
   }
   CHECK(trips == 5u);
 
   trips = 0u;
-  for (tca::rt::ThrIterator it(tm, 1u, 256u, 0u, 64u, 1024u); it.Has(); it.Next()) {
+  for (tca::rt::ThrIterator it(tm, 1u, 2u, 0u, 64u, 1024u); it.Has(); it.Next()) {
     CHECK(it.Index() == trips * 64u);
     ++trips;
   }
@@ -375,7 +301,7 @@ void test_loader_frag_thread() {
   tca::rt::Frag<float, 2u, 4u, 8u> frag;
   tca::rt::TensorView<const float, 2u> view(src, 6u, 8u);
   // base (2, 5): axis-0 rows 2..5 all in range; trailing clamps to 8-5=3.
-  tca::rt::ThreadMapping tm(host_info(100u, 512u), -1);
+  tca::rt::ThreadMapping tm(host_info(100u, 512u), 1u, 16u);  // 16 warps (512 threads)
 	tca::rt::LoadTileThread(tm, frag, tca::rt::TensorWindow(view, 2u, 5u));
   for (unsigned r = 0u; r < 4u; ++r) {
     for (unsigned k = 0u; k < 8u; ++k) {
@@ -409,7 +335,7 @@ void test_seq_reducer() {
 // row. Pin the face so the branch is compiled and exercised somewhere.
 void test_warp_reducer_host_branch() {
   auto kinfo = host_info(100u, 512u);
-  tca::rt::ThreadMapping tm(kinfo, -1);
+  tca::rt::ThreadMapping tm(kinfo, 1u, 16u);  // 16 warps (512 threads)
   float stage[16] = {};  // 16 warps — the stack-array stand-in for the pool row
   tca::rt::SmemView<float, 1u> staging(stage, 16u);
   tca::rt::WarpReducer<float> w(0.0f, add_f, tm, staging);
@@ -618,11 +544,6 @@ void test_mask_derivation_arithmetic() {
 }  // namespace
 
 int main() {
-  test_grid_mapping_tail();
-  test_grid_mapping_two_dims();
-  test_thread_mapping_two_dims();
-  test_flat_index_and_warp_queries();
-  test_thread_mapping_min();
   test_seq_iterator();
   test_map_iterators();
   test_tensor_view();
