@@ -409,6 +409,62 @@ func TestRuntimeFlatQueryVerifyShape(t *testing.T) {
 	}
 }
 
+// TestRuntimeLaneQueryVerifyShape pins the fix4 §3.1 lane vocabulary (T4):
+// the ZERO-OPERAND thread query with field "lane_id" (the WARP lane-chunk
+// walks' lane identity — a pure function of the flat rank, no DoSoC slot)
+// and the ZERO-ARG "lane_id" attribute read on a MAPPING object are
+// verifier-legal. The vocabulary stays closed everywhere else: a
+// one-operand lane query (the lane has no map dimension), "lane_id" on a
+// KernelInfo object, an unknown zero-operand field, and an unknown getattr
+// payload all fail closed.
+func TestRuntimeLaneQueryVerifyShape(t *testing.T) {
+	g := NewGraph("lane")
+	lane := g.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	lane.field = "lane_id"
+	ki := g.NewRuntimeKernelInfo("ctor")
+	tm := g.NewRuntimeThreadMapping("ctor", ki, []int{4, 2})
+	ga := g.NewRuntimeGetAttribute("ctor", "lane_id", tm)
+	g.NewReturn("ctor", lane, ga)
+	if vs := Verify(g); len(vs) != 0 {
+		t.Fatalf("the zero-operand lane query + zero-arg lane_id getattr must verify clean, got %v", vs)
+	}
+
+	// One-operand lane query: the lane has no map dimension — the DoSoC form
+	// stays index/dimension-only.
+	g2 := NewGraph("laneops")
+	lane2 := g2.NewRuntimeThreadQuery("ctor", "lane_id", u32const(g2, 0)).(*runtimeQueryNode)
+	g2.NewReturn("ctor", lane2)
+	if vs := Verify(g2); len(vs) == 0 {
+		t.Fatal("a one-operand lane_id query must be a shape violation (the lane carries no DoSoC)")
+	}
+
+	// "lane_id" on a KernelInfo object: the attribute applies to a mapping.
+	g3 := NewGraph("laneki")
+	ki3 := g3.NewRuntimeKernelInfo("ctor")
+	g3.NewReturn("ctor", g3.NewRuntimeGetAttribute("ctor", "lane_id", ki3))
+	if vs := Verify(g3); len(vs) == 0 {
+		t.Fatal("lane_id on a KernelInfo object must be a shape violation (mappings only)")
+	}
+
+	// Unknown zero-operand field: the flat family is index/lane_id only.
+	g4 := NewGraph("lanebad")
+	bad := g4.NewRuntimeThreadQueryFlat("ctor").(*runtimeQueryNode)
+	bad.field = "warp_chunk"
+	g4.NewReturn("ctor", bad)
+	if vs := Verify(g4); len(vs) == 0 {
+		t.Fatal("an unknown zero-operand query field must fail closed")
+	}
+
+	// Unknown getattr payload.
+	g5 := NewGraph("lanega")
+	ki5 := g5.NewRuntimeKernelInfo("ctor")
+	tm5 := g5.NewRuntimeThreadMapping("ctor", ki5, []int{4})
+	g5.NewReturn("ctor", g5.NewRuntimeGetAttribute("ctor", "warp_chunk", tm5))
+	if vs := Verify(g5); len(vs) == 0 {
+		t.Fatal("an unknown getattr payload must fail closed")
+	}
+}
+
 // TestRuntimeFlatQueryValueNumbering pins the flat form's value contract:
 // two flat queries of the same kind are GVN-equal; a flat query is NOT equal
 // to the dim-0 one-operand query (distinct operand lists hash distinct — the
