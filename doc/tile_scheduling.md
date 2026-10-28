@@ -15,6 +15,8 @@ This document defines the canonical tile scheduling model for the TCA compiler. 
 
 **Relationship to tca.md.** This document is the detailed expansion of tca.md §5.5 (Iteration Factoring), §5.7 (Automatic Parallelization), and §5.10 (Reduce Lowering). It is consistent with the implemented vocabulary: per-LNT absolute LoC extents, whole-warp thread groups, the three-verb memory IR (MemNew/MemLoad/MemStore + storage class).
 
+**Relationship to tensorization.** Tensor-core instruction support (`ldmatrix` + `mma.sync`) is specified as a property of this scheduling constraint system in the companion [tile_scheduling_tensorization.md](./tile_scheduling_tensorization.md), which extends the factor matrix with stride-decorated layers and per-node layout equations.
+
 ---
 
 ## 2. Definitions
