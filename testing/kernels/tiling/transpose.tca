@@ -1,0 +1,27 @@
+// transpose — a written as-clause PERMUTATION (as (j, i, k)): distinct from
+// identity inference; exercises the lowering permutation path, with the
+// trailing axis reduced (out[j][i] = sum_k x[i][j][k]).
+//
+// FALLBACK VARIANT (spike wall, recorded in SUMMARY): the v0 pkg rungs
+// require at least one reduction before the store, so the pure copy form
+// (map only) is not expressible. The written permutation moves into the
+// root map's as clause over a trailing reduced axis.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="Transpose")
+kernel transpose(
+  x: tensor<dtype=f32, shape=[R, C, K]>,
+) -> tensor<dtype=f32, shape=[C, R]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(x[i][j][k])
+    as (j, i, k)
+    (v: f32) -> f32:
+      v
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (j, i) -> f32:
+      acc + %0
+  ;
+  return out;
+}

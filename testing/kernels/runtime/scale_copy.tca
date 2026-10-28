@@ -1,0 +1,27 @@
+// scale_copy — elementwise affine map + tiled store coverage.
+//
+// FALLBACK VARIANT (spike wall, recorded in SUMMARY): the v0 pkg rungs
+// require at least one reduction before ANY store, so a pure no-reducer
+// elementwise kernel is not expressible in the v0 frontend. The affine map
+// lowers over a trailing reduced axis (out[i][j] = sum_k (gain*x + bias));
+// the elementwise map and the tiled store remain exercised.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="ScaleCopy")
+kernel scale_copy(
+  x: tensor<dtype=f32, shape=[R, C, K]>,
+  gain: f32,
+  bias: f32,
+) -> tensor<dtype=f32, shape=[R, C]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(x[i][j][k])
+    [gain, bias] (v: f32) -> f32:
+      gain * v + bias
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  ;
+  return out;
+}

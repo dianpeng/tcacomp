@@ -1,0 +1,27 @@
+// dup_expr — dedup/GVN coverage: the map lambda deliberately repeats the
+// identical subexpression (v*v + v*v) so HIR GVN must fold the duplicates.
+//
+// FALLBACK VARIANT (spike wall, recorded in SUMMARY): the v0 pkg rungs
+// require at least one reduction before the store, so the pure-elementwise
+// form (map only) is not expressible. The repeated subexpressions move into
+// the root map over a trailing reduced axis; the dedup intent is unchanged.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="DupExpr")
+kernel dup_expr(
+  x: tensor<dtype=f32, shape=[R, C, K]>,
+  gain: f32,
+  bias: f32,
+) -> tensor<dtype=f32, shape=[R, C]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(x[i][j][k])
+    [gain, bias] (v: f32) -> f32:
+      (v*v + v*v) * gain + (v*v + v*v) * bias
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  ;
+  return out;
+}

@@ -1,0 +1,20 @@
+// row_sum — SeqReducer coverage: map identity | reduce over the last axis,
+// cooperative tile window loads, no elementwise tail.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="RowSum")
+kernel row_sum(
+  x: tensor<dtype=f32, shape=[R, C]>,
+) -> tensor<dtype=f32, shape=[R]>
+{
+  dimvar (i, j);
+  let out = map
+    on(x[i][j])
+    (v: f32) -> f32:
+      v
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i) -> f32:
+      acc + %0
+  ;
+  return out;
+}

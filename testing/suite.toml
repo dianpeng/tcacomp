@@ -1,0 +1,153 @@
+# tcacomp testing suite registry — the 14-kernel corpus across 5 categories.
+# Parsed by testing/orchestrator.py via stdlib tomllib. All fields are DATA:
+# never interpolated into shell strings (fixed argv lists only). Dims mirror
+# the in-runner baked constants; scalars mirror the runner-baked values
+# (reporting mirrors — the runner sources hold the load-bearing values).
+# Tolerances: reduce-carrying kernels 2e-3 (the proven frontend-matmul
+# bound); tiny-K (<= 8 term) reduce + elementwise vocabulary 1e-5.
+# bench_bytes = bytes moved per iteration: matmuls 4*(M*K + K*N + 2*M*N);
+# the rank-3 fallback kernels report their actual moved bytes 4*(inputs +
+# output).
+
+suite = "tcacomp-testing"
+version = 1
+
+[[test]]
+name = "dup_expr"
+category = "dedup"
+kernel = "testing/kernels/dedup/dup_expr.tca"
+runner = "testing/runners/dup_expr.cu"
+dims = [256, 256, 8]
+tolerance = 1e-5
+scalars = { gain = 1.5, bias = 0.25 }
+bench_bytes = 2359296
+
+[[test]]
+name = "dup_const"
+category = "dedup"
+kernel = "testing/kernels/dedup/dup_const.tca"
+runner = "testing/runners/dup_const.cu"
+dims = [256, 256, 8]
+tolerance = 1e-5
+scalars = {}
+bench_bytes = 2359296
+
+[[test]]
+name = "axpy3"
+category = "fusion"
+kernel = "testing/kernels/fusion/axpy3.tca"
+runner = "testing/runners/axpy3.cu"
+dims = [512, 512, 4]
+tolerance = 1e-5
+scalars = { alpha = 2.0, beta = 0.5, gamma = 0.75 }
+bench_bytes = 9437184
+
+[[test]]
+name = "mlp"
+category = "fusion"
+kernel = "testing/kernels/fusion/mlp.tca"
+runner = "testing/runners/mlp.cu"
+dims = [64, 128, 64]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 98304
+
+[[test]]
+name = "softmax"
+category = "fusion"
+kernel = "testing/kernels/fusion/softmax.tca"
+runner = "testing/runners/softmax.cu"
+dims = [128, 256]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 131584
+
+[[test]]
+name = "mm_small"
+category = "tiling"
+kernel = "testing/kernels/tiling/mm_small.tca"
+runner = "testing/runners/mm_small.cu"
+dims = [32, 32, 32]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 16384
+
+[[test]]
+name = "mm_mid"
+category = "tiling"
+kernel = "testing/kernels/tiling/mm_mid.tca"
+runner = "testing/runners/mm_mid.cu"
+dims = [128, 256, 64]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 262144
+
+[[test]]
+name = "mm_splitk"
+category = "tiling"
+kernel = "testing/kernels/tiling/mm_splitk.tca"
+runner = "testing/runners/mm_splitk.cu"
+dims = [64, 128, 64]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 98304
+
+[[test]]
+name = "transpose"
+category = "tiling"
+kernel = "testing/kernels/tiling/transpose.tca"
+runner = "testing/runners/transpose.cu"
+dims = [192, 96, 8]
+tolerance = 1e-5
+scalars = {}
+bench_bytes = 663552
+
+[[test]]
+name = "row_sum"
+category = "runtime"
+kernel = "testing/kernels/runtime/row_sum.tca"
+runner = "testing/runners/row_sum.cu"
+dims = [512, 1024]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 2099200
+
+[[test]]
+name = "scale_copy"
+category = "runtime"
+kernel = "testing/kernels/runtime/scale_copy.tca"
+runner = "testing/runners/scale_copy.cu"
+dims = [512, 512, 4]
+tolerance = 1e-5
+scalars = { gain = 1.25, bias = -0.125 }
+bench_bytes = 5242880
+
+[[test]]
+name = "gemm"
+category = "llm"
+kernel = "testing/kernels/llm/gemm.tca"
+runner = "testing/runners/gemm.cu"
+dims = [256, 128, 192]
+tolerance = 2e-3
+scalars = {}
+bench_bytes = 622592
+
+[[test]]
+name = "qk_score"
+category = "llm"
+kernel = "testing/kernels/llm/qk_score.tca"
+runner = "testing/runners/qk_score.cu"
+dims = [128, 64, 192]
+tolerance = 2e-3
+scalars = { scale = 0.125 }
+bench_bytes = 278528
+
+[[test]]
+name = "layernorm"
+category = "llm"
+kernel = "testing/kernels/llm/layernorm.tca"
+runner = "testing/runners/layernorm.cu"
+dims = [128, 256, 64]
+tolerance = 1e-5
+scalars = { inv_n = 0.015625, eps = 0.00001 }
+bench_bytes = 8519680

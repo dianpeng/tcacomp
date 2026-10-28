@@ -1,0 +1,34 @@
+// softmax — the softmax reduction core over x[R, C]: map exp | sum-reduce,
+// emitting the per-row softmax normalizer s[R] = sum_j exp(x[i][j]).
+//
+// FALLBACK VARIANT (spike walls, all recorded in SUMMARY): the full softmax
+// (max-subtract, exp, sum, div) is not expressible in the v0 frontend —
+// (1) rank-2 dynamic intermediates are rejected by the builder ("a
+// multiplicative GMEM size is not constructed"); (2) the final normalize
+// division is a rank-preserving map-only chain, rejected by the v0 pkg
+// rungs ("require at least one reduction before the store"; a reduce must
+// drop exactly one axis, so no identity-reduce exists); (3) reading a
+// rank-1 dynamic intermediate (the max m) from a downstream chain is
+// rejected by the typeinfer pass ("memload operand is not a tensor
+// parameter"), and an unused max-reduce let trips final-lower ("cannot
+// erase node: 1 use(s) still point at it"). The shipped single-let form
+// keeps the exp map + sum-reduce; the max-subtract/-inf_f32 seed and the
+// broadcast intermediate bindings are blocked by wall (3).
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="Softmax")
+kernel softmax(
+  x: tensor<dtype=f32, shape=[R, C]>,
+) -> tensor<dtype=f32, shape=[R]>
+{
+  dimvar (i, j);
+  let s = map
+    on(x[i][j])
+    (v: f32) -> f32:
+      expf(v)
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i) -> f32:
+      acc + %0
+  ;
+  return s;
+}
