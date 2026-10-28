@@ -27,3 +27,4 @@ cmake-build-*/
 # nvcc / object intermediates
 *.o
 testing/__pycache__/
+testing/.build/
