@@ -1,0 +1,28 @@
+// qk_score — attention scores Q@K^T with scale: the proven matmul_scale
+// shape re-targeted (root map over q[i][k], kk[j][k] — reduced axis k is
+// the LAST binding occurrence but an explicit as (i, j) survives) plus a
+// scalar-capture piped map (v * scale).
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="QkScore")
+kernel qk_score(
+  q: tensor<dtype=f32, shape=[H, D]>,
+  kk: tensor<dtype=f32, shape=[N, D]>,
+  scale: f32,
+) -> tensor<dtype=f32, shape=[H, N]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(q[i][k], kk[j][k])
+    (l: f32, r: f32) -> f32:
+      l * r
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  | map
+    on()
+    [scale] (v: f32) -> f32:
+      v * scale
+  ;
+  return out;
+}

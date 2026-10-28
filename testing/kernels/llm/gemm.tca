@@ -1,0 +1,23 @@
+// gemm — plain matmul, the LLM workhorse shape ([128,128]x[128,96]; sized
+// so the racecheck-instrumented run fits the suite's 300s per-subprocess
+// timeout — the [256,128]x[128,192] form passes plain and memcheck but
+// exceeds it).
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="Gemm")
+kernel gemm(
+  lhs: tensor<dtype=f32, shape=[M, K]>,
+  rhs: tensor<dtype=f32, shape=[K, N]>,
+) -> tensor<dtype=f32, shape=[M, N]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(lhs[i][k], rhs[k][j])
+    (l: f32, r: f32) -> f32:
+      l * r
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  ;
+  return out;
+}

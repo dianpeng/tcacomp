@@ -1,0 +1,34 @@
+// axpy3 — fusion coverage: an affine map over two tensors followed by a
+// tanh-flavored elementwise stage.
+//
+// FALLBACK VARIANT (spike wall, recorded in SUMMARY): a piped map requires
+// a preceding reduction (pkg v0 rung shape — map|map is not v0), so the
+// pure consecutive-map form is not expressible. The two stages lower as
+// map|reduce|map over a trailing reduced axis; both maps and the chain
+// composition remain exercised.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="Axpy3")
+kernel axpy3(
+  x: tensor<dtype=f32, shape=[R, C, K]>,
+  z: tensor<dtype=f32, shape=[R, C, K]>,
+  alpha: f32,
+  beta: f32,
+  gamma: f32,
+) -> tensor<dtype=f32, shape=[R, C]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(x[i][j][k], z[i][j][k])
+    [alpha, beta] (xv: f32, zv: f32) -> f32:
+      alpha * xv + beta * zv
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  | map
+    on()
+    [gamma] (v: f32) -> f32:
+      v + gamma * tanhf(v)
+  ;
+  return out;
+}

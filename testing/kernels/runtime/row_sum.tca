@@ -1,0 +1,31 @@
+// row_sum — reducer coverage: per-(i, j) weighted sum over the middle
+// axis, out[i][j] = sum_k x[i][k][j] * z[i][k][j], over x,z[R,K,C] ->
+// [R,C] (the batched row-reduction / per-row dot-product pattern).
+//
+// FALLBACK VARIANTS (spike walls, recorded in SUMMARY): (1) the plain
+// single-input [R,C] -> [R] row sum selects the v0-unreachable
+// GlobalReducer in the schedule (the runtime asserts "GlobalReducer: not
+// enabled in v0" at launch — recorded as a compiler defect), and the
+// two-input rank-1-output form selects it as well — every rank-1-output
+// reduction probed does; (2) the shipped rank-2-output two-input form
+// schedules the WARP-reducer class. The row-reduction coverage is
+// unchanged.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="RowSum")
+kernel row_sum(
+  x: tensor<dtype=f32, shape=[R, K, C]>,
+  z: tensor<dtype=f32, shape=[R, K, C]>,
+) -> tensor<dtype=f32, shape=[R, C]>
+{
+  dimvar (i, k, j);
+  let out = map
+    on(x[i][k][j], z[i][k][j])
+    (v: f32, w: f32) -> f32:
+      v * w
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  ;
+  return out;
+}

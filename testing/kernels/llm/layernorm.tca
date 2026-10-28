@@ -1,0 +1,38 @@
+// layernorm — RMS-flavored map|reduce|map over x[R, C, K] with a weight
+// operand z: per (i, j) weighted energy S = sum_k (x^2 * z), then the
+// self-normalizing piped map y = S * rsqrtf(S * inv_n + eps) — the rsqrtf
+// + scalar-capture + piped-map vocabulary of the normalize stage.
+//
+// FALLBACK VARIANTS (spike walls, recorded in SUMMARY): (1) the five-let
+// true layernorm needs rank-2 dynamic intermediates ("a multiplicative
+// GMEM size is not constructed"), and the documented RMS-norm fallback's
+// final normalize map is a map-only chain ("v0 pkg rungs require at least
+// one reduction before the store"; a reduce must drop exactly one axis);
+// (2) the single-input reduction of the shipped shape selects the
+// v0-unreachable GlobalReducer (recorded compiler defect), so a weight
+// operand z carries the map into the WARP-reducer schedule class.
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="Layernorm")
+kernel layernorm(
+  x: tensor<dtype=f32, shape=[R, C, K]>,
+  z: tensor<dtype=f32, shape=[R, C, K]>,
+  inv_n: f32,
+  eps: f32,
+) -> tensor<dtype=f32, shape=[R, C]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(x[i][j][k], z[i][j][k])
+    (v: f32, w: f32) -> f32:
+      (v * v) * w
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  | map
+    on()
+    [inv_n, eps] (v: f32) -> f32:
+      v * rsqrtf(v * inv_n + eps)
+  ;
+  return out;
+}

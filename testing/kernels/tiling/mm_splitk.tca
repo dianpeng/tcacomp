@@ -1,0 +1,21 @@
+// mm_splitk — the fix4 §3.5 split-k schedule class: reduced K=128 dim picks
+// WARP (the proven frontend-matmul shape, re-targeted).
+@runtime(cxx_path="runtime/tca_runtime.h");
+@name(cxx="MmSplitk")
+kernel mm_splitk(
+  lhs: tensor<dtype=f32, shape=[M, K]>,
+  rhs: tensor<dtype=f32, shape=[K, N]>,
+) -> tensor<dtype=f32, shape=[M, N]>
+{
+  dimvar (i, j, k);
+  let out = map
+    on(lhs[i][k], rhs[k][j])
+    (l: f32, r: f32) -> f32:
+      l * r
+  | reduce(init = 0.0f)
+    on(acc: f32, %0: f32)
+    as (i, j) -> f32:
+      acc + %0
+  ;
+  return out;
+}
