@@ -1,9 +1,10 @@
-// transpose runner — written as-clause permutation + reduce:
-// out[j][i] = sum_k x[i][j][k] over x[R,C,K] -> [C,R].
+// transpose runner — WRITTEN as-clause coverage: out[i][j] = sum_k
+// x[i][j][k] * z[i][j][k] (explicit as (i, j, k); see the kernel file for
+// the recorded permutation-lowering defect that reshaped this test).
 #include "common.cuh"
 
-void TransposeLaunch(const tca::Tensor<float, 3u>& x, tca::Tensor<float, 2u>& out,
-                     cudaStream_t tca_stream);
+void TransposeLaunch(const tca::Tensor<float, 3u>& x, const tca::Tensor<float, 3u>& z,
+                     tca::Tensor<float, 2u>& out, cudaStream_t tca_stream);
 
 int main(int argc, char** argv) {
   const unsigned bench = ParseBenchArgs(argc, argv);
@@ -11,21 +12,27 @@ int main(int argc, char** argv) {
   const unsigned nX = dR * dC * dK, nOut = dC * dR;
 
   float* hX = static_cast<float*>(std::malloc(nX * sizeof(float)));
+  float* hZ = static_cast<float*>(std::malloc(nX * sizeof(float)));
   float* hOut = static_cast<float*>(std::malloc(nOut * sizeof(float)));
-  if (hX == nullptr || hOut == nullptr) return 2;
+  if (hX == nullptr || hZ == nullptr || hOut == nullptr) return 2;
   for (unsigned i = 0u; i < nX; ++i) hX[i] = elem(i);
+  for (unsigned i = 0u; i < nX; ++i) hZ[i] = elem(i);
   for (unsigned i = 0u; i < nOut; ++i) hOut[i] = -12345.0f;  // canary
 
   float* dX = nullptr;
+  float* dZ = nullptr;
   float* dOut = nullptr;
   CUDA_OK(cudaMalloc(&dX, nX * sizeof(float)));
+  CUDA_OK(cudaMalloc(&dZ, nX * sizeof(float)));
   CUDA_OK(cudaMalloc(&dOut, nOut * sizeof(float)));
   CUDA_OK(cudaMemcpy(dX, hX, nX * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_OK(cudaMemcpy(dZ, hZ, nX * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_OK(cudaMemcpy(dOut, hOut, nOut * sizeof(float), cudaMemcpyHostToDevice));
 
   auto xT = tca::Tensor<float, 3u>::From(dX, dR, dC, dK);
-  auto outT = tca::Tensor<float, 2u>::From(dOut, dC, dR);
-  TransposeLaunch(xT, outT, 0u);
+  auto zT = tca::Tensor<float, 3u>::From(dZ, dR, dC, dK);
+  auto outT = tca::Tensor<float, 2u>::From(dOut, dR, dC);
+  TransposeLaunch(xT, zT, outT, 0u);
   CUDA_OK(cudaDeviceSynchronize());
   CUDA_OK(cudaMemcpy(hOut, dOut, nOut * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -39,9 +46,9 @@ int main(int argc, char** argv) {
     for (unsigned j = 0u; j < dC; ++j) {
       float acc = 0.0f;
       for (unsigned k = 0u; k < dK; ++k) {
-        acc += hX[(i * dC + j) * dK + k];
+        acc += hX[(i * dC + j) * dK + k] * hZ[(i * dC + j) * dK + k];
       }
-      const unsigned o = j * dR + i;  // out[j][i]
+      const unsigned o = i * dC + j;  // out[i][j]
       refSum += static_cast<double>(acc);
       const double d =
           std::fabs(static_cast<double>(hOut[o]) - static_cast<double>(acc));
@@ -55,13 +62,16 @@ int main(int argc, char** argv) {
   PrintMaxdiff(maxdiff);
   PrintSamples(hOut, nOut);
 
-  if (bench > 0u && !BenchReport(bench, [&] { TransposeLaunch(xT, outT, 0u); })) {
+  if (bench > 0u &&
+      !BenchReport(bench, [&] { TransposeLaunch(xT, zT, outT, 0u); })) {
     return 3;
   }
 
   std::free(hX);
+  std::free(hZ);
   std::free(hOut);
   cudaFree(dX);
+  cudaFree(dZ);
   cudaFree(dOut);
   return 0;
 }

@@ -20,7 +20,7 @@ runner = "testing/runners/dup_expr.cu"
 dims = [256, 256, 8]
 tolerance = 1e-5
 scalars = { gain = 1.5, bias = 0.25 }
-bench_bytes = 2359296
+bench_bytes = 4456448
 
 [[test]]
 name = "dup_const"
@@ -30,7 +30,7 @@ runner = "testing/runners/dup_const.cu"
 dims = [256, 256, 8]
 tolerance = 1e-5
 scalars = {}
-bench_bytes = 2359296
+bench_bytes = 4456448
 
 [[test]]
 name = "axpy3"
@@ -57,10 +57,10 @@ name = "softmax"
 category = "fusion"
 kernel = "testing/kernels/fusion/softmax.tca"
 runner = "testing/runners/softmax.cu"
-dims = [128, 256]
+dims = [128, 8, 256]
 tolerance = 2e-3
 scalars = {}
-bench_bytes = 131584
+bench_bytes = 2228224
 
 [[test]]
 name = "mm_small"
@@ -100,17 +100,17 @@ runner = "testing/runners/transpose.cu"
 dims = [192, 96, 8]
 tolerance = 1e-5
 scalars = {}
-bench_bytes = 663552
+bench_bytes = 1253376
 
 [[test]]
 name = "row_sum"
 category = "runtime"
 kernel = "testing/kernels/runtime/row_sum.tca"
 runner = "testing/runners/row_sum.cu"
-dims = [512, 1024]
+dims = [512, 4, 1024]
 tolerance = 2e-3
 scalars = {}
-bench_bytes = 2099200
+bench_bytes = 18874368
 
 [[test]]
 name = "scale_copy"
@@ -120,7 +120,7 @@ runner = "testing/runners/scale_copy.cu"
 dims = [512, 512, 4]
 tolerance = 1e-5
 scalars = { gain = 1.25, bias = -0.125 }
-bench_bytes = 5242880
+bench_bytes = 9437184
 
 [[test]]
 name = "gemm"
@@ -150,4 +150,4 @@ runner = "testing/runners/layernorm.cu"
 dims = [128, 256, 64]
 tolerance = 1e-5
 scalars = { inv_n = 0.015625, eps = 0.00001 }
-bench_bytes = 8519680
+bench_bytes = 16908288

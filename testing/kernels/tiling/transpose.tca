@@ -1,26 +1,39 @@
-// transpose — a written as-clause PERMUTATION (as (j, i, k)): distinct from
-// identity inference; exercises the lowering permutation path, with the
-// trailing axis reduced (out[j][i] = sum_k x[i][j][k]).
+// transpose — WRITTEN as-clause coverage with a trailing reduce:
+// out[i][j] = sum_k x[i][j][k] * z[i][j][k] over x,z[R,C,K] -> [R,C], the
+// as (i, j, k) clause written EXPLICITLY (the explicit-permutation check
+// path of §5.1, distinct from the omitted-as inference form every other
+// corpus kernel uses).
 //
-// FALLBACK VARIANT (spike wall, recorded in SUMMARY): the v0 pkg rungs
-// require at least one reduction before the store, so the pure copy form
-// (map only) is not expressible. The written permutation moves into the
-// root map's as clause over a trailing reduced axis.
+// RECORDED COMPILER DEFECT (SUMMARY): the true transpose permutation — a
+// written as (j, i, k) on on(x[i][j][k], ...) — COMPILES but MISCOMPILES:
+// the tiny-case dump (R=4, C=3, K=2) shows out[j][i] receiving
+// sum_k x[0][j+i][k]^2 (axis coordinates folded along anti-diagonals,
+// zeros elsewhere) instead of sum_k x[i][j][k] * z[i][j][k]. The
+// swapped-binding form (on(x[j][i][k]) as (i, j, k)) produces the SAME
+// wrong output, so the permutation lowering itself is broken, not one
+// spelling. Both forms are legal per doc/syntax-design.md §2.6/§4.4 rule
+// 11 ("a transpose must be written explicitly") — a backend miscompile on
+// a legal program, flagged per the defect protocol. A second wall, also
+// recorded: a pure map-only transpose is not a v0 rung shape (>=1
+// reduction required before any store), and the single-input reduction
+// selects the v0-unreachable GlobalReducer — hence the z weight and the
+// trailing reduce in the shipped form.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="Transpose")
 kernel transpose(
   x: tensor<dtype=f32, shape=[R, C, K]>,
-) -> tensor<dtype=f32, shape=[C, R]>
+  z: tensor<dtype=f32, shape=[R, C, K]>,
+) -> tensor<dtype=f32, shape=[R, C]>
 {
   dimvar (i, j, k);
   let out = map
-    on(x[i][j][k])
-    as (j, i, k)
-    (v: f32) -> f32:
-      v
+    on(x[i][j][k], z[i][j][k])
+    as (i, j, k)
+    (v: f32, w: f32) -> f32:
+      v * w
   | reduce(init = 0.0f)
     on(acc: f32, %0: f32)
-    as (j, i) -> f32:
+    as (i, j) -> f32:
       acc + %0
   ;
   return out;

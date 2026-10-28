@@ -1,34 +1,37 @@
-// softmax — the softmax reduction core over x[R, C]: map exp | sum-reduce,
-// emitting the per-row softmax normalizer s[R] = sum_j exp(x[i][j]).
+// softmax — the softmax reduction core with a mask/weight operand z (the
+// attention-mask pattern), over the middle axis: out[i][j] = sum_k
+// exp(x[i][k][j]) * z[i][k][j] — the batched masked-softmax normalizer.
 //
-// FALLBACK VARIANT (spike walls, all recorded in SUMMARY): the full softmax
-// (max-subtract, exp, sum, div) is not expressible in the v0 frontend —
-// (1) rank-2 dynamic intermediates are rejected by the builder ("a
-// multiplicative GMEM size is not constructed"); (2) the final normalize
-// division is a rank-preserving map-only chain, rejected by the v0 pkg
-// rungs ("require at least one reduction before the store"; a reduce must
-// drop exactly one axis, so no identity-reduce exists); (3) reading a
-// rank-1 dynamic intermediate (the max m) from a downstream chain is
-// rejected by the typeinfer pass ("memload operand is not a tensor
-// parameter"), and an unused max-reduce let trips final-lower ("cannot
-// erase node: 1 use(s) still point at it"). The shipped single-let form
-// keeps the exp map + sum-reduce; the max-subtract/-inf_f32 seed and the
-// broadcast intermediate bindings are blocked by wall (3).
+// FALLBACK VARIANTS (spike walls, recorded in SUMMARY): (1) the full
+// softmax is not expressible in the v0 frontend — rank-2 dynamic
+// intermediates are rejected by the builder ("a multiplicative GMEM size
+// is not constructed"); the final normalize division is a rank-preserving
+// map-only chain, rejected by the v0 pkg rungs ("require at least one
+// reduction before the store"; a reduce must drop exactly one axis); and
+// reading a rank-1 dynamic intermediate (a max-reduce result) from a
+// downstream chain trips a typeinfer invariant ("memload operand is not a
+// tensor parameter"), while an unused max-reduce let trips final-lower
+// ("cannot erase node: 1 use(s) still point at it"); (2) the [R,C] -> [R]
+// normalizer — single- or two-input — selects the v0-unreachable
+// GlobalReducer in the schedule (every rank-1-output reduction probed
+// does; recorded as a compiler defect); the shipped rank-2-output
+// two-input form schedules the WARP-reducer class.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="Softmax")
 kernel softmax(
-  x: tensor<dtype=f32, shape=[R, C]>,
-) -> tensor<dtype=f32, shape=[R]>
+  x: tensor<dtype=f32, shape=[R, K, C]>,
+  z: tensor<dtype=f32, shape=[R, K, C]>,
+) -> tensor<dtype=f32, shape=[R, C]>
 {
-  dimvar (i, j);
-  let s = map
-    on(x[i][j])
-    (v: f32) -> f32:
-      expf(v)
+  dimvar (i, k, j);
+  let out = map
+    on(x[i][k][j], z[i][k][j])
+    (v: f32, w: f32) -> f32:
+      expf(v) * w
   | reduce(init = 0.0f)
     on(acc: f32, %0: f32)
-    as (i) -> f32:
+    as (i, j) -> f32:
       acc + %0
   ;
-  return s;
+  return out;
 }
