@@ -1,5 +1,5 @@
-// gemm runner — plain matmul [256,128]x[128,192] -> [256,192], the LLM
-// workhorse.
+// gemm runner — plain matmul [128,128]x[128,96] -> [128,96], the LLM
+// workhorse (sized for the racecheck 300s budget; see the kernel file).
 #include "common.cuh"
 
 void GemmLaunch(const tca::Tensor<float, 2u>& lhs, const tca::Tensor<float, 2u>& rhs,
@@ -7,7 +7,7 @@ void GemmLaunch(const tca::Tensor<float, 2u>& lhs, const tca::Tensor<float, 2u>&
 
 int main(int argc, char** argv) {
   const unsigned bench = ParseBenchArgs(argc, argv);
-  const unsigned dM = 256u, dK = 128u, dN = 192u;
+  const unsigned dM = 128u, dK = 128u, dN = 96u;
   const unsigned nLhs = dM * dK, nRhs = dK * dN, nOut = dM * dN;
 
   float* hLhs = static_cast<float*>(std::malloc(nLhs * sizeof(float)));

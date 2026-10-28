@@ -127,10 +127,10 @@ name = "gemm"
 category = "llm"
 kernel = "testing/kernels/llm/gemm.tca"
 runner = "testing/runners/gemm.cu"
-dims = [256, 128, 192]
+dims = [128, 128, 96]
 tolerance = 2e-3
 scalars = {}
-bench_bytes = 622592
+bench_bytes = 212992
 
 [[test]]
 name = "qk_score"

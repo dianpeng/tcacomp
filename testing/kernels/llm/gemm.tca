@@ -1,4 +1,7 @@
-// gemm — plain matmul, the LLM workhorse shape.
+// gemm — plain matmul, the LLM workhorse shape ([128,128]x[128,96]; sized
+// so the racecheck-instrumented run fits the suite's 300s per-subprocess
+// timeout — the [256,128]x[128,192] form passes plain and memcheck but
+// exceeds it).
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="Gemm")
 kernel gemm(
