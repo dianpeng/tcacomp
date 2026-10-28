@@ -243,22 +243,28 @@ Constraints:
 - The whole-warp ruling: every thread group is a whole number of physical warps. This means LoC at the THREAD level is always a multiple of 32, and the THREAD layer's factor extent covers the same number of threads as the WARP layer's factor extent × 32.
 - The CTA-level maximum (2^31−1) is the CUDA grid dimension limit; in practice the per-CTA resource limits (registers, shared memory) are the binding constraint.
 
-### 5.4 Provisional: Factor = LoC on Parallel Layers
+### 5.4 Factor = LoC on Parallel Layers (Ruled)
 
-**(provisional, see Q-1)** On all non-SEQ layers, we use the canonical form:
+On all non-SEQ layers, the canonical form is:
 
 ```
-L[m][i] = F[m][i]  for all m < M-1 (non-SEQ layers)
+F[m][i] = L[m][i]  for all m < M-1 (non-SEQ layers)
+F[M-1][i] = S[i] / ( Π_{m=0}^{M-2} L[m][i] )   (SEQ layer, derived)
 ```
 
-This means all per-unit sequential slack is pushed into the single SEQ layer. Parallel layers are "full": every factor extent is also the LoC extent. Each unit at layer m processes exactly `R[m]` worth of iterations, all sequentially inside the unit.
+**Ruling (author, 2026-10-28).** A parallel layer's factor extent is exactly its LoC — there is no per-unit sequential slack at CTA/WARP/THREAD layers. If a dimension's LoC is 1 at some layer, that dimension simply **does not participate** in that layer's SoC assignment. The SEQ layer's factor extent is then *derived*, not chosen: it is the residual left over after all parallel layers have taken their shares,
 
-Under this reading:
-- The schedule search picks LoC extents on parallel layers; the factor matrix is identical to the LoC matrix on those layers.
-- Only the SEQ layer has sequential loops; CTA/WARP/THREAD layers are fully parallel.
-- This is the simpler model, and all worked examples in the source docs follow it.
+```
+F[M-1][i] = S[i] / ( Π_{m<M-1} L[m][i] )
+```
 
-The open question Q-1 asks whether this is a required canonicalization or just the common case.
+so a dimension that no parallel layer picks up (all LoCs are 1) is absorbed entirely by the SEQ layer, and the column-product invariant `Π_m F[m][i] = S[i]` is enforced automatically by the constraint system. The quantity constraint `1 ≤ L[m][i] ≤ F[m][i]` guarantees the residual is ≥ 1.
+
+Consequences:
+
+- The scheduler searches over LoC extents on parallel layers only; the factor matrix is identical to the LoC matrix there, and the SEQ row is computed.
+- Only the SEQ layer emits sequential loops; CTA/WARP/THREAD layers are fully parallel.
+- Non-participation is expressed as LoC = 1 ("taboo" dimension), never as factor > LoC.
 
 ---
 
@@ -321,6 +327,12 @@ Memory buffers have a **storage class** and an **owning SoC**:
 
 **Key principle:** storage class + owner together define where data lives and who can write it. This is consistent with the project's memory IR model (three verbs + storage class).
 
+### 7.1.1 The wmem Convention (Ruled)
+
+A warp-owned SMEM region is denoted **wmem** as a conceptual convenience. Physically, wmem is ordinary shared memory **replicated once per runtime warp** and each replication is assigned to exactly one warp of the CTA.
+
+Example: a CTA with warp allocation `[2][2]` (2×2 = 4 warps per CTA in the two sharded dimensions) replicates each wmem buffer 4 times; runtime warp w accesses only its own replication. The convention exists because the *per-warp-private* view makes reducer reasoning easier (a warp reads and writes "its" wmem with no cross-warp interference, exactly like a thread and its fragment); it does not introduce a new storage class. When the warp tier is the destination of a cross-thread combine (§8.3), one replication is written per warp and the cross-warp combine (§8.3 step 3) reads across replications.
+
 ### 7.2 Hoisting Rule
 
 When a per-unit buffer at layer m+1 is hoisted (promoted) to layer m (i.e., allocated at the higher level and reused across iterations of the lower level), its shape becomes:
@@ -358,7 +370,9 @@ A `reduce` operation collapses the last dimension of the producing map's `as` or
 
 ### 8.2 Reduce Stop Rule (RSR)
 
-Given a reduced axis k (the last dimension), the **Reduce Stop Rule (RSR)** determines which layers participate in the reduction hierarchy.
+**Single reduced axis (ruled).** A reduce always applies to a **single dimension** of the input polytope. Conceptually, that dimension is partitioned across SoC spaces — a portion runs sequentially inside one thread, groups of the portion across the fine-grained thread shards of a warp, further groups across warps, and so on — a layered, hierarchical partition of the one axis. Multiple reduced dimensions appear only as chained reduce operations, each with its own RSR.
+
+Given the reduced axis k (the last dimension), the **Reduce Stop Rule (RSR)** determines which layers participate in the reduction hierarchy.
 
 **Formal statement.** Scan layers inner-to-outer (from M−1 down to 0). Maintain an accumulated product `acc = 1`. For each layer m:
 
@@ -366,23 +380,33 @@ Given a reduced axis k (the last dimension), the **Reduce Stop Rule (RSR)** dete
 2. If `acc == S[k]`, stop. The set R = {M−1, M−2, ..., m} is the set of layers covered by the reducer.
 3. If `acc > S[k]`, the factorization is invalid for this reduce (should not happen if the column product is exactly S[k]).
 
-**Direction:** inner-to-outer. The innermost layer (SEQ) is always included. The outermost included layer is the first one (going outward) whose factor completes coverage of the reduced axis.
+**Direction:** inner-to-outer. The innermost layer (SEQ) is always included. The outermost included layer is the first one (going outward) whose factor completes coverage of the reduced axis: at that layer the axis is fully exhausted/visited and no further tier of reduction is needed.
+
+**Unvisited-layer constraint (ruled).** Any layer *not* in R (i.e., layers outer than the RSR stop layer) must have `L[m][k] = 1` for the reduced dimension k — the reduced axis is not parallelized above the stop layer. Combined with the F = LoC canonicalization (§5.4), this also forces `F[m][k] = 1` there, so the reduced axis is entirely covered by the R layers.
 
 **R is ordered outer-to-inner** for the purpose of describing the reducer hierarchy: R = {r_0, r_1, ..., r_{|R|−1}} with r_0 the outermost covered layer and r_{|R|−1} = M−1 the innermost (SEQ).
 
 ### 8.3 Reducer Lowering Sequence
 
-A reducer over reduced axis k with coverage R lowers to a sequence of operations moving up the SoC hierarchy:
+A reducer over reduced axis k with coverage R lowers to a ladder of operations moving up the SoC hierarchy:
 
 1. **Fragment accumulator (SEQ layer):** each thread accumulates into a register (FRAG) during its sequential loop. This is the innermost Reduce operation.
-2. **Cross-thread combine (THREAD → WARP):** threads within a warp combine their partial results.
-   - The destination is a warp-owned SMEM region (or a shuffle-based combiner — see Q-2).
+2. **Per-thread combine (THREAD → WARP):** partial results of the threads inside one warp are combined.
+   - **Mechanism (ruled).** Because tile scheduling allows *fine-grained sharding on different axes* for the threads of a single warp, the traditional single-axis full-warp shuffle reduction is not applicable. Instead, the runtime groups the lanes of a warp by layout modular arithmetic on the reduced axis and performs a **per-group** reduction with `__shfl_xor` — this is the *per-thread combine*. The combined value of each group is then written into the tier above: the per-warp accumulated storage (wmem, §7.1.1).
+   - **Grouping rule.** With the warp's thread layout `L[THREAD]` and reduced axis k last in the thread sharding order, a group is the set of lanes sharing all thread coordinates except the k-shard: group member id = `lane_id % L[THREAD][k]`, group id = `lane_id / L[THREAD][k]`. Example: warp thread sharding `[2][4][4]`, reduce along the last dimension → 8 groups of 4 threads; the group members are lanes with equal `lane_id / 4`, member within group = `lane_id % 4`; the warp-level accumulated storage has shape `[2][4]` (the surviving thread-shard axes), one slot per group.
+   - This step is register-file-resident (shuffle path); the write into wmem is the first SMEM traffic of the ladder.
 3. **Cross-warp combine (WARP → CTA):** warps within a CTA combine their partial results.
    - The destination is a CTA-owned SMEM region.
 4. **Cross-CTA combine (CTA → GMEM):** (optional, only if R includes CTA and multi-CTA reduction is needed).
    - The destination is a GMEM buffer.
 
-**General rule (frag → smem(thread) → smem(warp) → smem(cta) → gmem):** each Combine step moves the accumulator from the inner layer's storage to the outer layer's storage. The specific mechanism (shuffle vs SMEM load/store) is a codegen detail — see Q-2.
+**General rule (frag → wmem/smem(warp) → smem(cta) → gmem):** each Combine step moves the accumulator from the inner tier's storage to the outer tier's storage. The per-thread combine uses the grouped shuffle path (register file); all other combines are SMEM load/store steps. Conceptually, reduction is a *tiered reduction over the SoC/memory hierarchy layers*, not an opaque runtime object: the reducer is just a list of reduction operations moving the reduced result from FRAG to SMEM at successively coarser SoC levels.
+
+### 8.3.1 Reducer.Init Semantics (Ruled)
+
+`reducer.Init` at tier X **allocates that tier's intermediate reduction memory and initializes it with the reducer's identity value** (e.g. 0 for sum, −∞ for max). Each SoC category in the ladder has its own intermediate storage whose purpose is to receive the combined values of the tier below, readying them for the next tier's reduction — the ladder is climbed tier by tier.
+
+The ladder terminates at the RSR stop layer (§8.2): no combine is emitted above it. A tier above the RSR stop layer (such as the `reducer<cta>` in the legacy cg sample, where RSR stops at WARP) does not perform a reduction — its initialized memory is the **output staging** that the top combine's final values are deposited into, from which the epilogue writes out. Initializing it with the identity value is what makes the deposit well-defined when some upper-tier slices receive no contribution (e.g. tail tiles).
 
 **Associativity/commutativity requirement.** The combiner must be associative and commutative for the parallel reduction to be correct. This is restated from tca.md §2.5.
 
@@ -407,14 +431,14 @@ This section carries the running example through every concept defined above.
 
 ### 9.2 Factor Matrix F
 
-(provisional: F = L on non-SEQ layers, per Q-1)
+Per §5.4, F = L on the non-SEQ layers and the SEQ row is the derived residual:
 
 ```
           M     N     K
 (0/CTA)  [ 4 ][ 4 ][ 1 ]    F[0] = [4, 4, 1]
 (1/WARP) [ 2 ][ 2 ][ 2 ]    F[1] = [2, 2, 2]
 (2/THR)  [ 4 ][ 4 ][ 2 ]    F[2] = [4, 4, 2]
-(3/SEQ)  [ 4 ][ 2 ][ 4 ]    F[3] = [4, 2, 4]
+(3/SEQ)  [ 4 ][ 2 ][ 4 ]    F[3] = [4, 2, 4]   (derived: S[i] / Π_{m<3} L[m][i])
 ```
 
 **Verification of column-product invariant:**
@@ -422,9 +446,14 @@ This section carries the running example through every concept defined above.
 - N: 4 × 2 × 4 × 2 = 128 ✓
 - K: 1 × 2 × 2 × 4 = 16 ✓
 
+**Verification of the derived SEQ row:**
+- M: 128 / (4 × 2 × 4) = 128 / 32 = 4 ✓
+- N: 128 / (4 × 2 × 4) = 128 / 32 = 2 ✓
+- K: 16 / (1 × 2 × 2) = 16 / 4 = 4 ✓
+
 ### 9.3 LoC Matrix L
 
-(provisional: F = L on non-SEQ layers, so L = F for layers 0–2)
+Per §5.4, L = F for layers 0–2; L[3] = 1 by the SEQ constraint.
 
 ```
           M     N     K
@@ -496,13 +525,13 @@ int thr_2 = lane_id % 2;    // [0, 2)
 __shared__ float lhs_smem[32][16];  // per-CTA: R[0] on M×N dims
 __shared__ float rhs_smem[16][16];  // per-CTA
 
-// Reducer: CTA-level (output buffer at CTA-owned SMEM)
-// shape: surviving M×N dims at CTA level = [4,4] units * [32,16] per-unit
-// = full [128, 128]? No — per-CTA output region = R[0]_M × R[0]_N = 32 × 16
-// (provisional interpretation, see Q-3)
+// Reducer: CTA-tier output staging (§8.3.1) — RSR stops at WARP (§9.8),
+// so the CTA-tier memory is initialized with the identity value and receives
+// the top (cross-warp) combine's final values; the epilogue writes it out.
+// Per-CTA output region = R[0]_M × R[0]_N = 32 × 16.
 
-// Warp-level reducer init
-float acc_frag[4][2];  // per-thread fragment: SEQ output shape = F[3][0..1] = [4, 2]
+// Per-thread fragment accumulator: surviving SEQ dims = F[3][M] × F[3][N] = [4][2]
+float acc_frag[4][2];
 
 // Layer 3: SEQ — actual sequential loops
 for (int seq_0 = 0; seq_0 < 4; seq_0++) {
@@ -522,11 +551,17 @@ for (int seq_0 = 0; seq_0 < 4; seq_0++) {
   }
 }
 
-// Thread-level combine → warp-level (intra-warp)
-// (shuffle or smem(thread); see Q-2)
+// Per-thread combine (§8.3 step 2): grouped shuffle reduction.
+// Thread sharding is [4][4][2]; K is the reduced axis and is last in the
+// thread shard order, so each group is the pair of lanes sharing thr_0/thr_1:
+//   group member id = lane_id % 2,  group id = lane_id / 2
+// __shfl_xor(mask=0xffffffff, value, laneMask=1) reduces within each pair.
+// Each group then writes its combined value into its warp's wmem slot.
 reducer_combine_thread(acc_frag, thr_0, thr_1, thr_2);
 
-// Warp-level combine → CTA-level (cross-warp, via smem(warp) → smem(cta))
+// Cross-warp combine (§8.3 step 3): the top combine — warps along the K
+// shard (warp_2) combine their wmem partials into the CTA-tier staging
+// buffer. RSR stops here (§9.8): no combine is emitted above this tier.
 reducer_combine_warp(acc_warp, warp_0, warp_1, warp_2);
 
 // Write out CTA-owned output region
@@ -535,60 +570,17 @@ reducer_combine_warp(acc_warp, warp_0, warp_1, warp_2);
 
 ### 9.7 Hoisted Cache Shapes
 
-For the LHS buffer (indexed by [M, K]):
+**Hoisting rule restated for this example.** A buffer used by the units of layer m+1, when hoisted to layer m, gains the layer-m owner coordinates as leading dimensions: one slot per layer-m unit, each slot keeping the inner buffer shape (§7.2). Concretely, hoisting from layer m+1 to m prepends the *surviving* layer-m LoC extents along the dimensions that index the buffer (reduced-axis coordinates are elided above the RSR stop layer — §7.3, §9.8).
 
-- **SEQ/FRAG (per thread):** `[4, 4]` — the SEQ-level tile access shape (seq_0 × seq_2 = 4 × 4). Wait — let's be precise. The per-thread sequential region is R[3] = [1,1,1] (single points). The fragment buffer for LHS in the SEQ layer would be the tile loaded at the thread level: shape = [F[3][0], F[3][2]] = [4, 4] (since N is not an index of LHS). Actually, the FRAG buffer is the per-thread tile of LHS accessed during the SEQ loop. Its shape is the per-thread region along the dimensions that index LHS.
+For the LHS operand cache (indexed by dims M, K), hoisted tier by tier:
 
-More systematically, applying the hoisting rule:
+- **FRAG (per thread, innermost):** the tile each thread touches in its SEQ loop = `F[3][M] × F[3][K]` = `[4][4]`. (K is not yet fully reduced inside the thread — the thread iterates seq_2 over K — so K still indexes the operand tile.)
+- **Hoisted to WARP (wmem, one copy per warp):** one copy per warp covering its threads' tiles = warp's region along (M, K) = `R[1][M] × R[1][K]` = `[16][8]`. Note the hoist skips a *slot-per-thread* intermediate: the operand is shared read-only, so one warp-level copy serves all 32 lanes.
+- **Hoisted to CTA (SMEM, CTA-owned):** the CTA's region along (M, K) = `R[0][M] × R[0][K]` = `[32][16]` — this is the `lhs_smem[32][16]` of the loop-nest sketch (§9.6).
 
-- At SEQ (layer 3): each thread's LHS access shape = SEQ-region along indexed dims = F[3][M] × F[3][K] = 4 × 4. Storage: FRAG.
-- Hoisted to THREAD (layer 2): shape = THREAD-LoC along indexed dims × inner shape = F[2][M] × F[2][K] × ... no — wait, the hoisting rule says: owner-coordinate extents at the new level ++ inner buffer shape.
+Symmetrically, the RHS operand cache (indexed by K, N) has CTA shape `R[0][K] × R[0][N]` = `[16][16]`.
 
-Actually let me be precise. When hoisting from layer m+1 to m:
-- The buffer at m+1 has shape `B_{m+1}`.
-- After hoisting to layer m, shape = `LoC(m)[indexed_dims] ++ B_{m+1}`.
-
-Wait, that's right. The number of buffer "copies" equals the number of owners at the higher level. Each copy has the inner shape.
-
-For LHS (indexed by M, K — two dims):
-
-- Hoisted from SEQ → THREAD: shape = `F[2][M] × F[2][K] ++ F[3][M] × F[3][K]`
-  No — that double-counts. The correct shape at THREAD level is: one per thread, each holding its own tile. The tile per thread is F[3][M] × F[3][K]. So total shape = `F[2][M] × F[2][K]`... no.
-
-Let me re-state the hoisting rule correctly:
-
-> A buffer hoisted to level m has shape = (owner-coordinate extents at m) ++ (inner buffer shape)
-
-The "owner-coordinate extents at m" are how many parallel owners there are at level m along the dimensions that index the buffer. The "inner buffer shape" is the per-owner buffer shape.
-
-So for LHS at SEQ level (one copy per thread, shape = per-thread access = F[3][M] × F[3][K] = 4 × 4):
-
-- FRAG: `[4][4]` (per-thread, register file)
-
-Hoisted to THREAD-owned SMEM (one copy per thread, but now in SMEM — same shape, different storage class):
-
-- SMEM(thread): `[4][4]` per thread, total = 32 threads × 4×4 floats = 32×16×4 B = 2048 B
-
-Hoisted to WARP-owned SMEM:
-- One copy per warp, each copy covers all threads in the warp. Per-warp shape = F[2][M] × F[3][M] × ... no.
-
-I think I'm overcomplicating this. Let me use the v1 doc's formulation, which is clear: "concatenation of inner tile's cache when hoist out". The shape at layer m is the concatenation of the layer-m LoC shape and the inner buffer's shape.
-
-For LHS (indexed by M, K):
-- At SEQ (layer 3): `[F[3][M], F[3][K]] = [4, 4]`
-- At THREAD (layer 2): `[F[2][M], F[2][K], F[3][M], F[3][K]]`... no, that doesn't make sense physically.
-
-The correct interpretation (consistent with v1's example): when you hoist a buffer up a layer, you add the outer layer's coordinate extents as new leading dimensions. The buffer has one "slot" per unit of the outer layer, and each slot has the inner shape.
-
-So LHS at:
-- SEQ: `[4][4]` (4×4 floats = per-thread tile, indexed by seq_M and seq_K)
-- THREAD: `[4][2][4][4]` (thread dims: thr_M=4, thr_K=2; each thread has 4×4 frag — total 4×2×4×4? No, thr_M and thr_K are the thread index dimensions, not spatial dimensions of the buffer. Each thread owns one 4×4 tile. The SMEM(thread) buffer is indexed by thread coordinates AND intra-thread coordinates.)
-
-Actually, yes — that's exactly it. An SMEM buffer owned by "thread" is indexed by (thread_id, local_index). The thread_id part has shape LoC(thread), and the local part has shape per-thread.
-
-So: SMEM(thread) LHS shape = `[F[2][M], F[2][K], F[3][M], F[3][K]]` = `[4, 2, 4, 4]`
-
-Wait, but F[2][K] = 2, and the K dimension is the reduced one. At layers above RSR stop, the reduced dimension is elided. Let me check RSR first.
+The accumulator ladder is a different composition — it follows §8.3 and is worked out in §9.9.
 
 ### 9.8 RSR and Reduce Sequence
 
@@ -602,103 +594,44 @@ RSR scan (inner to outer, layers 3→2→1→0):
 Coverage set R = {1, 2, 3} (WARP, THREAD, SEQ). RSR stops at layer 1 (WARP). Layer 0 (CTA) is NOT covered.
 
 **Reducer sequence (inner to outer):**
-1. SEQ: per-thread fragment accumulation (FRAG) — Reduce per element
-2. THREAD → WARP: intra-warp thread combine — Combine to warp-owned SMEM
-3. WARP: done — the reduce output lives at warp-owned SMEM (or whatever the WARP-level destination is)
+1. **SEQ (FRAG):** per-thread fragment accumulation — Reduce per element (§8.3 step 1).
+2. **THREAD tier (per-thread combine):** grouped `__shfl_xor` reduction inside the warp (§8.3 step 2), each group writing its combined value into its slot of the per-warp accumulator (wmem).
+3. **WARP tier (cross-warp combine — the top combine):** the two warps along the K shard (warp_2 ∈ {0, 1}) combine their wmem partials into the CTA-tier staging buffer. RSR stops here; no combine is emitted above this tier.
 
-The CTA layer has no reduce combine step — the surviving M×N dimensions are partitioned across warps, and each warp writes its own slice of the output.
+**Unvisited-layer constraint check:** layer 0 (CTA) is outside R; its reduced-axis entries are L[0][K] = F[0][K] = 1 ✓ (§8.2) — K is not parallelized above the stop layer.
 
-**(provisional, see Q-3)** What about the `reducer<cta>` in the cg sample? It likely represents the CTA-level output buffer allocation, not a CTA-level combine step (since there is no CTA-level combine when RSR stops at WARP).
+**The `reducer<cta>` of the legacy cg sample** is the CTA-tier staging buffer of §8.3.1: initialized with the reducer's identity value, receives the top combine's final values, and is written out by the epilogue. It is not a combine tier — no cross-CTA reduction exists when RSR stops at WARP.
 
-### 9.9 Cache Shapes with RSR Axis Elision
+### 9.9 Accumulator Ladder Shapes with RSR Axis Elision
 
-With K as the reduced axis and RSR stopping at WARP (layer 1):
+With K as the reduced axis and RSR stopping at WARP (layer 1), the accumulator at each tier carries only surviving (non-reduced) dimensions:
 
-The accumulator/reducer buffer at each level only carries surviving (non-reduced) dimensions:
-
-- **SEQ/FRAG:** per-thread accumulator shape = surviving SEQ dims = F[3][M] × F[3][N] = [4][2]
-  - The K dimension is consumed by the reduce; it doesn't appear in the accumulator shape.
-- **THREAD → WARP combine destination (warp-owned SMEM):**
-  - shape = warp_coords_surviving ++ per-thread_acc_shape
-  - = [F[2][M], F[2][N]] ++ [F[3][M], F[3][N]] = [4, 4, 4, 2]
-  - Wait — each warp has F[2][M] × F[2][N] = 4 × 4 = 16 threads, and each contributes a [4][2] accumulator.
-  - The warp-owned SMEM buffer shape = [16, 4, 2] = [F[2][M]*F[2][N], F[3][M], F[3][N]]
-  - Or equivalently, indexed by thread coordinates: [F[2][M], F[2][N], F[3][M], F[3][N]] = [4, 4, 4, 2]
+- **FRAG (per thread):** `F[3][M] × F[3][N] = [4][2]`. K does not appear — it is consumed by the sequential accumulation over seq_2.
+- **wmem (per warp):** indexed by (group coordinates) ++ (per-thread accumulator shape), where a group is the set of lanes sharing all thread shards except the reduced K shard (thr_2): `[F[2][M], F[2][N]] ++ [4, 2] = [4][4][4][2]`. Each of the 4×4 = 16 groups deposits one `[4][2]` combined partial. This buffer is replicated per warp (§7.1.1) — 8 replications for the 2×2×2 = 8 warps of this CTA.
+- **CTA-tier staging (SMEM, CTA-owned):** after the cross-warp combine across warp_2, indexed by `(warp_0, warp_1, thr_0, thr_1, seq_M, seq_N)` = `[2][2][4][4][4][2]`, i.e. exactly the per-CTA output region `[32][16]` on the surviving M×N dims (2·4·4 = 32 on M, 2·4·2 = 16 on N ✓, matching R[0] restricted to (M, N)). The warp_2 coordinate is elided: combining across it is what finishes the reduced axis.
 
 ---
 
-## 10. Open Questions / Required Author Rulings
+## 10. Resolved Rulings (Author Decisions, 2026-10-28)
 
-### Q-1: Must factor extent equal LoC on every non-SEQ layer?
+The five open questions raised by the design review (doc/review/tile_scheduling.md) were ruled by the author. The rulings are normative; the provisional markers previously used in this document have been removed. Each entry records the question, the ruling, and where it is formalized.
 
-**Question:** Is `F[m][i] = L[m][i]` for all non-SEQ layers m a required canonicalization, or just the common case?
+### Q-1: Must factor extent equal LoC on every non-SEQ layer? — RESOLVED
 
-**Reading A (required):** All per-unit sequential slack is pushed into the single SEQ layer. Parallel layers have no sequential interior beyond what the inner layers cover. This is the simpler model and all worked examples follow it.
+**Ruling.** Yes, by construction. A LoC of 1 on a dimension at some layer means the dimension does not participate in that layer's SoC assignment; the constraint system requires each dimension to be a full factorization of the input shape's extent, so any dimension no parallel layer picks up is absorbed by the SEQ layer automatically. Formalized in §5.4 (F = L on non-SEQ layers; SEQ row derived as the residual `S[i] / Π_{m<M-1} L[m][i]`).
 
-**Reading B (optional):** A parallel layer's factor extent can be larger than its LoC, meaning each unit sequentially iterates over the remaining factor. For example, a CTA with F[0][M] = 8 and L[0][M] = 4 would mean each CTA processes 2 sub-tiles of dimension M sequentially.
+### Q-2: Cross-thread collection: shuffle vs SMEM(thread) region — RESOLVED
 
-**Mechanical impact:**
-- A: simpler codegen (only SEQ layer has sequential loops); search space = LoC space.
-- B: richer schedule space; sequential loops at any layer; more complex codegen.
+**Ruling.** The per-thread (intra-warp) combine is shuffle-based: because threads within a warp are fine-grain sharded across different axes, the runtime forms lane groups by layout modular arithmetic and performs a per-group `__shfl_xor` reduction; each group then writes its combined value into the per-warp accumulated storage (wmem) one tier above. The wmem tier is physically SMEM replicated per warp (§7.1.1). No SMEM is consumed by the intra-warp combine itself. Formalized in §8.3 step 2 and §9.8–§9.9.
 
-**Provisional reading used in this doc:** A (F = L on parallel layers), marked "(provisional, see Q-1)" at each relevant point.
+### Q-3: Role of reducer.Init at layers above the RSR stop layer — RESOLVED
 
-### Q-2: Cross-thread collection: shuffle vs SMEM(thread) region
+**Ruling.** `reducer.Init` at tier X allocates that tier's intermediate reduction memory and initializes it with the reducer's identity value. Each SoC tier in the ladder owns an intermediate storage that receives the tier below's combined values for the next tier's reduction; the ladder climbs until the RSR stop layer, above which no combine is emitted — the next tier's initialized memory stages the output that the epilogue writes out. Formalized in §8.3.1.
 
-**Question:** When combining partial results across threads within a warp, is the mechanism: (a) warp shuffle instructions (`__shfl_sync` family), (b) thread-owned SMEM regions with loads/stores and a barrier, or (c) both with a selection rule?
+### Q-4: RSR generalization to multiple reduced dimensions — RESOLVED
 
-**Reading A (shuffle):** Thread-level combine uses warp shuffle. This is register-file-only, intra-warp only, no SMEM allocation.
+**Ruling.** Reduce always applies to a single dimension of the input polytope; multiple reductions are chained operations. RSR is per-axis: scan the tile-matrix column inner-to-outer, stop at the layer where the product of visited factors equals the input extent of that dimension; every *unvisited* (outer) layer must have LoC = 1 on the reduced dimension. Formalized in §8.2.
 
-**Reading B (SMEM(thread)):** Each thread writes its accumulator to a thread-owned SMEM slot; combine reads from SMEM; barrier synchronization required. Works across warps (with appropriate synchronization).
+### Q-5: Per-unit region shape vs stride — one quantity or two? — RESOLVED
 
-**Reading C (both):** Intra-warp combine uses shuffle; cross-warp combine uses SMEM(warp) or SMEM(cta) depending on level.
-
-**Mechanical impact:**
-- Affects SMEM budget accounting (does thread-level combine consume SMEM?).
-- Affects the reducer lowering path (different codegen for shuffle vs SMEM).
-- Affects applicability: shuffle is intra-warp only; SMEM works at any level.
-
-**Note:** The storage class + owner model is compatible with all three readings — the question is about the collection mechanism, not the data model.
-
-### Q-3: Role of reducer.Init at layers above the RSR stop layer
-
-**Question:** What does a `reducer<X>` represent when X is a layer above the RSR stop layer? For example, in our matmul example RSR stops at WARP (layer 1), but the cg sample initializes a `reducer<cta>`.
-
-**Reading A (output buffer):** Init at the outermost R layer allocates the output buffer at that layer's owned storage. In our example, WARP is the outermost covered layer, so the output is at warp-owned SMEM. The "cta" reducer in the sample is a misnomer / pre-allocated CTA-level output buffer that warps write into directly.
-
-**Reading B (scaffolding):** Init at layers above RSR is a no-op structural placeholder. No allocation; no combine at that level.
-
-**Reading C (accumulator):** The reducer is an actual accumulator at the CTA level that receives cross-warp combines — but this would mean RSR *should* include CTA, which contradicts the math (K=16, 2×2×4=16 → stop at WARP).
-
-**Mechanical impact:**
-- Affects codegen shape of multi-level reducers.
-- Affects SMEM allocation: does the CTA layer allocate a reducer buffer?
-- Clarifies what "RSR stop" means for the layer above.
-
-### Q-4: RSR generalization to multiple reduced dimensions
-
-**Question:** How does RSR generalize when there are multiple reduced dimensions (chained reduces, or a single reduce over multiple axes)?
-
-**Reading A (independent):** Each reduce axis has its own RSR, computed independently. The reducer stack for axis k stops at its own layer.
-
-**Reading B (shared):** All reduces share a single layer sequence; the RSR is determined by the outermost stop layer across all reduced axes.
-
-**Mechanical impact:**
-- Affects scheduling of multi-reduce chains.
-- Affects reducer stack shape (one unified stack vs per-axis sub-stacks).
-- Likely deferred beyond v0 (v0 has exactly one reduce per map chain).
-
-### Q-5: Per-unit region shape vs stride — one quantity or two?
-
-**Question:** Is "per-unit region shape" the same quantity as "stride row", or are they distinct?
-
-**Reading A (same):** stride[m][i] = R[m][i] = product of factors below m in column i. Both names refer to the same number. The cg sample's middle column has a typo.
-
-**Reading B (different):** There are two distinct quantities — e.g. "output region shape" (only surviving non-reduced dims) and "full stride" (all dims including reduced ones).
-
-**Mechanical impact:**
-- Determines whether the canonical doc needs one or two N-vector quantities per layer.
-- Reading A is simpler and consistent with the definitions in §4.2–§4.3.
-- Reading B would be needed if the cg sample's middle column intentionally shows a different quantity.
-
-**Provisional reading used in this doc:** A (one quantity), with the cg sample's middle column treated as erroneous (F-3).
+**Ruling.** One quantity: the stride row equals the per-unit region shape (§4.2–§4.3); the legacy cg sample's inconsistent middle column is erroneous (finding F-3 in the review doc). The "unit" itself may be coarse-grained: the atomic unit of a layer's LoC is normally a thread, but a layer may instead use a warp unit or warpgroup unit — expressed through the alignment/modularity constraint (whole-warp/whole-warpgroup multiples), so different tile layers may carry different unit granularities while keeping the single region/stride quantity.

@@ -191,7 +191,7 @@ The canonical doc should apply the following changes, in this order:
 
 ---
 
-## 6. Open questions for the author
+## 6. Open questions for the author — RESOLVED (rulings recorded 2026-10-28)
 
 | ID | Question | Possible readings | Mechanical impact |
 |----|----------|-------------------|-------------------|
@@ -200,3 +200,11 @@ The canonical doc should apply the following changes, in this order:
 | Q-3 | What is the normative role of reducer.Init at layers above the RSR stop layer? | (a) output buffer allocation at that layer's owned SMEM; (b) no-op scaffolding; (c) CTA-level accumulator for cross-warp combine (but RSR says no combine). | Affects codegen shape of multi-level reducer, SMEM allocation per layer. |
 | Q-4 | How does RSR generalize to multiple reduced dimensions? | (a) each reduce axis has its own RSR, independent; (b) reduces share the layer sequence. | Affects scheduling of multi-reduce chains, reducer stack shape. |
 | Q-5 | Does the cg sample's middle column represent a different quantity than stride, or is it just wrong? | (a) same quantity (stride = per-unit region shape) — middle col has a typo; (b) different quantities (e.g. "output region shape" vs "stride"). | Determines whether the canonical doc needs one or two region-shape quantities. |
+
+### Rulings (author, 2026-10-28)
+
+- **Q-1 → reading (a), enforced by construction.** LoC = 1 on a dimension means it does not participate in that layer's SoC assignment; the full-factorization constraint guarantees any dimension untouched by all parallel layers is picked up by the SEQ layer automatically. Canonical doc §5.4 now derives the SEQ row as the residual.
+- **Q-2 → per-thread combine is grouped shuffle.** Fine-grained axis sharding within a warp rules out the traditional single-axis full-warp reduction; the runtime groups lanes by layout modular arithmetic and reduces per group with `__shfl_xor`, then writes each group's combined value into the per-warp accumulator (wmem = SMEM replicated per warp). Canonical doc §7.1.1, §8.3 step 2.
+- **Q-3 → Init = allocate + identity-initialize that tier's intermediate memory.** Each SoC tier's intermediate storage receives the tier below's combined values for the next tier; the ladder stops at the RSR layer, above which the initialized memory stages the output for write-out. Canonical doc §8.3.1.
+- **Q-4 → reduce is always single-dimension; RSR is per-axis.** Unvisited (outer) layers must carry LoC = 1 on the reduced dimension. Canonical doc §8.2.
+- **Q-5 → one quantity (stride row = per-unit region shape); the cg middle column is erroneous.** The LoC unit may be coarse-grained (thread by default; warp or warpgroup units expressible via the alignment/modularity constraint), which does not split the region/stride quantity. Canonical doc §4.2–§4.3, §10.
