@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 01.1 complete (verified 8/8), next Phase 02
-last_updated: "2026-10-28T16:05:00.000Z"
-last_activity: 2026-10-28 - Completed quick task 261028-t4u: comprehensive compiler testing suite (testing/ tree, 14/14 PASS on A6000, 2 compiler defects recorded)
+stopped_at: v0.0.0 tagged at e9e46ae; next: backend optimization/scheduling milestone (post-0.0.0)
+last_updated: "2026-10-29T06:41:06.000Z"
+last_activity: 2026-10-29 - Completed quick task 261029-k4l: cut v0.0.0 MVP release (design/RELEASE-v0.0.0.md release notes + local annotated tag v0.0.0 at e9e46ae + STATE.md record)
 progress:
   total_phases: 6
   completed_phases: 1
@@ -20,17 +20,16 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-10-15)
 
-**Core value:** `matmul_scale` (and the other documented example kernels) compiles end-to-end and runs correctly on the target GPU with numerical results matching a CPU reference — frontend source → TCA IR → optimization passes → CUDA C++ + runtime, in one automated flow.
-**Current focus:** Phase 01.1 — ir-architecture-refinement (verification next), then Phase 02
+**Core value:** `matmul_scale` (and the other documented example kernels) compiles end-to-end and runs correctly on the target GPU with numerical results matching a CPU reference — frontend source → TCA IR → optimization passes → CUDA C++ + runtime, in one automated flow. **ACHIEVED at v0.0.0** (tagged e9e46ae, 2026-10-29).
+**Current focus:** v0.0.0 MVP release CUT (2026-10-29) — correctness-first compiler landed end-to-end and GPU-verified (14/14 suite, memcheck/racecheck clean); next milestone: backend optimization/scheduling (post-0.0.0)
 
 ## Current Position
 
-Phase: 02 (naive-codegen-runtime-e2e) — NEXT
-Plan: 0 of 4
-Status: Phase 01.1 complete (verified 8/8, goldens byte-identical); ready for code review
-Last activity: 2026-10-28 - Completed quick task 261028-g21: review and consolidate tile scheduling design docs (errata doc + canonical rewrite + pointer stubs)
+Milestone: v0.0.0 CUT — tagged at e9e46ae on dev (local annotated tag, unpushed)
+Status: correctness-first compiler landed end-to-end (frontend → SSA IR → full opt pipeline → CUDA C++ codegen → C++20 runtime → testing suite), GPU-verified on the A6000; ROADMAP.md phase checkboxes lag actual progress — do not read them as a progress report
+Last activity: 2026-10-29 - Completed quick task 261029-k4l: v0.0.0 MVP release (release notes doc + local tag + STATE record)
 
-Progress: [██░░░░░░░░] 17%
+Progress: [██░░░░░░░░] 17% (roadmap-checkbox-derived; lags actual state)
 
 ## Performance Metrics
 
@@ -83,6 +82,7 @@ None yet.
 
 | # | Description | Date | Commit | Directory | Status |
 |---|-------------|------|--------|-----------|--------|
+| 261029-k4l | Cut v0.0.0 MVP release — design/RELEASE-v0.0.0.md release notes (scope, validation evidence 14/14 GPU + sanitizers, known issues D1/D2 + spike walls W1-W6, performance caveat, explicitly-NOT list); local annotated tag v0.0.0 at e9e46ae (local only, user pushes when ready); STATE.md record | 2026-10-29 | PENDING | [261029-k4l-v0.0.0-mvp-release](./quick/261029-k4l-v0.0.0-mvp-release/) | Complete |
 | 261028-t4u | Comprehensive compiler testing suite (SUITE-01) — repo-root `testing/` tree: 14 TCA kernels across 5 categories (dedup 2, fusion 3, tiling 4, runtime 2, llm 3) + 15 runner TUs (host CPU reference + CANARY/CHECKSUM/REF_CHECKSUM/MAXDIFF/SAMPLES/BENCH_US protocol) + suite.toml registry + fixture cmake template + stdlib-only Python 3.13 orchestrator (compile → content-hash cmake build → GPU run → numerical verify → ANSI reporting; --list/--filter/--category/--bench-iters/--sanitizer/--jobs/--keep-builds/--clean/--verbose). A6000 battery: full suite 14 passed/0 failed (22.8s, canary 0, maxdiff 2.4e-7…5.3e-5 within per-test tolerances, none broadened); memcheck 14/14 + racecheck 14/14 zero errors with numerics enforced; benchmark table at --bench-iters 20. TWO GENUINE COMPILER DEFECTS found and recorded (never papered over): D1 single-input and rank-1-output reductions select the v0-unreachable KindRuntimeGlobalReducer (runtime asserts at launch — repro: corpus commit 3086e59); D2 transpose as-permutation miscompiles (both legal spellings produce identical wrong output). SEVEN frontend walls forced documented per-kernel fallbacks (map-only rung shape, piped-map-after-map, rank-2 dynamic intermediates, intermediate-tensor typeinfer trip, unused-let final-lower erase, mlp P-12 piped binding, softmax piped binds) — each recorded in its kernel file header. gemm resized [128,128]x[128,96] for the racecheck 300s timeout. Gates: go build/vet green, module count 1, zero .go files under testing/, no compiler/runtime/Go-source changes. User WIP (concurrent doc/ → design/ move) untouched | 2026-10-28 | 6a2c4a8 | [261028-t4u-build-a-comprehensive-compiler-testing-s](./quick/261028-t4u-build-a-comprehensive-compiler-testing-s/) | Complete |
 | 261028-g21 | Review and consolidate tile scheduling design docs — full review of 3 source docs (tile_scheduling.md v1 prose, tile_scheduling2.md v2 formalization, tile_scheduling_cg.md codegen sample); 16 findings total: 3 CRITICAL (RSR arithmetic, tile() quotient/block swap, cg stride table), 6 HIGH (MaxLoC mis-indexed, Q-1 factor-vs-LoC, Q-2 shuffle-vs-SMEM, Q-3 reducer Init above RSR, stride representation, factor-vs-LoC matrix), 7 MEDIUM (reducer typo, warpgroup count, example mismatch, vocab typos, codegen sketch defects, reduce axis ordering, tca.md positioning); 5 open questions Q-1..Q-5; canonical rewrite of doc/tile_scheduling.md as 10-section normative doc (tca.md tone, matmul [128][128][16] running example end-to-end); pointer-stub headers on both superseded files. Deviations: 2 (worktree source-file copy, Q-5 new open question). | 2026-10-28 | 438430b | [261028-g21-review-tile-scheduling-design-docs-doc-t](./quick/261028-g21-review-tile-scheduling-design-docs-doc-t/) |  |
 | 261027-iq6 | Implement doc/fix/fix4.md T6+T7 (A6000 e2e + sanitizer + doc pointer stubs, §8/§9) — T6: frontend matmul_scale GREEN on the A6000 under the new factorization schedule (both syntax variants, canary 0, maxAbs ≤ 2e-3 vs CPU reference — §9(1) carried by the real frontend fixture); compute-sanitizer memcheck+racecheck ZERO errors on every runnable fixture (§9(3)); hermetic pin of the frontend fixture's §5.1 derived launch signature (zero-warp admission class: __launch_bounds__(32), literal dim3(64,1,1)/dim3(32,1,1), smem 0u, 4-arg ValidateLaunch with MaxCTAPolicy 512). ONE mechanical defect found+fixed: C1b forced-FRAG access on a WARP-covered dim emitted the raw lane-chunk walk IV instead of the chunk-local coordinate (memcheck-proven: 241 invalid __local__ reads → 0; fix 218334c + hermetic RED→GREEN pin TestLowerC1bFragChunkLocalAccess + sanctioned golden re-pin). DESIGN GAP STOPPED+HANDED OFF (author ruling needed): §3.1's CTA×WARP(surviving) composition leaves the out[m,n,k] cross product 63/64 uncovered (A6000 histogram probe: every (m,n) pair carries exactly 16/1024 k values; per-warp coupled-walk counter-hypothesis probed and refuted) — golden matmul fixtures t.Skip'd with evidence inline (one line to delete post-ruling); three candidate rulings recorded (reduced-only WARP legality + fail-closed mirror / warp-sliced template redesign / tiling-verify coverage check); decide-side silent-wrong risk flagged. reduce3/reducet1 re-targeted to Wave-1-legal CTA+SEQ schedules (crafted WARP-on-reduced records were §3.5 fail-closed correctly). T7: pointer stubs landed — loop_tile_lower.md (6), rt.md (4), cg.md (4) additions-only 'superseded by doc/fix/fix4.md §X' headers; final_lower.md verified clean; runtime_objects.md rows updated to the landed factorization API (ndim+absolute extents, 4-arg ValidateLaunch, launch-derived totals). Gates: hermetic build/vet/test green at every commit, module count 1, goldens byte-stable except the sanctioned re-pin, scope fenced (ReducedDimWarp default false). Handoff: the §3.1 coverage ruling (candidates 1/2/3); Wave-2 T8 split-k. | 2026-10-27 | 1e8d401 | [261027-iq6-implement-doc-fix-fix4-md-t6-t7-a6000-e2](./quick/261027-iq6-implement-doc-fix-fix4-md-t6-t7-a6000-e2/) |  |
