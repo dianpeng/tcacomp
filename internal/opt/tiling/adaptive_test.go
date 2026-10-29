@@ -355,6 +355,7 @@ func TestSearchRechoiceCollapse(t *testing.T) {
 	// Evaluate the ceremony vector directly: traffic must stay 49152 while
 	// score' carries the 0.0625 tierEff cut.
 	lf := overlapOf(fx, p)
+	lf.reduced = reducedIters(fx.g) // Pass.Run populates this; overlapOf alone does not
 	window := windowOf(lf, p)
 	digits := []schedDigit{
 		{soc: SoCTA, loc: 16, tile: 256},

@@ -399,7 +399,14 @@ type Params struct {
 	// CTA dim contributes min(LoC_d, ceil(NominalExtent/T_d)) active
 	// CTAs — dynamic shapes carry no per-dim extent at compile time, so
 	// the uniform stand-in applies to every CTA dim (grid waste beyond
-	// the nominal extent reads as idleFrac in the score').
+	// the nominal extent reads as idleFrac in the score'). Under fix5
+	// (quick-261029-qwo) it ALSO feeds the R1 adaptive LoC digits
+	// (adaptiveLoC: every dim's digit list gains one extent-derived top
+	// digit per SoC, so a full-grid candidate exists at every tile size)
+	// and the R4 tier-efficiency guard (reducedTierEff: a warp-sharded
+	// reduced dim whose stand-in extent cannot feed its lanes earns no
+	// full traffic credit) — the const-extent path of both formulas uses
+	// the dim's own extent when one is known.
 	NominalExtent int
 	// SMs is the SM count of the occupancy model — the A6000 (GA102,
 	// sm_86) pin: 84. Same pinning discipline as MaxCache.
