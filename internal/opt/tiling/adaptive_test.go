@@ -139,8 +139,11 @@ func TestAdaptiveDigitListConstExtent(t *testing.T) {
 
 	// extent 96: adaptive = clamp(ceil(96/T), 2, 512) -> 3@T32, 2@T64 (dedup
 	// drops the repeated 2 at T128/T256); 3 is NOT in CtaLoCPresets {2,4,...}.
+	// R3 call-site update (quick-261029-v9k): the queried dim is passed as
+	// its own warpDim winner — the CTA-section assertions are winner-
+	// independent, and the pin keeps exercising the full per-dim list.
 	fx := newChain("adapt96", 96, 4096, 4096)
-	digits := digitListOf(fx.iters[0], p, nil)
+	digits := digitListOf(fx.iters[0], p, nil, fx.iters[0])
 	if n := count(digits, SoCTA, 3, 32); n != 1 {
 		t.Fatalf("digitListOf(extent 96) must carry the adaptive (CTA, 3, T32) exactly once, got %d", n)
 	}
@@ -163,9 +166,10 @@ func TestAdaptiveDigitListConstExtent(t *testing.T) {
 	}
 
 	// Dedup against presets: extent 512, tile 32 -> adaptive 16, which IS a
-	// preset — the pair must appear exactly once.
+	// preset — the pair must appear exactly once. (R3: the dim passed as
+	// its own winner — CTA assertions are winner-independent.)
 	fx2 := newChain("adapt512", 512, 4096, 4096)
-	if n := count(digitListOf(fx2.iters[0], p, nil), SoCTA, 16, 32); n != 1 {
+	if n := count(digitListOf(fx2.iters[0], p, nil, fx2.iters[0]), SoCTA, 16, 32); n != 1 {
 		t.Fatalf("digitListOf(extent 512) must carry (CTA, 16, T32) exactly once (preset wins the adaptive duplicate), got %d", n)
 	}
 }

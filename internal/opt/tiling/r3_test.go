@@ -106,13 +106,13 @@ func TestWarpDimRanking(t *testing.T) {
 	}
 
 	// (b) L1 dynamic-tie fall-through to L2 MEMBERSHIP: every dim stands in
-	// at one extent (4096), so the stride-1 set decides. A site whose
-	// innermost subscript chases the OUTER window dim r puts r in the set:
-	// an in-set dim beats the innermost out-of-set dim k.
+	// at one extent (4096), so the stride-1 set decides. Both sites'
+	// innermost subscript chases the OUTER window dim r, so stride1Set =
+	// {r} and the in-set OUTER dim beats the innermost out-of-set dim k.
 	fxB, _, _ := scaleCopyFx(t, false) // r, c, k — all dynamic
-	rB, kB := fxB.iters[0], fxB.iters[2]
-	csRb := []SiteFacts{{AxesIters: [][]ir.Node{{rB}, {fxB.iters[1]}, {kB}}}, // 3D load: innermost k
-		{AxesIters: [][]ir.Node{{rB}, {fxB.iters[1]}, {rB}}}} // degenerate axis chasing r: innermost r
+	rB := fxB.iters[0]
+	csRb := []SiteFacts{{AxesIters: [][]ir.Node{{rB}, {rB}}}, // 2D-ish load: innermost r
+		{AxesIters: [][]ir.Node{{rB}, {rB}, {rB}}}} // 3D load: innermost r
 	if got := warpDimOf(fxB.iters, csRb, nil, p); got != rB {
 		t.Fatalf("L2 membership: warpDimOf must take the in-set OUTER dim r over the innermost out-of-set k, got iter %v", nodeID(got))
 	}
