@@ -411,6 +411,11 @@ func TestDefaultParams(t *testing.T) {
 	if p.MaxCache != 65536 || p.MaxFragPerThread != 256 || p.CacheDims != 2 || p.MaxCS != 16 || p.NominalExtent != 4096 {
 		t.Fatalf("secondary defaults changed: %+v", p)
 	}
+	// quick-261029-n63 occupancy model pins (A6000/sm_86).
+	if p.SMs != 84 || p.WarpsPerSM != 48 || p.ThreadsPerSM != 1536 ||
+		p.SmemPerSM != 102400 || p.ReservedSmemPerCTA != 1024 || p.OccEps != 0.15 {
+		t.Fatalf("occupancy model defaults changed: %+v", p)
+	}
 	assertIntList(t, "TileSizes", p.TileSizes, []int{32, 64, 128, 256})
 	assertIntList(t, "CtaLoCPresets", p.CtaLoCPresets, []int{2, 4, 8, 16, 32, 64})
 	assertIntList(t, "WarpLoCPresets", p.WarpLoCPresets, []int{2, 4, 8, 16, 32})
@@ -459,6 +464,13 @@ func TestParamsValidate(t *testing.T) {
 		{"maxfrag negative", func(p *Params) { p.MaxFragPerThread = -8 }},
 		{"maxcs zero", func(p *Params) { p.MaxCS = 0 }},
 		{"nominalextent zero", func(p *Params) { p.NominalExtent = 0 }},
+		{"sms zero", func(p *Params) { p.SMs = 0 }},
+		{"warps per sm zero", func(p *Params) { p.WarpsPerSM = 0 }},
+		{"threads per sm zero", func(p *Params) { p.ThreadsPerSM = 0 }},
+		{"smem per sm zero", func(p *Params) { p.SmemPerSM = 0 }},
+		{"reserved smem zero", func(p *Params) { p.ReservedSmemPerCTA = 0 }},
+		{"occ eps zero", func(p *Params) { p.OccEps = 0 }},
+		{"occ eps over one", func(p *Params) { p.OccEps = 1.5 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

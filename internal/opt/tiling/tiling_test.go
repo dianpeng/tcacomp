@@ -1568,6 +1568,9 @@ func TestParamsSurface(t *testing.T) {
 		"MaxPartitionCta", "MaxPartitionThr", "MaxCTA", "MaxWarpsPerCTA",
 		"MaxCache", "MaxFragPerThread", "CacheDims", "MaxCS",
 		"ReducedDimWarp", "NominalExtent",
+		// quick-261029-n63 occupancy model fields.
+		"SMs", "WarpsPerSM", "ThreadsPerSM", "SmemPerSM",
+		"ReservedSmemPerCTA", "OccEps",
 	} {
 		if _, ok := rt.FieldByName(want); !ok {
 			t.Fatalf("Params must carry the fix4 2.1 field %q", want)
