@@ -7,6 +7,8 @@
 
 ---
 
+---
+
 uI = [128][128][16]
 
 --------------------------------------------------------
@@ -17,6 +19,33 @@ uI = [128][128][16]
 (2/THR):   [4][4][2]   | [4][4][4]    | [4][4][4]         <- [4][2]
 (3/SEQ)    [4][4][4]   | [1][1][1]    | [1][1][1]
 --------------------------------------------------------
+
+(0/CTA):   [4][4][1] |       combine project
+(1/WARP):  [2][2][2] | cache combine   -     cache
+(2/THR):   [4][4][2] | cache combine   -     cache
+(3/SEQ)    [4][4][4] | map   reduce    -     map
+
+tile(4, 4, 1) -> {
+  smem reduce;
+  reduce.init();
+  tile(2, 2, 2) -> {
+    reduce.init()
+    tile(4, 4, 2) -> {
+      reduce.init();
+      tile(4, 4, 4) -> {
+        auto lhs = mem_load(g_lhs[i4][j4])
+        auto rhs = mem_load(g_rhs[k4][j4])
+        const auto value = lhs * rhs;
+        reduce.reduce(value);
+      }
+      reduce.combine();
+    }
+    reduce.combine()
+  }
+
+  reduce.combine(reduce);
+  mem_write(gxx, reduce);
+}
 
 // CTA level
 for (auto cta_0 = 0; cta_0 < 4; cta_0++) {
