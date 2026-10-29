@@ -2611,3 +2611,283 @@ func TestLoweredMatmulPrintGolden(t *testing.T) {
 		t.Fatal("a for-loop rendered: the deferred statement-nesting contract landed — update this pin and the golden as a conscious contract change")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// quick-261029-v9k (fix5 T2 R3): WARP-on-a-NON-reduced-dim lowering flow
+// ---------------------------------------------------------------------------
+
+// r3ScaleCopyUsed builds the scale_copy schedule class with real data flow:
+// R=512, C=512, K=4 chain; x[r][c][k], z[r][c][k] (the C1b forced-FRAG
+// sites — R is a thread-varying non-covered coordinate of their INS), a
+// w[c][k] site (SMEM window — covered {C, K}, no thread-varying
+// non-covered INS dim), a reduce over K, and the single-owner [R][C]
+// store. Under the R3 collapse record (R=CTA, C=WARP, K=SEQ) this is the
+// exact configuration the suite never exercised before T2: the WARP digit
+// on a covered NON-reduced dim.
+func r3ScaleCopyUsed(t *testing.T) (fx fixture, x, z, w, store ir.Node) {
+	t.Helper()
+	fx = newChain32("r3sc", 512, 512, 4) // R, C, K
+	xP := fx.g.NewInputParam("ctor", ir.RoleTensor, "x",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}, {Name: "d1"}, {Name: "d2"}}))
+	zP := fx.g.NewInputParam("ctor", ir.RoleTensor, "z",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}, {Name: "d1"}, {Name: "d2"}}))
+	wP := fx.g.NewInputParam("ctor", ir.RoleTensor, "w",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d1"}, {Name: "d2"}}))
+	out2 := fx.g.NewInputParam("ctor", ir.RoleTensor, "out2",
+		ir.InternTensor(ir.TF32, []ir.DimRef{{Name: "d0"}, {Name: "d1"}}))
+	iv := func(i int) ir.Node { return fx.g.NewInductionVariable("ctor", fx.iters[i]) }
+	x = fx.g.NewMemLoad("ctor", xP, []ir.Node{iv(0), iv(1), iv(2)})
+	z = fx.g.NewMemLoad("ctor", zP, []ir.Node{iv(0), iv(1), iv(2)})
+	w = fx.g.NewMemLoad("ctor", wP, []ir.Node{iv(1), iv(2)})
+	prod := fx.g.NewBinOp("ctor", ir.BinOpMul, fx.g.NewBinOp("ctor", ir.BinOpMul, x, z), w)
+	// The reduce pipes the Map's tensor output (rank 3 [R,C,K] — the
+	// map/reduce idiom of warpReduceFx/reduce3_test; a scalar pipe fails
+	// typeinfer's "nothing to reduce"), dropping the LAST dim (K).
+	mp := fx.g.NewMap("ctor", []ir.Node{x, z, w}, ir.NewLambda(nil, prod),
+		append([]ir.Node(nil), fx.dims...))
+	acc := fx.g.NewLambdaInputParam("ctor", "acc", ir.InternScalar(ir.TF32))
+	now := fx.g.NewLambdaInputParam("ctor", "now", ir.InternScalar(ir.TF32))
+	comb := fx.g.NewBinOp("ctor", ir.BinOpAdd, fx.g.NewParamRef("ctor", acc), fx.g.NewParamRef("ctor", now))
+	val := fx.g.NewReduce("ctor", fx.g.NewConst("ctor", ir.InternScalar(ir.TF32), 0), mp,
+		ir.NewLambda([]ir.Node{acc, now}, comb))
+	env := ir.NewEnv()
+	store = fx.g.NewMemStoreChained("ctor", env, out2, []ir.Node{iv(0), iv(1)}, val)
+	fx.g.NewReturnChained("ctor", env, []ir.Node{out2}, store)
+	return fx, x, z, w, store
+}
+
+// r3ScaleCopyRecord crafts the R3 collapse record for r3ScaleCopyUsed:
+// R=CTA(16,T256), C=WARP(2,T32), K=SEQ(T32) — the qwo-derived winner
+// class on the const-K scale_copy shape. Site tier derivations (the judge
+// model of fix4 §3.3): x/z covered {K, C} with R a thread-varying
+// non-covered INS dim -> C1b forced FRAG, per-thread window
+// ceil(T_c/32)=1 x T_k=32 x 4 B = 128 B; w covered {C, K} (tie nil) with
+// C WARP-covered and no thread-varying non-covered INS dim -> SMEM window
+// (K_c x T_c) x T_k x 4 = 64x32x4 = 8192 B.
+func r3ScaleCopyRecord(t *testing.T, fx fixture, x, z, w ir.Node) *Record {
+	t.Helper()
+	return recordOf(t, fx, map[int]IterDecision{
+		0: {SoC: SoCTA, LoC: 16, TileSize: 256},
+		1: {SoC: SoCWARP, LoC: 2, TileSize: 32},
+		2: {SoC: SoCSequential, LoC: 1, TileSize: 32},
+	}, map[uint64]SiteDecision{
+		x.BasePtr().ID(): {Promoted: true, Tie: fx.iters[0], Class: ClassFRAG},
+		z.BasePtr().ID(): {Promoted: true, Tie: fx.iters[0], Class: ClassFRAG},
+		w.BasePtr().ID(): {Promoted: true, Tie: nil, Class: ClassSMEM},
+	})
+}
+
+// laneChunkMul reports whether n's subtree contains a lane_id x c mul
+// (the zero-operand lane query multiplied by a chunk size).
+func laneChunkMul(n ir.Node) bool {
+	if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() {
+		return false
+	}
+	if n.KindOf() == ir.KindBinOp {
+		if code, _ := ir.BinOpCodeOf(n); code == ir.BinOpMul {
+			if ops := ir.OperandsOf(n); len(ops) == 2 && ops[0] != nil &&
+				ops[0].KindOf() == ir.KindRuntimeThreadQuery &&
+				len(ir.OperandsOf(ops[0])) == 0 &&
+				ir.RuntimeAttributeOf(ops[0]) == "lane_id" {
+				return true
+			}
+		}
+	}
+	for _, op := range ir.OperandsOf(n) {
+		if laneChunkMul(op) {
+			return true
+		}
+	}
+	return false
+}
+
+// chunkLocalCoord reports whether n is the C1b chunk-LOCAL coordinate
+// (inside - lane x c) — the iq6 access form.
+func chunkLocalCoord(n ir.Node) bool {
+	if n == nil || n.KindOf() != ir.KindBinOp {
+		return false
+	}
+	if code, _ := ir.BinOpCodeOf(n); code != ir.BinOpSub {
+		return false
+	}
+	ops := ir.OperandsOf(n)
+	if len(ops) != 2 {
+		return false
+	}
+	return laneChunkMul(ops[1])
+}
+
+// TestLowerR3WarpNonReducedFlow is the fix5 §3 guard pin for T2: the
+// WARP-on-a-NON-reduced-dim layout (the R3 collapse schedule class:
+// covered dims INCLUDING the WARP dim, the reduced dim SEQ) lowers through
+// tile-lower EXACTLY like the K-WARP split-k class the suite exercises —
+// the machinery is dim-agnostic, only the CHOICE of dim is new (fix5 §3
+// "already flows"). Locked: the WARP template on C (between stride
+// K_d x T_d, lane-chunk inside walk with the F1-clamped bound), the C1b
+// forced-FRAG chunk-LOCAL access (the iq6 form) and the kzv chunk-origin
+// fill window on the FRAG sites, the SMEM window access with the warp
+// rank in the WARP-covered coordinate (R2 rank-in-index), the per-thread
+// LoadTileThread FRAG fill and the cooperative LoadTileCta SMEM fill, the
+// single-owner GMEM store, and verifier + typeinfer health. The one-tier
+// reducer face (reduced dim SEQ -> SeqReducer, zero WarpReducer/
+// GlobalReducer/ThreadMapping-reducer operands) is pinned at the
+// final-lower level by quick-261029-qwo's TestReducerOneTierSeqLadder
+// (unchanged, kept green by the full suite); the multi-tier WarpReducer
+// path's byte-stability rides on the same suite. Every assertion here
+// passes on the UNCHANGED lower code — confirming the fix5 §3 expectation
+// (a RED pin would have been a minimal mechanical defect in T2 scope).
+func TestLowerR3WarpNonReducedFlow(t *testing.T) {
+	fx, x, z, w, store := r3ScaleCopyUsed(t)
+	rec := r3ScaleCopyRecord(t, fx, x, z, w)
+	runLower(t, fx.g, rec)
+
+	// The WARP template on the NON-reduced C dim: between stride K_d x T_d
+	// = 2 x 32 = 64, in warp units (soc 2, loc = K_d = 2); inside is the
+	// lane-chunk walk (step 1, soc 0).
+	loops := nestOf(t, fx.g)
+	var cBetween, cInside ir.Node
+	for _, l := range loops {
+		if ann := loopAnnotations(l); ann["soc"] == 2 {
+			cBetween = l
+			break
+		}
+	}
+	// The multi-dim canonical nest orders ALL betweens before the insides
+	// ([R.b, C.b, K.b, R.i, C.i, K.i] — TestLowerMultiDimTemplates), so C's
+	// inside is NOT adjacent to C's between: it is the soc-0 step-1 loop
+	// whose IV init is the lane x c mul.
+	for _, l := range loops {
+		if loopAnnotations(l)["soc"] != 0 || dimvarStep(t, l) != 1 {
+			continue
+		}
+		liv := ir.OperandsOf(l)[0]
+		lin := ir.OperandsOf(liv)[1]
+		if lin != nil && lin.KindOf() == ir.KindBinOp {
+			if code, _ := ir.BinOpCodeOf(lin); code == ir.BinOpMul && laneChunkMul(lin) {
+				cInside = l
+				break
+			}
+		}
+	}
+	if cBetween == nil {
+		t.Fatal("the C WARP between loop must exist (soc 2)")
+	}
+	if got := dimvarStep(t, cBetween); got != 64 {
+		t.Fatalf("C WARP between step = %v, want K_d x T_d = 2 x 32 = 64", got)
+	}
+	if ann := loopAnnotations(cBetween); ann["loc"] != 2 {
+		t.Fatalf("C WARP between loc = %v, want K_d = 2 (warp units)", ann["loc"])
+	}
+	if cInside == nil || dimvarStep(t, cInside) != 1 || loopAnnotations(cInside)["soc"] != 0 {
+		t.Fatalf("C WARP inside = %v, want the lane-chunk walk (step 1, soc 0)", cInside)
+	}
+	// Lane-chunk init: lane_id x ceil(T_c/32) = lane x 1.
+	iv := ir.OperandsOf(cInside)[0]
+	init := ir.OperandsOf(iv)[1]
+	if init == nil || init.KindOf() != ir.KindBinOp {
+		t.Fatalf("C inside IV init = %v (%s), want the lane x c mul", init, kindOf(init))
+	}
+	if code, _ := ir.BinOpCodeOf(init); code != ir.BinOpMul {
+		t.Fatalf("C inside IV init must be a mul (lane x c), got code %v", code)
+	}
+	mulOps := ir.OperandsOf(init)
+	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
+		t.Fatalf("C inside chunk size = %v, want ceil(32/32) = 1", mulOps[1])
+	}
+	if lane := mulOps[0]; lane == nil || lane.KindOf() != ir.KindRuntimeThreadQuery ||
+		len(ir.OperandsOf(lane)) != 0 || ir.RuntimeAttributeOf(lane) != "lane_id" {
+		t.Fatalf("C inside chunk lane operand = %v, want the zero-operand lane_id query", lane)
+	}
+	// Lane-chunk bound: umin((lane+1) x c, F1 tile_max).
+	bound := boundOf(t, cInside)
+	if bound.KindOf() != ir.KindCall || ir.CallNameOf(bound) != "umin" {
+		t.Fatalf("C inside bound must be a umin call, got %s", kindOf(bound))
+	}
+
+	// Buffers: two 128 B FRAG windows (x, z) + one 8192 B SMEM window (w);
+	// the FRAG fills are per-thread (variant 2) and their source's C axis
+	// carries the kzv chunk-origin window (the lane chunk term added to
+	// the warp window origin — each lane fills ITS OWN chunk).
+	var fragBufs []ir.Node
+	smemSeen := false
+	for _, n := range fx.g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemNew {
+			continue
+		}
+		v, ok := ir.ConstValueOf(ir.OperandsOf(n)[0])
+		if !ok {
+			continue
+		}
+		switch v {
+		case 128:
+			fragBufs = append(fragBufs, n)
+		case 8192:
+			smemSeen = true
+		}
+	}
+	if len(fragBufs) != 2 || !smemSeen {
+		t.Fatalf("buffers: %d x 128 B FRAG + smem %v, want exactly 2 FRAG + 1 x 8192 B SMEM", len(fragBufs), smemSeen)
+	}
+	for _, buf := range fragBufs {
+		fill := findFillOf(t, fx.g, buf)
+		if v := loaderVariantOf(t, fill); v != 2 {
+			t.Fatalf("FRAG fill variant = %v, want 2 (LoadTileThread)", v)
+		}
+		src := ir.OperandsOf(fill)[0]
+		if !laneChunkMul(src) {
+			t.Fatalf("the FRAG fill source %d must carry the lane chunk term (kzv chunk-origin window: rank x T + round + lane x c)", fill.BasePtr().ID())
+		}
+	}
+
+	// Access rewrite: x/z read their FRAG windows with the CHUNK-LOCAL C
+	// coordinate (inside_C - lane x 1 — the iq6 form, here on a
+	// NON-reduced dim); w reads its SMEM window with the warp rank in the
+	// WARP-covered C coordinate (R2 rank-in-index) and the plain walk in
+	// the SEQ-covered K coordinate (no thread query).
+	fragChunkLocal, smemRanked := 0, 0
+	seenAccess := make(map[*ir.Base]bool)
+	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
+		if n.KindOf() != ir.KindMemLoad || seenAccess[n.BasePtr()] {
+			continue // shared Map-body nodes flatten twice — count once
+		}
+		seenAccess[n.BasePtr()] = true
+		sc, _ := ir.StorageClassOf(n)
+		hasChunkLocal, hasRank := false, false
+		for _, c := range ir.OperandsOf(n)[1:] {
+			if chunkLocalCoord(c) {
+				hasChunkLocal = true
+			}
+			if subtreeHasKind(t, fx.g, c, ir.KindRuntimeThreadQuery) {
+				hasRank = true
+			}
+		}
+		switch sc {
+		case ir.StorageFrag:
+			if !hasChunkLocal {
+				t.Fatalf("FRAG access %d must carry the chunk-local C coordinate (inside - lane x c)", n.BasePtr().ID())
+			}
+			fragChunkLocal++
+		case ir.StorageSMem:
+			if !hasRank {
+				t.Fatalf("SMEM access %d must carry the warp rank in the WARP-covered C coordinate", n.BasePtr().ID())
+			}
+			smemRanked++
+		}
+	}
+	if fragChunkLocal != 2 || smemRanked != 1 {
+		t.Fatalf("access rewrite: %d chunk-local FRAG + %d rank-in-index SMEM, want 2 + 1", fragChunkLocal, smemRanked)
+	}
+
+	// Loads erased, single-owner GMEM store survives.
+	if !x.BasePtr().Erased() || !z.BasePtr().Erased() || !w.BasePtr().Erased() {
+		t.Fatal("all three promoted loads must be erased")
+	}
+	if store.BasePtr().Erased() || store.KindOf() != ir.KindMemStore {
+		t.Fatal("the single-owner GMEM store must survive (stores never route through the cache)")
+	}
+
+	assertVerifyAndRootReachable(t, fx.g)
+	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
+		t.Fatalf("typeinfer re-run over the R3-lowered graph: %v", err)
+	}
+}
