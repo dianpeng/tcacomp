@@ -2441,35 +2441,36 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatalf("cache entry under %q is %T, want *Record", RecordName, cache.Get(RecordName))
 	}
 
-	// The REAL searched record over the worked example (the fix4 model's
-	// winner under the 2026-10-26 one-currency amendment, checker-derived
-	// round 2): the schedule assigns M=CTA/4/256 (the R-LOCCAP cap at
-	// T=256: ceil(1024/256) = 4), N=SEQ/1/256, K=WARP/2/32, blockDim 64 —
-	// score 16776960 (rhs 65536×255 = 16711680 + lhs 4×255×64 = 65280),
-	// 256 ahead of the closest challengers at 16776704 (N=SEQ/1/128 +
-	// K=WARP/2/64 or K=WARP/4/32). lhs (covered {K}, a WARP dim under the
-	// C1b forced-FRAG precedence — M is a thread-varying non-covered
-	// coordinate) promotes as a 4-byte per-lane FRAGMENT with per-thread
-	// reuse 256 (its n-walk; §2.7 keeps FRAG record semantics per-thread);
-	// rhs (covered {N SEQ, K WARP}) promotes as a 2·32·256·4 = 65536 B
-	// SMEM window at the MaxCache cap with COLLECTIVE reuse T_M = 256 (the
-	// old per-thread ceil(256/64) = 4 trips × 64 readers = the same
-	// collective 256; sharing 1 since the only WARP dim K ∈ rhs's
-	// subscripts). The decide pass publishes the record UNSTAMPED (F7:
-	// tiling-verify owns the stamp).
+	// The REAL searched record over the worked example, RE-DERIVED under
+	// fix5 R3 (quick-261029-v9k — the actual post-R3 search output, pinned
+	// per the "re-derive, never weaken" rule): the R3 ranking makes N the
+	// per-LNT WARP winner (L1 extent — N=2048 is the largest const extent
+	// of the 1024/2048/512 fixture), so the pre-R3 winner's K=WARP leaves
+	// the feasible area and the new argmax is M=CTA/4/256 (the R-LOCCAP cap
+	// at T=256: ceil(1024/256) = 4), N=WARP/2/256, K=SEQ/1/32, blockDim 64.
+	// lhs (tie N, covered {K}, forced FRAG under the C1b precedence — M is a
+	// thread-varying non-covered coordinate) promotes as a T_k×4 = 128 B
+	// per-thread window with per-thread reuse 8 (the N WARP dim is not in
+	// lhs's subscripts: sharing factor 32 across the 256-element N walk ->
+	// ceil? no — the lane chunk ceil(256/32) = 8 trips, §2.7 per-thread);
+	// rhs (covered {N WARP, K SEQ}) promotes as the (K_n×T_n)×T_k×4 =
+	// 512×32×4 = 65536 B SMEM window at the MaxCache cap with COLLECTIVE
+	// reuse T_M = 256 (§2.4: CTA trips, blockDim-independent; sharing 1
+	// since the only WARP dim N ∈ rhs's subscripts). The decide pass
+	// publishes the record UNSTAMPED (F7: tiling-verify owns the stamp).
 	dM, dN, dK := decisionOf(t, rec, fx.iters[0]), decisionOf(t, rec, fx.iters[1]), decisionOf(t, rec, fx.iters[2])
 	if dM.SoC != SoCTA || dM.LoC != 4 || dM.TileSize != 256 ||
-		dN.SoC != SoCSequential || dN.TileSize != 256 ||
-		dK.SoC != SoCWARP || dK.LoC != 2 || dK.TileSize != 32 {
-		t.Fatalf("searched schedule = M%s/%d/%d N%s/%d/%d K%s/%d/%d, want the probed winner",
+		dN.SoC != SoCWARP || dN.LoC != 2 || dN.TileSize != 256 ||
+		dK.SoC != SoCSequential || dK.LoC != 1 || dK.TileSize != 32 {
+		t.Fatalf("searched schedule = M%s/%d/%d N%s/%d/%d K%s/%d/%d, want the probed winner (M=CTA/4/256 N=WARP/2/256 K=SEQ/1/32 — re-derived under R3, derivation in the test comment)",
 			dM.SoC, dM.LoC, dM.TileSize, dN.SoC, dN.LoC, dN.TileSize, dK.SoC, dK.LoC, dK.TileSize)
 	}
 	sl, ok := rec.SiteDecisionOf(lhs)
 	if !ok {
 		t.Fatal("the searched record must carry lhs's site entry")
 	}
-	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4 || sl.Reuse != 256 {
-		t.Fatalf("searched lhs decision = %+v, want promoted %s of 4 B (the K lane chunk) with reuse 256",
+	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 128 || sl.Reuse != 8 {
+		t.Fatalf("searched lhs decision = %+v, want promoted %s of 128 B (T_k = 32 x 4 B, the whole K SEQ tile per thread) with reuse 8 (the N WARP lane chunk ceil(256/32))",
 			sl, ClassFRAG)
 	}
 	sr, ok := rec.SiteDecisionOf(rhs)
@@ -2477,7 +2478,7 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatal("the searched record must carry rhs's site entry")
 	}
 	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 256 {
-		t.Fatalf("searched rhs decision = %+v, want promoted %s of 65536 B (at the MaxCache cap) with collective reuse 256 (= T_M; the pre-amendment per-thread count was 4)",
+		t.Fatalf("searched rhs decision = %+v, want promoted %s of 65536 B (at the MaxCache cap) with collective reuse 256 (= T_M)",
 			sr, ClassSMEM)
 	}
 	if rec.Verified {
@@ -2496,14 +2497,15 @@ func TestDecideLowerComposition(t *testing.T) {
 		t.Fatalf("tile-lower over the real record: %v", err)
 	}
 
-	// Lowered products: BOTH sites promote — lhs as a 4 B FragNew buffer
-	// (variant 2, the per-lane chunk ceil(32/32) = 1 element of the
-	// WARP-covered K dim) and rhs as a 65536 B MemNewSMem factor window
-	// (variant 1, the cooperative loader) — and the loads are erased.
+	// Lowered products: BOTH sites promote — lhs as a 128 B FragNew buffer
+	// (variant 2, the per-thread whole-K-tile window T_k = 32 x 4 B under
+	// the R3 winner; pre-R3 it was the 4 B K lane chunk) and rhs as a
+	// 65536 B MemNewSMem factor window (variant 1, the cooperative loader)
+	// — and the loads are erased.
 	if !lhs.BasePtr().Erased() || !rhs.BasePtr().Erased() {
 		t.Fatal("both promoted loads must be erased")
 	}
-	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 4)
+	lbuf := findBuffer(t, fx.g, ir.KindMemNew, 128)
 	rbuf := findBuffer(t, fx.g, ir.KindMemNew, 65536)
 	if v := loaderVariantOf(t, findFillOf(t, fx.g, lbuf)); v != 2 {
 		t.Fatalf("the real-record fragment fill variant = %v, want 2 (LoadTileThread)", v)
