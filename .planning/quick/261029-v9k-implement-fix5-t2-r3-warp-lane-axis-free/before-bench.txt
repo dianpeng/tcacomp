@@ -1,0 +1,52 @@
+# quick-261029-v9k Task 1 — BEFORE-state benchmark at parent fdf8ef3
+# (the state T2's commits build on; identical tree to current HEAD 262b5e7,
+# which only adds planning docs).
+#
+# Build: git worktree at fdf8ef3, fresh scripts/build.sh binary (bin/ absent
+# in the fresh checkout — provably not a copied prebuilt).
+# Harness: python3.13 testing/orchestrator.py --bench-iters 20 (A6000,
+# content-addressed fixture cache all hits — same .cu bytes as qwo's runs).
+# Suite: 14 passed, 0 failed, 0 skipped, canary 0 everywhere.
+#
+# Sanity anchors vs qwo-measured (all inside +/-3%, well under the 20%
+# abort band): scale_copy 2387250 vs ~2350000, axpy3 2387140 vs ~2370000,
+# dup_expr 1201110 vs ~1170000, dup_const 1214390 vs ~1180000.
+
+PASS dup_expr [dedup] compile 0.1s build 0.0s run 25.4s (cache) maxdiff 1.90735e-06
+PASS dup_const [dedup] compile 0.1s build 0.0s run 25.6s (cache) maxdiff 7.15256e-07
+PASS axpy3 [fusion] compile 0.1s build 0.0s run 50.3s (cache) maxdiff 9.53674e-07
+PASS mlp [fusion] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS softmax [fusion] compile 0.1s build 0.0s run 1.4s (cache) maxdiff 3.8147e-06
+PASS mm_small [tiling] compile 0.1s build 0.0s run 0.2s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.1s build 0.0s run 7.2s (cache) maxdiff 4.76837e-07
+PASS row_sum [runtime] compile 0.1s build 0.0s run 10.0s (cache) maxdiff 4.76837e-07
+PASS scale_copy [runtime] compile 0.1s build 0.0s run 50.3s (cache) maxdiff 2.38419e-07
+PASS gemm [llm] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.1s build 0.0s run 0.5s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.1s build 0.0s run 10.5s (cache) maxdiff 9.53674e-06
+
+  dedup: 2 passed, 0 failed, 0 skipped (51.2s)
+  fusion: 3 passed, 0 failed, 0 skipped (52.2s)
+  llm: 3 passed, 0 failed, 0 skipped (11.6s)
+  runtime: 2 passed, 0 failed, 0 skipped (60.4s)
+  tiling: 4 passed, 0 failed, 0 skipped (8.2s)
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr        1201110.0  1192600.0  1215390.0  3,710,275
+  dup_const       1214390.0  1208830.0  1233100.0  3,669,701
+  axpy3           2387140.0  2373270.0  2405680.0  3,953,343
+  mlp                6424.4     6289.0     7897.3 15,301,639
+  softmax           60090.9    59583.8    66878.2 37,080,889
+  mm_small           2883.2     2880.2     2902.6  5,682,496
+  mm_mid             6471.7     6410.7     6521.6 40,506,392
+  mm_splitk          6104.9     6102.4     6108.6 16,102,343
+  transpose        335771.0   330301.0   342950.0  3,732,830
+  row_sum          470696.0   466918.0   473880.0 40,098,849
+  scale_copy      2387250.0  2364230.0  2464840.0  3,953,161
+  gemm              10172.0     9803.3    13685.1 20,939,048
+  qk_score          17473.6    17465.6    17495.3 15,939,932
+  layernorm         494086.0  489702.0  504105.0 34,221,346
+14 passed, 0 failed, 0 skipped, total 183.5s
