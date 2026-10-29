@@ -1,0 +1,52 @@
+  fixture: /tmp/tcacomp-suite/3aa9b1a3eaf75670
+  fixture: /tmp/tcacomp-suite/f1ce2f4f4b52959d
+  fixture: /tmp/tcacomp-suite/fa1006a16aa1e16c
+  fixture: /tmp/tcacomp-suite/d5d4e3d9900681e5
+  fixture: /tmp/tcacomp-suite/7986ec3cf552007c
+  fixture: /tmp/tcacomp-suite/425737db0ba40a97
+  fixture: /tmp/tcacomp-suite/6f488fa9723abb45
+  fixture: /tmp/tcacomp-suite/d48851b142de1924
+  fixture: /tmp/tcacomp-suite/6117d3a5230fa537
+  fixture: /tmp/tcacomp-suite/962813325ad5dbcb
+  fixture: /tmp/tcacomp-suite/c1fb7e8473dfa66e
+  fixture: /tmp/tcacomp-suite/8541d21b1429c717
+  fixture: /tmp/tcacomp-suite/bd373e3e36ad6cdb
+  fixture: /tmp/tcacomp-suite/569e7055dc87a7d8
+PASS dup_expr [dedup] compile 0.1s build 0.0s run 24.7s (cache) maxdiff 1.90735e-06
+PASS dup_const [dedup] compile 0.1s build 0.0s run 25.0s (cache) maxdiff 7.15256e-07
+PASS axpy3 [fusion] compile 0.1s build 0.0s run 50.0s (cache) maxdiff 9.53674e-07
+PASS mlp [fusion] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS softmax [fusion] compile 0.1s build 0.0s run 1.4s (cache) maxdiff 3.8147e-06
+PASS mm_small [tiling] compile 0.1s build 0.0s run 0.2s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.1s build 0.0s run 7.1s (cache) maxdiff 4.76837e-07
+PASS row_sum [runtime] compile 0.1s build 0.0s run 9.9s (cache) maxdiff 4.76837e-07
+PASS scale_copy [runtime] compile 0.1s build 0.0s run 49.4s (cache) maxdiff 2.38419e-07
+PASS gemm [llm] compile 0.1s build 0.0s run 0.3s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.1s build 0.0s run 0.5s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.1s build 0.0s run 10.4s (cache) maxdiff 9.53674e-06
+
+  dedup: 2 passed, 0 failed, 0 skipped (49.8s)
+  fusion: 3 passed, 0 failed, 0 skipped (51.9s)
+  llm: 3 passed, 0 failed, 0 skipped (11.4s)
+  runtime: 2 passed, 0 failed, 0 skipped (59.4s)
+  tiling: 4 passed, 0 failed, 0 skipped (8.0s)
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr        1168350.0  1160110.0  1179190.0  3,814,309
+  dup_const       1183560.0  1174470.0  1196590.0  3,765,291
+  axpy3           2376770.0  2372370.0  2378720.0  3,970,592
+  mlp                6295.4     6290.1     6301.1 15,615,261
+  softmax           59596.2    59584.3    59615.8 37,388,693
+  mm_small           2882.2     2880.3     2883.9  5,684,586
+  mm_mid             6494.4     6468.5     6526.1 40,364,622
+  mm_splitk          6099.6     6093.4     6110.3 16,116,440
+  transpose        330317.0   330303.0   330492.0  3,794,464
+  row_sum          464614.0   464580.0   464791.0 40,623,761
+  scale_copy      2345760.0  2339450.0  2350940.0  4,023,082
+  gemm               9819.2     9761.9     9946.1 21,691,380
+  qk_score          17409.5    17403.2    17416.8 15,998,621
+  layernorm        487413.0   487101.0   487908.0 34,689,858
+14 passed, 0 failed, 0 skipped, total 180.5s
