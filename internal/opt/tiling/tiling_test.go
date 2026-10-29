@@ -1062,18 +1062,26 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 	}
 
 	best := enumerateBest(t, fx, p)
-	if traffic != best {
-		t.Fatalf("chosen schedule scores %d, but the enumerated maximum is %d", traffic, best)
+	// The cross-check compares score' (quick-261029-n63): the occupancy-
+	// aware objective — float64(traffic) × occupancyOf(...).factor — on
+	// BOTH sides via the SHARED occupancyOf (constraints.go), never a
+	// re-derived formula. The chosen schedule's post-eviction smem is the
+	// record's kernel-wide promoted sum (this fixture has one LNT).
+	chosen := float64(traffic) * occupancyOf(socMap, smem, p).factor
+	if chosen != best {
+		t.Fatalf("chosen schedule scores %v, but the enumerated maximum is %v", chosen, best)
 	}
 }
 
 // enumerateBest mirrors the pass's feasible-area search over the matmul
-// fixture and returns the maximum score — the optimality cross-check.
-// The judge's gates and arithmetic are re-derived here INDEPENDENTLY (no
-// judgeSite call): digit lists with the R-LOCCAP cap, the tier rule, the
+// fixture and returns the maximum score' (quick-261029-n63: float64
+// traffic × the SHARED occupancyOf factor — the cross-check exercises the
+// same function the search calls, never a re-derived formula). The judge's
+// gates and arithmetic are re-derived here INDEPENDENTLY (no judgeSite
+// call): digit lists with the R-LOCCAP cap, the tier rule, the
 // factor-model bytes, the lane-aware reuse with sharing, the F6 gate,
 // the greedy eviction, and the kernel-wide budget feasibility.
-func enumerateBest(t *testing.T, fx fixture, p Params) int {
+func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	t.Helper()
 	facts := overlapOf(fx, p)
 	window := windowOf(facts, p)
@@ -1082,7 +1090,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) int {
 		digitLists[i] = digitListOf(it, p, nil)
 	}
 	tree := treeItersOf(facts.Tree)
-	best := -1
+	best := -1.0
 	socVec := make([]schedDigit, len(window))
 	var walk func(i int, st partState)
 	walk = func(i int, st partState) {
@@ -1272,8 +1280,11 @@ func enumerateBest(t *testing.T, fx fixture, p Params) int {
 					score += s.bytes * (s.reuse - 1) * holders
 				}
 			}
-			if score > best {
-				best = score
+			// score' via the SHARED occupancyOf — the same function the
+			// search calls (post-eviction smem, the full decision map).
+			scoreP := float64(score) * occupancyOf(iters, smem, p).factor
+			if scoreP > best {
+				best = scoreP
 			}
 			return
 		}

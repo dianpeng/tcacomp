@@ -229,22 +229,32 @@ func feLineContains(src, want string) bool {
 // fePinScheduleSignature pins the fix4 §3.5 SPLIT-K schedule class on the
 // emitted frontend fixture (quick-261027-kzv T8a: the Wave-2 flip makes the
 // feM=64, feN=128, feQ=64 matmul_scale the dedicated split-k kernel — the
-// fix4 §8 staged item). The selected schedule is the §3.5 vector
-// M=CTA(T=256,LoC=64) × N(reduced)=WARP(K=2,T=32) × Q=SEQ(T=256):
+// fix4 §8 staged item; quick-261029-n63 re-chose the vector under the
+// occupancy-aware objective). The selected schedule is
+// M=CTA(T=32,LoC=64) × N(reduced)=WARP(K=32,T=256) × Q=SEQ(T=256):
 //
 //   - gridDim 64 = Π CTA LoC over the LNT's CTA dims (M=CTA/64), emitted
 //     as a literal dim3 in both the launch and ValidateLaunch;
-//   - blockDim 64 = (Π warp K=2)×32 — two physical warps split the reduced
-//     N dim (the split-k vector);
-//   - smem 65544u = 65536 B rhs SMEM window (the MaxCache cap) + 8 B
-//     reducer staging row (`tca_smem + 65536u`, extent 2u = #warps) at a
-//     disjoint offset — the v0 pool never overlaps;
+//   - blockDim 1024 = (Π warp K=32)×32 — 32 physical warps split the
+//     reduced N dim (the split-k vector);
+//   - smem 128u = the reducer staging row ONLY (`tca_smem + 0u`, extent
+//     32u = #warps × sizeof(float)) — the occupancy-aware search (quick-
+//     261029-n63) demoted the rhs SMEM window: at the §3.5 vector the
+//     one-currency traffic is 8355840 (lhs 32 B FRAG × 255 reuse × 1024
+//     holders) against the old window-carrying vectors' 16776960, and the
+//     grid is fully active at the nominal extent (T=32 → activeGrid
+//     min(64, ceil(4096/32)=128) = 64 = grid, idleFrac 0, ctasPerSM 1 via
+//     the 48-warp/32-warp residency term, fill 64/84) — factor ≈ 0.7976
+//     beats the LoC=16/T=256 window vector's 0.3119 (idleFrac 0.75 at
+//     active 16 of 64): 8355840×0.7976 ≈ 6.66M > 16776960×0.3119 ≈ 5.23M.
+//     Derivation from the freshly emitted .cu — never force a schedule to
+//     match a pin;
 //   - 512u — the MaxCTAPolicy constant (cg.Options), the 4th ValidateLaunch
 //     arg of the 4-arg contract (fix4 §4.3);
-//   - __launch_bounds__(64) — the derived blockDim (fix4 §5.1);
+//   - __launch_bounds__(1024) — the derived blockDim (fix4 §5.1);
 //   - the WarpReducer bracket: construction with the combine function +
 //     thread map + staging view, per-element [Init() → N tile-between
-//     ThrIterator rounds (K_d·T_d = 2×32 = 64 stride) with lane-chunk
+//     ThrIterator rounds (K_d·T_d = 32×256 = 8192 stride) with lane-chunk
 //     inside walks → Reduce(value) per element → Combine()], and the
 //     single-owner store gated on is_first_in_cta().
 //
@@ -257,23 +267,25 @@ func feLineContains(src, want string) bool {
 func fePinScheduleSignature(t *testing.T, files map[string][]byte) {
 	t.Helper()
 	pins := []struct{ name, want string }{
-		{"derived __launch_bounds__ (blockDim 64 = 2 warps)", "__launch_bounds__(64)"},
-		{"4-arg ValidateLaunch (literal derived dim3 grid/block, smem 65544u, MaxCTAPolicy 512u)",
-			"ValidateLaunch(dim3(64u, 1u, 1u), dim3(64u, 1u, 1u), 65544u, 512u)"},
-		{"literal dim3 kernel launch", "<<<dim3(64u, 1u, 1u), dim3(64u, 1u, 1u), 65544u"},
-		{"§3.5 WarpReducer construction (combine fn, thread map, disjoint staging row at 65536)",
+		{"derived __launch_bounds__ (blockDim 1024 = 32 warps)", "__launch_bounds__(1024)"},
+		{"4-arg ValidateLaunch (literal derived dim3 grid/block, smem 128u, MaxCTAPolicy 512u)",
+			"ValidateLaunch(dim3(64u, 1u, 1u), dim3(1024u, 1u, 1u), 128u, 512u)"},
+		{"literal dim3 kernel launch", "<<<dim3(64u, 1u, 1u), dim3(1024u, 1u, 1u), 128u"},
+		{"§3.5 WarpReducer construction (combine fn, thread map, staging row at tca_smem + 0)",
 			"tca::rt::WarpReducer<float> reducer0("},
-		{"§3.5 reducer staging row: #warps x sizeof(T) at tca_smem + 65536, extent 2",
-			"tca_smem + 65536u), 2u)"},
-		{"§3.5 reduced-dim N tile-between rounds, K_d*T_d = 64 stride",
-			"ThrIterator(thread_map1, 0u, 2u, 0u, 64u,"},
+		{"§3.5 reducer staging row: #warps x sizeof(T) at tca_smem + 0, extent 32",
+			"tca_smem + 0u), 32u)"},
+		{"§3.5 reduced-dim N tile-between rounds, K_d*T_d = 8192 stride",
+			"ThrIterator(thread_map1, 0u, 32u, 0u, 8192u,"},
+		{"lhs FRAG window per thread (8 floats, LoadTileThread fill)",
+			"tca::rt::Frag<float, 1u, 8u>"},
 	}
 	for name, content := range files {
 		src := string(content)
 		for _, pin := range pins {
 			if !feLineContains(src, pin.want) {
 				t.Fatalf("e2e: emitted %s lost the fix4 §3.5 split-k schedule signature — %s: no line matches %q\n"+
-					"M=CTA/64 x N(reduced)=WARP/2 x Q=SEQ; smem 65544 = 65536 rhs window + 8 reducer staging",
+					"M=CTA/64 x N(reduced)=WARP/32 x Q=SEQ; smem 128 = 32-warp reducer staging (occupancy-aware re-choice, quick-261029-n63)",
 					name, pin.name, pin.want)
 			}
 		}
@@ -320,7 +332,8 @@ func TestFrontendMatmulScalePipeline(t *testing.T) {
 
 // TestFrontendMatmulScale is the DEDICATED fix4 §3.5 split-k matmul e2e
 // (quick-261027-kzv T8): post-flip the real pipeline selects the §3.5
-// vector M=CTA × N(reduced)=WARP/2 × Q=SEQ, so this frontend test IS the
+// vector M=CTA × N(reduced)=WARP × Q=SEQ (32 warps under quick-261029-n63's
+// occupancy-aware objective), so this frontend test IS the
 // split-k numerical battery — the WarpReducer staging fold and cross-warp
 // Combine protocol end-to-end on the A6000.
 func TestFrontendMatmulScale(t *testing.T) {
