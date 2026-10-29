@@ -48,8 +48,8 @@ type schedResult struct {
 	score   float64 // score' — the occupancy-scaled objective
 	traffic int     // the raw post-eviction one-currency traffic sum
 	partism int     // partition count: 2×#CTA dims + #WARP dims (R-PARTITION)
-	smem    int // the chosen schedule's promoted-SMEM window bytes
-	frag    int // the chosen schedule's promoted-FRAG per-thread bytes
+	smem    int     // the chosen schedule's promoted-SMEM window bytes
+	frag    int     // the chosen schedule's promoted-FRAG per-thread bytes
 	// promotedCount is the post-eviction promoted-site count (the
 	// zero-cache warning's predicate — read by the caller, never the
 	// record).
