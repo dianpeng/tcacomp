@@ -1,0 +1,46 @@
+# fix6 — Shape specialization + work-shape model (TODO / future fix)
+
+- Status: TODO — recorded 2026-10-29 from the fix5 T1 gate-3 investigation (quick-261029-qwo) and the const-shape experiment. Not yet designed to implementation depth; this doc captures the ruling intent, the measured evidence, and the known defects to fix. When implementation starts, run the full discuss → research → plan cycle.
+- Relationship: fix5 §4 T3 already reserved "fix6" for the register-blocking / work-shape model (FRAG windows > 1×1, bracket amortization, float4 vectorization, RA smem, cp.async pipelining, swizzle). This doc ADDS the shape-specialization track (§1 below) which the T1 evidence showed is a prerequisite for the heuristic vocabulary (fix5 R1/R4, n63 occupancy) to bite on real kernels. The two tracks are independent and can land in either order; both are required for the elementwise family to reach its target.
+
+## §1 Ruled intent — frontend-declared shape lists, per-shape specialization, dispatching launcher
+
+Ruling (author, 2026-10-29): the frontend should allow the kernel author to declare a **list of possible shapes**; the compiler specializes the kernel for each declared shape and emits a **dispatching launcher** that selects the specialized variant at launch time. The performance/optimization fixes (n63 occupancy objective, fix5 R1/R2/R4, T2/R3) pay off per specialized variant because every heuristic formula finally reads true extents.
+
+Target shape (to be designed):
+
+1. **Shape declaration syntax.** Some frontend spelling that binds concrete extents (or extent sets) to a kernel — e.g. an annotation carrying a shape list, or literal shape dims (already legal per design §2.4: `shape=[512u, 512u, 4u]` — see §2 defect D-fix6-01 for what is broken today).
+2. **Per-shape compilation.** Each declared shape compiles the kernel body with every dim extent a compile-time const: `constExtentOf` succeeds on every dim → `adaptiveLoC` (R1), `reducedTierEff` (R4), and the n63 occupancy `activeGrid` all read true values. No `NominalExtent` stand-in on specialized variants (the stand-in remains only for the unspecialized dynamic fallback, if one is emitted).
+3. **Dispatching launcher.** The host-side entry validates the runtime shape against the declared list and jumps to the matching specialized kernel; an undeclared shape either falls back to a dynamic compile (if emitted) or fails launch with a clear error. Design decision to make: fallback policy, dispatch cost, and whether the shape list lives in the kernel signature or a separate registry.
+4. **Runtime:** no change expected (launch/shape validation already lives behind `ValidateLaunch`; the dispatcher composes above it).
+
+## §2 Measured evidence — why this matters (2026-10-29 const-K experiment)
+
+Hardcoding ONLY the reduced extent (`shape=[R, C, 4u]` on `scale_copy`, mixed dynamic/static) was run end-to-end on the A6000 as a cheap probe of "do the fix5 T1 fixes pay off once the compiler sees the real K":
+
+- Correctness: CANARY 0, MAXDIFF 2.4e-7 — the const-extent pipeline is sound.
+- Emitted schedule: **unchanged** — still the fix5 §0 ceremony vector `R=CTA(T=256,LoC=16) C=SEQ K=WARP(T=32,LoC=2)`, 16 CTAs × 64 threads, per-element `WarpReducer` bracket (verified in the emitted `.cu`).
+- Benchmark: 2.47–2.49 s (`--bench 20`, avg of 20) vs the 2.35 s dynamic-extent baseline — **flat, no boost**.
+
+Mechanism (confirms and extends the qwo diagnosis):
+
+1. R4 DOES bite with const K=4 (`min(1, 4/64) = 0.0625` cuts the ceremony vector's K-covering fills 16×) — but scoring is relative, and the only collapse alternative reachable by the v0 search vocabulary is `C=SEQ, K=SEQ` (blockDim 32; WARP digits are restricted to the reduced dim — fix4 `ReducedDimWarp` tier rules). That vector's per-thread FRAG window is `4 B × T_c × T_k ≥ 4 B × 32 × 32 = 4096 B > MaxFragPerThread 256 B` (tile presets bottom out at 32, `record.go TileSizes`) → both load sites declined → traffic 0 → cannot beat even the penalized ceremony vector.
+2. Therefore: **const shapes are necessary but NOT sufficient** for the elementwise family. The unlock is fix5 T2 (R3 — WARP digit free to land on C: the collapse vector with `C=WARP` prices FRAG at 128 B and wins by 16× in the qwo unit fixture, score 7704.9 vs 481.5) and/or the §3 work-shape model (FRAG windows > 1×1 price the all-SEQ collapse honestly). With those landed, per-shape specialization delivers the payoff: every heuristic formula reads true extents, and the specialized variant compiles to the lanes-on-C schedule the fix5 spec targets.
+
+Consequence for sequencing: T2 (fix5) is not blocked by this doc; shape specialization and T2 compose.
+
+## §3 fix5 T3 track — work-shape model (carried from fix5 §4, unchanged intent)
+
+Register blocking / FRAG windows > 1×1, bracket amortization, effect-chain vectorization (float4), RA smem, explicit barriers + cp.async pipelining, swizzle. Sequenced after T1/T2 land and their numbers are pinned. The 2026-10-29 evidence adds one requirement: the FRAG per-thread budget model must learn to price multi-element windows (the current `Π T_d × dtype` vs `MaxFragPerThread` decline is what zeroes every full-collapse vector).
+
+## §4 Known defects to fix (prerequisites found during the experiment)
+
+- **D-fix6-01 — fully-static shapes with repeated extents do not compile.** The driver keys static dims by the canonical `e<extent>` spelling (`internal/syntax/build/build.go` `dimKey`), so a tensor like `shape=[512u, 512u, 4u]` collapses its two 512-positions into ONE dim → the chain `Iter` rung rejects it ("dim @e512 is listed twice", `pkg/chain.go`). Same-extent positions are distinct iteration spaces and must be distinct dims. A positional-dim attempt (key `owner#e<extent>@<pos>`) progresses past the driver but then hits pkg's name-based reconciliation (`checkOperand` requires the access axis to BE the tensor's own dim, and `dimvar binds distinct shape dims` rejects cross-tensor unification) — the proper fix must unify by-extent static dims PER CHAIN (one IV per dimvar) while keeping per-position identity within a tensor, and plumb the same discipline through `pkg.Local`'s `e<extent>` lookup. Mixed dynamic/static shapes (`[R, C, 4u]`) work today and were the experiment vehicle.
+- **D-fix6-02 — launcher signature changes with const dims.** The generated `Launch` wrapper gains explicit `uint32_t e4`-style params for const dims (`ScaleCopyLaunch(uint32_t e4, ...)` vs the dynamic `ScaleCopyLaunch(...)`), so specialized variants need matching runner/launcher declarations. The dispatching launcher in §1 should absorb this (one stable host face, per-shape kernel entry points behind it).
+
+## §5 Verification gates (when this lands)
+
+1. Hermetic gates unchanged: `go build/vet/test` exit 0; module count 1.
+2. A fully-static suite kernel (repeated extents included — D-fix6-01 fixed) compiles and runs 14/14-clean.
+3. The elementwise family with declared shapes + fix5 T2 landed: ≥10× vs the 2026-10-29 pinned baselines (dup_expr 1.168 s, dup_const 1.184 s, axpy3 2.377 s, scale_copy 2.346 s), no suite kernel >5% slower, memcheck clean on every schedule-changed kernel (the n63/qwo protocol).
+4. The unspecialized/dynamic path (if kept) shows no regression beyond noise — the stand-in behavior is unchanged there by construction, pinned by the existing tests.
