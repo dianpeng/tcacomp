@@ -1,6 +1,7 @@
 # fix5 — Scheduler heuristic vocabulary for sane occupancy schedules (implementation spec)
 
-- Status: READY FOR IMPLEMENTATION PLANNING. Extends fix4 (the factorization model is unchanged — this spec widens the feasible area's *vocabulary* and the objective's *currency*; no constraint is relaxed, no record field changes meaning).
+- Status: READY FOR IMPLEMENTATION. Extends fix4 (the factorization model is unchanged — this spec widens the feasible area's *vocabulary* and the objective's *currency*; no constraint is relaxed, no record field changes meaning).
+- **Amendment 2026-10-29 (author rulings, second session): the three §6 open questions are RESOLVED** — (1) T1 accepts 1-warp CTAs as the interim collapsed-kernel shape (duplicate warps rejected: they duplicate loads, ~N× GMEM traffic, reintroducing the ceremony R2 removed); (2) `MaxCTA` stays **512** for T1, decision deferred to the T1 measurement (one-line Params change); (3) WARP placement is **extent-aware — largest nominal extent first, stride-1 as tie-break, the reduced axis as last-resort fallback**, which preserves the n63 family-B split-K wins exactly (large K wins on extent) while freeing small-K kernels to coalesce on C. The provisional R3 ordering below is superseded by this ruling.
 - **Built on quick-261029-n63** (SM occupancy in the tiling objective: `score' = traffic × (1−idleFrac) × (ε+(1−ε)·fill)`), which delivered 6.9×–29.1× on the reduce-carrying compute family but **left the elementwise/latency-bound family flat (±1.2%)**: dup_expr 1.26 s, dup_const 1.23 s, axpy3 2.45 s, scale_copy 2.38 s (A6000, `--bench-iters 20`).
 - **Conflict rule: where this doc disagrees with `design/fix/fix4.md` on the topics it touches (LoC presets, reducer wiring, thread-map slots), THIS DOC WINS.** fix4's factorization model, constraint arithmetic, record schema, and tiling-verify protocol are inherited verbatim. `design/milestone2/tile_scheduling.md` remains the canonical semantic model; this doc is the v0-search vocabulary to reach it.
 - All section-§ references to fix4 (`§1.3`, `§2.1`, …) are to `design/fix/fix4.md`.
@@ -47,16 +48,17 @@ When the reduced axis is entirely covered by the SEQ layer under the chosen fact
 - Runtime: `WarpReducer` gains a single-tier fast path (or the compiler simply never constructs a reducer object for a one-tier ladder — the latter is preferred: no runtime surface change, final-lower emits a plain accumulator).
 - Interaction with R1: collapse removes the `ReducedDimWarp` traffic penalty that currently makes K=SEQ vectors score dead-last (the warp-sharded fills that demote to per-thread FRAG disappear), so the search can now *choose* K=SEQ on small-K kernels.
 
-### R3 — Warp/lane axis freed from the reduced dim, coalescing preference
+### R3 — Warp/lane axis freed from the reduced dim, extent-aware placement (RULING AMENDED)
 
-The WARP digit may land on **any** dim (not only the reduced one). When multiple dims are eligible, the digit list orders WARP candidates by a coalescing heuristic:
+The WARP digit may land on **any** dim (not only the reduced one). Placement is **extent-aware** (author ruling, 2026-10-29 session 2):
 
 ```
-prefer the dim with stride-1 innermost access AND the largest nominal extent;
-tie → the reduced dim (current behavior); tie → dim order.
+the WARP digit goes to the dim with the LARGEST nominal extent;
+tie → the stride-1 dim (coalescing);
+last-resort fallback → the reduced dim (today's behavior).
 ```
 
-This is the `tile_scheduling.md` §8.3 step-2 machinery (group = lanes sharing all thread coords except the k-shard) applied to whichever axis carries the lanes; the reducer grouping rule is unchanged, it just operates on the actual shard layout. With R2+R3, the saner elementwise schedule falls out naturally: R→CTA (adaptive LoC), C→WARP (lanes sweep contiguous C, fully coalesced), K→SEQ per lane (4 FMAs in registers, no ceremony).
+Rationale: this preserves the n63 family-B split-K wins exactly (a large K wins on extent, so warps-on-K is unchanged for the matmul family) while small-K kernels escape to the long coalescible dim (scale_copy: warps on C). The earlier provisional "stride-1 first" ordering would have risked regressing the split-K matmuls and is superseded. This is the `tile_scheduling.md` §8.3 step-2 machinery (group = lanes sharing all thread coords except the k-shard) applied to whichever axis carries the lanes; the reducer grouping rule is unchanged, it just operates on the actual shard layout. With R2+R3, the saner elementwise schedule falls out naturally: R→CTA (adaptive LoC), C→WARP (lanes sweep contiguous C, fully coalesced), K→SEQ per lane (4 FMAs in registers, no ceremony).
 
 ### R4 — Work-shape term deferred; tier-efficiency guard ruled IN for R2 only
 
@@ -67,7 +69,7 @@ A full per-thread work model (register tiles, ILP, bracket amortization) is **de
 | Surface | Change |
 |---|---|
 | `Params` (record.go) | No new fields; `NominalExtent` (already the stand-in extent) feeds R1's adaptive digits and R4's tier efficiency. Document in the §2.1-style table. |
-| `digitListOf` (search.go) | Add the R1 adaptive top digit per SoC; for WARP dims, order candidates by the R3 coalescing heuristic (needs each dim's stride-1 status — derived from the site's subscripts, available at the site facts level; the ordering is per-window-dim, computed once per LNT). |
+| `digitListOf` (search.go) | Add the R1 adaptive top digit per SoC; for WARP dims, order candidates by the R3 extent-aware heuristic (largest nominal extent, stride-1 tie-break, reduced axis last-resort — computed once per LNT). |
 | `judge.go` | R4: apply tier efficiency to K-covering fill holders when the reduced dim is warp-sharded and `NominalExtent_k < 32·ΠK`. |
 | `constraints.go` | `locPresetOK` gains the adaptive-digit acceptance path (same formula, shared with verify). |
 | `occupancyOf` | Unchanged; R1 makes its `fill` reachable. |
@@ -98,8 +100,10 @@ Each task: TDD pins first (RED), implementation (GREEN), re-derive — never wea
 3. Benchmark gate vs the n63-pinned numbers (`--bench-iters 20`): elementwise family (dup_expr, dup_const, axpy3, scale_copy) each ≥10× faster; no suite kernel >5% slower. Results recorded in the task SUMMARY with the .cu-diff attribution per family (the n63 precedent).
 4. Correctness invariants: schedules remain legal under the unchanged constraint set (tiling-verify green); D1/D2 untouched (GlobalReducer still unreachable — cross-CTA reduction is NOT part of this spec).
 
-## §6 Open questions (author rulings needed before T2)
+## §6 Resolved rulings (author decisions, 2026-10-29 second session)
 
-1. **Idle-warp duplication interim**: in T1, a fully-collapsed kernel may run blockDim=32 (one warp/CTA) with CTAs as the only wide parallelism — accepted as the interim shape (capacity 2,688 CTAs makes fill reachable)? Or must T1 also allow *duplicate* warps (same coordinates, no shard dim) to raise blockDim, wasting compute but raising occupancy?
-2. **MaxCTA 512→2048**: bump the policy ceiling in T1, or measure first at 512?
-3. **R3 ordering vs reduced-dim preference**: when a non-reduced stride-1 dim and the reduced dim are both WARP-eligible, does coalescing always outrank the reducer's natural axis (this spec says yes), or is it extent-dependent?
+The three open questions from the first draft were ruled by the author; the rulings are normative and folded into §1 above.
+
+1. **T1 interim CTA shape — RESOLVED: accept 1-warp CTAs.** Duplicate warps were rejected: they duplicate the loads (~N× GMEM traffic) unless SMEM-shared, reintroducing the ceremony R2 removes. Occupancy is not lost (48 one-warp CTAs fill an SM's 1,536 threads); blockDim 128–1,024 with real per-lane work arrives properly in T2 via R3 lanes-on-C.
+2. **`MaxCTA` — RESOLVED: stays 512 for T1; decide from measurement.** The T1 benchmark shows where fill actually binds; the raise to 2,048 (if warranted) is then a one-line Params change, since the occupancy factor already self-regulates toward grid ≈ capacity.
+3. **WARP-axis precedence — RESOLVED: extent-aware, largest nominal extent first** (stride-1 tie-break, reduced axis last-resort). Preserves the n63 split-K wins (large K wins on extent) while freeing small-K kernels to coalesce on C.
