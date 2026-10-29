@@ -1,5 +1,9 @@
 package tiling
 
+import (
+	"tcacomp/internal/ir"
+)
+
 // constraints.go is the SINGLE SOURCE of the fix4 §2.3 constraint
 // arithmetic — MAPM (expanded-instance dim caps), MALoC (factorization
 // product bounds), and CuMAP (the CTA-dim presence) — shared by the
@@ -109,4 +113,107 @@ func intIn(v int, xs []int) bool {
 		}
 	}
 	return false
+}
+
+// occupancy is the SM-occupancy factor product of one completed schedule
+// (quick-261029-n63, the locked design): the grid the factorization
+// launches, the nominal-extent-active portion of it, the per-SM CTA
+// residency, and the final multiplicative factor
+//
+//	factor = (1 − idleFrac) × (ε + (1−ε)·fill)
+//
+// applied to the post-eviction traffic sum as the search objective's
+// score'. Every field is a pin: the unit tests in occupancy_test.go
+// carry the derivations.
+type occupancy struct {
+	grid, activeGrid       int     // launched CTAs; the NominalExtent-active portion
+	blockDim               int     // the launch blockDim (blockDimOf, Π warp K × 32)
+	ctasPerSM, capacity    int     // resident CTAs per SM; SMs × ctasPerSM
+	idleFrac, fill, factor float64 // wasted-grid fraction; active/capacity (clamped ≤ 1); the score' multiplier
+}
+
+// occupancyOf is THE single source of the occupancy arithmetic (the
+// locked design point: the search and every test/verify re-derivation
+// call this, never re-derive the formula). It extracts the CTA dims
+// from a completed per-iter decision map, derives the blockDim via
+// blockDimOf (judge.go — no second derivation), and delegates to
+// occupancyCompute. Callers: the search applies the factor AFTER the
+// greedy eviction loop (the eviction itself is occupancy-blind);
+// tiling-verify never calls it — legality re-derivation is unchanged by
+// construction (occupancy scales selection only).
+//
+// The CuMAP constraint guarantees ≥ 1 CTA dim on every evaluated
+// schedule, so the extracted slice is never empty here; no empty-CTA
+// path is built for it.
+func occupancyOf(iters map[ir.Node]IterDecision, smemBytes int, p Params) occupancy {
+	cta := make([]IterDecision, 0, len(iters))
+	for _, d := range iters {
+		if d.SoC == SoCTA {
+			cta = append(cta, d)
+		}
+	}
+	return occupancyCompute(cta, blockDimOf(iters), smemBytes, p)
+}
+
+// occupancyCompute is the formula core over a plain CTA-dim slice — the
+// test-facing entry (no IR needed). Formulas, ALL over CTA dims only,
+// per the locked design:
+//
+//	grid        = Π LoC_d
+//	activeGrid  = Π_d min(LoC_d, ceil(NominalExtent/T_d))
+//	smemPerCTA  = smemBytes + ReservedSmemPerCTA
+//	ctasPerSM   = min(WarpsPerSM/(blockDim/32), ThreadsPerSM/blockDim,
+//	                  (SmemPerSM−ReservedSmemPerCTA)/smemPerCTA)
+//	              — INTEGER (floor) division throughout; the smem term
+//	              clamps to 0 when smemPerCTA exceeds its numerator
+//	capacity    = SMs × ctasPerSM  (capacity == 0 → fill = 0)
+//	idleFrac    = 1 − activeGrid/grid  (per-dim min ⇒ activeGrid ≤ grid,
+//	              so idleFrac ≥ 0 by construction)
+//	fill        = min(1, activeGrid/capacity)  as float64
+//	factor      = (1−idleFrac) × (ε + (1−ε)·fill)
+//
+// Every division is guarded: the clamps are TOTAL — capacity == 0 makes
+// fill 0 and the factor degrades to (1−idleFrac)×ε, never a
+// divide-by-zero panic (threat T-n63-02). NominalExtent models every
+// CTA dim at the uniform stand-in extent: dynamic shapes carry no
+// per-dim extent at compile time.
+func occupancyCompute(cta []IterDecision, blockDim, smemBytes int, p Params) occupancy {
+	if blockDim < 32 {
+		blockDim = 32 // blockDimOf yields ≥ 32 (the empty warp product × 32); a defensive floor, unreachable from the search
+	}
+	grid, active := 1, 1
+	for _, d := range cta {
+		grid *= d.LoC
+		perDim := ceilDiv(p.NominalExtent, d.TileSize)
+		if d.LoC < perDim {
+			perDim = d.LoC // min(LoC_d, ceil(N/T_d))
+		}
+		active *= perDim
+	}
+	smemPerCTA := smemBytes + p.ReservedSmemPerCTA
+	smemTerm := 0 // smemPerCTA > the numerator: no CTA of this size fits — total clamp
+	if num := p.SmemPerSM - p.ReservedSmemPerCTA; smemPerCTA <= num {
+		smemTerm = num / smemPerCTA
+	}
+	warpsPerCTA := blockDim / 32
+	ctasPerSM := min(p.WarpsPerSM/warpsPerCTA, p.ThreadsPerSM/blockDim, smemTerm)
+	capacity := p.SMs * ctasPerSM
+	fill := 0.0 // capacity == 0: the clamped, total fill — never a division
+	if capacity > 0 {
+		fill = float64(active) / float64(capacity)
+		if fill > 1 {
+			fill = 1
+		}
+	}
+	idleFrac := 1.0 - float64(active)/float64(grid)
+	return occupancy{
+		grid:       grid,
+		activeGrid: active,
+		blockDim:   blockDim,
+		ctasPerSM:  ctasPerSM,
+		capacity:   capacity,
+		idleFrac:   idleFrac,
+		fill:       fill,
+		factor:     (1.0 - idleFrac) * (p.OccEps + (1.0-p.OccEps)*fill),
+	}
 }

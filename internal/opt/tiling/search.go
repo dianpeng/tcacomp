@@ -11,11 +11,18 @@
 //
 // Determinism contract (fix4 §2.2, INV): the enumeration order is fixed
 // (outermost window dim = most significant digit), selection is
-// strictly-greater on the lexicographic key (traffic, partitionCount)
+// strictly-greater on the lexicographic key (score', partitionCount)
 // with exact ties keeping the FIRST-enumerated candidate, and the
 // LoC-descending digit order resolves full ties toward LARGER LoC
 // vectors ("use the partitioned space fully" — traffic is LoC-neutral,
 // so the tie-only preference never overrides traffic).
+//
+// score' (quick-261029-n63) is the occupancy-aware objective:
+// score' = traffic × (1 − idleFrac) × (ε + (1−ε)·fill), where traffic is
+// the post-eviction one-currency sum and the occupancy factor comes from
+// occupancyOf (constraints.go — the single source). The eviction loop,
+// the constraint predicates, and the enumeration order are untouched:
+// occupancy scales ONLY the final selection.
 package tiling
 
 import (
@@ -30,14 +37,17 @@ import (
 // schedResult is one LNT's search product: per-iter decisions (keyed by
 // the ITER node — the pass converts to BIV keys at record assembly),
 // per-site decisions keyed by MemLoad node id, the chosen schedule's
-// score (post-eviction traffic avoided), its partition count (the
-// tiebreak), and its kernel-wide budget consumption (what the caller
-// adds to the running floors for the next LNT).
+// occupancy-aware score (score' = traffic × the occupancy factor, applied
+// AFTER the greedy eviction), the raw post-eviction traffic sum it was
+// scaled from (diagnostics + the fixed-schedule traffic pins), the
+// partition count (the tiebreak), and its kernel-wide budget consumption
+// (what the caller adds to the running floors for the next LNT).
 type schedResult struct {
 	iters   map[ir.Node]IterDecision
 	sites   map[uint64]SiteDecision
-	score   int
-	partism int // partition count: 2×#CTA dims + #WARP dims (R-PARTITION)
+	score   float64 // score' — the occupancy-scaled objective
+	traffic int     // the raw post-eviction one-currency traffic sum
+	partism int     // partition count: 2×#CTA dims + #WARP dims (R-PARTITION)
 	smem    int // the chosen schedule's promoted-SMEM window bytes
 	frag    int // the chosen schedule's promoted-FRAG per-thread bytes
 	// promotedCount is the post-eviction promoted-site count (the
@@ -167,8 +177,11 @@ func searchScheduleStats(lf lntFacts, p Params, smemFloor, fragFloor int) (sched
 // decision map (window digits plus the sequential defaults for every
 // non-window iter, R-DEFTILE), the per-LNT blockDim context, the site
 // judge, the greedy value-density eviction against the kernel-wide
-// floors, and the (traffic, partitionCount) key. Budget overflow never
-// fails here — it spills (fix4 §2.6).
+// floors, and the (score', partitionCount) key. Budget overflow never
+// fails here — it spills (fix4 §2.6). score' (quick-261029-n63) is the
+// post-eviction traffic sum scaled by the occupancy factor
+// (occupancyOf — constraints.go): the factor uses the POST-EVICTION smem
+// (evictability itself is occupancy-blind, unchanged).
 func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partState, defaultTile int, p Params, smemFloor, fragFloor int) schedResult {
 	treeIters := treeItersOf(lf.Tree)
 	iters := make(map[ir.Node]IterDecision, len(treeIters))
@@ -255,7 +268,7 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 			// windows are filled collectively (holders 1), FRAG windows
 			// by each of the blockDim holder threads — bytes × (reuse − 1)
 			// × holders is CTA-wide GMEM bytes avoided for every class.
-			res.score += s.j.bytes * (s.j.reuse - 1) * s.j.holders
+			res.traffic += s.j.bytes * (s.j.reuse - 1) * s.j.holders
 		}
 		res.sites[s.sf.Load.BasePtr().ID()] = SiteDecision{
 			Promoted: s.j.promoted, Tie: s.sf.Tie, Class: s.j.class,
@@ -265,6 +278,11 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 	res.smem = smem
 	res.frag = frag
 	res.promotedCount = promoted
+	// The occupancy factor (quick-261029-n63) applies AFTER the eviction
+	// loop, to the post-eviction promoted bytes: score' = traffic ×
+	// (1 − idleFrac) × (ε + (1−ε)·fill). Selection-only — the eviction,
+	// the constraints, and the enumeration are occupancy-blind.
+	res.score = float64(res.traffic) * occupancyOf(iters, smem, p).factor
 	return res
 }
 

@@ -110,7 +110,7 @@ func TestOccupancyCapacityZero(t *testing.T) {
 		t.Fatalf("capacity = %d, want 0", o.capacity)
 	}
 	if o.fill != 0 {
-		t.Fatalf("fill = %d, want 0 (capacity 0 clamps)", o.fill)
+		t.Fatalf("fill = %v, want 0 (capacity 0 clamps)", o.fill)
 	}
 	wantFactor := 1.0 * 0.15 // (1−idleFrac)=1, ε + (1−ε)·0 = ε
 	if math.Abs(o.factor-wantFactor) > 1e-12 {
@@ -149,9 +149,20 @@ func TestOccupancyMultiDim(t *testing.T) {
 	if o.capacity != 84*11 {
 		t.Fatalf("capacity = %d, want %d", o.capacity, 84*11)
 	}
-	// fill clamps at 1 once activeGrid >= capacity.
-	if o.fill != 1 {
-		t.Fatalf("fill = %v, want 1 (activeGrid %d >= capacity %d)", o.fill, o.activeGrid, o.capacity)
+	// fill = activeGrid/capacity = 128/924 — below the clamp.
+	wantFill := 128.0 / (84.0 * 11.0)
+	if math.Abs(o.fill-wantFill) > 1e-12 {
+		t.Fatalf("fill = %v, want %v (activeGrid %d / capacity %d)", o.fill, wantFill, o.activeGrid, o.capacity)
+	}
+	// And the clamp itself: an active grid at/over capacity clamps to 1
+	// (3 CTA dims at LoC 64/tile 64: active = 64³ = 262144 ≫ capacity).
+	big := occupancyCompute([]IterDecision{
+		{SoC: SoCTA, LoC: 64, TileSize: 64},
+		{SoC: SoCTA, LoC: 64, TileSize: 64},
+		{SoC: SoCTA, LoC: 64, TileSize: 64},
+	}, 32, 8*1024, p)
+	if big.fill != 1 {
+		t.Fatalf("fill = %v, want 1 (activeGrid %d >= capacity %d)", big.fill, big.activeGrid, big.capacity)
 	}
 }
 

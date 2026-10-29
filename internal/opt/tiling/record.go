@@ -394,11 +394,35 @@ type Params struct {
 	// any that slip through.
 	ReducedDimWarp bool
 	// NominalExtent is the documented stand-in extent for a reuse
-	// dimension whose BIV max operand is NOT a constant. Dormant: reuse is
-	// tile-derived under the fix4 model, so extents enter only the
-	// R-LOCCAP preset cap (const extents), never the objective; the knob
-	// stays on the surface for the future extent-aware ranking models.
+	// dimension whose BIV max operand is NOT a constant. Under
+	// quick-261029-n63 it feeds the occupancy factor's activeGrid: each
+	// CTA dim contributes min(LoC_d, ceil(NominalExtent/T_d)) active
+	// CTAs — dynamic shapes carry no per-dim extent at compile time, so
+	// the uniform stand-in applies to every CTA dim (grid waste beyond
+	// the nominal extent reads as idleFrac in the score').
 	NominalExtent int
+	// SMs is the SM count of the occupancy model — the A6000 (GA102,
+	// sm_86) pin: 84. Same pinning discipline as MaxCache.
+	SMs int
+	// WarpsPerSM is the occupancy model's per-SM warp residency — the
+	// A6000 pin: 48 (max warps per SM, sm_86).
+	WarpsPerSM int
+	// ThreadsPerSM is the occupancy model's per-SM thread residency —
+	// the A6000 pin: 1536 (48 × 32).
+	ThreadsPerSM int
+	// SmemPerSM is the occupancy model's per-SM shared-memory byte count
+	// — the A6000 pin: 102400 (the sm_86 per-SM figure; the per-block
+	// opt-in ceiling is lower and rides ReservedSmemPerCTA's accounting).
+	SmemPerSM int
+	// ReservedSmemPerCTA is the driver-reserved shared memory per CTA —
+	// the sm_86 pin: 1024. Subtracted from SmemPerSM before the smem
+	// residency term divides.
+	ReservedSmemPerCTA int
+	// OccEps is ε of the locked occupancy factor (0, 1]: factor =
+	// (1−idleFrac) × (ε + (1−ε)·fill). The floor ε keeps a schedule that
+	// fills the machine poorly but avoids traffic preferable to not
+	// running it at all; the A6000-calibrated default is 0.15.
+	OccEps float64
 }
 
 // DefaultParams returns the fix4 §2.1 defaults: window K=4, tiles
@@ -406,23 +430,31 @@ type Params struct {
 // {2,4,8,16,32}, MAPM caps 3/3, MaxCTA 512 (gridDim policy cap),
 // MaxWarpsPerCTA 32, 64 KB SMEM, 256 bytes/thread FRAG (F6), CacheDims 2,
 // MaxCS 16, ReducedDimWarp true (Wave 2, fix4 §3.5 split-k enabled),
-// nominal extent 4096.
+// nominal extent 4096, and the A6000/sm_86 occupancy model (quick-261029-n63):
+// SMs 84, WarpsPerSM 48, ThreadsPerSM 1536, SmemPerSM 102400,
+// ReservedSmemPerCTA 1024, OccEps 0.15.
 func DefaultParams() Params {
 	return Params{
-		WindowK:          4,
-		TileSizes:        []int{32, 64, 128, 256},
-		CtaLoCPresets:    []int{2, 4, 8, 16, 32, 64},
-		WarpLoCPresets:   []int{2, 4, 8, 16, 32},
-		MaxPartitionCta:  3,
-		MaxPartitionThr:  3,
-		MaxCTA:           512,
-		MaxWarpsPerCTA:   32,
-		MaxCache:         65536,
-		MaxFragPerThread: 256,
-		CacheDims:        2,
-		MaxCS:            16,
-		ReducedDimWarp:   true,
-		NominalExtent:    4096,
+		WindowK:            4,
+		TileSizes:          []int{32, 64, 128, 256},
+		CtaLoCPresets:      []int{2, 4, 8, 16, 32, 64},
+		WarpLoCPresets:     []int{2, 4, 8, 16, 32},
+		MaxPartitionCta:    3,
+		MaxPartitionThr:    3,
+		MaxCTA:             512,
+		MaxWarpsPerCTA:     32,
+		MaxCache:           65536,
+		MaxFragPerThread:   256,
+		CacheDims:          2,
+		MaxCS:              16,
+		ReducedDimWarp:     true,
+		NominalExtent:      4096,
+		SMs:                84,
+		WarpsPerSM:         48,
+		ThreadsPerSM:       1536,
+		SmemPerSM:          102400,
+		ReservedSmemPerCTA: 1024,
+		OccEps:             0.15,
 	}
 }
 
@@ -433,7 +465,10 @@ func DefaultParams() Params {
 // MaxWarpsPerCTA in [1, 32] (the hardware warp bound), and TileSizes
 // non-empty with entries >= 2 (tile size 1 is not a legal schedule — the
 // compiler never generates a non-tiling schedule, the 2026-10-24 ruling;
-// a tile below 2 would poison the arithmetic).
+// a tile below 2 would poison the arithmetic). The quick-261029-n63
+// occupancy fields fail fast too: SMs/WarpsPerSM/ThreadsPerSM/SmemPerSM/
+// ReservedSmemPerCTA >= 1 and OccEps in (0, 1] (threat T-n63-01's
+// boundary gate).
 func (p Params) Validate() error {
 	if p.WindowK < 1 {
 		return fmt.Errorf("tiling: WindowK %d must be >= 1", p.WindowK)
@@ -488,6 +523,24 @@ func (p Params) Validate() error {
 	}
 	if p.NominalExtent < 1 {
 		return fmt.Errorf("tiling: NominalExtent %d must be >= 1", p.NominalExtent)
+	}
+	if p.SMs < 1 {
+		return fmt.Errorf("tiling: SMs %d must be >= 1 (the occupancy model's SM count)", p.SMs)
+	}
+	if p.WarpsPerSM < 1 {
+		return fmt.Errorf("tiling: WarpsPerSM %d must be >= 1 (the occupancy model's per-SM warp residency)", p.WarpsPerSM)
+	}
+	if p.ThreadsPerSM < 1 {
+		return fmt.Errorf("tiling: ThreadsPerSM %d must be >= 1 (the occupancy model's per-SM thread residency)", p.ThreadsPerSM)
+	}
+	if p.SmemPerSM < 1 {
+		return fmt.Errorf("tiling: SmemPerSM %d must be >= 1 (the occupancy model's per-SM shared-memory bytes)", p.SmemPerSM)
+	}
+	if p.ReservedSmemPerCTA < 1 {
+		return fmt.Errorf("tiling: ReservedSmemPerCTA %d must be >= 1 (the per-CTA driver SMEM reservation)", p.ReservedSmemPerCTA)
+	}
+	if p.OccEps <= 0 || p.OccEps > 1 {
+		return fmt.Errorf("tiling: OccEps %v must lie in (0, 1] (the occupancy factor's ε)", p.OccEps)
 	}
 	return nil
 }
