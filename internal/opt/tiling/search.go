@@ -261,6 +261,7 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 	}
 
 	promoted := 0
+	scaledTraffic := 0.0 // R4 (fix5 §1): the score' currency — traffic × per-site tierEff
 	for _, s := range sites {
 		if s.j.promoted {
 			promoted++
@@ -268,7 +269,12 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 			// windows are filled collectively (holders 1), FRAG windows
 			// by each of the blockDim holder threads — bytes × (reuse − 1)
 			// × holders is CTA-wide GMEM bytes avoided for every class.
+			// The int res.traffic stays the RAW pin (fixed-schedule tests
+			// and tiling-verify consume it); R4's tierEff scales ONLY the
+			// float64 score currency.
 			res.traffic += s.j.bytes * (s.j.reuse - 1) * s.j.holders
+			scaledTraffic += float64(s.j.bytes*(s.j.reuse-1)) * float64(s.j.holders) *
+				reducedTierEff(lf.reduced, iters, s.sf.Covered, p)
 		}
 		res.sites[s.sf.Load.BasePtr().ID()] = SiteDecision{
 			Promoted: s.j.promoted, Tie: s.sf.Tie, Class: s.j.class,
@@ -279,10 +285,12 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 	res.frag = frag
 	res.promotedCount = promoted
 	// The occupancy factor (quick-261029-n63) applies AFTER the eviction
-	// loop, to the post-eviction promoted bytes: score' = traffic ×
-	// (1 − idleFrac) × (ε + (1−ε)·fill). Selection-only — the eviction,
-	// the constraints, and the enumeration are occupancy-blind.
-	res.score = float64(res.traffic) * occupancyOf(iters, smem, p).factor
+	// loop, to the post-eviction promoted bytes: score' = R4-scaled traffic
+	// × (1 − idleFrac) × (ε + (1−ε)·fill). Selection-only — the eviction,
+	// the constraints, and the enumeration are occupancy- and tierEff-blind;
+	// a site covering no reduced warp-sharded dim carries tierEff exactly 1
+	// (bit-identical to the pre-R4 score).
+	res.score = scaledTraffic * occupancyOf(iters, smem, p).factor
 	return res
 }
 
@@ -294,13 +302,25 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 // extents enumerate uncapped. R-REDUCED: when ReducedDimWarp is false (the
 // Wave-1 policy, now the explicit opt-out), a reducer-consuming dim carries
 // no WARP digits at all.
+//
+// R1 (fix5 §1): after each SoC section's preset digits, the section gains
+// its ONE extent-derived adaptive top digit per tile —
+// clamp(ceil(effExtent/T), 2, MaxCTA) for CTA / (..., MaxWarpsPerCTA) for
+// WARP, effExtent the const extent or the NominalExtent stand-in. Dedup:
+// a value already present (a preset, or an adaptive value from an earlier
+// tile) appears exactly once — presets win the duplicate. Placement is
+// deterministic: tiles ascending, appended after the section's presets.
 func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit {
 	tiles := tileCandidates(p) // deduped, ascending (entries >= 2 by Validate)
-	out := make([]schedDigit, 0, len(tiles)*(1+len(p.CtaLoCPresets)+len(p.WarpLoCPresets)))
+	out := make([]schedDigit, 0, len(tiles)*(2+len(p.CtaLoCPresets)+len(p.WarpLoCPresets)))
 	for _, t := range tiles {
 		out = append(out, schedDigit{soc: SoCSequential, loc: 1, tile: t})
 	}
 	extent, constExtent := constExtentOf(iter)
+	effExtent := extent // the R1/R4 effective-extent discipline (const wins)
+	if !constExtent {
+		effExtent = p.NominalExtent
+	}
 	capOf := func(tile int) int {
 		if !constExtent {
 			return -1 // uncapped
@@ -311,6 +331,27 @@ func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit 
 		}
 		return c
 	}
+	// adaptiveSection appends the R1 adaptive digit per tile (tiles
+	// ascending) after the section's preset digits, skipping values already
+	// present in the digit list (presets win; repeated adaptive values
+	// collapse to the first-lowest tile). The adaptive value derives from
+	// the effective extent, so it needs no R-LOCCAP cap of its own.
+	adaptiveSection := func(soc SoCType) {
+		seen := make(map[int]bool, len(out))
+		for _, d := range out {
+			if d.soc == soc {
+				seen[d.loc] = true
+			}
+		}
+		for _, t := range tiles {
+			loc := adaptiveLoC(soc, t, effExtent, p)
+			if seen[loc] {
+				continue
+			}
+			seen[loc] = true
+			out = append(out, schedDigit{soc: soc, loc: loc, tile: t})
+		}
+	}
 	for _, loc := range presetDesc(p.CtaLoCPresets) {
 		for _, t := range tiles {
 			if c := capOf(t); c >= 0 && loc > c {
@@ -319,6 +360,7 @@ func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit 
 			out = append(out, schedDigit{soc: SoCTA, loc: loc, tile: t})
 		}
 	}
+	adaptiveSection(SoCTA)
 	if reduced[iter] && !p.ReducedDimWarp {
 		// R-REDUCED: WARP on a reducer-consuming dim is pruned from the
 		// feasible area while the split-k capability gate is closed
@@ -333,6 +375,7 @@ func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit 
 			out = append(out, schedDigit{soc: SoCWARP, loc: k, tile: t})
 		}
 	}
+	adaptiveSection(SoCWARP)
 	return out
 }
 

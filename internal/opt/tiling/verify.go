@@ -186,7 +186,15 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d / TileSize %d (LoC must be >= 1 and TileSize >= 2 — the compiler never generates a non-tiling schedule, the 2026-10-24 ruling)",
 					it.BasePtr().ID(), d.LoC, d.TileSize)
 			}
-			if !locPresetOK(d.SoC, d.LoC, v.Params) {
+			// The fix5 R1 effective-extent discipline: the iter's const
+			// extent when known, else the NominalExtent stand-in — exactly
+			// what digitListOf enumerated the adaptive digit from, so the
+			// re-check can never disagree with the search on a const dim.
+			effExtent, ok := constExtentOf(it)
+			if !ok {
+				effExtent = v.Params.NominalExtent
+			}
+			if !locPresetOK(d.SoC, d.LoC, d.TileSize, effExtent, v.Params) {
 				return fmt.Errorf("tiling-verify: iter node %d carries LoC %d outside its SoC %s preset list (fix4 2.7)",
 					it.BasePtr().ID(), d.LoC, d.SoC)
 			}

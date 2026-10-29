@@ -284,6 +284,41 @@ func siteReuseCount(sf SiteFacts, iters map[ir.Node]IterDecision, ctx blockDimCt
 	return reuse
 }
 
+// reducedTierEff is the R4 tier-efficiency factor (fix5 §1 R4): for each
+// of the site's COVERED dims that is reduced (reducer-consuming) AND
+// WARP-assigned, multiply min(1, effExtent_k / (32 · K_k)) into the
+// product; every other covered dim contributes exactly 1. A warp-sharded
+// reduced dim whose effective extent cannot feed its lanes earns no full
+// traffic credit for the fills it fragments — the minimal objective
+// amendment that lets the search CHOOSE K=SEQ on small-K kernels (without
+// it the collapse vectors keep losing to the warp-ceremony vectors).
+// effExtent_k is the dim's const extent or the NominalExtent stand-in —
+// the SAME effective-extent discipline as R1's adaptiveLoC.
+//
+// Selection-only (the n63 occupancy precedent): evalSchedule folds this
+// into the float64 score' currency ONLY — the int traffic pin, the judge,
+// the eviction, and tiling-verify stay R4-blind.
+func reducedTierEff(reduced map[ir.Node]bool, iters map[ir.Node]IterDecision, covered []ir.Node, p Params) float64 {
+	eff := 1.0
+	for _, c := range covered {
+		if !reduced[c] {
+			continue // R4 guards reduced dims only
+		}
+		d, ok := iters[c]
+		if !ok || d.SoC != SoCWARP {
+			continue // SEQ/CTA-covered reduced dims fragment nothing
+		}
+		extent, ok := constExtentOf(c)
+		if !ok {
+			extent = p.NominalExtent // dynamic-extent stand-in (feeds every lane)
+		}
+		if e := float64(extent) / float64(32*d.LoC); e < 1.0 {
+			eff *= e // min(1, ·): a fed lane army contributes exactly 1
+		}
+	}
+	return eff
+}
+
 // ceilDiv is the ceiling of a/b over positive integers.
 func ceilDiv(a, b int) int {
 	if b < 1 {

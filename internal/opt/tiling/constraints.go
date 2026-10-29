@@ -91,15 +91,46 @@ func (s partState) cumapOK() bool { return s.ctaDims >= 1 }
 // under MAPM).
 func (s partState) partitionCount() int { return 2*s.ctaDims + (s.thrDims - s.ctaDims) }
 
-// locPresetOK reports whether an absolute LoC belongs to its SoC's preset
-// list (fix4 §2.7's first re-check): CTA -> CtaLoCPresets, WARP ->
-// WarpLoCPresets, SEQ -> the implicit 1.
-func locPresetOK(soc SoCType, loc int, p Params) bool {
+// adaptiveLoC is the R1 adaptive top digit (fix5 §1) — THE single source
+// of the formula, shared by the search's digitListOf (enumeration) and
+// tiling-verify's locPresetOK re-check (acceptance):
+//
+//	LoC_adaptive(d) = clamp(ceil(extent / T_d), 2, MaxCTA)          // CTA dims
+//	K_adaptive(d)   = clamp(ceil(extent / T_d), 2, MaxWarpsPerCTA)  // WARP dims
+//
+// extent is the dim's EFFECTIVE extent: its const extent when one is
+// known, else Params.NominalExtent (the caller resolves it via
+// constExtentOf — the same discipline digitListOf's R-LOCCAP capOf uses,
+// so the search's digit and verify's re-check can never disagree).
+// Effect (fix5 §0 defect 2): at every tile size there now exists a
+// full-grid candidate, so the occupancy factor's fill term is reachable
+// (the preset ceiling no longer caps the menu below device capacity).
+func adaptiveLoC(soc SoCType, tile, extent int, p Params) int {
+	cap := p.MaxCTA
+	if soc == SoCWARP {
+		cap = p.MaxWarpsPerCTA
+	}
+	loc := ceilDiv(extent, tile)
+	if loc < 2 {
+		loc = 2 // tile >= extent: the floor granularity stays >= 2
+	}
+	if loc > cap {
+		loc = cap // the policy ceiling is the real cap (MaxCTA / MaxWarpsPerCTA)
+	}
+	return loc
+}
+
+// locPresetOK reports whether an absolute LoC is legal for its SoC (fix4
+// §2.7's first re-check, grown by fix5 §1 R1): preset-list membership OR
+// equality with the R1 adaptive digit — the SAME shared adaptiveLoC
+// formula the search enumerates (single source; the tile and the
+// effective extent pin which adaptive value the digit must equal).
+func locPresetOK(soc SoCType, loc, tile, extent int, p Params) bool {
 	switch soc {
 	case SoCTA:
-		return intIn(loc, p.CtaLoCPresets)
+		return intIn(loc, p.CtaLoCPresets) || loc == adaptiveLoC(soc, tile, extent, p)
 	case SoCWARP:
-		return intIn(loc, p.WarpLoCPresets)
+		return intIn(loc, p.WarpLoCPresets) || loc == adaptiveLoC(soc, tile, extent, p)
 	default:
 		return loc == 1
 	}

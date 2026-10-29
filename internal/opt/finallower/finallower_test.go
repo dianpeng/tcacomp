@@ -712,6 +712,65 @@ func provenanceOf(t *testing.T, cache *opt.Cache) *tiling.Provenance {
 	return prov
 }
 
+// TestReducerOneTierSeqLadder pins fix5 R2's realization on the lowering
+// side (quick-261029-qwo): when the reduced dim is entirely SEQ under the
+// chosen factorization (the one-tier ladder — no WARP digit on the reduced
+// dim, the K=SEQ collapse vector the R1+R4 search now chooses on small-K
+// LNTs), the construction is the RuntimeSequentialReducer face and NOTHING
+// else: no WarpReducer, no ThreadMapping operand, no SMEM staging row, no
+// GlobalReducer; the store keeps the single-owner path. The runtime
+// SeqReducer class is itself the per-thread accumulator (Init/Reduce/
+// Combine on registers, no synchronization — runtime/tca/reducer.h), so
+// runtime/ is untouched per fix5 §3; the per-element bracket structure is
+// unchanged (bracket amortization is fix6, out of scope).
+func TestReducerOneTierSeqLadder(t *testing.T) {
+	rx := newRedFx(t, false, false)
+	cache := runTileLowerScheduleSplitK(t, rx.f, []tiling.IterDecision{
+		{SoC: tiling.SoCTA, LoC: 100, TileSize: 32},
+		{SoC: tiling.SoCSequential, LoC: 1, TileSize: 64}, // the reduced dim: entirely SEQ
+	})
+	if err := runFinalLower(t, rx.f.g, cache); err != nil {
+		t.Fatalf("final-lower over the one-tier ladder: %v", err)
+	}
+	g := rx.f.g
+
+	// The one-tier construction: exactly one SequentialReducer with the
+	// 2-operand face (init, lambda) — no ThreadMapping, no staging row.
+	seqs := liveOfKind(g, ir.KindRuntimeSequentialReducer)
+	if len(seqs) != 1 || len(liveOfKind(g, ir.KindRuntimeWarpReducer)) != 0 ||
+		len(liveOfKind(g, ir.KindRuntimeGlobalReducer)) != 0 {
+		t.Fatalf("one-tier ladder: exactly one SEQ reducer construction expected, got %d seq / %d warp / %d global",
+			len(seqs), len(liveOfKind(g, ir.KindRuntimeWarpReducer)), len(liveOfKind(g, ir.KindRuntimeGlobalReducer)))
+	}
+	ops := ir.OperandsOf(seqs[0])
+	if len(ops) != 2 || ops[0].BasePtr() != rx.init.BasePtr() || ops[1].BasePtr() != rx.lambda.BasePtr() {
+		t.Fatalf("the SEQ construction must carry (init, lambda) ONLY — no ThreadMapping/staging (zero ceremony), got %d operands", len(ops))
+	}
+	// Zero reducer staging: no SMEM-class MemNew lives in the graph (the
+	// fixture promotes no cache site, and the SEQ construction allocates
+	// none).
+	for _, n := range liveOfKind(g, ir.KindMemNew) {
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageSMem {
+			t.Fatalf("one-tier ladder must allocate no SMEM staging row, found %d", n.BasePtr().ID())
+		}
+	}
+	// The reducer bracket references no thread mapping: the per-LNT
+	// RuntimeThreadMapping that exists is the launch machinery (objects.go
+	// builds the GridMapping/ThreadMapping pair ALWAYS, even with zero
+	// warp portions — the one-warp launch), not reducer ceremony; the
+	// zero-ceremony claim is the SEQ construction's 2-operand face pinned
+	// above (no ThreadMapping/staging operand).
+	for _, u := range ir.OperandsOf(seqs[0]) {
+		if u.KindOf() == ir.KindRuntimeThreadMapping {
+			t.Fatal("the SEQ construction must not reference the ThreadMapping (no warp-collective bracket)")
+		}
+	}
+	// The single-owner store survives on the collapsed path.
+	if len(liveOfKind(g, ir.KindMemStore)) != 1 {
+		t.Fatalf("the epilogue store must remain single-owner (exactly one MemStore), got %d", len(liveOfKind(g, ir.KindMemStore)))
+	}
+}
+
 // TestReducerBracketPlacement pins the R3 bracket law on the tiled path:
 // the construction is a RuntimeWarpReducer (X's Soc 2, LR-7 + R1/R2)
 // carrying (%init, %lambda, ThreadMapping, staging MemNewSMem — one

@@ -571,8 +571,14 @@ func TestMultiCTADimAdmitted(t *testing.T) {
 	}
 	for _, it := range fx.iters {
 		d := decisionOf(t, rec, it)
-		if d.LoC != 1 && !locPresetOK(d.SoC, d.LoC, p) {
-			t.Fatalf("iter %d carries LoC %d outside its preset list", it.BasePtr().ID(), d.LoC)
+		if d.LoC != 1 {
+			extent, ok := constExtentOf(it)
+			if !ok {
+				extent = p.NominalExtent
+			}
+			if !locPresetOK(d.SoC, d.LoC, d.TileSize, extent, p) {
+				t.Fatalf("iter %d carries LoC %d outside its preset list", it.BasePtr().ID(), d.LoC)
+			}
 		}
 	}
 }
@@ -754,18 +760,54 @@ func TestEviction(t *testing.T) {
 	})
 }
 
-// TestStructuralInfeasibility pins the fix4 §2.6 hard error: an LNT
-// where no CTA-carrying digit exists at all (here: Params with no CTA
-// presets — a surface Validate rejects, probed directly at the search
-// entry) is structural infeasibility, never an un-parallelized schedule.
+// TestStructuralInfeasibility pins the fix4 §2.6 hard error and its fix5
+// R1 revision: an empty CTA preset list alone no longer starves the
+// feasible area — the R1 adaptive digit (adaptiveLoC, constraints.go)
+// always exists, so the search succeeds and CTA dims carry extent-derived
+// adaptive LoCs (menu completeness is R1's purpose). The hard error
+// itself survives only in the fully digit-less degenerate case (no tiles
+// at all — a surface Validate rejects, probed directly at the search
+// entry): no digit of any SoC can exist, so no CTA-carrying vector exists.
 func TestStructuralInfeasibility(t *testing.T) {
+	// R1 revision: presets nil -> the adaptive digit still fills the menu
+	// (probed at the search entry — Params.Validate rejects nil presets,
+	// so this uses searchSchedule directly, like the degenerate case).
 	fx, _, _ := matmul()
 	p := DefaultParams()
-	p.CtaLoCPresets = nil // no CTA digit can exist
+	p.CtaLoCPresets = nil
 	lf := overlapOf(fx, p)
-	_, err := searchSchedule(lf, p, 0, 0)
+	res, err := searchSchedule(lf, p, 0, 0)
+	if err != nil {
+		t.Fatalf("with nil CtaLoCPresets the R1 adaptive digit must keep the area searchable (menu completeness), got %v", err)
+	}
+	cta := 0
+	for it, d := range res.iters {
+		if d.SoC != SoCTA {
+			continue
+		}
+		cta++
+		extent, ok := constExtentOf(it)
+		if !ok {
+			extent = p.NominalExtent
+		}
+		if !locPresetOK(d.SoC, d.LoC, d.TileSize, extent, p) {
+			t.Fatalf("adaptive-only CTA dim carries LoC %d rejected by the shared locPresetOK", d.LoC)
+		}
+	}
+	if cta == 0 {
+		t.Fatal("with nil CtaLoCPresets the R1 adaptive digit must still admit CTA dims (menu completeness)")
+	}
+
+	// The surviving degenerate case: no tiles at all -> no digit of any
+	// SoC exists -> structural infeasibility, never an un-parallelized
+	// schedule.
+	p2 := DefaultParams()
+	p2.CtaLoCPresets = nil
+	p2.TileSizes = nil
+	lf2 := overlapOf(fx, p2)
+	_, err = searchSchedule(lf2, p2, 0, 0)
 	if err == nil {
-		t.Fatal("a CTA-less feasible area must be a hard error (structural infeasibility)")
+		t.Fatal("a digit-less feasible area must be a hard error (structural infeasibility)")
 	}
 	if !strings.Contains(err.Error(), "structural infeasibility") {
 		t.Fatalf("the error must name structural infeasibility, got %q", err.Error())
