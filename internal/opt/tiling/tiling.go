@@ -104,8 +104,12 @@ func (p Pass) Run(ctx *opt.Context, g *ir.Graph) error {
 	// Populated here — after analyzeOverlap — so the discovery logic
 	// itself stays untouched.
 	reduced := reducedIters(g)
+	// §3.1 (ruling 2026-10-30): the eliminated set rides beside the
+	// reducer-consuming set — warpDimOf's WARP ranking consumes it.
+	eliminated := reducedAxesOf(g)
 	for i := range op.Trees {
 		op.Trees[i].reduced = reduced
+		op.Trees[i].eliminated = eliminated
 	}
 	record := &Record{
 		Iters: make(map[ir.Node]IterDecision),

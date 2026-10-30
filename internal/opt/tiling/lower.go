@@ -176,6 +176,18 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 			return err
 		}
 	}
+	// §3.1 fail-closed MIRROR (author ruling, 2026-10-30, iq6 candidate-1 —
+	// unconditional, BOTH flag modes): a WARP-assigned dim that is NOT an
+	// eliminated axis (a SURVIVING warp dim) is rejected before any
+	// rewrite. GPU-proven on the R3 re-choice kernels (row_sum/softmax,
+	// canary exactly 1/64 of the output space): the CTA-coupled-inside ×
+	// lane-chunk composition covers only a diagonal of the cross product —
+	// the iq6 §3.1 class. The decide-side §3.1 prune (warpDimOf) makes the
+	// class unrepresentable; this mirror catches hand-stamped or corrupted
+	// records. Lift BOTH fences when the cross-product lowering is designed.
+	if err := rejectWarpSurvivingDims(g, decisions); err != nil {
+		return err
+	}
 
 	// Launch-blockDim pre-pass (fix4 §3.2/§5.1): the launch blockDim is
 	// the MAX over the forest's LNTs of (Π warp K_d) × 32 — never the
@@ -259,6 +271,58 @@ type lowerRun struct {
 	rewrites       []*lntRewrite // per-root products, Roots() order
 	fills          []*siteFill   // PHASE 4 products, for the §8 placement/scope checks
 	prov           *Provenance   // the P-5 provenance under construction
+}
+
+// rejectWarpSurvivingDims is the §3.1 fail-closed mirror (author ruling,
+// 2026-10-30, iq6 candidate-1): in a REDUCE-CARRYING graph, every
+// WARP-assigned iter that is NOT an ELIMINATED reduction axis
+// (reducedAxesOf — feeds a Reduce's value, never a store subscript) fails
+// closed with a named error. A WARP digit on a SURVIVING output axis
+// lowers through the CTA-coupled-inside × lane-chunk composition whose
+// cross product is 63/64 UNCOVERED — GPU-proven on the R3 re-choice
+// kernels (row_sum/softmax: canary exactly 1/64 of the output space; the
+// iq6 §3.1 class "every (m,n) pair carries 16/1024 k values").
+//
+// Scope — reduce-carrying graphs ONLY (both ReducedDimWarp modes): every
+// REAL v0 kernel reduces (the chain shape is map|reduce[|map]|store), so
+// the mirror binds 100% of kernels that reach codegen. A crafted
+// no-Reduce template graph (the lower-test corpus' mechanics fixtures)
+// never occurs in the pipeline and carries no output-axis reduction to
+// protect — the mirror stays silent there, leaving the template pins
+// intact for the future §3.1 lowering's machinery tests. The decide-side
+// §3.1 prune (warpDimOf) makes the class unrepresentable; this mirror
+// catches hand-stamped or corrupted records the way the tile-floor gate
+// catches tile 1. Lift BOTH fences when the tile-lower cross-product
+// lowering is designed.
+func rejectWarpSurvivingDims(g *ir.Graph, decisions map[ir.Node]IterDecision) error {
+	eliminated := reducedAxesOf(g)
+	if len(eliminated) == 0 {
+		// Also short-circuit when the graph carries NO live Reduce at all
+		// (see the scope note): nothing real to protect.
+		hasReduce := false
+		for _, n := range g.AllocatedNodes() {
+			if n != nil && n.BasePtr() != nil && !n.BasePtr().Erased() && n.KindOf() == ir.KindReduce {
+				hasReduce = true
+				break
+			}
+		}
+		if !hasReduce {
+			return nil
+		}
+	}
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindIter {
+			continue
+		}
+		d, ok := decisions[n]
+		if !ok || d.SoC != SoCWARP || eliminated[n] {
+			continue
+		}
+		return fmt.Errorf(
+			"tile-lower: WARP-assigned iter node %d is a SURVIVING (non-eliminated) axis — the §3.1 CTA-coupled-inside × lane-chunk composition covers only a diagonal of the cross product (GPU-proven 1/64 coverage on row_sum/softmax, the iq6 class). Surviving-WARP vectors are pruned from the decide-side feasible area (warpDimOf §3.1 prune); design the tile-lower cross-product lowering before lifting either fence",
+			n.BasePtr().ID())
+	}
+	return nil
 }
 
 // rejectWarpReducedDims is the fix4 §3.5 Wave-1 defense: every
