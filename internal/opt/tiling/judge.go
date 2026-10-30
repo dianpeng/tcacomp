@@ -38,12 +38,30 @@ package tiling
 //     multiplied per-window bytes by per-thread trips, rewarding
 //     warp-splits that shrink blockDim without moving wire bytes — that
 //     phantom term is gone.
-//   - GATES: traffic avoided (bytes × (reuse − 1) × holders, all sites in
-//     the one CTA-wide currency — equivalently reads-served minus
+//   - FRAG PRICING (fix6 §3, quick-261030-v62 — the honest register-block
+//     model): a FRAG site's RAW per-thread window (siteWindowBytesRaw —
+//     Π T_d × sizeof over the covered dims) is priced as a STREAMED
+//     REGISTER BLOCK for the budget: its budget footprint is
+//
+//        blockFootprint = min(rawWindow, MaxFragPerThread)
+//
+//     (the window's peak live per-thread bytes under budget-sized
+//     streaming — one chunk of at most the whole budget lives in
+//     registers at a time). The per-site F6 size DECLINE is REMOVED: an
+//     over-budget window promotes when its traffic gate passes, exactly
+//     like every other class. The TRAFFIC term keeps pricing the RAW
+//     window: traffic = rawWindow × (reuse − 1) × holders, no cap — the
+//     one-currency avoided-GMEM model is not weakened (the block pricing
+//     must not reward shrinking the fill). The kernel-wide budget still
+//     binds on the block footprints: Σ blockFootprint over the kernel's
+//     promoted FRAG sites vs MaxFragPerThread spills by value density
+//     (ReasonEvicted, fix4 §2.6) — never a per-site decline, never a
+//     failure.
+//   - GATES: traffic avoided (rawBytes × (reuse − 1) × holders, all sites
+//     in the one CTA-wide currency — equivalently reads-served minus
 //     elements-refilled per fill epoch) > 0 — this also fails closed a
-//     zero-byte site; and a FRAG site's per-thread bytes <=
-//     MaxFragPerThread (F6). Fill cost is therefore visible to the gate
-//     and the eviction density both.
+//     zero-byte site. Fill cost is therefore visible to the gate and the
+//     eviction density both.
 
 import (
 	"tcacomp/internal/ir"
@@ -76,11 +94,22 @@ type siteJudgment struct {
 	promoted bool
 	class    CacheClass
 	reuse    int // re-traversal count within one fill epoch (§2.4: collective for SMEM, per-thread for FRAG)
-	bytes    int // factor-model window footprint
+	// bytes is the BUDGET footprint (fix6 §3): the SMEM window bytes, or
+	// for FRAG the register-block footprint min(rawWindow,
+	// MaxFragPerThread). It feeds the search's eviction sum, tiling-
+	// verify's kernel-wide re-check, and the lower's budget resolution —
+	// the ONE shared pricing source (siteWindowBytes).
+	bytes int
+	// rawBytes is the TRAFFIC footprint (fix6 §3): the RAW factor-model
+	// window — sizeof × Π covered factors, no budget transform. The
+	// objective's traffic term (rawBytes × (reuse − 1) × holders) prices
+	// it uncapped; == bytes for SMEM sites and at-or-under-budget FRAG
+	// sites.
+	rawBytes int
 	// holders is the currency scale (fix4 §2.4 amendment): the threads
 	// that fill a window per epoch — 1 for a collectively-filled SMEM
 	// window, the LNT blockDim for a per-thread FRAG window. Multiplied
-	// into traffic (bytes × (reuse − 1) × holders) it puts every site
+	// into traffic (rawBytes × (reuse − 1) × holders) it puts every site
 	// class in the ONE CTA-wide GMEM-byte currency.
 	holders int
 	reason  string
@@ -89,9 +118,13 @@ type siteJudgment struct {
 // judgeSite is the fix4 §2.4 promotion judge. The site is classified by
 // the SoC of its COVERED dims (the cached trailing dimensions; rank >=
 // CacheDims is guaranteed by the admission filter), priced by the shared
-// siteWindowBytes, and gated on traffic avoided and the FRAG budget. An
-// iter with NO decision, or a covered iter at tile < 2, fails closed
-// (ReasonUnknownIter) — never scored.
+// siteWindowBytesRaw (traffic) / siteWindowBytes (budget), and gated on
+// traffic avoided — there is NO per-site FRAG size decline (fix6 §3: an
+// over-budget window prices as a streamed register block and promotes
+// when its traffic gate passes, like every other class; the kernel-wide
+// budget binds later, by eviction). An iter with NO decision, or a
+// covered iter at tile < 2, fails closed (ReasonUnknownIter) — never
+// scored.
 func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx blockDimCtx, p Params) siteJudgment {
 	if len(sf.Covered) == 0 {
 		return siteJudgment{reason: ReasonEmptyCovered}
@@ -141,27 +174,27 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx blockDimCtx, p 
 	if class == ClassFRAG {
 		holders = ctx.blockDim
 	}
-	bytes := siteWindowBytes(sf, iters, class)
-	if class == ClassFRAG && bytes > p.MaxFragPerThread {
-		return siteJudgment{class: class, holders: holders, bytes: bytes, reason: ReasonFragBytes}
-	}
+	// fix6 §3 (quick-261030-v62): NO per-site FRAG size decline — the raw
+	// window is priced, never declined on size. rawBytes is the traffic
+	// footprint (uncapped); bytes is the budget footprint (the streamed
+	// register block: min(raw, MaxFragPerThread) for FRAG, the window
+	// itself for SMEM) — both from the ONE shared source.
+	rawBytes := siteWindowBytesRaw(sf, iters, class)
+	bytes := siteWindowBytes(sf, iters, class, p)
 	reuse := siteReuseCount(sf, iters, ctx, class)
 	// One-currency promotion gate (§2.4): traffic avoided in the CTA-wide
 	// currency must be positive. This subsumes the old reuse < 2 gate AND
 	// fails closed a zero-byte site (an unavailable element type prices 0
 	// bytes — no traffic claim). A fail-closed reuse 0 makes the product
 	// negative, declining the site the same way.
-	if bytes*(reuse-1)*holders <= 0 {
-		return siteJudgment{class: class, holders: holders, reuse: reuse, bytes: bytes, reason: ReasonLowReuse}
+	if rawBytes*(reuse-1)*holders <= 0 {
+		return siteJudgment{class: class, holders: holders, reuse: reuse, bytes: bytes, rawBytes: rawBytes, reason: ReasonLowReuse}
 	}
-	return siteJudgment{promoted: true, class: class, holders: holders, reuse: reuse, bytes: bytes}
+	return siteJudgment{promoted: true, class: class, holders: holders, reuse: reuse, bytes: bytes, rawBytes: rawBytes}
 }
 
-// siteWindowBytes is the site's factor-model footprint (fix4 §2.4, the
-// ONE bytes function the search, tiling-verify's cross-check, and the
-// lower's budget resolution share — decide and lower MUST agree, so
-// neither side carries its own arithmetic): sizeof(dtype) × Π over the
-// covered dims of the dim's factor,
+// siteWindowBytesRaw is the site's RAW factor-model footprint (fix4 §2.4):
+// sizeof(dtype) × Π over the covered dims of the dim's factor,
 //
 //   - SMEM window class: WARP -> K_d × T_d (one window per warp
 //     coordinate), SEQ -> T_d, CTA -> LoC_d × T_d (diagnostic only —
@@ -171,9 +204,11 @@ func judgeSite(sf SiteFacts, iters map[ir.Node]IterDecision, ctx blockDimCtx, p 
 //     under C1b -> ceil(T_d/32) (the lane's consecutive chunk) — NO other
 //     lane division.
 //
-// An unavailable element type reports 0 (fail closed: contributes no
-// traffic).
-func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision, class CacheClass) int {
+// This is the TRAFFIC footprint (the fill/buffer size the lower allocates
+// — its per-dim buffer extents use exactly these factors) and the SMEM
+// budget number. An unavailable element type reports 0 (fail closed:
+// contributes no traffic).
+func siteWindowBytesRaw(sf SiteFacts, iters map[ir.Node]IterDecision, class CacheClass) int {
 	e, ok := elemTypeOf(sf.Load)
 	if !ok {
 		return 0
@@ -196,6 +231,29 @@ func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision, class CacheCl
 		}
 	}
 	return bytes
+}
+
+// siteWindowBytes is the site's BUDGET footprint — the ONE bytes function
+// the search's eviction sum, tiling-verify's kernel-wide cross-check, and
+// the lower's budget resolution share (decide and lower MUST agree, so
+// neither side carries its own arithmetic). For SMEM sites it is the
+// window itself (siteWindowBytesRaw). For FRAG sites it is the streamed
+// register-block footprint under the fix6 §3 ruling (quick-261030-v62):
+//
+//	blockFootprint = min(siteWindowBytesRaw, MaxFragPerThread)
+//
+// the window's peak live per-thread bytes under budget-sized streaming.
+// The over-budget remainder still fills (and its RAW bytes price the
+// traffic term via siteJudgment.rawBytes — the one-currency avoided-GMEM
+// model is not weakened); only the BUDGET accounting chunks it. The
+// kernel-wide Σ blockFootprint vs MaxFragPerThread binds by eviction
+// (fix4 §2.6), never by a per-site decline.
+func siteWindowBytes(sf SiteFacts, iters map[ir.Node]IterDecision, class CacheClass, p Params) int {
+	raw := siteWindowBytesRaw(sf, iters, class)
+	if class != ClassFRAG {
+		return raw
+	}
+	return min(raw, p.MaxFragPerThread)
 }
 
 // siteReuseCount is the fix4 §2.4 reuse factor under the 2026-10-26

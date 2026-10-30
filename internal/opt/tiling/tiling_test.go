@@ -1562,13 +1562,13 @@ func TestFragBudgetGate(t *testing.T) {
 	iters := mk(func(d map[ir.Node]IterDecision) {})
 	ctx := blockDimCtx{blockDim: blockDimOf(iters)}
 	j := judgeSite(siteOf(t, lf, lhs), iters, ctx, p)
-	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 {
-		t.Fatalf("a 256 B FRAG at the cap must promote with its budget footprint == 256, got (%v, %s, %d B)", j.promoted, j.class, j.bytes)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.rawBytes != 256 {
+		t.Fatalf("a 256 B FRAG at the cap must promote with block == raw == 256, got (%v, %s, block %d, raw %d)", j.promoted, j.class, j.bytes, j.rawBytes)
 	}
 	iters2 := mk(func(d map[ir.Node]IterDecision) { d[window[len(window)-1]] = IterDecision{SoCSequential, 1, 128} })
 	j = judgeSite(siteOf(t, lf, lhs), iters2, ctx, p)
-	if !j.promoted || j.bytes != 256 {
-		t.Fatalf("a 512 B raw FRAG must PROMOTE priced at the 256 B block (fix6 §3: no per-site size decline), got (promoted %v, block %d)", j.promoted, j.bytes)
+	if !j.promoted || j.bytes != 256 || j.rawBytes != 512 {
+		t.Fatalf("a 512 B raw FRAG must PROMOTE priced at the 256 B block (fix6 §3: no per-site size decline), got (promoted %v, block %d, raw %d)", j.promoted, j.bytes, j.rawBytes)
 	}
 
 	// Schedule level: the same 256 B block site survives at floor 0 but is

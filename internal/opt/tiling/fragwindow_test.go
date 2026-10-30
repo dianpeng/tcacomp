@@ -63,19 +63,20 @@ func TestFragWindowHonestPricing(t *testing.T) {
 	// T64: 4 B × 64 = 256 B raw — exactly the cap. Block == raw (both
 	// 256): the boundary case is unchanged by the repricing.
 	j := judgeSite(siteOf(t, lf, lhs), mk(64), ctx, p)
-	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.reason != "" {
-		t.Fatalf("a 256 B FRAG at the cap must promote with its budget footprint == 256, got (promoted %v, %s, block %d, %q)",
-			j.promoted, j.class, j.bytes, j.reason)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.rawBytes != 256 || j.reason != "" {
+		t.Fatalf("a 256 B FRAG at the cap must promote with block == raw == 256, got (promoted %v, %s, block %d, raw %d, %q)",
+			j.promoted, j.class, j.bytes, j.rawBytes, j.reason)
 	}
 	// T128: 4 B × 128 = 512 B raw — OVER the cap. Pre-fix6 this DECLINED
 	// with the F6 reason (the defect: the decline zeroed every full-
 	// collapse vector, fix6 §2's 4096 B evidence). Fix6 §3: PROMOTED, the
-	// budget prices the 256 B register block (the search-level traffic
-	// pin below proves the traffic term keeps the raw 512 B window).
+	// budget prices the 256 B register block, the judgment's rawBytes
+	// carries the raw 512 B window for the traffic term (pinned through
+	// the search-level traffic in TestFragWindowSearchTraffic too).
 	j = judgeSite(siteOf(t, lf, lhs), mk(128), ctx, p)
-	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.reason != "" {
-		t.Fatalf("a 512 B raw FRAG must PROMOTE priced as a 256 B block (fix6 §3: no per-site size decline), got (promoted %v, %s, block %d, %q)",
-			j.promoted, j.class, j.bytes, j.reason)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.rawBytes != 512 || j.reason != "" {
+		t.Fatalf("a 512 B raw FRAG must PROMOTE priced as a 256 B block (fix6 §3: no per-site size decline), got (promoted %v, %s, block %d, raw %d, %q)",
+			j.promoted, j.class, j.bytes, j.rawBytes, j.reason)
 	}
 	if j.bytes > p.MaxFragPerThread {
 		t.Fatalf("the block footprint %d must stay within MaxFragPerThread %d", j.bytes, p.MaxFragPerThread)

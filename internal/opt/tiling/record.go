@@ -116,7 +116,7 @@ type IterDecision struct {
 // means the cache sits directly above the OUTERMOST loop of the site's
 // LNT. DoSoC is deliberately absent — the lower pass derives it (§1c).
 //
-// The 2026-10-21 rulings (R2/R4/F4/F6) make the record self-describing —
+// The 2026-10-21 rulings (R2/R4/F4) make the record self-describing —
 // Reuse is the site's re-traversal count within one fill epoch (0 when
 // not computed) under the 2026-10-26 one-currency amendment semantics
 // (§2.4/§2.7: COLLECTIVE per window instance for SMEM sites, PER-THREAD
@@ -138,26 +138,29 @@ type SiteDecision struct {
 	// value on a decline; else 0. The holders scaling to the CTA-wide
 	// currency lives only in the objective, never here.
 	Reuse int
-	// Bytes is the site's window-model footprint (window bytes for SMEM,
-	// per-thread bytes for FRAG); the computed value on a frag-byte or
-	// reuse decline; else 0.
+	// Bytes is the site's BUDGET footprint under the fix6 §3 model: the
+	// window-model bytes for SMEM; for FRAG the register-block footprint
+	// min(raw per-thread window, MaxFragPerThread) (the computed value on
+	// a decline; else 0). The site's RAW window — what the traffic term
+	// prices and the lower allocates — is derivable from the covered
+	// dims' decisions via the shared siteWindowBytesRaw, exactly what
+	// tiling-verify's judge cross-check re-runs.
 	Bytes int
 	// Reason names the decline cause on a non-promoted entry ("" when
 	// promoted) — one of the Reason constants below.
 	Reason string
 }
 
-// The decline reasons (R2 tier rule, F4 drop-rule gate, F6 frag budget,
-// the per-thread reuse gate, the R4 non-candidate declarations, and the
-// fix4 §2.6 greedy-eviction demotion). Stable strings: the record,
-// tiling-verify, and the tests pin them.
+// The decline reasons (R2 tier rule, the per-thread reuse gate, the R4
+// non-candidate declarations, and the fix4 §2.6 greedy-eviction
+// demotion). Stable strings: the record, tiling-verify, and the tests
+// pin them. (The F6 per-site FRAG size decline is GONE — fix6 §3,
+// quick-261030-v62: over-budget windows price as register blocks and
+// promote; the budget binds kernel-wide by eviction.)
 const (
 	// ReasonCTACovered: a covered dim is CTA-assigned — no coherent fill
 	// variant exists under the v0 mechanics (R2 tier rule, refusal).
 	ReasonCTACovered = "covered dim CTA-assigned: no coherent fill variant (R2 tier rule)"
-	// ReasonFragBytes: the per-thread FRAG footprint exceeds
-	// MaxFragPerThread (F6).
-	ReasonFragBytes = "FRAG bytes exceed MaxFragPerThread (F6)"
 	// ReasonLowReuse: reuse < 2 in the site's currency (collective for
 	// SMEM, per-thread for FRAG — the §2.4 one-currency gate): the cached
 	// bytes are not re-traversed, so no CTA-wide traffic is avoided.
@@ -371,13 +374,16 @@ type Params struct {
 	// (greedy spill); it is never a hard error.
 	MaxCache int
 	// MaxFragPerThread is the per-thread FRAG byte budget (F6, ruled
-	// 2026-10-21; default 256 bytes/thread): the SUM of promoted FRAG
-	// sites' per-thread bytes, kernel-wide, must stay within it — an
-	// unbounded register footprint spills to local memory (doc/tca.md
-	// §5.8), strictly worse than the GMEM load it replaced. It gates the
-	// judge (a single site over the cap is declined) and the schedule
-	// feasibility (the accumulated sum, spill-gated per fix4 §2.6), and
-	// backs the lower's halve/drop fallback.
+	// 2026-10-21; default 256 bytes/thread), repriced by fix6 §3
+	// (quick-261030-v62): the SUM of promoted FRAG sites' register-block
+	// footprints — min(raw per-thread window, MaxFragPerThread) each —
+	// kernel-wide, must stay within it (an unbounded register footprint
+	// spills to local memory, doc/tca.md §5.8, strictly worse than the
+	// GMEM load it replaced). There is NO per-site size decline anymore:
+	// an over-budget window promotes and prices its budget chunk; an
+	// over-budget SUM spills by value density (fix4 §2.6, ReasonEvicted),
+	// never fails, and the repriced sum backs the lower's halve/drop
+	// fallback.
 	MaxFragPerThread int
 	// CacheDims is the dimension-level reuse count: only the last
 	// CacheDims tensor dimensions may be promoted (hardcoded 2 in the doc).

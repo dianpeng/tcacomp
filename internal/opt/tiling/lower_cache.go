@@ -55,13 +55,16 @@ package tiling
 //
 // WINDOW SIZING + ACCESS (fix4 §2.4/§3.3, R-C1B): a covered WARP dim's
 // SMEM buffer extent is K_d x T_d (one window per warp coordinate — the
-// SAME factor the decide side's shared siteWindowBytes prices; the old
+// SAME factor the decide side's shared siteWindowBytesRaw prices; the old
 // whole-group #threads_d x T_d shard window is gone, 32x smaller now),
 // and the access index on that dim is thread_map.index(d)·T_d + i (d =
 // the dim's ThreadMap slot in warp units, i = the lane's sequential
 // inside walk). A C1b forced-FRAG site sizes its WARP-covered dim at
 // ceil(T_d/32) per lane. SEQ covered dims contribute T_d and index by
-// their plain inside coordinate. FRAG buffers are per-thread: plain i.
+// their plain inside coordinate. FRAG buffers are per-thread: plain i —
+// sized by the RAW window factors (fix6 §3: the budget side chunks the
+// same window to min(raw, MaxFragPerThread); the allocation itself stays
+// the full window).
 
 import (
 	"fmt"
@@ -133,8 +136,11 @@ func (p LowerPass) resolveBudget(rec *Record, facts []lntFacts, decisions map[ir
 			m[it] = dec(it)
 		}
 		// The record's class decides the pricing model (the C1b precedence
-		// may have forced FRAG over a WARP-covered dim — per-thread bytes).
-		return siteWindowBytes(sf, m, rec.Sites[sf.Load.BasePtr().ID()].Class)
+		// may have forced FRAG over a WARP-covered dim — per-thread bytes),
+		// priced by the SAME shared budget function the decide side's
+		// eviction and tiling-verify gate (siteWindowBytes — fix6 §3: FRAG
+		// prices the register-block footprint, min(raw, MaxFragPerThread)).
+		return siteWindowBytes(sf, m, rec.Sites[sf.Load.BasePtr().ID()].Class, p.Params)
 	}
 	// kernelSum returns (smem, frag) over every promoted, non-dropped site
 	// — the SAME window-bytes sums the decide feasibility and tiling-verify
@@ -371,13 +377,16 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	}
 
 	// Buffer: the fix4 §2.4/§3.3 WINDOW model (R-C1B) — per covered dim,
-	// the SAME factors the decide side's shared siteWindowBytes prices
-	// (one budget, both halves; a divergence would break the fail-closed
-	// record agreement): a WARP-covered dim contributes K_d x T_d under
-	// the SMEM class (one window per warp coordinate — 32x smaller than
-	// the old whole-group shard window) and ceil(T_d/32) under a C1b
-	// forced-FRAG site (the lane's consecutive chunk); SEQ dims
-	// contribute T_d either way.
+	// the SAME RAW factors the decide side's shared siteWindowBytesRaw
+	// prices (the fill/buffer size — the actual allocation, NOT the
+	// budget chunk: fix6 §3 prices the budget as min(raw, MaxFragPerThread)
+	// via siteWindowBytes, but the over-budget remainder still fills and
+	// reads — one budget, both halves; a divergence would break the
+	// fail-closed record agreement): a WARP-covered dim contributes K_d x
+	// T_d under the SMEM class (one window per warp coordinate — 32x
+	// smaller than the old whole-group shard window) and ceil(T_d/32)
+	// under a C1b forced-FRAG site (the lane's consecutive chunk); SEQ
+	// dims contribute T_d either way.
 	// The tile TENSOR TYPE binds via SetType — the typeinfer MemLoadSMem rule's
 	// own message names this pass as the binder ("cache lowering must bind
 	// buffer types first"), the one documented exception to P8's
