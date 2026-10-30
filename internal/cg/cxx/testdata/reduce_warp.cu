@@ -37,8 +37,8 @@ __global__ void __launch_bounds__(32) Redwarp(uint32_t d0, uint32_t d1, const fl
       auto v3 = tca::rt::umin(v2, c0);
       auto v4 = (c0 - v3);
       auto v5 = tca::rt::umin(c5, v4);
-      // @d0 walk — sequential, LoC=1
-      for (auto d0_it1 = tca::rt::SeqIterator(0u, 1u, v5); d0_it1.Has(); d0_it1.Next()) {
+      // @d0 tile-between rounds — thread/warp, T=32, LoC=32
+      for (auto d0_it1 = tca::rt::ThrIterator(thread_map1, 0u, 32u, thread_map1.index(), 32u, v5); d0_it1.Has(); d0_it1.Next()) {
         // per-element bracket opens (argument-free; re-initializes from the construction-time init)
         reducer0.Init();
         // @d1 tile-between rounds — sequential, T=64, LoC=1
@@ -55,10 +55,7 @@ __global__ void __launch_bounds__(32) Redwarp(uint32_t d0, uint32_t d1, const fl
         }
         // per-element combine — every participant receives the element's final value
         auto v11 = reducer0.Combine();
-        // single-owner store — the element's owner thread writes (R2/R3)
-        if (thread_map1.is_first_in_cta()) {
-          out_v.Set(v11, (v2 + d0_it1.Index()));
-        }
+        out_v.Set(v11, (v2 + d0_it1.Index()));
       }
     }
   }
