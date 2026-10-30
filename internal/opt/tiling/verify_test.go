@@ -356,9 +356,12 @@ func TestVerifyForLoopStep(t *testing.T) {
 //     8192 B rhs — the vector evacuates BOTH sites and scores 0.
 //   - The all-SEQ-covered vector (M=CTA/64/8, N=SEQ/1/8, K=SEQ/1/8,
 //     blockDim 32) judges lhs as a 32 B FRAG at reuse 8 (the N walk),
-//     traffic 32×7×32 = 7168; rhs is a 256 B FRAG (≤ MaxFragPerThread —
-//     ReasonFragBytes cannot fire) that declines ReasonLowReuse on the M
-//     CTA dim (per-thread ceil(8/32) = 1 trip). No SMEM exists, nothing
+//     traffic 32×7×32 = 7168; rhs is a 256 B RAW FRAG window — priced at
+//     the 256 B register block under fix6 §3 (min(raw, MaxFragPerThread),
+//     no per-site decline — re-derivation note: the old comment said
+//     "ReasonFragBytes cannot fire"; the reason is GONE, the honest
+//     pricing replaced it) — that declines ReasonLowReuse on the M CTA
+//     dim (per-thread ceil(8/32) = 1 trip). No SMEM exists, nothing
 //     evicts, score 7168 > 0 — TRAFFIC decides; the partitionCount
 //     tiebreak never comes into play.
 //

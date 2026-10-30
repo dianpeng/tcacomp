@@ -104,15 +104,23 @@ func compileTcaSource(t *testing.T, fname, src string) string {
 // rebuild renders a bare `SeqIterator(0u, 1u, ...)` — the defect-B shape.
 var laneOriginInitRe = regexp.MustCompile(`SeqIterator\(\(v\d+ \* c\d+\), 1u,`)
 
-// TestFix5T2OneTierCollapseEmission pins the §3.1-PRUNED row_sum emission
-// (the real [R,K,C] middle-reduce kernel the R3 re-choice had broken):
-//
-//  1. Multi-tier control: the emitted kernel constructs the WarpReducer
-//     (the restored pre-T2 schedule — the one-tier SeqReducer class is
-//     unreachable from real kernels under the prune).
-//  2. §3.1: the LNT factorization carries thread/warp on the ELIMINATED
-//     dim only — the surviving C dim must be sequential (the
-//     GPU-broken surviving-WARP class must not be representable).
+// TestFix5T2OneTierCollapseEmission pins the row_sum emission class.
+// RE-DERIVED under fix6 §3 (quick-261030-v62): the pre-fix6 pin locked
+// the MULTI-TIER WarpReducer schedule ("the restored pre-T2 class") —
+// under the F6 per-site FRAG decline the all-SEQ collapse was
+// unrepresentable in the search (its covered window priced over
+// MaxFragPerThread and declined, the qwo gate-3 mechanism). fix6 §3
+// prices the window honestly, and the honest winner on the [R,K,C]
+// middle-reduce shape is now the ALL-SEQ COLLAPSE: R=CTA(16,T256),
+// C=SEQ(1,T256), K=SEQ(1,T256), blockDim 32 — the per-thread K reduction
+// lowers through the ONE-TIER SeqReducer (no WarpReducer anywhere), with
+// the per-thread Frag<float, 2, 256, 256> windows (256 KB/thread — local
+// memory until the fix6 register-blocking codegen lands; legality is the
+// suite + memcheck's job per the fix6 §5.3 protocol, performance is
+// recorded honestly in the task SUMMARY). The §3.1 legality pin is
+// UNTOUCHED and load-bearing as ever: no SURVIVING dim carries
+// thread/warp (C stays sequential — the GPU-broken surviving-WARP class
+// stays unrepresentable).
 //
 // Re-instatement contract: when the §3.1 cross-product lowering lands and
 // the warpDimOf prune + rejectWarpSurvivingDims mirror lift, this test
@@ -122,26 +130,30 @@ var laneOriginInitRe = regexp.MustCompile(`SeqIterator\(\(v\d+ \* c\d+\), 1u,`)
 func TestFix5T2OneTierCollapseEmission(t *testing.T) {
 	cu := compileTcaSource(t, "row_sum.tca", rowSumOneTierSrc)
 
-	// 1. Multi-tier control: the restored pre-T2 schedule constructs the
-	//    WarpReducer (not the one-tier SeqReducer the pruned R3 re-choice
-	//    can no longer produce).
-	if !strings.Contains(cu, "tca::rt::WarpReducer<float>") {
-		t.Fatal("fixture control: the §3.1-pruned row_sum must emit its pre-T2 multi-tier WarpReducer schedule (the restored class)")
+	// 1. The fix6 §3 winner: the all-SEQ collapse lowers the per-thread K
+	//    reduction through the ONE-TIER SeqReducer — the multi-tier
+	//    WarpReducer ceremony class lost the search to the honest block
+	//    pricing (was: "must emit WarpReducer" while the collapse was
+	//    F6-declined — that decline is the defect fix6 §3 removes).
+	if strings.Contains(cu, "tca::rt::WarpReducer<float>") {
+		t.Fatal("fix6 §3: the honest winner is the all-SEQ collapse (one-tier SeqReducer) — the multi-tier WarpReducer ceremony must not appear")
+	}
+	if !strings.Contains(cu, "tca::rt::SeqReducer") {
+		t.Fatal("fix6 §3: the all-SEQ collapse lowers the per-thread K reduction through the one-tier SeqReducer")
 	}
 
-	// 2. §3.1: the WARP digit sits on the ELIMINATED dim only. The LNT
-	//    factorization line lists the surviving C dim as sequential —
-	//    a surviving dim carrying thread/warp is the GPU-broken class
-	//    (canary 1/64) and must be unrepresentable.
+	// 2. §3.1: a surviving dim carrying thread/warp is the GPU-broken
+	//    class (canary 1/64) and must be unrepresentable. Under the fix6
+	//    §3 collapse there is no WARP digit at all (K reduces
+	//    per-thread) — trivially pruned; the pin stays load-bearing for
+	//    the day the WARP digit re-enters: it may sit ONLY on the
+	//    eliminated K dim.
 	for _, line := range strings.Split(cu, "\n") {
 		if !strings.Contains(line, "LNT #0:") {
 			continue
 		}
 		if strings.Contains(line, "C=thread/warp") {
 			t.Fatalf("§3.1: the surviving C dim must not carry a WARP digit, LNT line: %s", strings.TrimSpace(line))
-		}
-		if !strings.Contains(line, "K=thread/warp") {
-			t.Fatalf("§3.1: the eliminated K dim must carry the WARP digit (the pre-T2 split-k class), LNT line: %s", strings.TrimSpace(line))
 		}
 	}
 }
