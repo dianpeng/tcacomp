@@ -6,11 +6,14 @@
 // pure consecutive-map form is not expressible. The two stages lower as
 // map|reduce|map over a trailing reduced axis; both maps and the chain
 // composition remain exercised.
+// const-K declaration (mixed dynamic/static form per design/fix/fix6.md —
+// fully-static is blocked by D-fix6-01/03): the trailing reduced extent is
+// a compile-time constant, Ku = 4.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="Axpy3")
 kernel axpy3(
-  x: tensor<dtype=f32, shape=[R, C, K]>,
-  z: tensor<dtype=f32, shape=[R, C, K]>,
+  x: tensor<dtype=f32, shape=[R, C, 4u]>,
+  z: tensor<dtype=f32, shape=[R, C, 4u]>,
   alpha: f32,
   beta: f32,
   gamma: f32,

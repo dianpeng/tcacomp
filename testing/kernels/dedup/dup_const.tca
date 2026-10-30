@@ -8,11 +8,14 @@
 // reduction selects the v0-unreachable GlobalReducer (recorded compiler
 // defect), so a second operand z weights the polynomial; the literal-reuse
 // coverage is unchanged.
+// const-K declaration (mixed dynamic/static form per design/fix/fix6.md —
+// fully-static is blocked by D-fix6-01/03): the trailing reduced extent is
+// a compile-time constant, Ku = 8.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="DupConst")
 kernel dup_const(
-  x: tensor<dtype=f32, shape=[R, C, K]>,
-  z: tensor<dtype=f32, shape=[R, C, K]>,
+  x: tensor<dtype=f32, shape=[R, C, 8u]>,
+  z: tensor<dtype=f32, shape=[R, C, 8u]>,
 ) -> tensor<dtype=f32, shape=[R, C]>
 {
   dimvar (i, j, k);
