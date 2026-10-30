@@ -4,7 +4,10 @@
 // behind this shape).
 #include "common.cuh"
 
-void SoftmaxLaunch(const tca::Tensor<float, 3u>& x, const tca::Tensor<float, 3u>& z,
+// e8: the const MIDDLE reduced extent the compiler now bakes into the
+// kernel (see the kernel file / design/fix/fix6.md D-fix6-02 — the emitted
+// Launch wrapper prepends uint32_t e<extent> for const dims).
+void SoftmaxLaunch(uint32_t e8, const tca::Tensor<float, 3u>& x, const tca::Tensor<float, 3u>& z,
                    tca::Tensor<float, 2u>& out, cudaStream_t tca_stream);
 
 int main(int argc, char** argv) {
@@ -33,7 +36,7 @@ int main(int argc, char** argv) {
   auto xT = tca::Tensor<float, 3u>::From(dX, dR, dK, dC);
   auto zT = tca::Tensor<float, 3u>::From(dZ, dR, dK, dC);
   auto outT = tca::Tensor<float, 2u>::From(dOut, dR, dC);
-  SoftmaxLaunch(xT, zT, outT, 0u);
+  SoftmaxLaunch(dK, xT, zT, outT, 0u);
   CUDA_OK(cudaDeviceSynchronize());
   CUDA_OK(cudaMemcpy(hOut, dOut, nOut * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -64,7 +67,7 @@ int main(int argc, char** argv) {
   PrintSamples(hOut, nOut);
 
   if (bench > 0u &&
-      !BenchReport(bench, [&] { SoftmaxLaunch(xT, zT, outT, 0u); })) {
+      !BenchReport(bench, [&] { SoftmaxLaunch(dK, xT, zT, outT, 0u); })) {
     return 3;
   }
 

@@ -10,11 +10,14 @@
 // reduction probed does; (2) the shipped rank-2-output two-input form
 // schedules the WARP-reducer class. The row-reduction coverage is
 // unchanged.
+// const-K declaration (mixed dynamic/static form per design/fix/fix6.md —
+// fully-static is blocked by D-fix6-01/03): the MIDDLE reduced extent is a
+// compile-time constant, Ku = 4.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="RowSum")
 kernel row_sum(
-  x: tensor<dtype=f32, shape=[R, K, C]>,
-  z: tensor<dtype=f32, shape=[R, K, C]>,
+  x: tensor<dtype=f32, shape=[R, 4u, C]>,
+  z: tensor<dtype=f32, shape=[R, 4u, C]>,
 ) -> tensor<dtype=f32, shape=[R, C]>
 {
   dimvar (i, k, j);

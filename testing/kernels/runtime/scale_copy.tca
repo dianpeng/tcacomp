@@ -8,11 +8,14 @@
 // defect), so a second operand z weights the affine term:
 // out[i][j] = sum_k (gain * x + bias) * z. The elementwise map and the
 // tiled store remain exercised.
+// const-K declaration (mixed dynamic/static form per design/fix/fix6.md —
+// fully-static is blocked by D-fix6-01/03): the trailing reduced extent is
+// a compile-time constant, Ku = 4.
 @runtime(cxx_path="runtime/tca_runtime.h");
 @name(cxx="ScaleCopy")
 kernel scale_copy(
-  x: tensor<dtype=f32, shape=[R, C, K]>,
-  z: tensor<dtype=f32, shape=[R, C, K]>,
+  x: tensor<dtype=f32, shape=[R, C, 4u]>,
+  z: tensor<dtype=f32, shape=[R, C, 4u]>,
   gain: f32,
   bias: f32,
 ) -> tensor<dtype=f32, shape=[R, C]>
