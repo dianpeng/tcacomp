@@ -1,34 +1,32 @@
-// fix5t2_one_tier_test.go — quick-261029-v9k follow-up (author ruling): the
-// R3 collapse re-choice (warps on a NON-reduced element dim, the reduced
-// dim SEQ — the one-tier SeqReducer ladder) exposed two latent defects on
-// the real row_sum/softmax kernels (GPU-proven: canary unwritten outputs
-// + memcheck Invalid __local__ read). These EMIT-LEVEL pins lock the fixed
-// emission shape hermetically (no GPU — the qwo e88f049 precedent: a
-// compile-level/emit-level pin is the RED gate; the orchestrator suite is
-// the numerical acceptance):
+// fix5t2_one_tier_test.go — quick-261029-v9k follow-up, RE-DERIVED under the
+// §3.1 ruling (author, 2026-10-30, iq6 candidate-1). History: the R3
+// re-choice (warps on a NON-reduced dim) exposed two latent one-tier-path
+// defects (GPU-proven: canary unwritten outputs + memcheck Invalid
+// __local__ reads on row_sum/softmax) — the executor's cg/finallower fixes
+// (RED 722a652 / GREEN fd72179) are real and stay locked at unit level
+// (the reduce_warp golden + TestReducerOneTierSeqLadder). The GPU failure
+// itself was then root-caused deeper: the C=WARP re-choice was the
+// SURVIVING-WARP class — the iq6 §3.1 CTA-coupled-inside × lane-chunk
+// cross-product hole (canary exactly 1/64 of the output space, the
+// "16/1024 k values" class) — a LOWERING defect, not an emission defect.
+// The ruling prunes the class (warpDimOf §3.1 prune + the tile-lower
+// mirror), so the real row_sum returns bit-identically to its pre-T2
+// multi-tier schedule (sha256 72db430…, GPU-verified 14/14 at every prior
+// battery). THIS pin now locks the pruned state:
 //
-//   - Defect A: the cg prescan gated EVERY Combine()-closure store on
-//     is_first_in_cta() — correct for the CTA-collective multi-tier
-//     WarpReducer (one elected writer stores the combined result), WRONG
-//     for the one-tier SeqReducer whose Combine is an identity over EACH
-//     THREAD'S OWN accumulator: every thread owns distinct output
-//     elements, so the gate drops every non-first thread's stores (the
-//     observed canary). The one-tier epilogue store must be UNGATED.
-//   - Defect B: finallower's buildElementLoop rebuilt the output-element
-//     loops as fresh UNIFORM init-0 walks (correct for multi-tier — every
-//     thread must walk every element; its WARP sharding lives on the
-//     REDUCED dim inside the bracket, never rebuilt). For the one-tier
-//     collapse the WARP dim IS an element dim: its lane-chunk walk's
-//     lane-origin init (lane x ceil(T/32)) is what makes the chunk-local
-//     FRAG coordinate and the store coordinate correct, and the uniform
-//     rebuild reset it to 0 — the FRAG access subtracted the lane origin
-//     from the now-origin-less local index (negative for lanes >= 1 — the
-//     observed Invalid __local__ read). The element loops must keep their
-//     original per-thread walks (lane-origin init intact).
+//   - the emitted row_sum is the multi-tier WarpReducer class (the
+//     restored pre-T2 schedule);
+//   - §3.1: NO surviving dim carries a WARP digit (the LNT factorization
+//     puts thread/warp on the ELIMINATED dim K only);
+//   - the one-tier SeqReducer class is unreachable from real kernels
+//     under the prune — when the §3.1 cross-product lowering is designed
+//     and the fences lift, re-instate the one-tier fixture control and
+//     pins A/B below (they are the ready-made RED gate for that lifting).
 //
-// The fixture is the real testing/kernels/runtime/row_sum.tca shape
-// ([R,K,C] -> [R,C], reduce the MIDDLE dim — the layout whose coalescing
-// axis is the non-reduced C, which R3 re-chooses onto the collapse).
+// The two emission properties the fixes landed (ungated one-tier store,
+// lane-origin walk init) remain pinned hermetically at unit level and
+// apply the moment the one-tier class is reachable again.
+
 package e2e
 
 import (
@@ -106,56 +104,44 @@ func compileTcaSource(t *testing.T, fname, src string) string {
 // rebuild renders a bare `SeqIterator(0u, 1u, ...)` — the defect-B shape.
 var laneOriginInitRe = regexp.MustCompile(`SeqIterator\(\(v\d+ \* c\d+\), 1u,`)
 
-// TestFix5T2OneTierCollapseEmission pins the two fixed emission properties
-// of the R3 one-tier collapse kernel (the row_sum [R,K,C] shape):
+// TestFix5T2OneTierCollapseEmission pins the §3.1-PRUNED row_sum emission
+// (the real [R,K,C] middle-reduce kernel the R3 re-choice had broken):
 //
-//  A. NO is_first_in_cta() anywhere: the one-tier SeqReducer's per-thread
-//     accumulator makes every thread the owner of ITS OWN output elements
-//     — the single-owner gate (R2/R3, correct for the CTA-collective
-//     WarpReducer) would drop every non-first thread's stores (GPU-proven:
-//     canary = unwritten outputs on row_sum/softmax).
-//  B. The WARP-covered element walk keeps its LANE-ORIGIN init: the
-//     chunk-local FRAG coordinate (insideIV - lane x c) and the store
-//     coordinate (betweenOrigin + insideIV) are only correct when the
-//     walk IV carries the lane-chunk init (GPU-proven: memcheck Invalid
-//     __local__ read, iq6 class, on row_sum/softmax).
+//  1. Multi-tier control: the emitted kernel constructs the WarpReducer
+//     (the restored pre-T2 schedule — the one-tier SeqReducer class is
+//     unreachable from real kernels under the prune).
+//  2. §3.1: the LNT factorization carries thread/warp on the ELIMINATED
+//     dim only — the surviving C dim must be sequential (the
+//     GPU-broken surviving-WARP class must not be representable).
 //
-// Positive controls: the kernel IS the one-tier class (SeqReducer present,
-// no WarpReducer) and the chunk-local FRAG subtraction survives.
+// Re-instatement contract: when the §3.1 cross-product lowering lands and
+// the warpDimOf prune + rejectWarpSurvivingDims mirror lift, this test
+// re-gains its one-tier fixture control (SeqReducer, no WarpReducer) and
+// the pins A (ungated epilogue store) / B (lane-origin walk init) — see
+// the file header.
 func TestFix5T2OneTierCollapseEmission(t *testing.T) {
 	cu := compileTcaSource(t, "row_sum.tca", rowSumOneTierSrc)
 
-	if !strings.Contains(cu, "tca::rt::SeqReducer<float>") {
-		t.Fatal("fixture control: the R3 re-choice must select the one-tier SeqReducer class")
-	}
-	if strings.Contains(cu, "tca::rt::WarpReducer<") || strings.Contains(cu, "tca::rt::GlobalReducer<") {
-		t.Fatal("fixture control: the one-tier collapse must not construct a Warp/GlobalReducer")
-	}
-
-	// Pin A — the epilogue store is ungated (no single-owner gate for the
-	// per-thread ladder). RED pre-fix: the cg prescan gates every
-	// Combine()-closure store.
-	if strings.Contains(cu, "is_first_in_cta()") {
-		t.Fatal("defect A: the one-tier SeqReducer's epilogue store must NOT be gated on is_first_in_cta() — every thread owns its own output elements (GPU-proven canary on row_sum/softmax)")
+	// 1. Multi-tier control: the restored pre-T2 schedule constructs the
+	//    WarpReducer (not the one-tier SeqReducer the pruned R3 re-choice
+	//    can no longer produce).
+	if !strings.Contains(cu, "tca::rt::WarpReducer<float>") {
+		t.Fatal("fixture control: the §3.1-pruned row_sum must emit its pre-T2 multi-tier WarpReducer schedule (the restored class)")
 	}
 
-	// Pin B — a lane-origin (non-const, lane-derived) walk init survives in
-	// the emitted element nest. RED pre-fix: the uniform element-loop
-	// rebuild renders every walk as SeqIterator(0u, 1u, ...).
-	if !laneOriginInitRe.MatchString(cu) {
-		t.Fatal("defect B: the WARP-covered element walk lost its lane-origin init (SeqIterator((vN * cM), 1u, ...)) — the uniform rebuild reset it to 0, breaking the chunk-local FRAG coordinate and the store coordinate (GPU-proven Invalid __local__ read on row_sum/softmax)")
-	}
-
-	// Control: the chunk-local FRAG access form survives (insideIV - lane x c).
-	chunkLocal := false
+	// 2. §3.1: the WARP digit sits on the ELIMINATED dim only. The LNT
+	//    factorization line lists the surviving C dim as sequential —
+	//    a surviving dim carrying thread/warp is the GPU-broken class
+	//    (canary 1/64) and must be unrepresentable.
 	for _, line := range strings.Split(cu, "\n") {
-		c := feCollapseLine(line)
-		if strings.Contains(c, ".Get(") && strings.Contains(c, " - v") {
-			chunkLocal = true
-			break
+		if !strings.Contains(line, "LNT #0:") {
+			continue
 		}
-	}
-	if !chunkLocal {
-		t.Fatal("fixture control: the C1b chunk-local FRAG access (insideIV - lane x c) must survive on the collapse path")
+		if strings.Contains(line, "C=thread/warp") {
+			t.Fatalf("§3.1: the surviving C dim must not carry a WARP digit, LNT line: %s", strings.TrimSpace(line))
+		}
+		if !strings.Contains(line, "K=thread/warp") {
+			t.Fatalf("§3.1: the eliminated K dim must carry the WARP digit (the pre-T2 split-k class), LNT line: %s", strings.TrimSpace(line))
+		}
 	}
 }

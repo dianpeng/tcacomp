@@ -293,65 +293,54 @@ func TestTierEffReduced(t *testing.T) {
 	}
 }
 
-// TestSearchRechoiceCollapse pins the fix5 §4 headline: under R1+R4 the
-// scale_copy-shaped LNT RE-CHOOSES away from the warp-collective ceremony
-// vector to the K=SEQ collapse vector — NO WARP digit on the reduced dim
-// (the one-tier ladder of R2: SeqReducer, zero ceremony), with the loads
-// still promoted.
-//
-// Worked derivation (kConst K=4 fixture; the winner was re-derived from
-// the actual search output, per the n63 "re-derive, never weaken" rule):
-//
-//   - Ceremony vector R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32): both loads
-//     promote FRAG 128 B reuse 4 (holders = blockDim 64) -> traffic 49152;
-//     R4 cuts it: tierEff = min(1, 4/(32·2)) = 0.0625 -> scaledTraffic
-//     3072; grid 16 fully active, factor ≈ 0.1567 -> score' ≈ 481.5.
-//   - Collapse vector R=CTA(16,T256) C=WARP(2,T32) K=SEQ(T32): K leaves
-//     the warp layer, so tierEff = 1 and the FRAG windows survive (C's
-//     lane chunk 1 × K's SEQ 32 × 4 B = 128 B <= 256): traffic 49152
-//     UNSCALED, factor identical (same grid, same blockDim 64) -> score'
-//     ≈ 7704.9 — strictly greater than every ceremony variant.
-//   - The R1 adaptive digits (> 64 at T <= 64) exist in the menu but no
-//     winning vector can carry them: at T_r <= 64 the reuse term
-//     ceil(T_r/blockDim) with blockDim >= 64 collapses to 1 (no traffic),
-//     and the blockDim-32 full-collapse declines its FRAG sites (4096 B >
-//     256 B). The adaptive digit's role here is menu completeness (a
-//     full-grid candidate exists at every tile), pinned by
-//     TestAdaptiveDigitListConstExtent.
-//
-// Note the REAL suite kernels carry dynamic K extents, under which R4's
-// stand-in is 1 (pinned in TestTierEffReduced) — the GPU-level consequence
-// is recorded in the task SUMMARY's benchmark table.
+// TestSearchRechoiceCollapse pins the §3.1-pruned search outcome on the
+// fix5 §4 headline fixture (scale_copy with K const 4 — R4's tierEff
+// bites). RE-DERIVED under the §3.1 ruling (author, 2026-10-30, iq6
+// candidate-1): the pre-ruling pin asserted the C=WARP K=SEQ collapse
+// winner — a SURVIVING-WARP vector, GPU-proven broken (row_sum/softmax
+// canary exactly 1/64; the CTA-coupled-inside × lane-chunk diagonal).
+// Under the prune the collapse vector is UNREPRESENTABLE (C, a surviving
+// axis, can never carry the WARP digit) AND its all-SEQ remainder is
+// FRAG-declined anyway (covered [C,K] prices 32x32x4 = 4096 B/thread >
+// MaxFragPerThread 256 B -> traffic 0 — the qwo gate-3 mechanism), so the
+// honest winner is the R4-PENALIZED CEREMONY vector
+// R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32): tierEff 0.0625 cuts its
+// score' 16x, but it is the only remaining positive-traffic class. The
+// loads stay promoted FRAG 128 B reuse 4 (the C1b per-thread window is
+// unchanged — K=WARP keeps the covered set's tier legal). The K=SEQ
+// collapse re-choice needs fix6's work-shape model (FRAG windows > 1x1
+// pricing) IN ADDITION to the §3.1 lowering; recorded in the task
+// SUMMARY, never chased out of scope.
 func TestSearchRechoiceCollapse(t *testing.T) {
 	fx, x, z := scaleCopyFx(t, true) // K const 4 — R4's tierEff bites
 	p := DefaultParams()
 	rec := runPass(t, fx.g, p)
 
-	// The collapse property: NO WARP digit on the reduced dim.
-	if !reducedIters(fx.g)[fx.iters[2]] {
-		t.Fatal("fixture setup: iter 2 must be the reduced dim")
+	if !reducedAxesOf(fx.g)[fx.iters[2]] {
+		t.Fatal("fixture setup: iter 2 (k) must be the ELIMINATED dim")
 	}
-	if d := decisionOf(t, rec, fx.iters[2]); d.SoC == SoCWARP {
-		t.Fatalf("fix5 T1 re-choice: the reduced dim must leave the warp layer (K=SEQ collapse), got %s/%d/T%d", d.SoC, d.LoC, d.TileSize)
+	// The pruned winner (derivation above): R=CTA(16,T256) C=SEQ(T32)
+	// K=WARP(2,T32) — the R4-penalized ceremony, the only positive-traffic
+	// class left. The surviving dim C must NEVER carry WARP.
+	if d := decisionOf(t, rec, fx.iters[1]); d.SoC == SoCWARP {
+		t.Fatalf("the surviving dim must not carry WARP under the §3.1 prune, got %s/%d/T%d", d.SoC, d.LoC, d.TileSize)
 	}
-	// The re-derived winner (derivation above): R=CTA(16,T256) C=WARP(2,T32)
-	// K=SEQ(T32) — collapse with the loads still promoted.
 	want := []IterDecision{
 		{SoC: SoCTA, LoC: 16, TileSize: 256},
-		{SoC: SoCWARP, LoC: 2, TileSize: 32},
 		{SoC: SoCSequential, LoC: 1, TileSize: 32},
+		{SoC: SoCWARP, LoC: 2, TileSize: 32},
 	}
 	for i, w := range want {
 		if d := decisionOf(t, rec, fx.iters[i]); d != w {
-			t.Fatalf("re-choice winner: iter %d must be %+v, got %+v (derivation in the test comment)", i, w, d)
+			t.Fatalf("pruned re-choice winner: iter %d must be %+v (derivation in the comment), got %+v", i, w, d)
 		}
 	}
-	// Both loads stay promoted FRAG 128 B reuse 4 — the collapse keeps the
-	// traffic, it just stops paying for the warp-collective fragmentation.
+	// Both loads stay promoted FRAG 128 B reuse 4 — the ceremony's C1b
+	// per-thread window is unchanged (128 x (4-1) x 64 holders per site).
 	for _, ld := range []ir.Node{x, z} {
 		sd, ok := rec.SiteDecisionOf(ld)
 		if !ok || !sd.Promoted || sd.Class != ClassFRAG || sd.Bytes != 128 || sd.Reuse != 4 {
-			t.Fatalf("re-choice winner: load %d must stay promoted FRAG 128 B reuse 4, got %+v (ok=%v)", ld.BasePtr().ID(), sd, ok)
+			t.Fatalf("pruned winner: load %d must stay promoted FRAG 128 B reuse 4, got %+v (ok=%v)", ld.BasePtr().ID(), sd, ok)
 		}
 	}
 

@@ -2717,177 +2717,39 @@ func chunkLocalCoord(n ir.Node) bool {
 	return laneChunkMul(ops[1])
 }
 
-// TestLowerR3WarpNonReducedFlow is the fix5 §3 guard pin for T2: the
-// WARP-on-a-NON-reduced-dim layout (the R3 collapse schedule class:
-// covered dims INCLUDING the WARP dim, the reduced dim SEQ) lowers through
-// tile-lower EXACTLY like the K-WARP split-k class the suite exercises —
-// the machinery is dim-agnostic, only the CHOICE of dim is new (fix5 §3
-// "already flows"). Locked: the WARP template on C (between stride
-// K_d x T_d, lane-chunk inside walk with the F1-clamped bound), the C1b
-// forced-FRAG chunk-LOCAL access (the iq6 form) and the kzv chunk-origin
-// fill window on the FRAG sites, the SMEM window access with the warp
-// rank in the WARP-covered coordinate (R2 rank-in-index), the per-thread
-// LoadTileThread FRAG fill and the cooperative LoadTileCta SMEM fill, the
-// single-owner GMEM store, and verifier + typeinfer health. The one-tier
-// reducer face (reduced dim SEQ -> SeqReducer, zero WarpReducer/
-// GlobalReducer/ThreadMapping-reducer operands) is pinned at the
-// final-lower level by quick-261029-qwo's TestReducerOneTierSeqLadder
-// (unchanged, kept green by the full suite); the multi-tier WarpReducer
-// path's byte-stability rides on the same suite. Every assertion here
-// passes on the UNCHANGED lower code — confirming the fix5 §3 expectation
-// (a RED pin would have been a minimal mechanical defect in T2 scope).
+// TestLowerR3WarpNonReducedFlow is RE-DERIVED under the §3.1 ruling
+// (author, 2026-10-30, iq6 candidate-1: reduced-only WARP legality +
+// fail-closed mirror): a WARP-assigned dim whose walk does NOT feed a
+// Reducer (a SURVIVING warp dim) is now REJECTED fail-closed by
+// tile-lower — GPU-proven on the R3 re-choice kernels (row_sum/softmax:
+// canary exactly 1/64 of the output space; the CTA-coupled-inside x
+// lane-chunk composition covers only a "diagonal" of the cross product,
+// the iq6 §3.1 class "every (m,n) pair carries 16/1024 k values").
+// fix5 §1 R3's premise ("the layout already flows — only the CHOICE of
+// dim is new") is GPU-disproven; the pre-ruling pin asserted the walk
+// structure of exactly this broken lowering (it pinned node SHAPES, not
+// coverage — the 261021-mlx "green tests pin node shapes not semantics"
+// trap). The search-side prune (TestS31SurvivingWarpPrune) makes the
+// class unrepresentable; this mirror catches hand-stamped or corrupted
+// records the way rejectWarpReducedDims catches the flag=false class.
+// When the §3.1 cross-product lowering is designed, lift BOTH fences.
 func TestLowerR3WarpNonReducedFlow(t *testing.T) {
-	fx, x, z, w, store := r3ScaleCopyUsed(t)
+	fx, x, z, w, _ := r3ScaleCopyUsed(t)
 	rec := r3ScaleCopyRecord(t, fx, x, z, w)
-	runLower(t, fx.g, rec)
-
-	// The WARP template on the NON-reduced C dim: between stride K_d x T_d
-	// = 2 x 32 = 64, in warp units (soc 2, loc = K_d = 2); inside is the
-	// lane-chunk walk (step 1, soc 0).
-	loops := nestOf(t, fx.g)
-	var cBetween, cInside ir.Node
-	for _, l := range loops {
-		if ann := loopAnnotations(l); ann["soc"] == 2 {
-			cBetween = l
-			break
-		}
+	cache := opt.NewCache()
+	cache.Put(rec)
+	err := (LowerPass{Params: DefaultParams()}).Run(&opt.Context{Pass: "tile-lower", Cache: cache}, fx.g)
+	if err == nil {
+		t.Fatal("a surviving-WARP record (C=WARP on a non-reduced dim) must be rejected fail-closed under the §3.1 ruling")
 	}
-	// The multi-dim canonical nest orders ALL betweens before the insides
-	// ([R.b, C.b, K.b, R.i, C.i, K.i] — TestLowerMultiDimTemplates), so C's
-	// inside is NOT adjacent to C's between: it is the soc-0 step-1 loop
-	// whose IV init is the lane x c mul.
-	for _, l := range loops {
-		if loopAnnotations(l)["soc"] != 0 || dimvarStep(t, l) != 1 {
-			continue
-		}
-		liv := ir.OperandsOf(l)[0]
-		lin := ir.OperandsOf(liv)[1]
-		if lin != nil && lin.KindOf() == ir.KindBinOp {
-			if code, _ := ir.BinOpCodeOf(lin); code == ir.BinOpMul && laneChunkMul(lin) {
-				cInside = l
-				break
-			}
-		}
+	msg := err.Error()
+	msg = strings.ToLower(msg)
+	if !strings.Contains(msg, "3.1") || !strings.Contains(msg, "surviving") {
+		t.Fatalf("the rejection must name the §3.1 surviving-WARP class for diagnosability, got %q", msg)
 	}
-	if cBetween == nil {
-		t.Fatal("the C WARP between loop must exist (soc 2)")
-	}
-	if got := dimvarStep(t, cBetween); got != 64 {
-		t.Fatalf("C WARP between step = %v, want K_d x T_d = 2 x 32 = 64", got)
-	}
-	if ann := loopAnnotations(cBetween); ann["loc"] != 2 {
-		t.Fatalf("C WARP between loc = %v, want K_d = 2 (warp units)", ann["loc"])
-	}
-	if cInside == nil || dimvarStep(t, cInside) != 1 || loopAnnotations(cInside)["soc"] != 0 {
-		t.Fatalf("C WARP inside = %v, want the lane-chunk walk (step 1, soc 0)", cInside)
-	}
-	// Lane-chunk init: lane_id x ceil(T_c/32) = lane x 1.
-	iv := ir.OperandsOf(cInside)[0]
-	init := ir.OperandsOf(iv)[1]
-	if init == nil || init.KindOf() != ir.KindBinOp {
-		t.Fatalf("C inside IV init = %v (%s), want the lane x c mul", init, kindOf(init))
-	}
-	if code, _ := ir.BinOpCodeOf(init); code != ir.BinOpMul {
-		t.Fatalf("C inside IV init must be a mul (lane x c), got code %v", code)
-	}
-	mulOps := ir.OperandsOf(init)
-	if v, ok := ir.ConstValueOf(mulOps[1]); !ok || v != 1 {
-		t.Fatalf("C inside chunk size = %v, want ceil(32/32) = 1", mulOps[1])
-	}
-	if lane := mulOps[0]; lane == nil || lane.KindOf() != ir.KindRuntimeThreadQuery ||
-		len(ir.OperandsOf(lane)) != 0 || ir.RuntimeAttributeOf(lane) != "lane_id" {
-		t.Fatalf("C inside chunk lane operand = %v, want the zero-operand lane_id query", lane)
-	}
-	// Lane-chunk bound: umin((lane+1) x c, F1 tile_max).
-	bound := boundOf(t, cInside)
-	if bound.KindOf() != ir.KindCall || ir.CallNameOf(bound) != "umin" {
-		t.Fatalf("C inside bound must be a umin call, got %s", kindOf(bound))
-	}
-
-	// Buffers: two 128 B FRAG windows (x, z) + one 8192 B SMEM window (w);
-	// the FRAG fills are per-thread (variant 2) and their source's C axis
-	// carries the kzv chunk-origin window (the lane chunk term added to
-	// the warp window origin — each lane fills ITS OWN chunk).
-	var fragBufs []ir.Node
-	smemSeen := false
-	for _, n := range fx.g.AllocatedNodes() {
-		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemNew {
-			continue
-		}
-		v, ok := ir.ConstValueOf(ir.OperandsOf(n)[0])
-		if !ok {
-			continue
-		}
-		switch v {
-		case 128:
-			fragBufs = append(fragBufs, n)
-		case 8192:
-			smemSeen = true
-		}
-	}
-	if len(fragBufs) != 2 || !smemSeen {
-		t.Fatalf("buffers: %d x 128 B FRAG + smem %v, want exactly 2 FRAG + 1 x 8192 B SMEM", len(fragBufs), smemSeen)
-	}
-	for _, buf := range fragBufs {
-		fill := findFillOf(t, fx.g, buf)
-		if v := loaderVariantOf(t, fill); v != 2 {
-			t.Fatalf("FRAG fill variant = %v, want 2 (LoadTileThread)", v)
-		}
-		src := ir.OperandsOf(fill)[0]
-		if !laneChunkMul(src) {
-			t.Fatalf("the FRAG fill source %d must carry the lane chunk term (kzv chunk-origin window: rank x T + round + lane x c)", fill.BasePtr().ID())
-		}
-	}
-
-	// Access rewrite: x/z read their FRAG windows with the CHUNK-LOCAL C
-	// coordinate (inside_C - lane x 1 — the iq6 form, here on a
-	// NON-reduced dim); w reads its SMEM window with the warp rank in the
-	// WARP-covered C coordinate (R2 rank-in-index) and the plain walk in
-	// the SEQ-covered K coordinate (no thread query).
-	fragChunkLocal, smemRanked := 0, 0
-	seenAccess := make(map[*ir.Base]bool)
-	for _, n := range flattenSubtree(ir.OperandsOf(store)[0]) {
-		if n.KindOf() != ir.KindMemLoad || seenAccess[n.BasePtr()] {
-			continue // shared Map-body nodes flatten twice — count once
-		}
-		seenAccess[n.BasePtr()] = true
-		sc, _ := ir.StorageClassOf(n)
-		hasChunkLocal, hasRank := false, false
-		for _, c := range ir.OperandsOf(n)[1:] {
-			if chunkLocalCoord(c) {
-				hasChunkLocal = true
-			}
-			if subtreeHasKind(t, fx.g, c, ir.KindRuntimeThreadQuery) {
-				hasRank = true
-			}
-		}
-		switch sc {
-		case ir.StorageFrag:
-			if !hasChunkLocal {
-				t.Fatalf("FRAG access %d must carry the chunk-local C coordinate (inside - lane x c)", n.BasePtr().ID())
-			}
-			fragChunkLocal++
-		case ir.StorageSMem:
-			if !hasRank {
-				t.Fatalf("SMEM access %d must carry the warp rank in the WARP-covered C coordinate", n.BasePtr().ID())
-			}
-			smemRanked++
-		}
-	}
-	if fragChunkLocal != 2 || smemRanked != 1 {
-		t.Fatalf("access rewrite: %d chunk-local FRAG + %d rank-in-index SMEM, want 2 + 1", fragChunkLocal, smemRanked)
-	}
-
-	// Loads erased, single-owner GMEM store survives.
-	if !x.BasePtr().Erased() || !z.BasePtr().Erased() || !w.BasePtr().Erased() {
-		t.Fatal("all three promoted loads must be erased")
-	}
-	if store.BasePtr().Erased() || store.KindOf() != ir.KindMemStore {
-		t.Fatal("the single-owner GMEM store must survive (stores never route through the cache)")
-	}
-
-	assertVerifyAndRootReachable(t, fx.g)
-	if err := (typeinfer.Pass{}).Run(nil, fx.g); err != nil {
-		t.Fatalf("typeinfer re-run over the R3-lowered graph: %v", err)
+	// The rejection happens BEFORE any mutation: the graph must be
+	// untouched (loads unerased, no cache buffers introduced).
+	if x.BasePtr().Erased() || z.BasePtr().Erased() || w.BasePtr().Erased() {
+		t.Fatal("the fail-closed rejection must precede any rewrite (loads must be unerased)")
 	}
 }

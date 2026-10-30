@@ -100,7 +100,7 @@ func TestWarpDimRanking(t *testing.T) {
 
 	// (a) L1 extent win, const extents distinct: 128 carries WARP.
 	fxA := newChain("r3l1", 64, 128, 64)
-	if got := warpDimOf(fxA.iters, nil, nil, p); got != fxA.iters[1] {
+	if got := warpDimOf(fxA.iters, nil, nil, false, p); got != fxA.iters[1] {
 		t.Fatalf("L1: warpDimOf({64,128,64}) = iter %v, want iter %d (extent 128 largest)",
 			nodeID(got), fxA.iters[1].BasePtr().ID())
 	}
@@ -113,7 +113,7 @@ func TestWarpDimRanking(t *testing.T) {
 	rB := fxB.iters[0]
 	csRb := []SiteFacts{{AxesIters: [][]ir.Node{{rB}, {rB}}}, // 2D-ish load: innermost r
 		{AxesIters: [][]ir.Node{{rB}, {rB}, {rB}}}} // 3D load: innermost r
-	if got := warpDimOf(fxB.iters, csRb, nil, p); got != rB {
+	if got := warpDimOf(fxB.iters, csRb, nil, false, p); got != rB {
 		t.Fatalf("L2 membership: warpDimOf must take the in-set OUTER dim r over the innermost out-of-set k, got iter %v", nodeID(got))
 	}
 
@@ -125,7 +125,7 @@ func TestWarpDimRanking(t *testing.T) {
 	lfC := overlapOf(fxC, p)
 	lfC.reduced = reducedIters(fxC.g)
 	windowC := windowOf(lfC, p)
-	if got := warpDimOf(windowC, lfC.CS, lfC.reduced, p); got != fxC.iters[2] {
+	if got := warpDimOf(windowC, lfC.CS, reducedAxesOf(fxC.g), true, p); got != fxC.iters[2] {
 		t.Fatalf("L2 within-set: warpDimOf(dyn matmul) = iter %v, want iter %d (k, innermost of the stride-1 set {k,j})",
 			nodeID(got), fxC.iters[2].BasePtr().ID())
 	}
@@ -134,7 +134,7 @@ func TestWarpDimRanking(t *testing.T) {
 	// const extents, no candidate sites, the INNER dim reduced -> the
 	// non-reduced OUTER dim wins.
 	fxD := newChain("r3l3", 64, 64)
-	if got := warpDimOf(fxD.iters, nil, map[ir.Node]bool{fxD.iters[1]: true}, p); got != fxD.iters[0] {
+	if got := warpDimOf(fxD.iters, nil, map[ir.Node]bool{fxD.iters[1]: true}, false, p); got != fxD.iters[0] {
 		t.Fatalf("L3: warpDimOf({64,64}, reduced=inner) = iter %v, want iter %d (non-reduced wins)",
 			nodeID(got), fxD.iters[0].BasePtr().ID())
 	}
@@ -142,7 +142,7 @@ func TestWarpDimRanking(t *testing.T) {
 	// (e) L4 window-order residual: equal extents, no sites, no reduced ->
 	// the innermost window dim wins (the total fallback).
 	fxE := newChain("r3l4", 64, 64)
-	if got := warpDimOf(fxE.iters, nil, nil, p); got != fxE.iters[1] {
+	if got := warpDimOf(fxE.iters, nil, nil, false, p); got != fxE.iters[1] {
 		t.Fatalf("L4: warpDimOf({64,64}) = iter %v, want iter %d (innermost fallback)",
 			nodeID(got), fxE.iters[1].BasePtr().ID())
 	}
@@ -155,7 +155,7 @@ func TestWarpDimRanking(t *testing.T) {
 	aFE, bFE, cFE := fxFE.iters[0], fxFE.iters[1], fxFE.iters[2]
 	csFE := []SiteFacts{{AxesIters: [][]ir.Node{{aFE}, {bFE}}}, // lhs[a][b]
 		{AxesIters: [][]ir.Node{{bFE}, {cFE}}}} // rhs[b][c]
-	if got := warpDimOf(fxFE.iters, csFE, map[ir.Node]bool{bFE: true}, p); got != bFE {
+	if got := warpDimOf(fxFE.iters, csFE, map[ir.Node]bool{bFE: true}, true, p); got != bFE {
 		t.Fatalf("frontend ranking: warpDimOf({64,128,64}) = iter %v, want iter %d (N wins L1)", nodeID(got), bFE.BasePtr().ID())
 	}
 
@@ -169,7 +169,7 @@ func TestWarpDimRanking(t *testing.T) {
 	lfSC := overlapOf(fxSC, p)
 	lfSC.reduced = reducedIters(fxSC.g)
 	kSC := fxSC.iters[2]
-	if got := warpDimOf(windowOf(lfSC, p), lfSC.CS, lfSC.reduced, p); got != kSC {
+	if got := warpDimOf(windowOf(lfSC, p), lfSC.CS, reducedAxesOf(fxSC.g), true, p); got != kSC {
 		t.Fatalf("dynamic scale_copy ranking: warpDimOf = iter %v, want iter %d (k via L2)", nodeID(got), kSC.BasePtr().ID())
 	}
 }
@@ -233,22 +233,23 @@ func TestWarpDimRestriction(t *testing.T) {
 	}
 }
 
-// TestR3SearchRechoiceConstK pins the spec's worked re-choice at search
-// level on the scale_copy shape with the tiny reduced dim CONST (k=4 —
-// the fixture where L1 eliminates k): the winner carries WARP on the long
-// non-reduced dim C with K=SEQ (the fix5 §4 T2 collapse vector), the
-// loads stay promoted FRAG, and the qwo ceremony vector is
-// unrepresentable because K's digit list no longer carries any WARP
-// digit.
-//
-// Derivation of the pinned winner (probe-verified on current HEAD, where
-// R1+R4 already re-choose it — quick-261029-qwo's TestSearchRechoiceCollapse):
-// R=CTA(16,T256) C=WARP(2,T32) K=SEQ(T32), both loads FRAG 128 B reuse 4.
-// Under R3 the collapse vector REMAINS representable (c wins the ranking:
-// L1 drops k, L2 {k} leaves {r,c} out, L3 ties, L4 innermost -> c) and the
-// ceremony vector R=CTA C=SEQ K=WARP leaves the feasible area entirely.
+// TestR3SearchRechoiceConstK pins the §3.1-pruned search outcome on the
+// scale_copy shape with the tiny reduced dim CONST (k=4 — the fixture
+// where R4's tierEff bites). RE-DERIVED under the §3.1 ruling (author,
+// 2026-10-30, iq6 candidate-1): the pre-ruling pin asserted the C=WARP
+// collapse winner — a SURVIVING-WARP vector, GPU-proven broken (row_sum/
+// softmax canary 1/64). Under the prune the collapse vector is
+// UNREPRESENTABLE, and the honest winner is the R4-PENALIZED CEREMONY
+// vector R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32): it is the only remaining
+// positive-traffic class — the all-SEQ collapse's covered [C,K] prices a
+// 32x32x4 = 4096 B/thread FRAG window > MaxFragPerThread 256 B (the qwo
+// gate-3 mechanism, FRAG-declined -> traffic 0 -> score' 0). The K=SEQ
+// collapse re-choice therefore needs fix6's work-shape model (FRAG
+// windows > 1x1 pricing) IN ADDITION to the §3.1 lowering; recorded in
+// the task SUMMARY, never chased out of scope. The loads stay promoted
+// (qwo's pin family) — K=WARP keeps the sites' covered set legal.
 func TestR3SearchRechoiceConstK(t *testing.T) {
-	fx, x, z := scaleCopyFx(t, true)
+	fx, _, _ := scaleCopyFx(t, true)
 	p := DefaultParams()
 	rec := runPass(t, fx.g, p)
 
@@ -258,27 +259,17 @@ func TestR3SearchRechoiceConstK(t *testing.T) {
 	}
 	want := []IterDecision{
 		{SoC: SoCTA, LoC: 16, TileSize: 256},
-		{SoC: SoCWARP, LoC: 2, TileSize: 32},
 		{SoC: SoCSequential, LoC: 1, TileSize: 32},
+		{SoC: SoCWARP, LoC: 2, TileSize: 32},
 	}
 	for i, w := range want {
 		if d := decisionOf(t, rec, fx.iters[i]); d != w {
-			t.Fatalf("R3 re-choice winner: iter %d must be %+v, got %+v (derivation in the test comment)", i, w, d)
+			t.Fatalf("pruned re-choice winner: iter %d must be %+v (the R4-penalized ceremony, derivation in the comment), got %+v", i, w, d)
 		}
 	}
-	// The ceremony vector is unrepresentable: no digit list can place WARP
-	// on the reduced dim anymore (k is never the winner once L1 sees the
-	// const 4).
-	if d := decisionOf(t, rec, fx.iters[2]); d.SoC == SoCWARP {
-		t.Fatalf("the reduced dim must not carry WARP under R3 on this shape, got %+v", d)
-	}
-	// The loads stay promoted FRAG 128 B reuse 4 (the collapse keeps the
-	// traffic; qwo's pin family).
-	for _, ld := range []ir.Node{x, z} {
-		sd, ok := rec.SiteDecisionOf(ld)
-		if !ok || !sd.Promoted || sd.Class != ClassFRAG || sd.Bytes != 128 || sd.Reuse != 4 {
-			t.Fatalf("R3 re-choice winner: load %d must stay promoted FRAG 128 B reuse 4, got %+v (ok=%v)", ld.BasePtr().ID(), sd, ok)
-		}
+	// The surviving-WARP class is unrepresentable: C must not carry WARP.
+	if d := decisionOf(t, rec, fx.iters[1]); d.SoC == SoCWARP {
+		t.Fatalf("the surviving dim must not carry WARP under the §3.1 prune, got %+v", d)
 	}
 }
 
@@ -320,5 +311,88 @@ func TestR3FamilyBGuard(t *testing.T) {
 	sr, ok := rec.SiteDecisionOf(rhs)
 	if !ok || sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 8388608 {
 		t.Fatalf("family-B guard: rhs must stay evicted (SMEM 8388608 B window over budget), got %+v (ok=%v)", sr, ok)
+	}
+}
+
+// TestS31SurvivingWarpPrune pins the §3.1 ruling (author, 2026-10-30,
+// iq6 candidate-1 direction): the WARP digit is legal ONLY on a REDUCED
+// dim. GPU-proven on the R3 re-choice kernels (row_sum/softmax, canary
+// 516096/32256 = exactly 1/64 of the output space covered): a WARP digit
+// on a non-reduced (surviving) dim lowers through the CTA-coupled-inside
+// x lane-chunk composition whose cross product is 63/64 UNCOVERED — the
+// iq6 §3.1 class (every (m,n) pair carries 16/1024 k values). fix5 §1
+// R3's premise ("the layout already flows through the existing thread-map
+// coordinate machinery — only the CHOICE of dim is new") is GPU-disproven;
+// the prune restores the fix4 reduced-only WARP feasible area until the
+// tile-lower cross-product lowering is designed, and the R3 ranking stays
+// as the tie-break AMONG REDUCED candidates (multiple reduced dims).
+//
+// This is a LEGALITY pin, not a weakened outcome: the surviving-WARP
+// class is pruned from the feasible area, so every pin asserting a
+// non-reduced WARP winner (TestWarpDimRanking cases (a)/(b)/(d)/(e),
+// TestWarpDimRestriction, TestR3SearchRechoiceConstK, qwo's
+// TestSearchRechoiceCollapse) is re-derived to the pruned legality with
+// this ruling in its comment.
+func TestS31SurvivingWarpPrune(t *testing.T) {
+	p := DefaultParams()
+
+	// (a) Non-reduced candidates are EXCLUDED: on the const-K scale_copy
+	// shape (reduced = {k}), the pre-prune R3 ranking picked c (L1 drops
+	// the tiny reduced k, L4 innermost); under the prune the winner must
+	// be a REDUCED dim — k — regardless of the extent ranking.
+	fx, _, _ := scaleCopyFx(t, true) // r, c dynamic; k const 4 (reduced)
+	lf := overlapOf(fx, p)
+	lf.reduced = reducedIters(fx.g)
+	// The prune consumes the ELIMINATED set (reducedAxesOf) — NOT lf.reduced,
+	// whose reducer-consuming semantic also contains the surviving r/c.
+	elim := reducedAxesOf(fx.g)
+	if !elim[fx.iters[2]] || elim[fx.iters[0]] || elim[fx.iters[1]] {
+		t.Fatalf("fixture setup: eliminated must be exactly {k}, got r=%v c=%v k=%v", elim[fx.iters[0]], elim[fx.iters[1]], elim[fx.iters[2]])
+	}
+	k := fx.iters[2]
+	if got := warpDimOf(windowOf(lf, p), lf.CS, elim, true, p); got != k {
+		t.Fatalf("prune: warpDimOf(const-K scale_copy) = iter %v, want the reduced iter k (surviving dims are pruned)", nodeID(got))
+	}
+
+	// (b) No reduced dim in the window -> NO WARP digit at all (nil
+	// winner: digitListOf then emits no WARP section anywhere).
+	fxN := newChain("s31nil", 64, 128)
+	if got := warpDimOf(fxN.iters, nil, nil, true, p); got != nil {
+		t.Fatalf("prune: warpDimOf(no reduced dims) = iter %v, want nil (no WARP section)", nodeID(got))
+	}
+
+	// (c) Search level: the C=WARP collapse vector is UNREPRESENTABLE on
+	// the const-K scale_copy shape — C's decision must not be WARP. The
+	// honest pruned winner (probe-derived, derivation below): the R4-
+	// penalized CEREMONY vector R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32) —
+	// the ONLY remaining positive-traffic class: the K=SEQ collapse
+	// vector's covered [C,K] prices a 32x32x4 = 4096 B/thread FRAG
+	// window > MaxFragPerThread 256 B (the qwo gate-3 mechanism), so it
+	// scores traffic 0 and loses to the 16x-cut ceremony. The collapse
+	// re-choice therefore needs fix6's work-shape model (FRAG windows
+	// > 1x1 pricing) IN ADDITION to the §3.1 lowering — recorded in the
+	// task SUMMARY, never chased out of scope here.
+	want := []IterDecision{
+		{SoC: SoCTA, LoC: 16, TileSize: 256},
+		{SoC: SoCSequential, LoC: 1, TileSize: 32},
+		{SoC: SoCWARP, LoC: 2, TileSize: 32},
+	}
+	rec := runPass(t, fx.g, p)
+	for i, w := range want {
+		if d := decisionOf(t, rec, fx.iters[i]); d != w {
+			t.Fatalf("prune: iter %d must be %+v (the R4-penalized ceremony, derivation in the comment), got %+v", i, w, d)
+		}
+	}
+	if d := decisionOf(t, rec, fx.iters[1]); d.SoC == SoCWARP {
+		t.Fatalf("prune: the search chose C=WARP (%s/%d/T%d) — surviving-WARP vectors must be unrepresentable", d.SoC, d.LoC, d.TileSize)
+	}
+
+	// (d) The ranking still resolves AMONG REDUCED candidates: with two
+	// reduced dims of distinct const extents, the L1 larger-extent one
+	// wins (the R3 comparator kept as the reduced-internal tie-break).
+	fx2 := newChain("s31two", 64, 128)
+	r2, k2 := fx2.iters[0], fx2.iters[1]
+	if got := warpDimOf(fx2.iters, nil, map[ir.Node]bool{r2: true, k2: true}, true, p); got != k2 {
+		t.Fatalf("prune: warpDimOf({64,128}, both reduced) = iter %v, want iter %d (L1 extent 128)", nodeID(got), k2.BasePtr().ID())
 	}
 }

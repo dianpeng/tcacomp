@@ -1146,12 +1146,15 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	facts := overlapOf(fx, p)
 	window := windowOf(facts, p)
 	digitLists := make([][]schedDigit, len(window))
-	// R3 (quick-261029-v9k): the mirror must search the SAME feasible area
-	// as the pass — the per-LNT WARP restriction binds here too, with the
-	// shared warpDimOf winner (never a re-derived ranking).
-	warpDim := warpDimOf(window, facts.CS, nil, p)
+	// R3 (quick-261029-v9k) + §3.1 prune (2026-10-30 ruling): the mirror
+	// must search the SAME feasible area as the pass — the per-LNT WARP
+	// restriction AND the surviving-WARP prune bind here too, with the
+	// shared warpDimOf winner (never a re-derived ranking), the same
+	// eliminated/reduced sets, and the same hasReduce discriminator.
+	reduced := reducedIters(fx.g)
+	warpDim := warpDimOf(window, facts.CS, reducedAxesOf(fx.g), len(reduced) > 0, p)
 	for i, it := range window {
-		digitLists[i] = digitListOf(it, p, nil, warpDim)
+		digitLists[i] = digitListOf(it, p, reduced, warpDim)
 	}
 	tree := treeItersOf(facts.Tree)
 	best := -1.0
