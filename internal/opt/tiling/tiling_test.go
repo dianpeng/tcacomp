@@ -222,46 +222,55 @@ func fix33Graph() (g *ir.Graph, lhs, rhs ir.Node, iters []ir.Node) {
 // TestFix33WorkedExample pins the searched record over the fix4 §3.3
 // worked-example SHAPE (M=4096, N=2048, K=512, lhs[m][k], rhs[n][k],
 // DefaultParams) under the 2026-10-26 one-currency reuse amendment
-// (fix4 §2.4/§3.3 re-pin, amendment commit 85c7791).
+// (fix4 §2.4/§3.3 re-pin, amendment commit 85c7791), as re-derived under
+// fix5 R3 (quick-261029-v9k — the "re-derive from the actual search output,
+// never weaken" rule).
 //
-// RESOLVED (the 261026-ky1 pin divergence, ratified by the amendment):
-// the pre-amendment reuse model mixed per-window bytes with per-thread
-// trips, so the doc's original N=WARP/K=SEQ vector and the implemented
-// winner disagreed on which warp-splits paid off. Under the amendment the
-// winner is exactly the §3.3 re-pin: M=CTA/16/256 (the R-LOCCAP cap
-// ceil(4096/256) = 16), N=SEQ/1/256, K=WARP/2/32, blockDim 64 — rhs SMEM
-// window 2·32·256·4 = 65536 at the MaxCache cap with COLLECTIVE reuse
-// T_M = 256 (was 4 under the per-thread model), lhs a 4 B lane-chunk
-// FRAG with per-thread reuse T_N = 256 (§2.7: FRAG record semantics stay
-// per-thread; the holders scaling lives only in the objective).
+// RE-DERIVED under R3 (the pinned vector below is the actual post-R3
+// search output): the R3 ranking makes M the per-LNT WARP winner (L1
+// extent — M=4096 is the largest const extent), so the pre-R3 §3.3 winner's
+// K=WARP digit LEAVES the feasible area (the WARP section now emits only
+// for M, and the objective prefers M=CTA over M=WARP here). The new
+// argmax: M=CTA/128/32 (the R1 adaptive digit ceil(4096/32) = 128 — a
+// full grid at tile 32), N=SEQ/1/256, K=SEQ/1/64 — NO WARP dim at all
+// (blockDim 32, the K reduce is per-thread sequential, the R2 one-tier
+// ladder). Sites: lhs (tie N, covered {K}, forced FRAG — M is a
+// thread-varying non-covered coordinate) promotes as a 256 B per-thread
+// window (T_k = 64 × 4 B, exactly at the F6 cap) with reuse 256 (the N
+// inside walk); rhs (covered {N, K}, no WARP-covered dim left) defaults to
+// the FRAG class at 256×64×4 = 65536 B > MaxFragPerThread and is DECLINED
+// with the F6 reason. The pre-R3 winner (M=CTA/16/256, N=SEQ, K=WARP/2/32,
+// rhs SMEM 65536 at the cap) is history — pinned in the R3 plan's
+// anticipated "const-extent fixtures whose WARP dim is no longer the
+// winner" move category; the suite's DYNAMIC matmul family keeps warps-on-K
+// split-K by construction (TestR3FamilyBGuard).
 func TestFix33WorkedExample(t *testing.T) {
 	g, lhs, rhs, iters := fix33Graph()
 
 	p := DefaultParams()
 	rec := runPass(t, g, p)
 	m, n, k := decisionOf(t, rec, iters[0]), decisionOf(t, rec, iters[1]), decisionOf(t, rec, iters[2])
-	if m.SoC != SoCTA || m.LoC != 16 || m.TileSize != 256 {
-		t.Fatalf("M decision = %s/%d/%d, want cta/16/256 (the R-LOCCAP cap at T=256: ceil(4096/256) = 16)", m.SoC, m.LoC, m.TileSize)
+	if m.SoC != SoCTA || m.LoC != 128 || m.TileSize != 32 {
+		t.Fatalf("M decision = %s/%d/%d, want cta/128/32 (the R1 adaptive digit ceil(4096/32) = 128 — re-derived under R3, derivation in the test comment)", m.SoC, m.LoC, m.TileSize)
 	}
 	if n.SoC != SoCSequential || n.LoC != 1 || n.TileSize != 256 {
-		t.Fatalf("N decision = %s/%d/%d, want seq/1/256 (the implemented model's winner)", n.SoC, n.LoC, n.TileSize)
+		t.Fatalf("N decision = %s/%d/%d, want seq/1/256 (the post-R3 winner)", n.SoC, n.LoC, n.TileSize)
 	}
-	if k.SoC != SoCWARP || k.LoC != 2 || k.TileSize != 32 {
-		t.Fatalf("K decision = %s/%d/%d, want warp/2/32 (the implemented model's winner)", k.SoC, k.LoC, k.TileSize)
+	if k.SoC != SoCSequential || k.LoC != 1 || k.TileSize != 64 {
+		t.Fatalf("K decision = %s/%d/%d, want seq/1/64 (no WARP dim under R3 on this shape — K=WARP left the feasible area)", k.SoC, k.LoC, k.TileSize)
 	}
-	// blockDim = Π warp K × 32 = 2×32 = 64 — the per-LNT judge context.
-	if bd := blockDimOf(iterSocMap(t, mustTreeOf(t, g), rec)); bd != 64 {
-		t.Fatalf("blockDim = %d, want 64", bd)
+	// blockDim: no WARP dims in the winner — 32 (the flat one-warp CTA).
+	if bd := blockDimOf(iterSocMap(t, mustTreeOf(t, g), rec)); bd != 32 {
+		t.Fatalf("blockDim = %d, want 32 (no WARP dims)", bd)
 	}
 	sl, _ := rec.SiteDecisionOf(lhs)
-	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 4 || sl.Reuse != 256 {
-		t.Fatalf("lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 256 bytes 4 (C1b: K lane chunk ceil(32/32) = 1 element x 4 B; reuse = the N inside walk T_n = 256)",
+	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 256 || sl.Reuse != 256 {
+		t.Fatalf("lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 256 bytes 256 (T_k = 64 × 4 B, exactly at the F6 cap; reuse = the N inside walk T_n = 256)",
 			sl.Promoted, sl.Class, sl.Reuse, sl.Bytes)
 	}
 	sr, _ := rec.SiteDecisionOf(rhs)
-	if !sr.Promoted || sr.Class != ClassSMEM || sr.Bytes != 65536 || sr.Reuse != 256 {
-		t.Fatalf("rhs = (%v, %s, reuse %d, bytes %d), want promoted smem reuse 256 bytes 65536 (window K_k×T_k × T_n = 2·32·256·4 at the MaxCache cap; §2.4 collective reuse on ReuseDims {M}: CTA trips T_M = 256 — the old per-thread ceil(256/64) = 4 trips × 64 readers = the same collective 256)",
-			sr.Promoted, sr.Class, sr.Reuse, sr.Bytes)
+	if sr.Promoted || sr.Class != ClassFRAG || sr.Bytes != 65536 {
+		t.Fatalf("rhs = (%v, %s, bytes %d), want DECLINED frag-class 65536 B (> MaxFragPerThread, the F6 reason)", sr.Promoted, sr.Class, sr.Bytes)
 	}
 }
 
@@ -415,7 +424,10 @@ func TestFactorizationDigits(t *testing.T) {
 	mIter := fx.iters[0] // extent 1024 (const)
 
 	t.Run("order and loc descent", func(t *testing.T) {
-		ds := digitListOf(mIter, p, nil)
+		// R3 call-site update (quick-261029-v9k): mIter is passed as its
+		// own warpDim winner — this subtest pins the WARP-section
+		// enumeration order for a dim that IS the per-LNT winner.
+		ds := digitListOf(mIter, p, nil, mIter)
 		if len(ds) == 0 {
 			t.Fatal("the digit list must not be empty")
 		}
@@ -455,7 +467,9 @@ func TestFactorizationDigits(t *testing.T) {
 	})
 
 	t.Run("loc cap per tile", func(t *testing.T) {
-		ds := digitListOf(mIter, p, nil)
+		// R3: mIter as its own winner (the cap assertions are CTA-section,
+		// winner-independent).
+		ds := digitListOf(mIter, p, nil, mIter)
 		for _, d := range ds {
 			if d.soc != SoCTA && d.soc != SoCWARP {
 				continue
@@ -471,7 +485,7 @@ func TestFactorizationDigits(t *testing.T) {
 		// 2 keeps the smallest preset legal — >= 1 CTA dim is ALWAYS
 		// enumerable (CuMAP feasibility).
 		tiny := newChain("tiny", 8)
-		ds := digitListOf(tiny.iters[0], p, nil)
+		ds := digitListOf(tiny.iters[0], p, nil, tiny.iters[0])
 		cta := 0
 		for _, d := range ds {
 			if d.soc == SoCTA && d.loc == 2 && d.tile == 256 {
@@ -490,7 +504,7 @@ func TestFactorizationDigits(t *testing.T) {
 		dv := g.NewDimVar("ctor", d, g.NewConst("ctor", u32, 0), g.NewConst("ctor", u32, 1))
 		biv := g.NewBoundedDimVar("ctor", dv, g.NewInputParam("ctor", ir.RoleDim, "extent", nil))
 		it := g.NewIter("ctor", biv, nil)
-		ds := digitListOf(it, p, nil)
+		ds := digitListOf(it, p, nil, it)
 		found64 := false
 		for _, dg := range ds {
 			if dg.soc == SoCTA && dg.loc == 64 {
@@ -528,7 +542,11 @@ func TestIncrementalPruning(t *testing.T) {
 	}
 	raw := 1
 	for i := 0; i < 3; i++ {
-		raw *= len(digitListOf(fx.iters[i], p, nil))
+		// R3 call-site update: each dim is passed as its own winner so the
+		// raw product keeps its pre-R3 meaning — the FULL per-dim menu
+		// size (the pruning probe compares the enumeration's completed
+		// count against the un-restricted digit-vector product).
+		raw *= len(digitListOf(fx.iters[i], p, nil, fx.iters[i]))
 	}
 	if stats.pruned == 0 {
 		t.Fatal("the enumeration must reject digits at placement (pruned = 0 — enumerate-then-filter crept in?)")
@@ -1128,8 +1146,15 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	facts := overlapOf(fx, p)
 	window := windowOf(facts, p)
 	digitLists := make([][]schedDigit, len(window))
+	// R3 (quick-261029-v9k) + §3.1 prune (2026-10-30 ruling): the mirror
+	// must search the SAME feasible area as the pass — the per-LNT WARP
+	// restriction AND the surviving-WARP prune bind here too, with the
+	// shared warpDimOf winner (never a re-derived ranking), the same
+	// eliminated/reduced sets, and the same hasReduce discriminator.
+	reduced := reducedIters(fx.g)
+	warpDim := warpDimOf(window, facts.CS, reducedAxesOf(fx.g), len(reduced) > 0, p)
 	for i, it := range window {
-		digitLists[i] = digitListOf(it, p, nil)
+		digitLists[i] = digitListOf(it, p, reduced, warpDim)
 	}
 	tree := treeItersOf(facts.Tree)
 	best := -1.0

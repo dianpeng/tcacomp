@@ -389,8 +389,12 @@ func (e *emitter) prescan() error {
 //     their only textual form is the INLINE SmemView construction inside
 //     the reducer ctor.
 //   - GATED: every GMEM MemStore whose value-operand closure consumes a
-//     Combine call (R3). Such stores are per-element epilogue stores inside
-//     a reducer's element loop — the runtime-owned ownership gate
+//     COMBINE OF A MULTI-TIER reducer (Warp/Global — R3, quick-261029-v9k
+//     amended: the one-tier SeqReducer's Combine is an IDENTITY over each
+//     thread's OWN accumulator — every thread owns distinct output
+//     elements, so its stores must stay UNGATED; gating them drops every
+//     non-first-thread store, GPU-proven as canary violations on the R3
+//     collapse kernels). Multi-tier: the runtime-owned ownership gate
 //     (is_first_in_cta, R2) wraps them so exactly one CTA thread writes
 //     each output element.
 func (e *emitter) scanReducerFacts() {
@@ -405,7 +409,18 @@ func (e *emitter) scanReducerFacts() {
 				e.staging[ops[3]] = true
 			}
 		case ir.KindRuntimeCallMethod:
-			if ir.RuntimeMethodOf(n) == "Combine" {
+			if ir.RuntimeMethodOf(n) != "Combine" {
+				continue
+			}
+			// Only MULTI-TIER Combines gate their stores: read the call's
+			// receiver (operand 0 — the reducer construction). The one-tier
+			// SeqReducer's Combine is per-thread identity — no gate.
+			ops := ir.OperandsOf(n)
+			if len(ops) == 0 || ops[0] == nil {
+				continue
+			}
+			switch ops[0].KindOf() {
+			case ir.KindRuntimeWarpReducer, ir.KindRuntimeGlobalReducer:
 				combineCalls = append(combineCalls, n)
 			}
 		}

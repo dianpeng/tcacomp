@@ -31,6 +31,12 @@ var (
 	bracketInitLine    = regexp.MustCompile(`reducer(\d+)\.Init\(\);`)
 	bracketReduceLine  = regexp.MustCompile(`reducer(\d+)\.Reduce\(`)
 	bracketCombineLine = regexp.MustCompile(`=\s*reducer(\d+)\.Combine\(\);`)
+	// bracketCtorLine captures the reducer CLASS at its construction
+	// (quick-261029-v9k: the one-tier SeqReducer's Combine is a per-thread
+	// identity — its epilogue store is legitimately UNGATED, so the (e) law
+	// only demands the is_first_in_cta gate for the CTA-collective
+	// Warp/Global classes).
+	bracketCtorLine = regexp.MustCompile(`tca::rt::(SeqReducer|WarpReducer|GlobalReducer)<[^>]+>\s+reducer(\d+)`)
 )
 
 // blCodeLine is one code line of the emitted text with its brace depth at
@@ -61,7 +67,11 @@ func ScanBracketLaw(cu string) error {
 	// Exactly one reducer bracket per kernel in v0.
 	initIdx := -1
 	reducer := ""
+	reducerClass := ""
 	for i, c := range codes {
+		if m := bracketCtorLine.FindStringSubmatch(c.text); m != nil && reducerClass == "" {
+			reducerClass = m[1]
+		}
 		m := bracketInitLine.FindStringSubmatch(c.text)
 		if m == nil {
 			continue
@@ -73,6 +83,9 @@ func ScanBracketLaw(cu string) error {
 	}
 	if initIdx < 0 {
 		return fmt.Errorf("bracket-law: no reducerN.Init() call in the text")
+	}
+	if reducerClass == "" {
+		return fmt.Errorf("bracket-law: no tca::rt::<Class>Reducer construction found for reducer%s", reducer)
 	}
 	d := codes[initIdx].depth // the parent scope's depth (X's parent)
 
@@ -169,8 +182,15 @@ func ScanBracketLaw(cu string) error {
 	}
 	combineIdx := xClose + 1
 
-	// (e) The gated single-owner store follows; no scope closes below the
-	// parent between Combine and the store's Set.
+	// (e) The single-owner store follows; no scope closes below the
+	// parent between Combine and the store's Set. The GATE itself is
+	// class-dependent (quick-261029-v9k): the CTA-collective Warp/Global
+	// reducers combine every thread's partial result into ONE value per
+	// element, so exactly one elected thread (is_first_in_cta, R2) may
+	// store it; the one-tier SeqReducer's Combine is a per-thread identity
+	// over its OWN elements — every thread stores its own, ungated
+	// (gating it drops every non-first-thread store: GPU-proven canary on
+	// the R3 collapse kernels).
 	gateIdx, setIdx := -1, -1
 	for i := combineIdx + 1; i < len(codes); i++ {
 		if codes[i].depth < d {
@@ -179,7 +199,7 @@ func ScanBracketLaw(cu string) error {
 		if gateIdx < 0 && strings.Contains(codes[i].text, "is_first_in_cta()") {
 			gateIdx = i
 		}
-		if gateIdx >= 0 && strings.Contains(codes[i].text, ".Set(") {
+		if setIdx < 0 && strings.Contains(codes[i].text, ".Set(") {
 			setIdx = i
 			break
 		}
@@ -190,7 +210,10 @@ func ScanBracketLaw(cu string) error {
 		}
 	}
 	if setIdx < 0 {
-		return fmt.Errorf("bracket-law: no is_first_in_cta()-gated .Set( after Combine")
+		return fmt.Errorf("bracket-law: no .Set( after Combine (the single-owner epilogue store is missing)")
+	}
+	if reducerClass != "SeqReducer" && (gateIdx < 0 || gateIdx > setIdx) {
+		return fmt.Errorf("bracket-law: %s requires an is_first_in_cta()-gated .Set( after Combine (the CTA-collective single-owner store)", reducerClass)
 	}
 	return nil
 }

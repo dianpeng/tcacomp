@@ -324,12 +324,25 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 		}
 	}
 
-	// Build the fresh uniform element chain innermost-first (the AST blocks
-	// carry the real statement order — since quick-261024-sdk removed the
-	// body slot there is NO loop-to-loop operand to wire; the loops are
-	// chained solely as Block items). Uniform: init 0, step 1, soc 0
-	// (sequential), loc 1 — every thread walks every element, which is what
-	// keeps Combine's collectives uniformly reached.
+	// Build the fresh element chain innermost-first (the AST blocks carry
+	// the real statement order — since quick-261024-sdk removed the body
+	// slot there is NO loop-to-loop operand to wire; the loops are chained
+	// solely as Block items).
+	//
+	// The fresh walks' HEADERS are class-dependent (quick-261029-v9k, the
+	// fix5 R2 one-tier amendment): MULTI-TIER (Warp/Global) builds UNIFORM
+	// walks — init 0, step 1, soc 0, loc 1 — because the CTA-collective
+	// Combine requires EVERY thread to walk EVERY element (the originals
+	// may be per-thread-specialized, e.g. the coupled CTA walk; the
+	// uniform rebuild flattens them, which is load-bearing there). The
+	// ONE-TIER SeqReducer's accumulator is PER-THREAD: each thread owns
+	// exactly the elements its OWN walks visit, so the fresh walks CLONE
+	// the original headers (init/step operands reused, soc/dosoc/loc/tile
+	// attributes copied) — the R3 collapse's WARP-covered element dim
+	// carries its lane-chunk init lane x ceil(T/32), and resetting it to 0
+	// (the uniform path) broke the chunk-local FRAG coordinate and the
+	// store coordinate, GPU-proven as memcheck Invalid __local__ reads on
+	// row_sum/softmax.
 	//
 	// R-A (HI-01, 2026-10-24 ruling): X's parent must be the INNERMOST
 	// output-element loop — the construction runs innermost-first, so the
@@ -338,16 +351,46 @@ func (lr *lowering) buildElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTB
 	// inserted into X's old parental position at the end). At
 	// len(betweenBlks)==1 elemBlk == outermostBlk — the committed
 	// 1-between-dim golden shape is bit-identical.
+	oneTier := construction.KindOf() == ir.KindRuntimeSequentialReducer
 	freshIVs := make([]ir.Node, len(betweenBlks))
 	freshBlks := make([]*ir.ASTBlock, len(betweenBlks))
 	var outermostBlk, elemBlk *ir.ASTBlock
 	for i := len(betweenBlks) - 1; i >= 0; i-- {
 		dimParam := ir.OperandsOf(betweenIVs[i])[0]
-		freshIV := lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
-		freshWrapper := lr.g.NewBoundedDimVar(lowerOrigin, freshIV, boundMaxs[i])
-		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper,
-			lr.g.NewKeyedAttribute(lowerOrigin, "soc", lr.u32c(0)),
-			lr.g.NewKeyedAttribute(lowerOrigin, "loc", lr.u32c(1)))
+		var freshIV, freshWrapper ir.Node
+		var attrs []ir.Node
+		if oneTier {
+			ivOps := ir.OperandsOf(betweenIVs[i])
+			if len(ivOps) != 3 {
+				return fmt.Errorf("final-lower: reduce node %d: between IV %d is not a (dim, init, step) dimvar (corrupted rewrite?)",
+					red.BasePtr().ID(), betweenIVs[i].BasePtr().ID())
+			}
+			freshIV = lr.g.NewDimVar(lowerOrigin, dimParam, ivOps[1], ivOps[2])
+			// Clone the original loop's annotation set (soc/dosoc/loc/tile)
+			// — the attribute NODES are cloned (never shared with the
+			// discarded original loop) to keep single ownership.
+			lops := ir.OperandsOf(betweenBlks[i].Loop())
+			if len(lops) < 2 {
+				return fmt.Errorf("final-lower: reduce node %d: between loop %d carries no header (corrupted schedule?)",
+					red.BasePtr().ID(), betweenBlks[i].Loop().BasePtr().ID())
+			}
+			for _, op := range lops[2:] {
+				k, v := ir.KeyedAttributeOf(op)
+				if k == "" {
+					return fmt.Errorf("final-lower: reduce node %d: between loop %d carries a non-attribute header operand %d (corrupted schedule?)",
+						red.BasePtr().ID(), betweenBlks[i].Loop().BasePtr().ID(), op.BasePtr().ID())
+				}
+				attrs = append(attrs, lr.g.NewKeyedAttribute(lowerOrigin, k, v))
+			}
+		} else {
+			freshIV = lr.g.NewDimVar(lowerOrigin, dimParam, lr.u32c(0), lr.u32c(1))
+			attrs = []ir.Node{
+				lr.g.NewKeyedAttribute(lowerOrigin, "soc", lr.u32c(0)),
+				lr.g.NewKeyedAttribute(lowerOrigin, "loc", lr.u32c(1)),
+			}
+		}
+		freshWrapper = lr.g.NewBoundedDimVar(lowerOrigin, freshIV, boundMaxs[i])
+		freshLoop := lr.g.NewForLoop(lowerOrigin, freshIV, freshWrapper, attrs...)
 		blk, err := ir.NewASTLoop(freshLoop)
 		if err != nil {
 			return fmt.Errorf("final-lower: reduce node %d: building an element loop block: %w", red.BasePtr().ID(), err)

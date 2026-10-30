@@ -134,6 +134,12 @@ type lntFacts struct {
 	// Params.ReducedDimWarp is false. Consumers that do not search (the
 	// lower, verify's fact re-derivation) leave it nil.
 	reduced map[ir.Node]bool
+	// eliminated is the kernel's REDUCED-AXES set (reducedAxesOf: feeds a
+	// Reduce's value, never a store subscript — the axes the reduction
+	// DROPS). Populated alongside reduced by the decide pass's Run; the
+	// §3.1 prune (warpDimOf) ranks WARP candidates among these ONLY (a
+	// WARP digit on a surviving axis is the GPU-broken iq6 §3.1 class).
+	eliminated map[ir.Node]bool
 }
 
 // findINS returns every Iter node a MemLoad's subscripts reference

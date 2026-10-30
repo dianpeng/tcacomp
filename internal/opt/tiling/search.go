@@ -91,10 +91,16 @@ func searchSchedule(lf lntFacts, p Params, smemFloor, fragFloor int) (schedResul
 func searchScheduleStats(lf lntFacts, p Params, smemFloor, fragFloor int) (schedResult, searchStats, error) {
 	var stats searchStats
 	window := windowOf(lf, p)
+	// R3 (fix5 §1): the WARP digit lands on exactly ONE dim per LNT — the
+	// extent-aware winner, computed once here and passed into every
+	// digitListOf call (feasible-area shaping, decide-side only: the
+	// enumeration order, the judge, the eviction, and tiling-verify are
+	// untouched, exactly like R-REDUCED).
+	warpDim := warpDimOf(window, lf.CS, lf.eliminated, len(lf.reduced) > 0, p)
 	digitLists := make([][]schedDigit, len(window))
 	anyCTADigit := false
 	for i, it := range window {
-		digitLists[i] = digitListOf(it, p, lf.reduced)
+		digitLists[i] = digitListOf(it, p, lf.reduced, warpDim)
 		for _, d := range digitLists[i] {
 			if d.soc == SoCTA {
 				anyCTADigit = true
@@ -310,7 +316,16 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 // a value already present (a preset, or an adaptive value from an earlier
 // tile) appears exactly once — presets win the duplicate. Placement is
 // deterministic: tiles ascending, appended after the section's presets.
-func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit {
+//
+// R3 (fix5 §1, quick-261029-v9k): the WARP preset section AND this
+// adaptiveSection(SoCWARP) call emit ONLY when iter is the LNT's
+// warpDimOf winner — the per-LNT WARP digit is enumerated on exactly one
+// (the extent-aware-chosen) dim. The R-REDUCED prune below stands on top
+// (a reduced winner under ReducedDimWarp=false carries no WARP section at
+// all — narrower than the pre-R3 flag=false semantics, where non-reduced
+// dims kept their WARP digits; fix5 §1 R3 consequence, recorded in the
+// task SUMMARY).
+func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool, warpDim ir.Node) []schedDigit {
 	tiles := tileCandidates(p) // deduped, ascending (entries >= 2 by Validate)
 	out := make([]schedDigit, 0, len(tiles)*(2+len(p.CtaLoCPresets)+len(p.WarpLoCPresets)))
 	for _, t := range tiles {
@@ -365,6 +380,11 @@ func digitListOf(iter ir.Node, p Params, reduced map[ir.Node]bool) []schedDigit 
 		// R-REDUCED: WARP on a reducer-consuming dim is pruned from the
 		// feasible area while the split-k capability gate is closed
 		// (explicit ReducedDimWarp=false — the Wave-1 policy).
+		return out
+	}
+	if iter != warpDim {
+		// R3: this dim lost the per-LNT WARP ranking — no WARP section at
+		// all (the winner dim's list below carries presets + adaptive).
 		return out
 	}
 	for _, k := range presetDesc(p.WarpLoCPresets) {
@@ -435,6 +455,47 @@ func reducedIters(g *ir.Graph) map[ir.Node]bool {
 	return out
 }
 
+// reducedAxesOf returns the kernel's ELIMINATED iter set: the iters that
+// feed a Reduce's value but are NOT a subscript axis of any MemStore —
+// the axes the reduction DROPS. Distinct from reducedIters (the
+// reducer-CONSUMING set, which additionally contains the SURVIVING axes:
+// in scale_copy [R,C,K] -> [R,C] every IV feeds the reduce value, but only
+// K is eliminated). The §3.1 prune (warpDimOf) and its tile-lower mirror
+// (rejectWarpSurvivingDims) need the ELIMINATED semantic: a WARP digit on
+// a SURVIVING axis is exactly the GPU-broken cross-product class
+// (row_sum/softmax, canary 1/64). Store subscripts pin the surviving
+// axes (MemStore operands are [value, tensor, axes...]).
+func reducedAxesOf(g *ir.Graph) map[ir.Node]bool {
+	stored := make(map[ir.Node]bool)
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindMemStore {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		for _, ax := range ops[min(2, len(ops)):] { // [value, tensor, axes...]
+			for _, it := range findAxisIters(ax) {
+				stored[it] = true
+			}
+		}
+	}
+	out := make(map[ir.Node]bool)
+	for _, n := range g.AllocatedNodes() {
+		if n == nil || n.BasePtr() == nil || n.BasePtr().Erased() || n.KindOf() != ir.KindReduce {
+			continue
+		}
+		ops := ir.OperandsOf(n)
+		if len(ops) == 0 || ops[0] == nil {
+			continue
+		}
+		for _, it := range findAxisIters(ops[0]) {
+			if !stored[it] {
+				out[it] = true
+			}
+		}
+	}
+	return out
+}
+
 // windowOf returns the LNT's search window: the last WindowK levels of
 // the root -> deepest-leaf spine, outermost-of-window first. Every iter
 // outside the window and every non-spine iter defaults sequential
@@ -450,6 +511,128 @@ func windowOf(lf lntFacts, p Params) []ir.Node {
 		out = append(out, t.Iter)
 	}
 	return out
+}
+
+// warpDimOf is the fix5 §1 R3 extent-aware WARP-dim ranking (quick-
+// 261029-v9k): computed ONCE per LNT in searchScheduleStats, its winner
+// is the only dim whose digit list carries a WARP section. The comparator
+// is TOTAL — it always resolves, never panics, never leaves a tie:
+//
+//	L1: effective extent DESC — constExtentOf's const value, else
+//	    Params.NominalExtent (the SAME discipline as R1's adaptiveLoC and
+//	    R4's reducedTierEff, so the ranking, the enumeration, and the
+//	    verify re-check can never disagree on an extent).
+//	L2: stride-1 set membership first — stride1Set is the union over cs of
+//	    the iters at each site's INNERMOST subscript position (the last
+//	    non-empty AxesIters entry — the coalescing axis of every admitted
+//	    candidate load); in-set dims rank above out-of-set dims, and
+//	    WITHIN the set the innermost WINDOW position wins.
+//	L3: non-reduced before reduced (the reduced axis as last-resort
+//	    fallback — fires only on residuals L1/L2 left tied; VACUOUS under
+//	    the §3.1 prune below, kept for comparator totality).
+//	L4: innermost window position (final fallback — window positions are
+//	    unique, so this always resolves).
+//
+// §3.1 PRUNE (author ruling, 2026-10-30, iq6 candidate-1 — supersedes the
+// fix5 §1 R3 "any dim" reading): the candidate set is RESTRICTED TO
+// REDUCED dims. A WARP digit on a non-reduced (surviving) dim lowers
+// through the CTA-coupled-inside × lane-chunk composition whose cross
+// product is 63/64 UNCOVERED — GPU-proven on the R3 re-choice kernels
+// (row_sum/softmax, canary exactly 1/64 of the output space; the iq6
+// §3.1 class "every (m,n) pair carries 16/1024 k values"). fix5 §3's
+// premise ("the layout already flows — only the CHOICE of dim is new")
+// is GPU-disproven. The prune restores the fix4 reduced-only WARP
+// feasible area until the tile-lower cross-product lowering is designed;
+// the R3 ranking stays as the tie-break AMONG REDUCED candidates. An LNT
+// with NO reduced dim in the window gets NO WARP digit at all. tile-lower
+// carries the fail-closed MIRROR (rejectWarpSurvivingDims).
+//
+// Consequences (fix5 §1 R3, recorded in the task SUMMARY): at most one
+// WARP dim per LNT (multi-warp-dim vectors leave the feasible area;
+// MAPM/MALoC accounting unchanged); an LNT whose winner is reduced under
+// explicit ReducedDimWarp=false carries no WARP dim at all. The ranking
+// reads only verified IR facts (constExtentOf, SiteFacts.AxesIters, the
+// reduced map) and never indexes an empty window (windowOf is non-empty
+// for every searched LNT; a nil/empty window yields nil, and digitListOf
+// then emits no WARP section for any dim — fail-safe, T-v9k-01).
+func warpDimOf(window []ir.Node, cs []SiteFacts, eliminated map[ir.Node]bool, hasReduce bool, p Params) ir.Node {
+	// §3.1 prune (ruling above): in a REDUCE-CARRYING kernel (every real
+	// v0 kernel — the chain shape is map|reduce[|map]|store), surviving
+	// (non-eliminated) candidates are excluded from the ranking
+	// entirely; no eliminated dim in the window means NO WARP digit
+	// anywhere (nil winner — digitListOf then emits no WARP section for
+	// any dim; fail-safe, T-v9k-01). The set is the ELIMINATED axes
+	// (reducedAxesOf) — NOT lf.reduced, whose reducer-consuming semantic
+	// also contains the SURVIVING axes. A crafted NO-REDUCE graph (the
+	// template-corpus fixtures — unreachable from the v0 pipeline) keeps
+	// the full-window R3 ranking: nothing real to protect, and the
+	// template pins stay intact for the future §3.1 lowering's machinery
+	// tests. The lower-side mirror (rejectWarpSurvivingDims) shares this
+	// scope.
+	if hasReduce {
+		var windowEliminated []ir.Node
+		for _, it := range window {
+			if eliminated[it] {
+				windowEliminated = append(windowEliminated, it)
+			}
+		}
+		if len(windowEliminated) == 0 {
+			return nil
+		}
+		window = windowEliminated
+	}
+	if len(window) == 0 {
+		return nil
+	}
+	// stride1Set: per site, the iters at the innermost NON-EMPTY subscript
+	// position (the load's coalescing axis).
+	stride1 := make(map[ir.Node]bool)
+	for _, sf := range cs {
+		for i := len(sf.AxesIters) - 1; i >= 0; i-- {
+			if len(sf.AxesIters[i]) == 0 {
+				continue
+			}
+			for _, it := range sf.AxesIters[i] {
+				stride1[it] = true
+			}
+			break
+		}
+	}
+	pos := make(map[ir.Node]int, len(window))
+	for i, it := range window {
+		pos[it] = i
+	}
+	effExtent := func(it ir.Node) int {
+		if e, ok := constExtentOf(it); ok {
+			return e
+		}
+		return p.NominalExtent
+	}
+	// better reports whether a ranks strictly above b (window order:
+	// index 0 = outermost, len-1 = innermost).
+	better := func(a, b ir.Node) bool {
+		if ea, eb := effExtent(a), effExtent(b); ea != eb {
+			return ea > eb // L1
+		}
+		sa, sb := stride1[a], stride1[b]
+		if sa != sb {
+			return sa // L2 membership: in-set first
+		}
+		if sa && pos[a] != pos[b] {
+			return pos[a] > pos[b] // L2 within-set: innermost window first
+		}
+		if ra, rb := eliminated[a], eliminated[b]; ra != rb {
+			return !ra // L3: non-reduced before reduced
+		}
+		return pos[a] > pos[b] // L4: innermost window (total — positions unique)
+	}
+	best := window[0]
+	for _, it := range window[1:] {
+		if better(it, best) {
+			best = it
+		}
+	}
+	return best
 }
 
 // spineOf returns the root -> deepest-leaf chain (deepest by Depth; ties
