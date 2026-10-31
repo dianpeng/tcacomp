@@ -295,22 +295,28 @@ func TestTierEffReduced(t *testing.T) {
 
 // TestSearchRechoiceCollapse pins the §3.1-pruned search outcome on the
 // fix5 §4 headline fixture (scale_copy with K const 4 — R4's tierEff
-// bites). RE-DERIVED under the §3.1 ruling (author, 2026-10-30, iq6
-// candidate-1): the pre-ruling pin asserted the C=WARP K=SEQ collapse
-// winner — a SURVIVING-WARP vector, GPU-proven broken (row_sum/softmax
-// canary exactly 1/64; the CTA-coupled-inside × lane-chunk diagonal).
-// Under the prune the collapse vector is UNREPRESENTABLE (C, a surviving
-// axis, can never carry the WARP digit) AND its all-SEQ remainder is
-// FRAG-declined anyway (covered [C,K] prices 32x32x4 = 4096 B/thread >
-// MaxFragPerThread 256 B -> traffic 0 — the qwo gate-3 mechanism), so the
-// honest winner is the R4-PENALIZED CEREMONY vector
-// R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32): tierEff 0.0625 cuts its
-// score' 16x, but it is the only remaining positive-traffic class. The
-// loads stay promoted FRAG 128 B reuse 4 (the C1b per-thread window is
-// unchanged — K=WARP keeps the covered set's tier legal). The K=SEQ
-// collapse re-choice needs fix6's work-shape model (FRAG windows > 1x1
-// pricing) IN ADDITION to the §3.1 lowering; recorded in the task
-// SUMMARY, never chased out of scope.
+// bites). RE-DERIVED under fix6 §3 (quick-261030-v62 — the work-shape
+// pricing the §3.1-era comment reserved: "the K=SEQ collapse re-choice
+// needs fix6's work-shape model ... IN ADDITION to the §3.1 lowering;
+// recorded in the task SUMMARY, never chased out of scope" — THIS task is
+// that fix arriving). History: the pre-§3.1 pin asserted the C=WARP K=SEQ
+// collapse winner — a SURVIVING-WARP vector, GPU-proven broken (row_sum/
+// softmax canary exactly 1/64); the §3.1 ruling pruned the class and the
+// pin re-derived to the R4-PENALIZED CEREMONY vector as "the only
+// remaining positive-traffic class" — because the all-SEQ collapse's
+// covered [C,K] priced 32x32x4 = 4096 B/thread > MaxFragPerThread 256 B
+// and F6-DECLINED (the qwo gate-3 mechanism, fix6 §2's measured deadlock).
+// fix6 §3 removes the decline and prices the window honestly: the
+// collapse's RAW 262144 B/thread window (at the maximizing T256 tiles)
+// prices at the 256 B register block, the reuse is the R inside walk
+// ceil(256/32) = 8, holders 32 — per-site traffic 58,720,256, dwarfing
+// the ceremony's 49,152 × 0.0625. The honest winner is now the all-SEQ
+// COLLAPSE vector R=CTA(16,T256) C=SEQ(1,T256) K=SEQ(1,T256): the §3.1
+// prune stays intact (C, a surviving axis, still cannot carry WARP), and
+// the kernel-wide block sum (256+256 > 256) evicts one load by value
+// density — the survivor promotes FRAG 256 B block reuse 8, the other
+// demotes ReasonEvicted. The full score comparison is pinned in
+// fragwindow_test.go's TestFragWindowCollapseBeatsCeremony.
 func TestSearchRechoiceCollapse(t *testing.T) {
 	fx, x, z := scaleCopyFx(t, true) // K const 4 — R4's tierEff bites
 	p := DefaultParams()
@@ -319,34 +325,45 @@ func TestSearchRechoiceCollapse(t *testing.T) {
 	if !reducedAxesOf(fx.g)[fx.iters[2]] {
 		t.Fatal("fixture setup: iter 2 (k) must be the ELIMINATED dim")
 	}
-	// The pruned winner (derivation above): R=CTA(16,T256) C=SEQ(T32)
-	// K=WARP(2,T32) — the R4-penalized ceremony, the only positive-traffic
-	// class left. The surviving dim C must NEVER carry WARP.
+	// The fix6 §3 winner (derivation above): the all-SEQ collapse
+	// R=CTA(16,T256) C=SEQ(1,T256) K=SEQ(1,T256). The surviving dim C
+	// must NEVER carry WARP (the §3.1 prune stays intact).
 	if d := decisionOf(t, rec, fx.iters[1]); d.SoC == SoCWARP {
 		t.Fatalf("the surviving dim must not carry WARP under the §3.1 prune, got %s/%d/T%d", d.SoC, d.LoC, d.TileSize)
 	}
 	want := []IterDecision{
 		{SoC: SoCTA, LoC: 16, TileSize: 256},
-		{SoC: SoCSequential, LoC: 1, TileSize: 32},
-		{SoC: SoCWARP, LoC: 2, TileSize: 32},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
 	}
 	for i, w := range want {
 		if d := decisionOf(t, rec, fx.iters[i]); d != w {
-			t.Fatalf("pruned re-choice winner: iter %d must be %+v (derivation in the comment), got %+v", i, w, d)
+			t.Fatalf("fix6 §3 re-choice winner: iter %d must be %+v (derivation in the comment), got %+v", i, w, d)
 		}
 	}
-	// Both loads stay promoted FRAG 128 B reuse 4 — the ceremony's C1b
-	// per-thread window is unchanged (128 x (4-1) x 64 holders per site).
-	for _, ld := range []ir.Node{x, z} {
-		sd, ok := rec.SiteDecisionOf(ld)
-		if !ok || !sd.Promoted || sd.Class != ClassFRAG || sd.Bytes != 128 || sd.Reuse != 4 {
-			t.Fatalf("pruned winner: load %d must stay promoted FRAG 128 B reuse 4, got %+v (ok=%v)", ld.BasePtr().ID(), sd, ok)
-		}
+	// Exactly one load survives the kernel-wide block eviction (256+256 >
+	// 256 evicts by value density, the tie falls to CS order — site x
+	// first): the survivor promotes FRAG at the 256 B block reuse 8; the
+	// other demotes ReasonEvicted. (Both raw windows are 262144 B — the
+	// fill the lower allocates — priced at the 256 B block for the
+	// budget.)
+	sx, okX := rec.SiteDecisionOf(x)
+	sz, okZ := rec.SiteDecisionOf(z)
+	if !okX || !okZ {
+		t.Fatal("both loads must carry record entries")
+	}
+	if sx.Promoted || sx.Reason != ReasonEvicted {
+		t.Fatalf("load x must be the density-evicted site, got %+v", sx)
+	}
+	if !sz.Promoted || sz.Class != ClassFRAG || sz.Bytes != 256 || sz.Reuse != 8 {
+		t.Fatalf("load z must survive promoted FRAG 256 B block reuse 8, got %+v", sz)
 	}
 
 	// R4 is selection-only: the raw int traffic pin survives UNSCALED.
 	// Evaluate the ceremony vector directly: traffic must stay 49152 while
-	// score' carries the 0.0625 tierEff cut.
+	// score' carries the 0.0625 tierEff cut (the ceremony class is
+	// unchanged by the fix6 §3 pricing — its 128 B windows sit under the
+	// cap, block == raw).
 	lf := overlapOf(fx, p)
 	lf.reduced = reducedIters(fx.g) // Pass.Run populates this; overlapOf alone does not
 	window := windowOf(lf, p)

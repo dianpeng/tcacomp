@@ -89,10 +89,11 @@ func (VerifyPass) Preserved() []string { return []string{RecordName} }
 //     under the per-LNT blockDim context (promotion flag, class, Reuse,
 //     Bytes — a divergence is corruption).
 //   - KERNEL-WIDE BUDGETS (the fix4 §2.3 MASRAM gates): the recomputed
-//     SMEM window-bytes sum and the per-thread FRAG sum, accumulated
-//     over ALL LNTs' promoted sites, stay within MaxCache /
-//     MaxFragPerThread — the SAME sums the decide feasibility and the
-//     lower's budget resolution gate.
+//     SMEM window-bytes sum and the per-thread FRAG sum — the FRAG sum of
+//     register-block footprints, min(raw window, MaxFragPerThread) per
+//     site under fix6 §3 — accumulated over ALL LNTs' promoted sites,
+//     stay within MaxCache / MaxFragPerThread — the SAME sums the decide
+//     feasibility and the lower's budget resolution gate.
 //   - FORLOOP STEP: every live ForLoop's dimvar step is a positive const
 //     (a zero/negative stride is an infinite/empty loop — the IR-verifier
 //     version of this invariant lands with T4; tiling-verify enforces it
@@ -259,11 +260,20 @@ func (v VerifyPass) Run(ctx *opt.Context, g *ir.Graph) error {
 			j := judgeSite(sf, dec, ctxSchedule, v.Params)
 			checks = append(checks, siteCheck{lf: lf, sf: sf, sd: sd, j: j})
 			if sd.Promoted {
+				// The kernel-wide sums account the RECORD's footprints —
+				// the decide-side priced blocks the lower's budget
+				// resolution will actually consume — gated against THIS
+				// pass's thresholds. (Re-pricing from the judge under this
+				// pass's MaxFragPerThread would instead measure a
+				// hypothetical re-decide: under a deliberately tight
+				// budget the record's 32 B block would re-price to 31 B
+				// and the gate could never fire — the gate must ask
+				// "does the RECORD fit this budget", fix6 §3.)
 				switch sd.Class {
 				case ClassSMEM:
-					smem += j.bytes
+					smem += sd.Bytes
 				case ClassFRAG:
-					frag += j.bytes
+					frag += sd.Bytes
 				}
 			}
 		}

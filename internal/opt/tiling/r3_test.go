@@ -235,19 +235,21 @@ func TestWarpDimRestriction(t *testing.T) {
 
 // TestR3SearchRechoiceConstK pins the §3.1-pruned search outcome on the
 // scale_copy shape with the tiny reduced dim CONST (k=4 — the fixture
-// where R4's tierEff bites). RE-DERIVED under the §3.1 ruling (author,
-// 2026-10-30, iq6 candidate-1): the pre-ruling pin asserted the C=WARP
-// collapse winner — a SURVIVING-WARP vector, GPU-proven broken (row_sum/
-// softmax canary 1/64). Under the prune the collapse vector is
-// UNREPRESENTABLE, and the honest winner is the R4-PENALIZED CEREMONY
-// vector R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32): it is the only remaining
-// positive-traffic class — the all-SEQ collapse's covered [C,K] prices a
-// 32x32x4 = 4096 B/thread FRAG window > MaxFragPerThread 256 B (the qwo
-// gate-3 mechanism, FRAG-declined -> traffic 0 -> score' 0). The K=SEQ
-// collapse re-choice therefore needs fix6's work-shape model (FRAG
-// windows > 1x1 pricing) IN ADDITION to the §3.1 lowering; recorded in
-// the task SUMMARY, never chased out of scope. The loads stay promoted
-// (qwo's pin family) — K=WARP keeps the sites' covered set legal.
+// where R4's tierEff bites). RE-DERIVED under fix6 §3 (quick-261030-v62):
+// the pre-fix6 pin asserted the R4-PENALIZED CEREMONY vector as "the only
+// remaining positive-traffic class" — the all-SEQ collapse's covered
+// [C,K] priced a 4096 B/thread FRAG window > MaxFragPerThread 256 B and
+// F6-declined (the qwo gate-3 mechanism). fix6 §3 prices the window
+// honestly (the register block min(raw, MaxFragPerThread) for the budget;
+// the RAW window for the traffic), so the collapse class scores
+// 58,720,256 raw traffic per surviving site vs the ceremony's 49,152 ×
+// 0.0625 tierEff — and the honest winner is the all-SEQ COLLAPSE
+// R=CTA(16,T256) C=SEQ(1,T256) K=SEQ(1,T256) (derivation in
+// adaptive_test.go's TestSearchRechoiceCollapse comment). The §3.1 prune
+// stays intact: C, a surviving axis, carries no WARP. The loads split:
+// one promotes FRAG at the 256 B block (reuse 8), the other is
+// ReasonEvicted (the kernel-wide block sum 512 > 256 spills by value
+// density — the fix5 R-EVICT semantics, unchanged).
 func TestR3SearchRechoiceConstK(t *testing.T) {
 	fx, _, _ := scaleCopyFx(t, true)
 	p := DefaultParams()
@@ -259,12 +261,12 @@ func TestR3SearchRechoiceConstK(t *testing.T) {
 	}
 	want := []IterDecision{
 		{SoC: SoCTA, LoC: 16, TileSize: 256},
-		{SoC: SoCSequential, LoC: 1, TileSize: 32},
-		{SoC: SoCWARP, LoC: 2, TileSize: 32},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
 	}
 	for i, w := range want {
 		if d := decisionOf(t, rec, fx.iters[i]); d != w {
-			t.Fatalf("pruned re-choice winner: iter %d must be %+v (the R4-penalized ceremony, derivation in the comment), got %+v", i, w, d)
+			t.Fatalf("fix6 §3 re-choice winner: iter %d must be %+v (the all-SEQ collapse, derivation in the comment), got %+v", i, w, d)
 		}
 	}
 	// The surviving-WARP class is unrepresentable: C must not carry WARP.
@@ -363,24 +365,22 @@ func TestS31SurvivingWarpPrune(t *testing.T) {
 
 	// (c) Search level: the C=WARP collapse vector is UNREPRESENTABLE on
 	// the const-K scale_copy shape — C's decision must not be WARP. The
-	// honest pruned winner (probe-derived, derivation below): the R4-
-	// penalized CEREMONY vector R=CTA(16,T256) C=SEQ(T32) K=WARP(2,T32) —
-	// the ONLY remaining positive-traffic class: the K=SEQ collapse
-	// vector's covered [C,K] prices a 32x32x4 = 4096 B/thread FRAG
-	// window > MaxFragPerThread 256 B (the qwo gate-3 mechanism), so it
-	// scores traffic 0 and loses to the 16x-cut ceremony. The collapse
-	// re-choice therefore needs fix6's work-shape model (FRAG windows
-	// > 1x1 pricing) IN ADDITION to the §3.1 lowering — recorded in the
-	// task SUMMARY, never chased out of scope here.
+	// honest winner (fix6 §3 re-derivation, quick-261030-v62 — was the
+	// R4-penalized ceremony while the all-SEQ collapse was F6-declined):
+	// the all-SEQ collapse R=CTA(16,T256) C=SEQ(1,T256) K=SEQ(1,T256) —
+	// the covered [C,K] RAW 262144 B/thread window prices at the 256 B
+	// register block, per-site traffic 58,720,256 vs the ceremony's
+	// 49,152 × 0.0625 tierEff (derivation in adaptive_test.go's
+	// TestSearchRechoiceCollapse comment).
 	want := []IterDecision{
 		{SoC: SoCTA, LoC: 16, TileSize: 256},
-		{SoC: SoCSequential, LoC: 1, TileSize: 32},
-		{SoC: SoCWARP, LoC: 2, TileSize: 32},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
+		{SoC: SoCSequential, LoC: 1, TileSize: 256},
 	}
 	rec := runPass(t, fx.g, p)
 	for i, w := range want {
 		if d := decisionOf(t, rec, fx.iters[i]); d != w {
-			t.Fatalf("prune: iter %d must be %+v (the R4-penalized ceremony, derivation in the comment), got %+v", i, w, d)
+			t.Fatalf("prune: iter %d must be %+v (the fix6 §3 all-SEQ collapse, derivation in the comment), got %+v", i, w, d)
 		}
 	}
 	if d := decisionOf(t, rec, fx.iters[1]); d.SoC == SoCWARP {
