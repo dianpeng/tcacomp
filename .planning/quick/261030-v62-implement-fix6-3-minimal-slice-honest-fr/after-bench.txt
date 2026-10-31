@@ -1,0 +1,38 @@
+FAIL dup_expr [dedup] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel dup_expr: cxx: fill 163 coordinate reconstruction ran out of axes
+FAIL dup_const [dedup] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel dup_const: cxx: fill 177 coordinate reconstruction ran out of axes
+FAIL axpy3 [fusion] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel axpy3: cxx: fill 167 coordinate reconstruction ran out of axes
+PASS mlp [fusion] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+FAIL softmax [fusion] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel softmax: cxx: fill 151 coordinate reconstruction ran out of axes
+PASS mm_small [tiling] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.0s build 3.3s run 3.8s (build) maxdiff 4.76837e-07
+FAIL row_sum [runtime] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel row_sum: cxx: fill 150 coordinate reconstruction ran out of axes
+FAIL scale_copy [runtime] compile 0.0s build 0.0s run 0.0s
+    reason: compile failed: tcacomp: kernel scale_copy: cxx: fill 156 coordinate reconstruction ran out of axes
+PASS gemm [llm] compile 0.0s build 0.0s run 0.5s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.0s build 0.0s run 0.6s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.0s build 3.3s run 9.7s (build) maxdiff 7.62939e-06
+
+  dedup: 0 passed, 2 failed, 0 skipped (0.1s)
+  fusion: 1 passed, 2 failed, 0 skipped (0.4s)
+  llm: 3 passed, 0 failed, 0 skipped (14.1s)
+  runtime: 0 passed, 2 failed, 0 skipped (0.1s)
+  tiling: 4 passed, 0 failed, 0 skipped (7.9s)
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  mlp                6718.6     6692.1     6978.8 14,631,663
+  mm_small           3009.7     3007.9     3012.2  5,443,768
+  mm_mid             6537.7     6474.7     6575.9 40,097,159
+  mm_splitk          6153.0     6148.0     6156.1 15,976,649
+  transpose        169675.0   167383.0   180830.0  7,386,922
+  gemm               9826.3     9807.7    10055.4 21,675,707
+  qk_score          17468.0    17460.4    17475.0 15,945,042
+  layernorm        455585.0   451767.0   458854.0 37,113,355
+8 passed, 6 failed, 0 skipped, total 22.6s
