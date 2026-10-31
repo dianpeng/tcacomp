@@ -2,6 +2,7 @@ package cxx
 
 import (
 	"fmt"
+	"strconv"
 
 	"tcacomp/internal/ir"
 )
@@ -37,6 +38,31 @@ import (
 //     params) take their biv, the rest take their axis, in order;
 //   - anything else: the FRAG mixed-with-skips form — fail closed (the v0
 //     search policy does not produce it).
+//
+// Const-dim reconciliation (D-fix6-03, quick-261031-c8n): a covered dim may
+// be COMPILE-TIME CONST, and the frontend builds its tensor DimRef as
+// {Extent: e} with an EMPTY Name (build.go dimKey) — the name-keyed covered
+// set can never match it. A DimRef{Extent>0} position is therefore
+// reconciled against the covered bivs' STATIC DIM DECLARATIONS: a static
+// dim's canonical InputParam spelling is "e<extent>" (build.go dimKey =
+// pkg.Builder's single declaration source), which IS its declared extent —
+// the ONLY extent surviving to codegen (RoleDim params carry no type, and
+// tile-lower's round bases are fresh dimvars whose original BIV bounds were
+// RAUW'd away). Claiming is by biv IDENTITY, never positional:
+//   - a DimRef{Extent>0} position claims the UNCLAIMED covered biv whose
+//     declared extent equals the ref's; ZERO matches means the position is
+//     NOT covered and takes its axis (a CTA-assigned const dim is a legal
+//     axis — never an error); MORE THAN ONE is a named fail-closed
+//     ambiguity (the repeated-extent D-fix6-01 class — never guessed);
+//   - a DimRef{Name} position claims the covered biv whose dim param
+//     carries that name (the pre-fix behavior, made identity-explicit so a
+//     const-covered dim preceding a dynamic-covered dim in tensor order —
+//     row_sum/softmax's [R, Ku, C] — cannot mis-assign the positional
+//     cursor); an already-claimed name match is a named fail-closed
+//     double-claim;
+//   - a covered biv left UNCLAIMED after the walk (its dim's declared
+//     extent matched no position — a non-canonical static dim name) is a
+//     named fail-closed error, never a silent drop.
 func (e *emitter) stmtFill(n ir.Node) error {
 	ops := ir.OperandsOf(n)
 	if len(ops) < 2 {
@@ -78,25 +104,83 @@ func (e *emitter) stmtFill(n ir.Node) error {
 	case len(axes) == rank:
 		coordNodes = axes
 	case len(axes)+len(bivs) == rank:
-		covered := map[string]bool{}
+		// The covered set keyed two ways: dim-param NAME (dynamic dims)
+		// and, for the const positions the name can never match,
+		// DECLARED EXTENT via the canonical "e<extent>" static-dim
+		// spelling (see the header convention block).
+		byName := make(map[string]ir.Node, len(bivs))
+		var statics []struct {
+			b      ir.Node
+			extent uint64
+		}
 		for _, b := range bivs {
 			d := e.bivDim(b)
 			if d == nil {
 				return fmt.Errorf("cxx: fill %d round base is not a dimvar", n.BasePtr().ID())
 			}
-			covered[ir.InputParamNameOf(d)] = true
+			name := ir.InputParamNameOf(d)
+			if _, dup := byName[name]; dup {
+				return fmt.Errorf("cxx: fill %d covered set declares dim @%s twice (repeated-extent ambiguity — the D-fix6-01 class: fail closed, never guessed)", n.BasePtr().ID(), name)
+			}
+			byName[name] = b
+			if ext, ok := staticDimExtent(name); ok {
+				statics = append(statics, struct {
+					b      ir.Node
+					extent uint64
+				}{b, ext})
+			}
 		}
-		ai, bi := 0, 0
-		for _, ref := range dims {
-			if covered[ref.Name] {
-				coordNodes = append(coordNodes, bivs[bi])
-				bi++
-			} else {
-				if ai >= len(axes) {
-					return fmt.Errorf("cxx: fill %d coordinate reconstruction ran out of axes", n.BasePtr().ID())
+		claimed := make(map[ir.Node]bool, len(bivs))
+		claim := func(b ir.Node) { claimed[b] = true; coordNodes = append(coordNodes, b) }
+		ai := 0
+		axis := func() error {
+			if ai >= len(axes) {
+				return fmt.Errorf("cxx: fill %d coordinate reconstruction ran out of axes", n.BasePtr().ID())
+			}
+			coordNodes = append(coordNodes, axes[ai])
+			ai++
+			return nil
+		}
+		for pos, ref := range dims {
+			if ref.Extent > 0 {
+				// A const position: claim the covered biv whose declared
+				// extent equals it; zero matches → the position is not
+				// covered and rides its axis (e.g. a CTA-assigned const
+				// dim) — exactly the pre-fix axis path for this case.
+				var hit ir.Node
+				for _, s := range statics {
+					if s.extent != ref.Extent || claimed[s.b] {
+						continue
+					}
+					if hit != nil {
+						return fmt.Errorf("cxx: fill %d const position %d (extent %d) matches multiple covered bivs (repeated-extent ambiguity — the D-fix6-01 class: fail closed, never guessed)", n.BasePtr().ID(), pos, ref.Extent)
+					}
+					hit = s.b
 				}
-				coordNodes = append(coordNodes, axes[ai])
-				ai++
+				if hit != nil {
+					claim(hit)
+					continue
+				}
+				if err := axis(); err != nil {
+					return err
+				}
+				continue
+			}
+			if b, ok := byName[ref.Name]; ok {
+				if claimed[b] {
+					return fmt.Errorf("cxx: fill %d position %d (dim @%s) double-claims an already-matched covered biv (repeated-extent ambiguity — the D-fix6-01 class: fail closed, never guessed)", n.BasePtr().ID(), pos, ref.Name)
+				}
+				claim(b)
+				continue
+			}
+			if err := axis(); err != nil {
+				return err
+			}
+		}
+		for _, b := range bivs {
+			if !claimed[b] {
+				return fmt.Errorf("cxx: fill %d covered dim @%s matched no tensor position — a static dim's declared-extent spelling is the canonical \"e<extent>\" (build.go dimKey); a non-canonical name cannot be reconciled (fail closed, never guessed)",
+					n.BasePtr().ID(), ir.InputParamNameOf(e.bivDim(b)))
 			}
 		}
 	default:
@@ -133,6 +217,28 @@ func (e *emitter) stmtFill(n ir.Node) error {
 	e.line(loader + "(" + e.curThread + ", " + bufView + ", tca::rt::TensorWindow(" + view +
 		", " + join(coords) + "));")
 	return nil
+}
+
+// staticDimExtent parses a dim InputParam's canonical static spelling
+// "e<extent>" (build.go dimKey / pkg.Builder's single declaration source)
+// into its declared compile-time extent. A dynamic dim's name never matches
+// (identifiers like "elem" fail the digit run; extent 0 is dynamic by
+// definition and is rejected), so a false return means "no declared static
+// extent" — the caller's name-keyed dynamic path owns the position.
+func staticDimExtent(name string) (uint64, bool) {
+	if len(name) < 2 || name[0] != 'e' {
+		return 0, false
+	}
+	for _, c := range name[1:] {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	ext, err := strconv.ParseUint(name[1:], 10, 64)
+	if err != nil || ext == 0 {
+		return 0, false
+	}
+	return ext, true
 }
 
 // bivDim returns a between-IV dimvar's dim InputParam operand.

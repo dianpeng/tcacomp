@@ -226,24 +226,27 @@ func fix33Graph() (g *ir.Graph, lhs, rhs ir.Node, iters []ir.Node) {
 // fix5 R3 (quick-261029-v9k — the "re-derive from the actual search output,
 // never weaken" rule).
 //
-// RE-DERIVED under R3 (the pinned vector below is the actual post-R3
-// search output): the R3 ranking makes M the per-LNT WARP winner (L1
-// extent — M=4096 is the largest const extent), so the pre-R3 §3.3 winner's
-// K=WARP digit LEAVES the feasible area (the WARP section now emits only
-// for M, and the objective prefers M=CTA over M=WARP here). The new
-// argmax: M=CTA/128/32 (the R1 adaptive digit ceil(4096/32) = 128 — a
-// full grid at tile 32), N=SEQ/1/256, K=SEQ/1/64 — NO WARP dim at all
-// (blockDim 32, the K reduce is per-thread sequential, the R2 one-tier
-// ladder). Sites: lhs (tie N, covered {K}, forced FRAG — M is a
-// thread-varying non-covered coordinate) promotes as a 256 B per-thread
-// window (T_k = 64 × 4 B, exactly at the F6 cap) with reuse 256 (the N
-// inside walk); rhs (covered {N, K}, no WARP-covered dim left) defaults to
-// the FRAG class at 256×64×4 = 65536 B > MaxFragPerThread and is DECLINED
-// with the F6 reason. The pre-R3 winner (M=CTA/16/256, N=SEQ, K=WARP/2/32,
-// rhs SMEM 65536 at the cap) is history — pinned in the R3 plan's
-// anticipated "const-extent fixtures whose WARP dim is no longer the
-// winner" move category; the suite's DYNAMIC matmul family keeps warps-on-K
-// split-K by construction (TestR3FamilyBGuard).
+// RE-DERIVED under fix6 §3 (quick-261030-v62 — the "re-derive from the
+// actual search output, never weaken" rule): the per-site F6 decline is
+// gone, so rhs (covered {N,K}, all-SEQ at T256) is no longer declined on
+// size: its RAW 256×256×4 = 262144 B/thread window prices at the 256 B
+// register block — but it still declines on the REUSE gate (the M CTA
+// dim's per-thread trips ceil(32/32) = 1 → reuse 1, no traffic). lhs
+// (covered {K}, forced FRAG under C1b — M is a thread-varying non-covered
+// coordinate) promotes at K=SEQ/T256: raw 1024 B, block 256 B, reuse 256
+// (tie N — probed: the tie is N, reuse dims {N} → T_n = 256; M is OUTER
+// than the tie, so M's assignment does not enter lhs's reuse at all),
+// holders 32 → traffic 8,355,840. The K tile
+// maximizes at 256 (same 256 B block price at every K tile, 4× the raw
+// window per K step), and M maximizes on the occupancy factor: LoC 128 at
+// T32 fills the grid exactly (active min(128, ceil(4096/32)) = 128,
+// idleFrac 0) vs the T256-adaptive LoC 16's worse factor at the identical
+// traffic — so the winner is M=CTA/128/32, N=SEQ/1/256, K=SEQ/1/256, no
+// WARP dim (blockDim 32, the K reduce is per-thread sequential). The
+// pre-fix6 winner (M=CTA/128/32, N=SEQ, K=SEQ/1/64 — lhs 256 B exactly at
+// the F6 cap, rhs F6-declined at 65536 B) is dominated by the T256 K
+// digit; the suite's DYNAMIC matmul family keeps warps-on-K split-K by
+// construction (TestR3FamilyBGuard).
 func TestFix33WorkedExample(t *testing.T) {
 	g, lhs, rhs, iters := fix33Graph()
 
@@ -251,13 +254,13 @@ func TestFix33WorkedExample(t *testing.T) {
 	rec := runPass(t, g, p)
 	m, n, k := decisionOf(t, rec, iters[0]), decisionOf(t, rec, iters[1]), decisionOf(t, rec, iters[2])
 	if m.SoC != SoCTA || m.LoC != 128 || m.TileSize != 32 {
-		t.Fatalf("M decision = %s/%d/%d, want cta/128/32 (the R1 adaptive digit ceil(4096/32) = 128 — re-derived under R3, derivation in the test comment)", m.SoC, m.LoC, m.TileSize)
+		t.Fatalf("M decision = %s/%d/%d, want cta/128/32 (the R1 adaptive digit ceil(4096/32) = 128 — re-derived under fix6 §3, derivation in the test comment)", m.SoC, m.LoC, m.TileSize)
 	}
 	if n.SoC != SoCSequential || n.LoC != 1 || n.TileSize != 256 {
-		t.Fatalf("N decision = %s/%d/%d, want seq/1/256 (the post-R3 winner)", n.SoC, n.LoC, n.TileSize)
+		t.Fatalf("N decision = %s/%d/%d, want seq/1/256 (the post-fix6 §3 winner)", n.SoC, n.LoC, n.TileSize)
 	}
-	if k.SoC != SoCSequential || k.LoC != 1 || k.TileSize != 64 {
-		t.Fatalf("K decision = %s/%d/%d, want seq/1/64 (no WARP dim under R3 on this shape — K=WARP left the feasible area)", k.SoC, k.LoC, k.TileSize)
+	if k.SoC != SoCSequential || k.LoC != 1 || k.TileSize != 256 {
+		t.Fatalf("K decision = %s/%d/%d, want seq/1/256 (the honest block pricing maximizes the raw K window at the same 256 B block)", k.SoC, k.LoC, k.TileSize)
 	}
 	// blockDim: no WARP dims in the winner — 32 (the flat one-warp CTA).
 	if bd := blockDimOf(iterSocMap(t, mustTreeOf(t, g), rec)); bd != 32 {
@@ -265,12 +268,17 @@ func TestFix33WorkedExample(t *testing.T) {
 	}
 	sl, _ := rec.SiteDecisionOf(lhs)
 	if !sl.Promoted || sl.Class != ClassFRAG || sl.Bytes != 256 || sl.Reuse != 256 {
-		t.Fatalf("lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 256 bytes 256 (T_k = 64 × 4 B, exactly at the F6 cap; reuse = the N inside walk T_n = 256)",
+		t.Fatalf("lhs = (%v, %s, reuse %d, bytes %d), want promoted frag reuse 256 bytes 256 (raw 1024 = T_k 256 × 4 B priced at the 256 B block; reuse = T_n = 256, the tie N — probed)",
 			sl.Promoted, sl.Class, sl.Reuse, sl.Bytes)
 	}
+	// rhs: raw 262144 B over the cap — priced, not declined on size —
+	// but the M-CTA per-thread reuse is 1 trip, so the reuse gate
+	// declines it (ReasonLowReuse). Bytes stays the computed 256 B block
+	// (the budget footprint, exactly what the F6 decline used to zero).
 	sr, _ := rec.SiteDecisionOf(rhs)
-	if sr.Promoted || sr.Class != ClassFRAG || sr.Bytes != 65536 {
-		t.Fatalf("rhs = (%v, %s, bytes %d), want DECLINED frag-class 65536 B (> MaxFragPerThread, the F6 reason)", sr.Promoted, sr.Class, sr.Bytes)
+	if sr.Promoted || sr.Class != ClassFRAG || sr.Bytes != 256 || sr.Reuse != 1 || sr.Reason != ReasonLowReuse {
+		t.Fatalf("rhs = (%v, %s, reuse %d, bytes %d, %q), want declined frag-class 256 B block reuse 1 (ReasonLowReuse — the honest reuse decline, fix6 §3)",
+			sr.Promoted, sr.Class, sr.Reuse, sr.Bytes, sr.Reason)
 	}
 }
 
@@ -857,9 +865,10 @@ func TestSearchWindow(t *testing.T) {
 // refuses the site; a thread-varying NON-covered INS coordinate (C1b)
 // forces ClassFRAG with per-lane pricing on a WARP-covered dim; else ANY
 // WARP-covered dim yields the SMEM window class (K_d × T_d windows) and
-// all-SEQ covered dims yield FRAG; the F6 per-site gate and the reuse
-// gate decline with named reasons; ANY covered dim at tile < 2 fails
-// closed.
+// all-SEQ covered dims yield FRAG (fix6 §3: over-budget FRAG windows
+// promote, priced at the min(raw, MaxFragPerThread) register block — no
+// per-site size decline exists); the reuse gate declines with a named
+// reason; ANY covered dim at tile < 2 fails closed.
 func TestPromotionJudge(t *testing.T) {
 	fx, lhs, rhs := matmul()
 	facts := overlapOf(fx, DefaultParams())
@@ -1139,8 +1148,10 @@ func TestTrafficArithmeticAndOptimality(t *testing.T) {
 // same function the search calls, never a re-derived formula). The judge's
 // gates and arithmetic are re-derived here INDEPENDENTLY (no judgeSite
 // call): digit lists with the R-LOCCAP cap, the tier rule, the
-// factor-model bytes, the lane-aware reuse with sharing, the F6 gate,
-// the greedy eviction, and the kernel-wide budget feasibility.
+// factor-model bytes, the lane-aware reuse with sharing, the fix6 §3
+// block pricing (FRAG: min(raw, MaxFragPerThread) for the budget, raw
+// for the traffic — no per-site decline), the greedy eviction, and the
+// kernel-wide budget feasibility.
 func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 	t.Helper()
 	facts := overlapOf(fx, p)
@@ -1179,9 +1190,9 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 				}
 			}
 			type site struct {
-				bytes, reuse int
-				class        CacheClass
-				ok           bool
+				raw, block, reuse int
+				class             CacheClass
+				ok                bool
 			}
 			var sites []site
 			for _, sf := range facts.CS {
@@ -1286,23 +1297,29 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 				if class == ClassFRAG {
 					holders = blockDim
 				}
-				ok2 := true
-				if class == ClassFRAG && bytes > p.MaxFragPerThread {
-					ok2 = false
+				// fix6 §3 mirror: NO per-site size decline — the FRAG
+				// budget prices the register block min(raw,
+				// MaxFragPerThread); the traffic term keeps the RAW
+				// window (the old mirror encoded the F6 decline, the
+				// defect fix6 §3 removes).
+				block := bytes
+				if class == ClassFRAG {
+					block = min(bytes, p.MaxFragPerThread)
 				}
+				ok2 := true
 				if bytes*(reuse-1)*holders <= 0 {
 					ok2 = false // one-currency gate: no traffic avoided
 				}
-				sites = append(sites, site{bytes: bytes, reuse: reuse, class: class, ok: ok2})
+				sites = append(sites, site{raw: bytes, block: block, reuse: reuse, class: class, ok: ok2})
 			}
-			// Greedy density eviction mirror.
+			// Greedy density eviction mirror — on the BLOCK footprints.
 			smem, frag := 0, 0
 			for _, s := range sites {
 				if s.ok {
 					if s.class == ClassSMEM {
-						smem += s.bytes
+						smem += s.block
 					} else {
-						frag += s.bytes
+						frag += s.block
 					}
 				}
 			}
@@ -1323,7 +1340,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 						}
 						continue
 					}
-					if sites[i].bytes < sites[pick].bytes {
+					if sites[i].block < sites[pick].block {
 						pick = i
 					}
 				}
@@ -1331,9 +1348,9 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 					break
 				}
 				if sites[pick].class == ClassSMEM {
-					smem -= sites[pick].bytes
+					smem -= sites[pick].block
 				} else {
-					frag -= sites[pick].bytes
+					frag -= sites[pick].block
 				}
 				sites[pick].ok = false
 			}
@@ -1344,7 +1361,7 @@ func enumerateBest(t *testing.T, fx fixture, p Params) float64 {
 					if s.class == ClassFRAG {
 						holders = blockDim
 					}
-					score += s.bytes * (s.reuse - 1) * holders
+					score += s.raw * (s.reuse - 1) * holders
 				}
 			}
 			// score' via the SHARED occupancyOf — the same function the
@@ -1408,20 +1425,33 @@ func scaffoldConstStore(g *ir.Graph, name string) {
 }
 
 // TestKernelWideSmemBudget pins the kernel-wide MASRAM scope: two LNTs
-// whose promotions are EACH individually legal under MaxCache cannot
-// both promote when their SUM exceeds it — the first LNT (Roots()
-// order) consumes the budget and the second LNT's sites are EVICTED in
-// every feasible schedule (ReasonEvicted, never an error). tiling-verify
-// stays green over the result — decide and verify gate the SAME
-// kernel-wide sum.
+// whose promotions are EACH individually legal under MaxCache cannot both
+// promote SMEM when their SUM exceeds it — the first LNT (Roots() order)
+// consumes the budget and the second LNT can add NO SMEM: its SMEM-argmax
+// vectors spill to zero by value density, and (fix6 §3 re-derivation,
+// quick-261030-v62) it rationally re-chooses a FRAG-carrying vector whose
+// block footprints fit the tiny FRAG budget. tiling-verify stays green
+// over the result — decide and verify gate the SAME kernel-wide sums.
+//
+// RE-DERIVED under fix6 §3: the old subtest pinned MaxFragPerThread=8 as
+// a FRAG killer ("T>=32 -> >=128 B can never promote") — that encoding of
+// the F6 per-site decline is exactly the defect fix6 §3 removes: the
+// honest block price min(raw, 8) = 8 B fits any positive budget, so the
+// second LNT's FRAG alternative (positive traffic) legitimately beats its
+// evicted-to-zero SMEM vectors. The kernel-wide budget STILL binds (the
+// second LNT adds no SMEM), the SMEM eviction-by-density mechanism stays
+// pinned by TestEviction's floor/density subtests, and the FRAG eviction
+// by density is exercised right here (the second LNT's two FRAG sites:
+// one promotes at the 8 B block, the other is ReasonEvicted — the
+// kernel-wide 8+8 > 8 sum spills).
 func TestKernelWideSmemBudget(t *testing.T) {
 	p := DefaultParams()
 	// Each LNT: two co-traversed SMEM sites; the winning schedule on the
 	// single-LNT graph promotes both at K=2/T=256 windows of 2·256·4 =
 	// 2048 B each (extent 64 caps K at 2) — 4096 B per LNT, exactly the
-	// budget below. MaxFragPerThread is pinned at 8 so the FRAG variants
-	// (T>=32 -> >=128 B) can never promote: without it, the second LNT
-	// legitimately switches to a FRAG-carrying vector instead of spilling.
+	// budget below. MaxFragPerThread stays pinned at 8: the FRAG variant's
+	// RAW window (T256 × 4 = 1024 B) prices at the 8 B block under fix6
+	// §3 — the budget still binds, on the block footprints.
 	p.MaxCache = 4096
 	p.MaxFragPerThread = 8
 
@@ -1443,7 +1473,7 @@ func TestKernelWideSmemBudget(t *testing.T) {
 	}
 	t.Run("each lnt alone is legal", single)
 
-	t.Run("sum over budget evicts the second lnt", func(t *testing.T) {
+	t.Run("sum over budget re-choices the second lnt off smem", func(t *testing.T) {
 		g := ir.NewGraph("kwb-two")
 		_, _, _, lpA, lqA := addWarpWindowLNT(g, "a")
 		_, _, _, lpB, lqB := addWarpWindowLNT(g, "b")
@@ -1455,17 +1485,35 @@ func TestKernelWideSmemBudget(t *testing.T) {
 				t.Fatalf("the first LNT's site must still promote, got (%v, %s)", sd.Promoted, sd.Class)
 			}
 		}
+		// The second LNT can add NO SMEM (the kernel-wide sum is already
+		// at MaxCache — its SMEM vectors spill to zero by density). Under
+		// fix6 §3 it re-chooses FRAG: both sites price at the 8 B block
+		// (min(1024, 8)); the kernel-wide 8+8 = 16 > 8 sum evicts one by
+		// value density, the survivor promotes. The budget binds on the
+		// block footprints — never an error.
+		promoted, evicted := 0, 0
 		for _, load := range []ir.Node{lpB, lqB} {
 			sd, ok := rec.SiteDecisionOf(load)
 			if !ok {
 				t.Fatal("the second LNT's sites must carry entries")
 			}
+			if sd.Class == ClassSMEM && sd.Promoted {
+				t.Fatalf("the second LNT must add no SMEM: the kernel-wide sum is already at MaxCache, got %+v", sd)
+			}
 			if sd.Promoted {
-				t.Fatalf("the second LNT's site must be evicted: the kernel-wide sum is already at MaxCache")
+				promoted++
+				if sd.Class != ClassFRAG || sd.Bytes != 8 {
+					t.Fatalf("the second LNT's survivor must promote FRAG at the 8 B block (fix6 §3), got %+v", sd)
+				}
+			} else {
+				evicted++
+				if sd.Reason != ReasonEvicted {
+					t.Fatalf("the spilled FRAG site must demote with ReasonEvicted, got %+v", sd)
+				}
 			}
-			if sd.Reason == "" {
-				t.Fatal("a demoted site must record its reason")
-			}
+		}
+		if promoted != 1 || evicted != 1 {
+			t.Fatalf("the second LNT: exactly one FRAG site promotes at the 8 B block and one is evicted, got promoted %d evicted %d", promoted, evicted)
 		}
 		// The record is CONSISTENT: verify gates the same kernel-wide sum
 		// and stays green.
@@ -1479,9 +1527,12 @@ func TestKernelWideSmemBudget(t *testing.T) {
 	})
 }
 
-// TestFragBudgetGate pins the F6 judge gate (a single FRAG site over
-// MaxFragPerThread declines) and the kernel-wide FRAG accumulation: an
-// over-floor candidate EVICTS its FRAG site instead of becoming
+// TestFragBudgetGate pins the fix6 §3 FRAG pricing (quick-261030-v62) and
+// the kernel-wide FRAG accumulation: a single FRAG site over
+// MaxFragPerThread PROMOTES priced at the register block (the old pin
+// encoded the F6 per-site decline — the defect fix6 §3 fixes: the §2
+// evidence is the 4096 B/thread window zeroing every collapse vector),
+// and an over-floor candidate EVICTS its FRAG site instead of becoming
 // infeasible.
 func TestFragBudgetGate(t *testing.T) {
 	fx, lhs, _ := matmul()
@@ -1502,23 +1553,29 @@ func TestFragBudgetGate(t *testing.T) {
 		mk2(iters)
 		return iters
 	}
-	// Judge level: lhs (covered {K}) at K SEQ tile 64 is a 256 B FRAG —
-	// exactly the cap, promoted; tile 128 is 512 B, declined.
+	// Judge level: lhs (covered {K}) at K SEQ tile 64 is a 256 B raw FRAG
+	// — exactly the cap, block == raw, promoted; tile 128 is 512 B raw,
+	// OVER the cap: pre-fix6 it declined with the F6 reason; fix6 §3
+	// prices it at the 256 B register block (min(512, 256)) and PROMOTES
+	// it (the traffic gate passes: reuse 64, holders 32). The judgment
+	// carries both numbers: block for the budget, raw for the traffic.
 	iters := mk(func(d map[ir.Node]IterDecision) {})
 	ctx := blockDimCtx{blockDim: blockDimOf(iters)}
 	j := judgeSite(siteOf(t, lf, lhs), iters, ctx, p)
-	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 {
-		t.Fatalf("a 256 B FRAG at the cap must promote, got (%v, %s, %d B)", j.promoted, j.class, j.bytes)
+	if !j.promoted || j.class != ClassFRAG || j.bytes != 256 || j.rawBytes != 256 {
+		t.Fatalf("a 256 B FRAG at the cap must promote with block == raw == 256, got (%v, %s, block %d, raw %d)", j.promoted, j.class, j.bytes, j.rawBytes)
 	}
 	iters2 := mk(func(d map[ir.Node]IterDecision) { d[window[len(window)-1]] = IterDecision{SoCSequential, 1, 128} })
 	j = judgeSite(siteOf(t, lf, lhs), iters2, ctx, p)
-	if j.promoted || j.reason != ReasonFragBytes || j.bytes != 512 {
-		t.Fatalf("a 512 B FRAG must decline with the F6 reason, got (%v, %q, %d B)", j.promoted, j.reason, j.bytes)
+	if !j.promoted || j.bytes != 256 || j.rawBytes != 512 {
+		t.Fatalf("a 512 B raw FRAG must PROMOTE priced at the 256 B block (fix6 §3: no per-site size decline), got (promoted %v, block %d, raw %d)", j.promoted, j.bytes, j.rawBytes)
 	}
 
-	// Schedule level: the same 256 B FRAG site survives at floor 0 but is
+	// Schedule level: the same 256 B block site survives at floor 0 but is
 	// EVICTED (ReasonEvicted) once earlier LNTs already consumed 128 FRAG
-	// bytes — the kernel-wide gate spills, never fails.
+	// bytes — the kernel-wide gate spills on the block footprints, never
+	// fails. (The over-cap T128 schedule-level traffic pin lives in
+	// fragwindow_test.go's TestFragWindowSearchTraffic.)
 	digits := make([]schedDigit, len(window))
 	for i := range window {
 		digits[i] = schedDigit{soc: SoCSequential, loc: 1, tile: 64}

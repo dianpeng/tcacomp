@@ -49,7 +49,7 @@ type schedResult struct {
 	traffic int     // the raw post-eviction one-currency traffic sum
 	partism int     // partition count: 2×#CTA dims + #WARP dims (R-PARTITION)
 	smem    int     // the chosen schedule's promoted-SMEM window bytes
-	frag    int     // the chosen schedule's promoted-FRAG per-thread bytes
+	frag    int     // the chosen schedule's promoted-FRAG register-block bytes (Σ min(raw, MaxFragPerThread), fix6 §3)
 	// promotedCount is the post-eviction promoted-site count (the
 	// zero-cache warning's predicate — read by the caller, never the
 	// record).
@@ -273,13 +273,16 @@ func evalSchedule(lf lntFacts, window []ir.Node, digits []schedDigit, st partSta
 			promoted++
 			// One CTA-wide currency (fix4 §2.4 amendment / §2.5): SMEM
 			// windows are filled collectively (holders 1), FRAG windows
-			// by each of the blockDim holder threads — bytes × (reuse − 1)
-			// × holders is CTA-wide GMEM bytes avoided for every class.
-			// The int res.traffic stays the RAW pin (fixed-schedule tests
-			// and tiling-verify consume it); R4's tierEff scales ONLY the
-			// float64 score currency.
-			res.traffic += s.j.bytes * (s.j.reuse - 1) * s.j.holders
-			scaledTraffic += float64(s.j.bytes*(s.j.reuse-1)) * float64(s.j.holders) *
+			// by each of the blockDim holder threads — RAW window bytes
+			// × (reuse − 1) × holders is CTA-wide GMEM bytes avoided for
+			// every class (fix6 §3: the traffic term prices the RAW
+			// window, uncapped — the budget side prices the register
+			// block via j.bytes, the ONE shared siteWindowBytes). The
+			// int res.traffic stays the RAW pin (fixed-schedule tests
+			// and tiling-verify consume it); R4's tierEff scales ONLY
+			// the float64 score currency.
+			res.traffic += s.j.rawBytes * (s.j.reuse - 1) * s.j.holders
+			scaledTraffic += float64(s.j.rawBytes*(s.j.reuse-1)) * float64(s.j.holders) *
 				reducedTierEff(lf.reduced, iters, s.sf.Covered, p)
 		}
 		res.sites[s.sf.Load.BasePtr().ID()] = SiteDecision{
