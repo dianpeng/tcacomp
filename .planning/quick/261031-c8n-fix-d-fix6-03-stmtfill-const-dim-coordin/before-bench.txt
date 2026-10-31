@@ -1,0 +1,48 @@
+# BEFORE benchmark table for quick-261031-c8n (D-fix6-03 fix + v62 merge)
+#
+# Source: copied VERBATIM from .planning/quick/261030-v62-implement-fix6-3-minimal-slice-honest-fr/before-bench.txt
+# — measured on branch worktree-agent-a895cd8fde2fee08d at base 2a42865, whose SUITE CODE
+#   is tree-identical to pre-merge dev HEAD (56c84bb is docs-only) — reusable as the
+#   canonical BEFORE table per the c8n plan.
+#
+# 2026-10-29 pinned baselines (--jobs 1, --bench-iters 20) for the no->5%-slower rule:
+#   dup_expr 1.168 s | dup_const 1.184 s | axpy3 2.377 s | scale_copy 2.346 s
+#
+PASS dup_expr [dedup] compile 0.0s build 0.0s run 25.2s (cache) maxdiff 1.90735e-06
+PASS dup_const [dedup] compile 0.0s build 0.0s run 25.5s (cache) maxdiff 7.15256e-07
+PASS axpy3 [fusion] compile 0.0s build 0.0s run 49.8s (cache) maxdiff 9.53674e-07
+PASS mlp [fusion] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS softmax [fusion] compile 0.0s build 0.0s run 1.4s (cache) maxdiff 3.8147e-06
+PASS mm_small [tiling] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.0s build 0.0s run 7.2s (cache) maxdiff 4.76837e-07
+PASS row_sum [runtime] compile 0.0s build 0.0s run 9.8s (cache) maxdiff 4.76837e-07
+PASS scale_copy [runtime] compile 0.0s build 0.0s run 49.6s (cache) maxdiff 2.38419e-07
+PASS gemm [llm] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.0s build 0.0s run 0.5s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.0s build 0.0s run 10.5s (cache) maxdiff 9.53674e-06
+
+  dedup: 2 passed, 0 failed, 0 skipped (50.8s)
+  fusion: 3 passed, 0 failed, 0 skipped (51.5s)
+  llm: 3 passed, 0 failed, 0 skipped (11.4s)
+  runtime: 2 passed, 0 failed, 0 skipped (59.5s)
+  tiling: 4 passed, 0 failed, 0 skipped (8.0s)
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr        1190420.0  1186540.0  1206380.0  3,743,593
+  dup_const       1209020.0  1203780.0  1223410.0  3,686,000
+  axpy3           2364780.0  2347570.0  2382620.0  3,990,724
+  mlp                6528.1     6279.7    10009.6 15,058,639
+  softmax           59328.9    58561.0    64516.9 37,557,143
+  mm_small           2882.8     2879.7     2885.7  5,683,462
+  mm_mid             6910.9     6435.8    10803.7 37,932,182
+  mm_splitk          6117.7     6113.4     6129.0 16,068,810
+  transpose        336315.0   330297.0   342878.0  3,726,792
+  row_sum          459049.0   455156.0   468077.0 41,116,238
+  scale_copy      2357240.0  2350010.0  2376470.0  4,003,489
+  gemm               9908.4     9903.9     9913.5 21,496,018
+  qk_score          17412.9    17404.0    17436.0 15,995,498
+  layernorm        492803.0   487021.0   508724.0 34,310,440
+14 passed, 0 failed, 0 skipped, total 181.2s
