@@ -184,6 +184,14 @@ var (
 	// pin proves its loop steps 1u).
 	fragChunkAnchors = regexp.MustCompile(
 		`tca::rt::TensorWindow\(x_v, [^,()]*, C_it\d+\.Index\(\), K_it\d+\.Index\(\)\)`)
+
+	// Pin 2 regexes (const true extent — see the subtest comment).
+	fragChunkConstDecl    = regexp.MustCompile(`tca::rt::Frag<float, 2u, 16u, 4u> tca_f\d+;`)
+	fragChunkConstRawDecl = regexp.MustCompile(`tca::rt::Frag<float, 2u, \d+u, 256u>`)
+	fragChunkConstCStep   = regexp.MustCompile(`SeqIterator\(0u, 16u, c\d+\)`)
+	fragChunkConstE4Step  = regexp.MustCompile(`SeqIterator\(0u, 4u, c\d+\)`)
+	fragChunkConstAnchors = regexp.MustCompile(
+		`tca::rt::TensorWindow\(x_v, [^,()]*, C_it\d+\.Index\(\), e4_it\d+\.Index\(\)\)`)
 )
 
 // TestFragChunkStream pins fix7 §3 slice 1a pin 1: a promoted FRAG site
@@ -222,5 +230,46 @@ func TestFragChunkStream(t *testing.T) {
 			t.Fatalf("fix7 §3 1a pin 1c: the fill's TensorWindow anchor must ride the covered dims' between iterators (x's window); got %d matches of %s in:\n%s", n, fragChunkAnchors, cu)
 		}
 		golden.Assert(t, "testdata/fragchunk_stream.cu", res.Files["fragchunk.cu"])
+	})
+
+	// Pin 2 (fix7 §3 slice 1a): a covered COMPILE-TIME-CONST dim sizes its
+	// chunk by its TRUE extent — the suite's exact pathology-2 shape: e4
+	// covered at the search's NOMINAL tile T=256 while its true const
+	// extent is 4. Re-derivation (policy + arithmetic, T-kel-01): raw =
+	// 64*256*4 = 65,536 B, priced budget = min(65536, 256) = 256 B. The
+	// e4 chunk base reduces to the TRUE extent 4 (NEVER the nominal 256;
+	// the const source precedence is pinned in
+	// lower_fragchunk.go staticIterExtent — the BIV max operand's const
+	// payload, then the dim param's canonical "e<extent>" spelling; NEVER
+	// ir.TypeOf, the nil-computed-cell gotcha). Then the halving loop:
+	// [64,4] = 1,024 B > 256 -> C 64->32 (512 B) -> 16 (256 B = budget).
+	// Expected: decl Frag<float, 2u, 16u, 4u>, C between step 16u, e4
+	// between step 4u, no 256 anywhere in the decl. RED at the pin's
+	// commit: the dynamic path chunks e4 by its nominal base (the halving
+	// loop crushes C to 1, then e4 256->...->8), emitting
+	// Frag<float, 2u, 1u, 8u>-class — pathology 2 alive.
+	t.Run("const true extent", func(t *testing.T) {
+		g := fragChunkGraph(t, "fragchunkconst", "constextent", 64, 256, 256)
+		res, err := Emit(g, emitOptions())
+		if err != nil {
+			t.Fatalf("Emit over the const-extent fixture (pathology 2 RED gate): %v", err)
+		}
+		cu := string(res.Files["fragchunkconst.cu"])
+		if fragChunkConstRawDecl.MatchString(cu) {
+			t.Fatalf("fix7 §3 1a pin 2: the decl must size the const dim by its TRUE extent 4, never the nominal T=256; found %s in:\n%s", fragChunkConstRawDecl, cu)
+		}
+		if !fragChunkConstDecl.MatchString(cu) {
+			t.Fatalf("fix7 §3 1a pin 2: the chunk must be [16, 4] (256 B), re-derivation in the subtest comment; no match of %s in:\n%s", fragChunkConstDecl, cu)
+		}
+		if !fragChunkConstCStep.MatchString(cu) {
+			t.Fatalf("fix7 §3 1a pin 2: C's between loop must advance by the chunk (SeqIterator step 16u); no match of %s in:\n%s", fragChunkConstCStep, cu)
+		}
+		if !fragChunkConstE4Step.MatchString(cu) {
+			t.Fatalf("fix7 §3 1a pin 2: the const dim's between loop must advance by its TRUE extent (SeqIterator step 4u, not 256u); no match of %s in:\n%s", fragChunkConstE4Step, cu)
+		}
+		if n := len(fragChunkConstAnchors.FindAllString(cu, -1)); n != 1 {
+			t.Fatalf("fix7 §3 1a pin 2: the fill's TensorWindow anchor must ride the covered dims' between iterators (C chunk-stepped, e4 true-extent-stepped); got %d matches of %s in:\n%s", n, fragChunkConstAnchors, cu)
+		}
+		golden.Assert(t, "testdata/fragchunk_const_extent.cu", res.Files["fragchunkconst.cu"])
 	})
 }
