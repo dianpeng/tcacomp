@@ -92,6 +92,14 @@ var (
 // (see testdata/fragchunk_const_extent.cu — reducer0.Init() per C_it3
 // step, Combine after X, no tca_f1 decl); every assertion below fails and
 // the golden is absent. RED evidence: red-task1.txt.
+//
+// RE-DERIVED under fix7 §5 slice 1c (quick-261101-oqg): the golden's fill
+// dst decl Frag<float, 2u, 16u, 4u> gains the alignas(16) spelling — rank 2
+// (RowMajorShape<2> = 16 B, data_ at the 16B-clean offset 16), trailing 4
+// (16 B rows): the 1c decl rule qualifies it, the loader's vec16 dst-side
+// check holds by construction. The 1b acc block Frag<float, 1u, 16u> is NOT
+// a fill dst and stays plain; every other line is byte-identical to the 1b
+// golden. The 1b assertions below are UNWEAKENED.
 func TestBracketAmortEmission(t *testing.T) {
 	g := fragChunkGraph(t, "bracketamort", "constextent", 64, 256, 256)
 	res, err := Emit(g, emitOptions())
