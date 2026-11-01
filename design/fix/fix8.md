@@ -1,6 +1,6 @@
 # fix8 — Parallelism buying: an occupancy-directed tiling search (the thread-starvation fix)
 
-- Status: PROPOSAL — recorded 2026-11-01 from the post-1c external audit (the SOTA/ceiling session). **Slice 0 (the measurement probe, §3) is executable now.** Slice 1 (the objective amendment, §4) REQUIRES an author ruling — the traffic-avoided objective is a ruled design (`design/optana/loop-tiling.md`), and this doc's job is to put the evidence for that ruling on the table, never to patch the ruling silently.
+- Status: PROPOSAL — recorded 2026-11-01 from the post-1c external audit (the SOTA/ceiling session). **Slice 0 (the measurement probe, §3) LANDED 2026-11-01 (quick-261101-u8a): the STOP rule FIRED at 1.00× — §1's expressibility analysis is contradicted; slice 1 is BLOCKED until the §3 candidate mechanisms are re-derived against the measured record.** Slice 1 (the objective amendment, §4) REQUIRES an author ruling — the traffic-avoided objective is a ruled design (`design/optana/loop-tiling.md`), and this doc's job is to put the evidence for that ruling on the table, never to patch the ruling silently.
 - Relationship: fix7 landed the work-shape spine (§3 streaming 1a, §4 bracket amortization 1b, §5 effect-chain vectorization 1c) under the explicit §3.3 scope guard "NO judge/search/pricing changes" — **this doc is the top layer that guard fenced off.** fix6 §2 already proved extent visibility alone is inert ("correct-but-inert": the escape vectors were §3.1-pruned or FRAG-declined, and the const-shape probes benchmarked flat). n63 landed SM occupancy as a **selection-only** score' factor. Nothing in fix1–fix7 buys threads.
 
 ## §1 Evidence base (2026-11-01, post-1c; measured against the sha256-manifest-verified 1c emissions)
@@ -43,13 +43,28 @@ Consequence: the search buys 16 CTAs where 512 are offered, 512 threads where 16
 
 ## §3 Slice 0 — the pinned-decision ceiling probe (measurement only, no production change)
 
+**STATUS: LANDED 2026-11-01 (quick-261101-u8a) — the STOP rule FIRED. Verdict: STOP, ratio 1.00× (§1's expressibility analysis is contradicted); slice 1 does NOT proceed on this model.** Vehicle (b) as ruled by the research: an env-gated `paramsFromEnv` Params overlay at the three tiling-family registry factories (`internal/opt/tiling/params_env.go`), OFF by default — proven zero-default-path by a sha256 HARD gate (all 14 unpinned suite emissions bit-identical to the 1c manifest; `zero-diff-manifest.txt`); production surface diff = the 3 factory lines; search/judge/record/constraints/cg/runtime ZERO diff. Records in `.planning/quick/261101-u8a-fix8-3-slice-0-pinned-decision-ceiling-p/`: `probe-manifest.txt` (22 points), `probe-readback.txt` (intended-vs-measured grids, launched AND active threads), `probe-bench.txt`, `probe-curve.txt`, `memcheck.txt`, `suite-run.txt` (14/14), `stop-rule-verdict.txt`.
+
+The measured record (min-µs of 4 repeats, `--jobs 1 --bench-iters 20`, in-session unpinned baselines; full table in `probe-bench.txt`):
+
+| point | grid | launched | active | min-µs |
+|---|---:|---:|---:|---:|
+| row_sum unpinned | 16 | 512 | **64** | 5,239.6 |
+| row_sum best pinned (rs-g16 = same schedule) | 16 | 512 | 64 | 5,240.4 |
+| row_sum rs-g512 | 512 | 16,384 | **64** | 5,516.2 (worse) |
+| axpy3 unpinned → g512t256 | 16→512 | 512→16,384 | 64 at every point | 3,523.3→3,579.2 (worse) |
+| dup_expr unpinned | 16 | 512 | **32** | 1,740.6 |
+| dup_expr dx-g256 (blockDim-1024 warp landing) | 256 | 262,144 | 262,144 | **998.7 (1.74× — the only bend)** |
+
+**STOP-rule arithmetic:** best pinned row_sum 5,240.4 µs vs in-session unpinned 5,239.6 µs = **1.00×** < 10× (the 10× bar was 523.8 µs; §1 estimated 40–80 µs at 16,384 threads — the measured answer is that 16,384 launched threads carry 64 active ones). Mechanisms, now measured-concrete: (1) active-vs-launched CTA accounting — every default-tile point of all three kernels runs 32–64 ACTIVE threads regardless of grid (T=256 tiles over 512/256-extent dims leave ceil(extent/T)=1–2 CTAs of work; the launched axis is a fiction the occupancy model's NominalExtent stand-in credits at 16); (2) fully-active big grids at blockDim 32 are INEXPRESSIBLE — full activity needs T small, and T<32 zeroes the FRAG reuse (ceil(T/32)=1 trip → zero traffic), so the search either stays at T=256 or degenerates (warp-ceremony landings; dx-g64/dx-g512 select the v0-unreachable GlobalReducer — the known D1 defect class — and fail at launch); (3) per-thread MLP is bounded by the 256 B FRAG budget / T-strided coupled walk. Additional probe findings: the plan's 2-dim CTA presets cannot realize (tier-1 refuses fully CTA-covered loads → zero traffic; single-dim presets + MaxCTA + NominalExtent=N×maxTile pin every grid cleanly), and the R1 adaptive digit collapses to its lowest tile under the MaxCTA clamp, so a grid pin must ride the preset list.
+
 **Purpose:** replace §1's arithmetic ceiling with a measured one — pin the decisions the search is allowed to express and measure what the CURRENT model delivers at each parallelism point.
 
 Protocol: for row_sum, axpy3, dup_expr — sweep the expressible decision space: grid ∈ {16, 64, 128, 256, 512} (R-CTA tile/LoC variants), thread-spread settings, chunk shapes within the existing 256 B budget — respecting the reduced-dim-WARP restriction (blockDim stays 32). Emit, build through the suite fixture path, bench `--jobs 1 --bench-iters 20`, and produce the honest table + the µs-vs-resident-threads curve against the bandwidth-arithmetic line.
 
 Vehicles (in order of preference): (a) existing Params knobs (tile presets, the R1 adaptive-LoC ceiling, `MaxCTAPolicy`) if they alone express the sweep points; (b) a TEST-ONLY decision-override hook in the tiling pass (env-gated, zero default-path change); (c) a throwaway branch. No RED pins required (no production semantics change); the deliverable is the measurement record.
 
-**STOP rule:** if the measured ceiling on row_sum is < 10× vs the 2026-11-01 number (5,238 µs), the §1 expressibility analysis is WRONG somewhere — stop and re-derive (candidates: over-provisioned CTA-mapping semantics, fill traffic scaling with grid, ThrIterator distribution effects) before any objective work. Never build slice 1 on a contradicted model.
+**STOP rule:** if the measured ceiling on row_sum is < 10× vs the 2026-11-01 number (5,238 µs), the §1 expressibility analysis is WRONG somewhere — stop and re-derive (candidates: over-provisioned CTA-mapping semantics, fill traffic scaling with grid, ThrIterator distribution effects) before any objective work. Never build slice 1 on a contradicted model. **→ FIRED at 1.00× (see STATUS above).**
 
 ## §4 Slice 1 — the objective amendment (design-first; REQUIRES AUTHOR RULING)
 
@@ -81,7 +96,7 @@ The n63/qwo §9 protocol verbatim: `scripts/build.sh` first (the stale-prebuilt 
 
 | # | Slice | Depends | Gates |
 |---|---|---|---|
-| 0 | pinned-decision ceiling probe (§3) | — | measured ceiling table + curve; STOP rule honored |
+| 0 | pinned-decision ceiling probe (§3) | — | measured ceiling table + curve; STOP rule honored — **DONE 2026-11-01: STOP fired at 1.00×** |
 | 1 | objective amendment (§4) | 0's numbers + author ruling | ≥10× streaming vs 2026-11-01; within ~2× of measured ceiling; §7 |
 | 2 | MaxCTAPolicy revisit (§5) | 0 (binds only past 512 CTAs) | re-measured, decided with numbers |
 
