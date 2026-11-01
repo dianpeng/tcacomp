@@ -69,6 +69,31 @@ func (e *emitter) emitExpr(n ir.Node) (string, error) {
 		return e.emitTensorDimOf(n)
 	case ir.KindRuntimeGetAttribute:
 		return e.emitGetAttr(n)
+	case ir.KindMemLoad:
+		// fix7 §4 slice 1b (quick-261101-mt9): the amortized reducer's acc
+		// read renders INLINE — the combiner body is inlined per element
+		// (tca_fN.Set((tca_fN.Get(c) + v), c)), so the minted FRAG-class
+		// load has no statement materialization and no local. FRAG only:
+		// an SMEM load keeps its statement form (its epoch contract is
+		// positional); the expression-position load never crosses a
+		// function boundary (kernel-body locals only).
+		if sc, _ := ir.StorageClassOf(n); sc == ir.StorageFrag {
+			ops := ir.OperandsOf(n)
+			if len(ops) == 0 || ops[0] == nil {
+				return "", fmt.Errorf("cxx: frag load %d carries no source buffer", n.BasePtr().ID())
+			}
+			view, err := e.bufferView(ops[0])
+			if err != nil {
+				return "", err
+			}
+			coords, _, err := e.accessAxes(n, 1)
+			if err != nil {
+				return "", err
+			}
+			return view + ".Get(" + join(coords) + ")", nil
+		}
+		return "", fmt.Errorf("cxx: node %d (%s) is not emittable as an expression — it must be materialized at its statement first",
+			n.BasePtr().ID(), n.KindOf())
 	default:
 		return "", fmt.Errorf("cxx: node %d (%s) is not emittable as an expression — it must be materialized at its statement first",
 			n.BasePtr().ID(), n.KindOf())

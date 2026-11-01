@@ -161,6 +161,16 @@ func TestFillCoordReconstruction(t *testing.T) {
 	// position's empty Name never matches the name-keyed covered set, so it
 	// consumes the single axis slot. Post-fix it must emit with the
 	// coordinate list in tensor dim order (R axis, C biv, e4 biv).
+	// RE-DERIVED under fix7 §4 slice 1b (quick-261101-mt9): this fixture is
+	// the qualifying const-innermost shape (one-tier SEQ reduce, between
+	// chain [thread-specialized R trip, uniform SEQ C element walk], FRAG
+	// fills at X level, element chunk = C's clamp target 2 > 1), so its
+	// reducer bracket amortizes — the golden regen carries the SAME
+	// load-bearing D-fix6-03 fact (the fill's tensor-dim-order coordinates,
+	// asserted by fillCoordOrder below, UNWEAKENED) plus the amortized
+	// nest (the chunk-wide acc block, init/store walks, inlined combiner).
+	// Red evidence: red-drift2.txt in the task dir; the amortized shape is
+	// byte-pinned by testdata/bracket_amort.cu.
 	t.Run("mixed dynamic/static", func(t *testing.T) {
 		g := fillCoordGraph(t, "fillcoord", "mixed")
 		res, err := Emit(g, emitOptions())

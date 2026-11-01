@@ -1,0 +1,6 @@
+=== RUN   TestFix5T2OneTierCollapseEmission
+    fix5t2_one_tier_test.go:142: fix6 §3: the all-SEQ collapse lowers the per-thread K reduction through the one-tier SeqReducer
+--- FAIL: TestFix5T2OneTierCollapseEmission (0.03s)
+FAIL
+FAIL	tcacomp/internal/e2e	0.030s
+FAIL

@@ -248,6 +248,18 @@ func TestFragChunkStream(t *testing.T) {
 	// commit: the dynamic path chunks e4 by its nominal base (the halving
 	// loop crushes C to 1, then e4 256->...->8), emitting
 	// Frag<float, 2u, 1u, 8u>-class — pathology 2 alive.
+	// RE-DERIVED under fix7 §4 slice 1b (quick-261101-mt9): this fixture is
+	// the qualifying const-innermost shape (one-tier SEQ reduce, between
+	// chain [thread-specialized R trip, uniform SEQ C element walk], FRAG
+	// fills at X level, element chunk 16 > 1), so its reducer bracket
+	// amortizes: the golden regen carries the SAME chunk facts (decl
+	// [16, 4], C between step 16u, e4 between step 4u, the per-round
+	// anchors) plus the amortized nest — the acc block Frag<float, 1u, 16u>
+	// tca_f1, the init walk (c3 = the construction's own 0.0f init), the
+	// element walk moved inside X, the inlined combiner, the store walk.
+	// The 1a chunk assertions below are UNWEAKENED; red evidence:
+	// red-drift3.txt in the task dir; the amortized shape is byte-pinned
+	// by testdata/bracket_amort.cu.
 	t.Run("const true extent", func(t *testing.T) {
 		g := fragChunkGraph(t, "fragchunkconst", "constextent", 64, 256, 256)
 		res, err := Emit(g, emitOptions())
