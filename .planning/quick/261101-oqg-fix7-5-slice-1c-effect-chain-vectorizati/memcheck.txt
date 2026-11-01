@@ -1,0 +1,32 @@
+=== memcheck axpy3 ===
+PASS axpy3 [fusion] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 9.53674e-07
+  fusion: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s
+=== memcheck dup_const ===
+PASS dup_const [dedup] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 4.76837e-07
+  dedup: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.5s
+=== memcheck dup_expr ===
+PASS dup_expr [dedup] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 1.90735e-06
+  dedup: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s
+=== memcheck layernorm ===
+PASS layernorm [llm] compile 0.0s build 0.0s run 0.5s (cache) maxdiff 7.62939e-06
+  llm: 1 passed, 0 failed, 0 skipped (0.5s)
+1 passed, 0 failed, 0 skipped, total 0.5s
+=== memcheck row_sum ===
+PASS row_sum [runtime] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 4.76837e-07
+  runtime: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s
+=== memcheck scale_copy ===
+PASS scale_copy [runtime] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 2.38419e-07
+  runtime: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s
+=== memcheck softmax ===
+PASS softmax [fusion] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 1.90735e-06
+  fusion: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s
+=== memcheck transpose ===
+PASS transpose [tiling] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 4.76837e-07
+  tiling: 1 passed, 0 failed, 0 skipped (0.4s)
+1 passed, 0 failed, 0 skipped, total 0.4s

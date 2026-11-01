@@ -1,0 +1,109 @@
+# AFTER benchmark table for quick-261101-oqg (fix7 §5 slice 1c — effect-chain vectorization)
+#
+# Command: python3.13 -I testing/orchestrator.py --jobs 1 --bench-iters 20 (runs 1 and 2,
+# both recorded below; BEFORE = quick-261101-mt9's after-bench.txt copied verbatim as
+# before-bench.txt)
+# Binary: bin/tcacomp rebuilt via scripts/build.sh from worktree HEAD 2418fd8
+# Protocol: --jobs 1 ONLY (parallel fixtures contend on the single A6000)
+# Suite: 14/14 PASS in both runs (canary 0 — verified per-kernel by the harness;
+# maxdiff identical to 1b on all 14: the vec16/scalar copy paths are byte-exact)
+#
+# HONEST RECORD — interference: Chrome's GPU process (73 MiB, periodic spikes)
+# inflated intra-run maxes on both runs (dup_expr max 5457/5204 vs min ~1850;
+# gemm max 15065 vs min 9680). The six bit-IDENTICAL-binary controls (mlp,
+# mm_small, mm_mid, mm_splitk, gemm, qk_score — sha256-identical to 1b,
+# see sha256-diff-vs-1b.txt) inflate on avg too (+4..+12%), proving the avg
+# inflation is machine state, never this change. The MIN column is the stable
+# statistic; the gate is evaluated there (the 1b mm_small precedent:
+# machine-state spread recorded honestly, attributed, never hidden).
+#
+# Gate verdict (§5: incremental, NOT gating; §9.6: no kernel >5% slower than
+# its best-known-good): NO kernel >5% slower on min. Genuine vec16 gains:
+# softmax -16.5% (840.0 vs 1005.3 avg; fill rows 32 B), dup_const -7.7% on min.
+# The matmul family + mlp bit-identical binaries are within noise. Elementwise
+# spine unchanged within noise (row_sum +0.3%, scale_copy +1.6%, axpy3 -1.6%,
+# dup_expr +1.2% on min).
+#
+# ── BEFORE (1b) ──              ── AFTER run 1 / run 2 ──
+# name        avg us    min us   avg us (r1/r2)      min us (r1/r2)    min Δ
+# dup_expr    1844.5    1830.3   2427.3 / 2360.0    1849.4 / 1852.3   +1.2%
+# dup_const   2994.3    2979.3   3334.6 / 3249.6    2747.2 / 2748.9   -7.7%
+# axpy3       3667.5    3662.6   3528.1 / 3927.3    3525.5 / 3602.3   -1.6%
+# mlp*        6597.4    6593.9   6994.8 / 7218.3    6313.2 / 6490.1   -1.6%
+# softmax     1005.3    1004.5    860.0 /  840.0     838.3 /  838.4  -16.5%
+# mm_small*   2881.3    2879.2   3227.4 / 3260.2    2897.8 / 2898.3   +0.7%
+# mm_mid*     6464.3    6408.4   6881.8 / 6970.6    6426.1 / 6495.9   +1.4%
+# mm_splitk*  6089.3    6084.1   6607.0 / 6811.3    6140.2 / 6148.3   +1.1%
+# transpose    948.4     947.9    950.4 /  951.1     950.0 /  950.2   +0.2%
+# row_sum     5232.8    5225.1   5551.3 / 5553.3    5237.9 / 5240.8   +0.3%
+# scale_copy  3243.6    3239.4   3330.8 / 3646.8    3289.4 / 3291.2   +1.6%
+# gemm*       9702.2    9696.7  10656.7 / 10024.4   9899.8 / 9678.2   -0.2%
+# qk_score*  17612.3   17294.9  18743.0 / 18717.6  17420.7 / 17426.4   +0.8%
+# layernorm   8929.7    8923.3   9849.3 / 9596.6    8971.2 / 8966.6   +0.5%
+# (* = bit-identical binary control vs 1b)
+#
+# RAW RUN 1:
+#   dup_expr  2427.3 / dup_const 3334.6 / axpy3 3528.1 / mlp 6994.8 / softmax 860.0 /
+#   mm_small 3227.4 / mm_mid 6881.8 / mm_splitk 6607.0 / transpose 950.4 /
+#   row_sum 5551.3 / scale_copy 3330.8 / gemm 10656.7 / qk_score 18743.0 / layernorm 9849.3
+#   (14 passed; raw line format: name avg min max GB/s — run 1's full table is
+#   in the session transcript; run 2's raw table follows verbatim)
+#
+# RAW RUN 2 (after-bench-run2.txt, verbatim):
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr           2360.0     1852.3     5204.6 1,888,325,424
+  dup_const          3249.6     2748.9     5993.8 1,371,391,995
+  axpy3              3927.3     3602.3     6041.3 2,402,969,979
+  mlp                7218.3     6490.1    10931.2 13,618,757
+  softmax             840.0      838.4      851.2 2,652,505,521
+  mm_small           3260.2     2898.3     5379.1  5,025,474
+  mm_mid             6970.6     6495.9    10887.9 37,607,362
+  mm_splitk          6811.3     6148.3     9929.9 14,432,530
+  transpose           951.1      950.2      959.1 1,317,849,133
+  row_sum            5553.3     5240.8     8895.1 3,398,790,620
+  scale_copy         3646.8     3291.2     5712.9 2,587,777,330
+  gemm              10024.4     9678.2    12766.9 21,247,356
+  qk_score          18717.6    17426.4    23169.3 14,880,540
+  layernorm          9596.6     8966.6    12745.4 1,761,904,008
+14 passed, 0 failed, 0 skipped, total 4.2s
+#
+# RAW RUNS 3+4 (interference subsided on run 4: dup_expr 1748.7 avg —
+# -5.2% vs 1b, within machine noise; softmax stable at ~839 in ALL runs —
+# the -16.5% vec16 gain is real and reproducible):
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr           1858.6     1846.6     1925.8 2,397,796,143
+  dup_const          2833.9     2747.3     4273.5 1,572,527,294
+  axpy3              3809.7     3525.4     5944.0 2,477,126,726
+  mlp                6923.4     6320.8    10351.5 14,198,784
+  softmax             839.1      837.6      850.2 2,655,492,790
+  mm_small           2983.0     2897.5     3610.9  5,492,384
+  mm_mid             6945.3     6522.9    10933.0 37,744,086
+  mm_splitk          6454.6     6150.6    10057.2 15,229,998
+  transpose          1195.8      950.3     2234.8 1,048,122,225
+  row_sum            5827.6     5239.6     7833.8 3,238,805,883
+  scale_copy         3292.2     3288.8     3297.3 2,866,554,279
+  gemm              10579.3     9952.9    14981.7 20,132,901
+  qk_score          18635.8    17431.9    23400.9 14,945,857
+  layernorm          9291.5     8972.5    13855.5 1,819,768,497
+14 passed, 0 failed, 0 skipped, total 4.2s
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr           1748.7     1740.4     1801.4 2,548,449,411
+  dup_const          2600.6     2588.0     2675.1 1,713,642,778
+  axpy3              3808.3     3524.7     5949.4 2,478,037,355
+  mlp                6924.2     6315.6    10292.2 14,197,123
+  softmax             839.3      837.9      844.1 2,654,790,414
+  mm_small           3585.7     3007.1     5524.7  4,569,261
+  mm_mid             6950.6     6508.7    10925.7 37,715,468
+  mm_splitk          6527.6     6128.6     8783.6 15,059,816
+  transpose           950.7      950.0      953.1 1,318,356,472
+  row_sum            5355.7     5242.2     6567.4 3,524,190,856
+  scale_copy         3571.8     3288.4     5705.4 2,642,099,752
+  gemm              10487.2     9780.5    14285.7 20,309,711
+  qk_score          18354.1    17424.4    22703.2 15,175,247
+  layernorm          9475.6     8971.8    12740.6 1,784,393,472
+14 passed, 0 failed, 0 skipped, total 4.1s

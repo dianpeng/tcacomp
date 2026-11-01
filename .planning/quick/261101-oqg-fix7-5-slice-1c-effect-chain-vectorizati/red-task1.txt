@@ -1,0 +1,16 @@
+# RED evidence — Task 1, Pin A (unit chunk-policy bias) — quick-261101-oqg
+# Captured 2026-11-01T10:25:39Z, pre-implementation (RED).
+# Subtest 1 FAILS (got 6, want 4 — the 1a raw halving); controls 2+3 PASS at RED.
+
+=== RUN   TestFragChunkVecBias
+=== RUN   TestFragChunkVecBias/snap_to_vector_width
+    fragvec_test.go:125: fix7 §5 1c: a vector-compatible true extent (24 % 4 == 0) under a 24 B budget must snap the halving step to the largest multiple of 4 within budget (raw half 12 -> 8 -> 4), got trailing chunk 6 (the 1a raw policy plans 6 — the vec16 row gate dead-fires on trailing % 4 != 0)
+=== RUN   TestFragChunkVecBias/extent_not_vector_compatible_keeps_raw_halving
+=== RUN   TestFragChunkVecBias/largest_multiple_within_budget
+--- FAIL: TestFragChunkVecBias (0.00s)
+    --- FAIL: TestFragChunkVecBias/snap_to_vector_width (0.00s)
+    --- PASS: TestFragChunkVecBias/extent_not_vector_compatible_keeps_raw_halving (0.00s)
+    --- PASS: TestFragChunkVecBias/largest_multiple_within_budget (0.00s)
+FAIL
+FAIL	tcacomp/internal/opt/tiling	0.002s
+FAIL
