@@ -57,7 +57,10 @@ func init() {
 		ID:       "tile-lower",
 		Priority: 116,
 		Requires: []string{"tiling", "tiling-verify"},
-		Factory:  func() opt.Pass { return LowerPass{Params: DefaultParams()} },
+		// fix8 §3 slice-0 probe hook: env-gated Params overlay, zero
+		// default path — mirrors the decide pass by construction (the
+		// same env read, never a second source).
+		Factory:  func() opt.Pass { return LowerPass{Params: mustParamsFromEnv()} },
 	})
 }
 

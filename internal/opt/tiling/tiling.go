@@ -32,7 +32,10 @@ func init() {
 	opt.Register(opt.PassSpec{
 		ID:       "tiling",
 		Priority: 114,
-		Factory:  func() opt.Pass { return Pass{Params: DefaultParams()} },
+		// fix8 §3 slice-0 probe hook: env-gated Params overlay, zero
+		// default path (unset env == DefaultParams, sha256 zero-diff
+		// proven against the 1c manifest).
+		Factory:  func() opt.Pass { return Pass{Params: mustParamsFromEnv()} },
 	})
 }
 
