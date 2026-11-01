@@ -1,0 +1,62 @@
+# BEFORE benchmark reference for quick-261101-kel (fix7 §3 slice 1a)
+#
+# Copied VERBATIM from
+# .planning/quick/261031-c8n-fix-d-fix6-03-stmtfill-const-dim-coordin/after-bench.txt
+# — the 2026-10-31 post-merge baseline (the honest BEFORE for this task;
+# the tree at c8n's merge commit 173577c is this task's base state, since
+# 1a changes only the emission realization, not the suite code).
+#
+# Gate references (pre-merge numbers, fix7.md §3.6):
+#   restoration: row_sum < 459 ms, softmax < 59.3 ms
+#   improvement: dup_expr < 787 ms, dup_const < 804 ms,
+#                axpy3 < 1351 ms, scale_copy < 1397 ms
+#   2026-10-29 elementwise pins: dup_expr 1168 ms | dup_const 1184 ms |
+#                axpy3 2377 ms | scale_copy 2346 ms (the >=10x gate
+#                reference — recorded honestly, NOT a 1a gate per §10)
+# AFTER benchmark table for quick-261031-c8n (D-fix6-03 fix + v62 merge)
+#
+# Command: python3.13 -I testing/orchestrator.py --tcacomp bin/tcacomp --bench-iters 20 --jobs 1
+# Binary: bin/tcacomp rebuilt via scripts/build.sh from merge commit 173577c (worktree-agent-a1e815ec76e467047)
+# Protocol: --jobs 1 ONLY (parallel fixtures contend on the single A6000, inflating timings 4-6x)
+# Suite: 14/14 PASS in this same run (canary 0, maxdiff <= 5.34e-05)
+# Baselines: BEFORE = v62 before-bench.txt (tree-identical suite code at 2a42865); 2026-10-29 pins
+#   dup_expr 1.168 s | dup_const 1.184 s | axpy3 2.377 s | scale_copy 2.346 s
+#
+PASS dup_expr [dedup] compile 0.0s build 0.0s run 16.8s (cache) maxdiff 1.90735e-06
+PASS dup_const [dedup] compile 0.0s build 0.0s run 17.7s (cache) maxdiff 4.76837e-07
+PASS axpy3 [fusion] compile 0.0s build 0.0s run 29.2s (cache) maxdiff 9.53674e-07
+PASS mlp [fusion] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 3.05176e-05
+PASS softmax [fusion] compile 0.0s build 0.0s run 5.8s (cache) maxdiff 1.90735e-06
+PASS mm_small [tiling] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.0s build 0.0s run 0.4s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.0s build 0.0s run 0.3s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.0s build 0.0s run 4.0s (cache) maxdiff 4.76837e-07
+PASS row_sum [runtime] compile 0.0s build 0.0s run 42.6s (cache) maxdiff 4.76837e-07
+PASS scale_copy [runtime] compile 0.0s build 0.0s run 30.1s (cache) maxdiff 2.38419e-07
+PASS gemm [llm] compile 0.0s build 0.0s run 0.5s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.0s build 0.0s run 0.6s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.0s build 0.0s run 9.9s (cache) maxdiff 7.62939e-06
+
+  dedup: 2 passed, 0 failed, 0 skipped (34.6s)
+  fusion: 3 passed, 0 failed, 0 skipped (35.5s)
+  llm: 3 passed, 0 failed, 0 skipped (11.1s)
+  runtime: 2 passed, 0 failed, 0 skipped (72.8s)
+  tiling: 4 passed, 0 failed, 0 skipped (5.1s)
+
+  BENCH (microseconds per iteration)
+  name               avg us     min us     max us       GB/s
+  dup_expr         787319.0   771912.0   802524.0  5,660,283
+  dup_const        803706.0   786647.0   818603.0  5,544,873
+  axpy3           1350980.0  1316540.0  1390110.0  6,985,436
+  mlp                6401.7     6398.4     6407.1 15,355,897
+  softmax          263084.0   255933.0   275781.0  8,469,629
+  mm_small           2928.8     2926.9     2932.5  5,594,024
+  mm_mid             6986.8     6571.8     7815.7 37,520,056
+  mm_splitk          6330.3     6205.7     6919.7 15,529,146
+  transpose        180375.0   168456.0   194910.0  6,948,723
+  row_sum         1979530.0  1936560.0  2142180.0  9,534,772
+  scale_copy      1396520.0  1336040.0  1483560.0  6,757,643
+  gemm              10067.4    10063.2    10071.3 21,156,604
+  qk_score          18098.7    17598.0    24395.5 15,389,393
+  layernorm        460099.0   454874.0   464652.0 36,749,239
+14 passed, 0 failed, 0 skipped, total 159.1s
