@@ -77,8 +77,9 @@ var (
 	// (c3 = 0.0f, never a hardcoded zero) stored per acc slot.
 	amortInitWalk = regexp.MustCompile(`tca_f1\.Set\(c3, C_it\d+\.Index\(\)\);`)
 	// amortStoreWalk pins the store walk: the Combine-value consumer drained
-	// from the acc block at the store-walk IV, coordinates rebuilt onto it.
-	amortStoreWalk = regexp.MustCompile(`out_v\.Set\(tca_f1\.Get\(C_it\d+\.Index\(\)\), \(v2 \+ R_it2\.Index\(\)\), \(C_it1\.Index\(\) \+ C_it\d+\.Index\(\)\)\);`)
+	// from the acc block at the store-walk IV, coordinates rebuilt onto it
+	// (the trip coordinate renders as the hoisted per-trip local vN).
+	amortStoreWalk = regexp.MustCompile(`out_v\.Set\(tca_f1\.Get\(C_it\d+\.Index\(\)\), v\d+, \(C_it\d+\.Index\(\) \+ C_it\d+\.Index\(\)\)\);`)
 )
 
 // TestBracketAmortEmission pins fix7 §4 slice 1b: the qualified flat-bracket
@@ -116,12 +117,21 @@ func TestBracketAmortEmission(t *testing.T) {
 		t.Fatalf("fix7 §4 1b pin (c): exactly one LoadTileThread fill site, got %d (%v) in:\n%s", len(fill), fill, cu)
 	}
 	xAt := indexOfMatch(t, cu, amortXLoop, "the X loop (e4 rounds)")
-	eAt := indexOfMatch(t, cu, amortElemWalk, "the element walk E")
 	homeAt := indexOfMatch(t, cu, amortHomeWalk, "the home walk")
 	accAt := indexOfMatch(t, cu, amortAccUpdate, "the acc update")
 	fillAt := strings.Index(cu, fill[0])
-	if !(xAt < fillAt && fillAt < eAt && eAt < homeAt && homeAt < accAt) {
-		t.Fatalf("fix7 §4 1b pin (c/d): the nest order must be X { fill; E { home { acc update } } } — got x@%d fill@%d e@%d home@%d acc@%d in:\n%s", xAt, fillAt, eAt, homeAt, accAt, cu)
+	// The init/E/store walks clone E's header — textually identical C
+	// step-1u loops; they are identified by OCCURRENCE ORDER: [0] the init
+	// walk, [1] the element walk E (inside X), [2] the store walk.
+	cWalks := amortElemWalk.FindAllStringIndex(cu, -1)
+	if len(cWalks) != 3 {
+		t.Fatalf("fix7 §4 1b pin (b): exactly three C step-1u walks (init, element, store — E's header cloned), got %d in:\n%s", len(cWalks), cu)
+	}
+	initAt, eAt, storeAt := cWalks[0][0], cWalks[1][0], cWalks[2][0]
+	// The full nest order: the init walk opens the bracket, then X { fill;
+	// E { home { acc update } } }, then the store walk drains the acc.
+	if !(initAt < xAt && xAt < fillAt && fillAt < eAt && eAt < homeAt && homeAt < accAt && accAt < storeAt) {
+		t.Fatalf("fix7 §4 1b pin (c/d): the nest order must be init-walk, X { fill; E { home { acc update } } }, store-walk — got init@%d x@%d fill@%d e@%d home@%d acc@%d store@%d in:\n%s", initAt, xAt, fillAt, eAt, homeAt, accAt, storeAt, cu)
 	}
 	// Pin (d): the element walk is nested inside X before home, and the
 	// fill's nest path excludes it (asserted by the order pin above).

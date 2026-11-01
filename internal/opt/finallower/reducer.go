@@ -273,7 +273,15 @@ func (lr *lowering) lowerReduce(red ir.Node) error {
 		return lr.moveCombineConsumers(red, dim, ownerLNT, combineCall, parentBlk, lr.scopeDepth(parentBlk), nil)
 	}
 
-	// (2.2) R3 — the per-output-element restructure.
+	// (2.2) R3 — the per-output-element restructure. fix7 §4 slice 1b
+	// (quick-261101-mt9): on the qualified shape (Q0-Q5, see
+	// amortizedQualifies) the per-element bracket chain is replaced by the
+	// amortized reshape — ONE bracket per chunk — and buildElementLoop
+	// never runs; on ANY miss the R3 restructure below runs UNCHANGED.
+	if ok, err := lr.tryAmortizedElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT,
+		construction, combineCall, reduceCall, piped, anchorBlk, anchorIdx, init, lambda, initTy); ok || err != nil {
+		return err
+	}
 	return lr.buildElementLoop(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall)
 }
 
@@ -753,38 +761,9 @@ func (lr *lowering) assertFillReadsInside(red, fill ir.Node, homeBlk *ir.ASTBloc
 //	    reference.
 func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 	combineCall ir.Node, dst *ir.ASTBlock, depth int, subs map[ir.Node]ir.Node) error {
-	epilogue, err := lr.epilogueOf(ownerLNT)
-	if err != nil {
+	moved, epilogue, err := lr.qualifyCombineConsumers(red, dim, ownerLNT, combineCall)
+	if err != nil || len(moved) == 0 {
 		return err
-	}
-	// The qualifying epilogue consumers: the Group's items (in order, the
-	// end node excluded) that CONSUME the Combine value. The between-IV
-	// reference alone must NOT qualify (the piped Map's projection lambda is
-	// a PRODUCER for the nest; Map Lower disposes it where it sits).
-	qualifies := func(n ir.Node) bool {
-		if n == nil || n.KindOf() == ir.KindReturn {
-			return false
-		}
-		return operandClosure(n)[combineCall]
-	}
-	var moved []ir.Node
-	for _, it := range epilogue.Items() {
-		if it.Node != nil && qualifies(it.Node) {
-			moved = append(moved, it.Node)
-		}
-	}
-	if len(moved) == 0 {
-		return nil
-	}
-	// (a) Reduced-dim dimvars are poison in moved consumers: their walks
-	// re-execute per element inside the bracket — the consumer would read
-	// an iteration variable of the WRONG element's strip.
-	reducedVars := lr.reducedDimVars(dim)
-	for _, m := range moved {
-		if containsAny(operandClosure(m), reducedVars) {
-			return fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined at the element-loop position (doc/tca.md §5.10 point 4)",
-				m.BasePtr().ID(), m.KindOf())
-		}
 	}
 	// (b) The moved consumers' between-dim coordinates rebuild onto the
 	// fresh element IVs (shared expression spines are cloned; the in-nest
@@ -797,21 +776,9 @@ func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 			}
 		}
 	}
-	// (c) The generalized enclosure assertion: every DimVar still in a
-	// moved consumer's closure must be defined at dst or an enclosing
-	// block.
-	for _, m := range moved {
-		for n := range operandClosure(m) {
-			if n.KindOf() != ir.KindDimVar {
-				continue
-			}
-			bBlk := n.BasePtr().SchedBlock()
-			if bBlk == nil || bBlk == dst || findSubBlock(bBlk, dst) != nil {
-				continue // unscheduled, or the bracket sits inside the IV's loop
-			}
-			return fmt.Errorf("final-lower: reduce node %d: moved consumer node %d (%s) references dimvar node %d whose loop does not enclose the bracket block — the coordinate is not defined at the bracket position (P-12)",
-				red.BasePtr().ID(), m.BasePtr().ID(), m.KindOf(), n.BasePtr().ID())
-		}
+	// (c) The generalized enclosure assertion.
+	if err := lr.assertConsumerEnclosure(red, moved, dst); err != nil {
+		return err
 	}
 	// Relocate: detach from the epilogue, then insert immediately after the
 	// Combine call's item in dst.
@@ -833,6 +800,71 @@ func (lr *lowering) moveCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
 			return fmt.Errorf("final-lower: reduce node %d: inserting a moved epilogue consumer: %w", red.BasePtr().ID(), err)
 		}
 		m.BasePtr().SetSched(depth, dst)
+	}
+	return nil
+}
+
+// qualifyCombineConsumers implements the shared collect + gate (a) half of
+// the consumer move (the per-element brackets and the fix7 §4 amortized
+// bracket both consume the Combine value the same way): the owning LNT's
+// epilogue items (in order, the end node excluded) whose operand closure
+// reaches combineCall, poison-checked against the reduced dim's loop
+// dimvars (a coordinate referencing them would read an iteration variable
+// of the WRONG element's strip). Returns the qualifying nodes and their
+// epilogue block. The between-IV reference alone must NOT qualify (the
+// piped Map's projection lambda is a PRODUCER for the nest; Map Lower
+// disposes it where it sits).
+func (lr *lowering) qualifyCombineConsumers(red, dim ir.Node, ownerLNT *ir.ASTLNT,
+	combineCall ir.Node) ([]ir.Node, *ir.ASTBlock, error) {
+	epilogue, err := lr.epilogueOf(ownerLNT)
+	if err != nil {
+		return nil, nil, err
+	}
+	qualifies := func(n ir.Node) bool {
+		if n == nil || n.KindOf() == ir.KindReturn {
+			return false
+		}
+		return operandClosure(n)[combineCall]
+	}
+	var moved []ir.Node
+	for _, it := range epilogue.Items() {
+		if it.Node != nil && qualifies(it.Node) {
+			moved = append(moved, it.Node)
+		}
+	}
+	if len(moved) == 0 {
+		return nil, epilogue, nil
+	}
+	// (a) Reduced-dim dimvars are poison in moved consumers: their walks
+	// re-execute per element inside the bracket — the consumer would read
+	// an iteration variable of the WRONG element's strip.
+	reducedVars := lr.reducedDimVars(dim)
+	for _, m := range moved {
+		if containsAny(operandClosure(m), reducedVars) {
+			return nil, nil, fmt.Errorf("final-lower: moved consumer node %d (%s) references a reduced-dim dimvar — its value is not defined at the element-loop position (doc/tca.md §5.10 point 4)",
+				m.BasePtr().ID(), m.KindOf())
+		}
+	}
+	return moved, epilogue, nil
+}
+
+// assertConsumerEnclosure is gate (c) of the consumer move (P-12): every
+// DimVar in every moved consumer's closure must be defined at a block
+// enclosing dst — a coordinate not live at the bracket position is a named
+// error, never an emitted out-of-scope reference.
+func (lr *lowering) assertConsumerEnclosure(red ir.Node, moved []ir.Node, dst *ir.ASTBlock) error {
+	for _, m := range moved {
+		for n := range operandClosure(m) {
+			if n.KindOf() != ir.KindDimVar {
+				continue
+			}
+			bBlk := n.BasePtr().SchedBlock()
+			if bBlk == nil || bBlk == dst || findSubBlock(bBlk, dst) != nil {
+				continue // unscheduled, or the bracket sits inside the IV's loop
+			}
+			return fmt.Errorf("final-lower: reduce node %d: moved consumer node %d (%s) references dimvar node %d whose loop does not enclose the bracket block — the coordinate is not defined at the bracket position (P-12)",
+				red.BasePtr().ID(), m.BasePtr().ID(), m.KindOf(), n.BasePtr().ID())
+		}
 	}
 	return nil
 }
@@ -1216,4 +1248,646 @@ func elementViewEqual(t, want ir.Type) bool {
 		return t.Equal(want)
 	}
 	return ir.InternScalar(nt.Elem()).Equal(want)
+}
+
+// ---------------------------------------------------------------------------
+// fix7 §4 slice 1b — the amortized bracket (quick-261101-mt9)
+// ---------------------------------------------------------------------------
+//
+// The §4 chunk-fold DECISION (recorded in design/fix/fix7.md §4 and the
+// 261101-mt9 plan): codegen emits an EXPLICIT chunk-wide accumulator — a
+// FRAG-class MemNew block spanning X's FULL walk — with the combiner body
+// inlined per element. NO runtime SeqReducer chunk-fold entry, NO
+// per-round partials: the block accumulates across ALL of X's chunk rounds
+// by construction, so there is nothing to fold. Rationale: (1) the
+// per-chunk accumulator is inherently a chunk-wide ARRAY (one accumulator
+// per output element of the chunk) — a runtime SeqReducer holds ONE scalar
+// acc_, so a runtime entry would need a NEW template-sized block-reducer
+// class (new runtime surface against the minimal-runtime doctrine; R1
+// struck template sizing from the reducer protocol) while codegen would
+// still declare/emit the block; (2) the combiner body is a pure homogeneous
+// scalar expression (LR-8-checked at construction) — map lambdas are
+// already inlined the same way by Map Lower (RAUW onto the lambda body
+// expression, maplower.go), so cloning it over (acc-slot load, piped)
+// reuses the verified rebuildWithSubs machinery; (3) runtime zero-diff —
+// runtime/tca/reducer.h stays untouched (layernorm/transpose keep their
+// SeqReducer — they fail the qualification below).
+//
+// LR-3 AMENDMENT (shape-scoped): LR-3's "the compiler emits no lambda-call
+// node and never reads current_value/init" is amended FOR THIS SHAPE ONLY
+// by fix7 §4's explicit authorization of the codegen-accumulator branch:
+// the amortized path mints no lambda-call node (the body is INLINED, the
+// same mechanism Map Lower uses), but it DOES read the combiner's
+// current_value binding (lambda param 0 <- the acc-slot load) — never the
+// init (the init walk stores the CONSTRUCTION'S OWN init operand). Every
+// other reducer shape keeps LR-3 verbatim.
+//
+// Where the reshape lives (verified empirically at the RED commit — the
+// plan's flat-branch premise did not match the emitted defect): the suite's
+// const-innermost reduces carry a NON-EMPTY between chain over the reduced
+// dim's provenance — X (the e4 tile-between loop) directly contains the
+// thread-specialized R coupled-inside walk, which contains the uniform SEQ
+// C inside walk, which contains home (between = 2). The per-element bracket
+// the §4 audit measured is buildElementLoop's R3 product (one bracket per
+// INNERMOST output element), so the amortization probe sits at the R3
+// call site, BEFORE the restructure, and subsumes it: the outer between
+// loops (thread-specialized trips) SURVIVE (unlike R3, which dissolves
+// them), the innermost uniform SEQ between loop becomes the element walk E
+// and moves INSIDE X, and fresh init/store walks cloning E's header drain
+// the acc block around X. Because the between loops keep their identity,
+// NO coordinate rebuild runs in the walk — only the moved consumers
+// rebuild E's IV onto the store-walk IV.
+//
+// The fill-placement-gap verdict (recorded in the plan): INSEPARABLE — the
+// fill's gap-closing position IS its current X-scoped derived position
+// (fill position = dominated-by-operand-scope LICM, the 2026-10-25
+// ruling); closing the §3.4 gap REQUIRES inverting the nesting (element
+// walk inside X), which is this reshape. The D-j scope discipline is
+// preserved: the fill stays an item of X's block, the reads stay in home
+// inside the element loop inside X — the fill precedes every read of its
+// buffer within each X round by construction (the assertFillReadsInside
+// epoch contract holds structurally; a stranded fill coordinate fails Q3
+// closed). The schedule pass is untouched.
+
+// amortizedPlan is the resolved qualification context for one reduce's
+// amortized bracket — every field read in the qualification probe,
+// consumed by the mutating apply step.
+type amortizedPlan struct {
+	eBlk                       *ir.ASTBlock // the element walk E (innermost between block)
+	eIV, eBoundMax             ir.Node      // E's header
+	eDimParam, eInit, eStep    ir.Node
+	eAttrs                     []ir.Node
+	grandBlk                   *ir.ASTBlock // B[0]'s enclosing block (xIdx = X's item in it)
+	xIdx                       int
+	xIV                        ir.Node // X's own IV (the D-j scope key)
+	chainHead                  *ir.ASTBlock // B[1] (nil when len(betweenBlks) == 1)
+	chainIdx                   int          // B[1]'s item index inside B[0]
+	chunk                      float64      // the acc block's element count (E's clamp const)
+	chunkDim                   string       // E's dim name (the acc buffer's debug dim)
+	elem                       ir.ElemType
+	body, param0Ref, param1Ref ir.Node // the combiner body and its two param refs
+}
+
+// tryAmortizedElementLoop evaluates the fix7 §4 qualification (Q0-Q5) and,
+// on success, replaces the per-element bracket chain with the amortized
+// reshape. Returns handled=true when the reshape ran (err carries its
+// failure), handled=false when ANY qualification check missed — the caller
+// then runs buildElementLoop unchanged. The probe is READ-ONLY: nothing is
+// mutated before every check has passed.
+func (lr *lowering) tryAmortizedElementLoop(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTBlock,
+	betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT, construction, combineCall, reduceCall, piped ir.Node,
+	anchorBlk *ir.ASTBlock, anchorIdx int, init, lambda ir.Node, initTy ir.Type) (bool, error) {
+	plan, ok := lr.amortizedQualifies(red, dim, x, xBlk, homeBlk, betweenBlks, ownerLNT, construction, combineCall, lambda, initTy)
+	if !ok {
+		return false, nil
+	}
+	return true, lr.applyAmortizedElementLoop(red, dim, ownerLNT, construction, combineCall,
+		reduceCall, piped, anchorBlk, anchorIdx, init, lambda, xBlk, homeBlk, betweenBlks, plan)
+}
+
+// amortizedQualifies is the read-only Q0-Q5 probe for the R3 (non-empty
+// between chain) shape. ANY miss returns ok=false (fail closed to today's
+// per-element brackets — never a guess). Checks, in order:
+//
+//	Q1: the construction is a one-tier SeqReducer (Warp/Global multi-tier
+//	    CTA-collective sync protocols never qualify).
+//	Q4: the between chain's INNERMOST block E (home's direct parent) is a
+//	    uniform SEQUENTIAL walk, and every OUTER between block is
+//	    thread-specialized (BlockThrLoop — per-trip brackets, as today);
+//	    each between body holds exactly its chain child plus re-placeable
+//	    node items (a second nested Block disqualifies). For the single-
+//	    between degenerate the loop above X's parental block must likewise
+//	    be non-sequential (the two-uniform-SEQ-walk element chunk —
+//	    layernorm/transpose's class — keeps today's shape).
+//	Q4d: E's static chunk is > 1 element — a 1-element amortization saves
+//	    zero ceremony (init walk + store walk ≡ Init + Combine) and marks
+//	    the element dim not chunk-covered (layernorm/transpose — the suite's
+//	    Q4-failing pair — are exactly this class: E's clamp target is 1).
+//	Q0/Q3: every tiered fill item directly in X is FRAG-class (an SMEM
+//	    cooperative fill disqualifies) and its window coordinate closure
+//	    references NEITHER E's IV (the inversion's safety condition: the
+//	    fill rides at X level) — a stranded coordinate fails closed.
+//	Q5: at least one Combine-value consumer exists in the owning LNT's
+//	    epilogue, none references a reduced-dim dimvar, and none is a
+//	    reduce-after-reduce chain (the Combine feeding another reduce).
+//	The combiner lambda must bind exactly (current_value, now) with both
+//	params referenced in the body (the acc/piped substitution sites), and
+//	E's clamped bound must expose the static chunk const that sizes the
+//	acc block.
+func (lr *lowering) amortizedQualifies(red, dim, x ir.Node, xBlk, homeBlk *ir.ASTBlock,
+	betweenBlks []*ir.ASTBlock, ownerLNT *ir.ASTLNT, construction, combineCall, lambda ir.Node,
+	initTy ir.Type) (*amortizedPlan, bool) {
+	// Q1: one-tier only.
+	if construction.KindOf() != ir.KindRuntimeSequentialReducer {
+		return nil, false
+	}
+	n := len(betweenBlks)
+	// Q4a: the innermost between block E is a uniform sequential walk with
+	// a well-formed (dim, init, step)/(iv, max) header; every outer between
+	// block is thread-specialized; each between body holds exactly its
+	// chain child plus node items.
+	for i, b := range betweenBlks {
+		want := ir.BlockThrLoop
+		if i == n-1 {
+			want = ir.BlockSeqLoop
+		}
+		if b.Kind() != want {
+			return nil, false
+		}
+		nBlocks := 0
+		for _, it := range b.Items() {
+			if it.Block != nil {
+				nBlocks++
+			}
+		}
+		if nBlocks != 1 {
+			return nil, false
+		}
+	}
+	eBlk := betweenBlks[n-1]
+	eLoop := eBlk.Loop()
+	if eLoop == nil {
+		return nil, false
+	}
+	eOps := ir.OperandsOf(eLoop)
+	if len(eOps) < 2 || eOps[0] == nil || eOps[1] == nil {
+		return nil, false
+	}
+	eIV := eOps[0]
+	ivOps := ir.OperandsOf(eIV)
+	if len(ivOps) != 3 || ivOps[0] == nil {
+		return nil, false
+	}
+	bOps := ir.OperandsOf(eOps[1])
+	if len(bOps) != 2 || bOps[0] == nil || bOps[0].BasePtr() != eIV.BasePtr() {
+		return nil, false
+	}
+	eBoundMax := bOps[1]
+	// Q4b: the single-between degenerate — the loop above X's parental
+	// block must be thread-specialized (a second uniform SEQ walk above
+	// the element scope disqualifies, the layernorm/transpose class).
+	if n == 1 {
+		if grandBlk, _ := lr.findBlockItem(xBlk); grandBlk != nil && grandBlk.Kind() == ir.BlockSeqLoop {
+			return nil, false
+		}
+	}
+	// Q0/Q3: the tiered fills directly in X.
+	for _, it := range xBlk.Items() {
+		if it.Node == nil {
+			continue
+		}
+		sc, isMem := ir.StorageClassOf(it.Node)
+		if !isMem || it.Node.KindOf() != ir.KindMemStore || sc == ir.StorageGMEM {
+			continue
+		}
+		if sc == ir.StorageSMem {
+			return nil, false // Q0: a cooperative SMEM fill disqualifies
+		}
+		if operandClosure(it.Node)[eIV] {
+			return nil, false // Q3: a fill window coordinate rides the element IV
+		}
+	}
+	// Q4d + the acc block's static chunk: E's clamped bound max — either a
+	// const itself (the unclamped degenerate) or the 1a clamp chain's const
+	// operand (umin(chunkConst, remaining)). A chunk of ONE saves zero
+	// ceremony (the init/store walks degenerate to the Init/Combine pair)
+	// and marks the element dim not chunk-covered — keep today's shape.
+	chunk, ok := staticChunkOf(eBoundMax)
+	if !ok || chunk <= 1 {
+		return nil, false
+	}
+	nt, ok := initTy.(*ir.NumericType)
+	if !ok || nt == nil || nt.Rank() != 0 {
+		return nil, false
+	}
+	// The combiner lambda: exactly (current_value, now), both referenced.
+	lamOps := ir.OperandsOf(lambda)
+	if len(lamOps) != 3 {
+		return nil, false
+	}
+	body := lamOps[2]
+	if body == nil {
+		return nil, false
+	}
+	var paramRefs [2]ir.Node
+	refs := 0
+	for nd := range operandClosure(body) {
+		if nd.KindOf() != ir.KindParam {
+			continue
+		}
+		pOps := ir.OperandsOf(nd)
+		if len(pOps) != 1 || pOps[0] == nil {
+			continue
+		}
+		for i := 0; i < 2; i++ {
+			if pOps[0].BasePtr() == lamOps[i].BasePtr() {
+				if paramRefs[i] != nil {
+					return nil, false // a param bound twice is corruption
+				}
+				paramRefs[i] = nd
+				refs++
+			}
+		}
+	}
+	if refs != 2 || paramRefs[0] == nil || paramRefs[1] == nil {
+		return nil, false
+	}
+	// Q5: consumers exist, poison-free, no reduce-after-reduce chain.
+	moved, _, err := lr.qualifyCombineConsumers(red, dim, ownerLNT, combineCall)
+	if err != nil || len(moved) == 0 {
+		return nil, false
+	}
+	for _, m := range moved {
+		for nd := range operandClosure(m) {
+			if nd.KindOf() == ir.KindReduce {
+				return nil, false // the Combine feeding another reduce — chain partials are out of scope
+			}
+		}
+	}
+	// E's annotation set (the oneTier header-clone idiom of buildElementLoop).
+	var attrs []ir.Node
+	for _, op := range eOps[2:] {
+		k, _ := ir.KeyedAttributeOf(op)
+		if k == "" {
+			return nil, false
+		}
+		attrs = append(attrs, op)
+	}
+	grandBlk, xIdx := lr.findBlockItem(xBlk)
+	if grandBlk == nil || xIdx < 0 {
+		return nil, false
+	}
+	plan := &amortizedPlan{
+		eBlk: eBlk, eIV: eIV, eBoundMax: eBoundMax,
+		eDimParam: ivOps[0], eInit: ivOps[1], eStep: ivOps[2],
+		eAttrs:   attrs,
+		grandBlk: grandBlk, xIdx: xIdx, xIV: ir.OperandsOf(x)[0],
+		chunk: chunk, chunkDim: ir.InputParamNameOf(ivOps[0]),
+		elem: nt.Elem(), body: body, param0Ref: paramRefs[0], param1Ref: paramRefs[1],
+	}
+	if n > 1 {
+		// The chain child that moves into X: B[1], nested inside B[0].
+		chainIdx := -1
+		for i, it := range betweenBlks[0].Items() {
+			if it.Block == betweenBlks[1] {
+				chainIdx = i
+				break
+			}
+		}
+		if chainIdx < 0 {
+			return nil, false
+		}
+		plan.chainHead = betweenBlks[1]
+		plan.chainIdx = chainIdx
+	}
+	return plan, true
+}
+
+// staticChunkOf extracts the static chunk const from the element walk's
+// clamped bound max: the bound is either the const itself (the unclamped
+// degenerate) or the 1a clamp chain's umin(chunkConst, remaining) — the
+// const operand IS the chunk the acc block sizes to. Anything else (both
+// operands const, no const at all) is ambiguous — fail closed.
+func staticChunkOf(boundMax ir.Node) (float64, bool) {
+	if v, ok := ir.ConstValueOf(boundMax); ok {
+		return v, true
+	}
+	if boundMax.KindOf() != ir.KindCall || ir.CallNameOf(boundMax) != "umin" {
+		return 0, false
+	}
+	ops := ir.OperandsOf(boundMax)
+	var chunk float64
+	nConst := 0
+	for _, op := range ops {
+		if v, ok := ir.ConstValueOf(op); ok {
+			chunk, nConst = v, nConst+1
+		}
+	}
+	if nConst != 1 {
+		return 0, false
+	}
+	return chunk, true
+}
+
+// applyAmortizedElementLoop performs the reshape on the qualified shape,
+// subsuming buildElementLoop. Assumes the plan was built by
+// amortizedQualifies against an unmutated tree. Steps (see the file
+// comment for the design rationale):
+//
+// (a)  the acc buffer — a FRAG-class MemNew with an InternTensor type
+//
+//	stamping the element chunk (the 1a lower_cache idiom; walk.go
+//	prints the decl verbatim — the P8 no-self-typing exception, same
+//	as tile-lower's buffer binding), inserted into the prologue head;
+//
+// (b)  the init/store walks — FRESH loops cloning E's header (dimParam,
+//
+//	init/step operands reused, annotation NODES cloned — the oneTier
+//	idiom of buildElementLoop);
+//
+// (c)  the acc update replaces the Reduce call item inside home: the
+//
+//	value is a rebuildWithSubs clone of the combiner body with
+//	{param0 <- acc load at E's IV, param1 <- the piped node}, stored
+//	to the acc at E's IV; the Reduce call is then explicitly erased
+//	(P-7: no whole-graph DCE sweep);
+//
+// (d)  the re-parent: the outer between block B[0] takes X's old position
+//
+//	in its enclosing block; X (carrying the fills) nests inside B[0]
+//	between the init and store walks; the inner chain B[1..] (E with
+//	home inside) moves into X immediately after the fills — the fill
+//	precedes every read of its buffer within each X round by
+//	construction (the assertFillReadsInside epoch contract); for the
+//	single-between degenerate E itself moves into X and the walks take
+//	X's old position;
+//
+// (e)  every Combine-value consumer rewires its value operand onto a
+//
+//	fresh acc load at the STORE-walk IV (SetDef through the choke
+//	point), rebuilds its E-IV coordinates onto the store-walk IV, and
+//	relocates into the store walk after the shared gates;
+//
+// (f)  the init walk stores the CONSTRUCTION'S OWN init operand (never a
+//
+//	hardcoded zero) to the acc at the init-walk IV;
+//
+// (g)  the Init/Reduce/Combine calls and the SeqReducer construction are
+//
+//	explicitly erased (the orphaned combiner lambda stays in the sea —
+//	the maplower precedent, NOT this pass's business; the emitter
+//	emits no symbol because registerLambda runs for surviving
+//	constructions only);
+//
+// (h)  every minted node is Sched-stamped at its block (the post-lower
+//
+//	verifier's dominance check reads the stamps).
+func (lr *lowering) applyAmortizedElementLoop(red, dim ir.Node, ownerLNT *ir.ASTLNT,
+	construction, combineCall, reduceCall, piped ir.Node,
+	anchorBlk *ir.ASTBlock, anchorIdx int, init, lambda ir.Node,
+	xBlk, homeBlk *ir.ASTBlock, betweenBlks []*ir.ASTBlock, p *amortizedPlan) error {
+	id := red.BasePtr().ID()
+
+	// (a) The acc buffer: chunk-wide FRAG block, prologue-declared.
+	eb, err := elemBytes(p.elem)
+	if err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: amortized bracket: %w", id, err)
+	}
+	prologue, err := lr.prologueOf(ownerLNT)
+	if err != nil {
+		return err
+	}
+	acc := lr.g.NewFragNew(lowerOrigin, lr.u32c(p.chunk*float64(eb)))
+	if err := lr.mctx.SetType(acc, ir.InternTensor(p.elem,
+		[]ir.DimRef{{Name: p.chunkDim, Extent: uint64(p.chunk)}})); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: amortized bracket: binding the acc block type: %w", id, err)
+	}
+	conIdx, ok := itemIndexOf(prologue, construction)
+	if !ok {
+		return fmt.Errorf("final-lower: reduce node %d: the reducer construction is not a prologue item (corrupted head?)", id)
+	}
+	if err := prologue.InsertItemAt(conIdx, ir.ASTItem{Node: acc}); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: inserting the acc block: %w", id, err)
+	}
+	acc.BasePtr().SetSched(0, prologue)
+
+	// (b) The init/store walks: fresh loops cloning E's header.
+	var hostBlk *ir.ASTBlock
+	if p.chainHead != nil {
+		hostBlk = betweenBlks[0] // the thread-specialized trips own the bracket
+	} else {
+		hostBlk = p.grandBlk // the single-between degenerate: X's old scope
+	}
+	hostDepth := lr.scopeDepth(hostBlk)
+	freshLoop := func() (ir.Node, *ir.ASTBlock, error) {
+		freshIV := lr.g.NewDimVar(lowerOrigin, p.eDimParam, p.eInit, p.eStep)
+		var attrs []ir.Node
+		for _, op := range p.eAttrs {
+			k, v := ir.KeyedAttributeOf(op)
+			attrs = append(attrs, lr.g.NewKeyedAttribute(lowerOrigin, k, v))
+		}
+		freshBIV := lr.g.NewBoundedDimVar(lowerOrigin, freshIV, p.eBoundMax)
+		fresh := lr.g.NewForLoop(lowerOrigin, freshIV, freshBIV, attrs...)
+		blk, err := ir.NewASTLoop(fresh)
+		if err != nil {
+			return nil, nil, err
+		}
+		fresh.BasePtr().SetSched(hostDepth+1, blk)
+		freshIV.BasePtr().SetSched(hostDepth+1, blk)
+		freshBIV.BasePtr().SetSched(hostDepth+1, blk)
+		return freshIV, blk, nil
+	}
+	initIV, initBlk, err := freshLoop()
+	if err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: amortized bracket: building the init walk: %w", id, err)
+	}
+	storeIV, storeBlk, err := freshLoop()
+	if err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: amortized bracket: building the store walk: %w", id, err)
+	}
+
+	// (f) The init walk body: the construction's OWN init operand (never a
+	// hardcoded zero) stored per acc slot.
+	initStore := lr.g.NewFragStore(lowerOrigin, init, acc, initIV)
+	initBlk.AppendItem(ir.ASTItem{Node: initStore})
+	initStore.BasePtr().SetSched(hostDepth+1, initBlk)
+
+	// (c) The acc update replaces the Reduce call item inside home.
+	accLoadE := lr.g.NewFragLoad(lowerOrigin, acc, p.eIV)
+	value := lr.rebuildWithSubs(p.body, map[ir.Node]ir.Node{
+		p.param0Ref: accLoadE,
+		p.param1Ref: piped,
+	})
+	accStore := lr.g.NewFragStore(lowerOrigin, value, acc, p.eIV)
+	anchorBlk.RemoveItemsIf(func(it ir.ASTItem) bool {
+		return it.Node != nil && it.Node.BasePtr() == reduceCall.BasePtr()
+	})
+	// anchorIdx+1: the Reduce call's own slot (immediately after the piped
+	// producer's item) — the acc update reads the producer's local.
+	if err := anchorBlk.InsertItemAt(anchorIdx+1, ir.ASTItem{Node: accStore}); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: inserting the acc update: %w", id, err)
+	}
+	accStore.BasePtr().SetSched(lr.scopeDepth(anchorBlk), anchorBlk)
+	if err := lr.mctx.Erase(reduceCall); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: erasing the Reduce call: %w", id, err)
+	}
+
+	// (d) The re-parent.
+	if p.chainHead != nil {
+		// B[0] takes X's old position; X nests inside B[0] between the
+		// walks; the inner chain (E with home inside) moves into X right
+		// after the fills.
+		b0 := betweenBlks[0]
+		p.grandBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == xBlk })
+		xTail := -1
+		for i, it := range xBlk.Items() {
+			if it.Block == b0 {
+				xTail = i
+				break
+			}
+		}
+		if xTail < 0 {
+			return fmt.Errorf("final-lower: reduce node %d: the outer between block is not an item of X (corrupted bracket?)", id)
+		}
+		xBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == b0 })
+		if err := p.grandBlk.InsertItemAt(p.xIdx, ir.ASTItem{Block: b0}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: placing the trip loop: %w", id, err)
+		}
+		b0.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == p.chainHead })
+		// D-j (the buildElementLoop discipline this reshape subsumes): B[0]'s
+		// node items whose operand closure references X's OWN IV (the
+		// fill, its source load, the per-round clamps — everything the
+		// scheduler landed in the trip walk) re-place INSIDE X, ahead of
+		// the element chain — the fill stays an item of X's block and
+		// precedes every read of its buffer within each X round. The
+		// remaining items (B[0]-scoped, e.g. the trip coordinate binop)
+		// stay where they are.
+		var xScoped []ir.Node
+		for _, it := range b0.Items() {
+			if it.Node != nil && operandClosure(it.Node)[p.xIV] {
+				xScoped = append(xScoped, it.Node)
+			}
+		}
+		if len(xScoped) > 0 {
+			b0.RemoveItemsIf(func(it ir.ASTItem) bool {
+				if it.Node == nil {
+					return false
+				}
+				for _, n := range xScoped {
+					if it.Node.BasePtr() == n.BasePtr() {
+						return true
+					}
+				}
+				return false
+			})
+			for _, n := range xScoped {
+				if err := xBlk.InsertItemAt(xTail, ir.ASTItem{Node: n}); err != nil {
+					return fmt.Errorf("final-lower: reduce node %d: re-placing an X-scoped item: %w", id, err)
+				}
+				xTail++
+				n.BasePtr().SetSched(lr.scopeDepth(xBlk), xBlk)
+			}
+		}
+		if err := xBlk.InsertItemAt(xTail, ir.ASTItem{Block: p.chainHead}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: nesting the element chain inside X: %w", id, err)
+		}
+		// The init/store/X trio takes the chain child's old position — the
+		// index clamps because the xScoped extraction above may have shrunk
+		// B[0] (the remaining items stay ahead).
+		hostIdx := p.chainIdx
+		if hostIdx > len(b0.Items()) {
+			hostIdx = len(b0.Items())
+		}
+		if err := b0.InsertItemAt(hostIdx, ir.ASTItem{Block: storeBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting the store walk: %w", id, err)
+		}
+		if err := b0.InsertItemAt(hostIdx, ir.ASTItem{Block: xBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting X into the trip loop: %w", id, err)
+		}
+		if err := b0.InsertItemAt(hostIdx, ir.ASTItem{Block: initBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting the init walk: %w", id, err)
+		}
+	} else {
+		// Single-between degenerate: E moves into X; the walks take X's
+		// old position in its enclosing block.
+		xTail := -1
+		for i, it := range xBlk.Items() {
+			if it.Block == p.eBlk {
+				xTail = i
+				break
+			}
+		}
+		if xTail < 0 {
+			return fmt.Errorf("final-lower: reduce node %d: the element walk is not an item of X (corrupted bracket?)", id)
+		}
+		xBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == p.eBlk })
+		p.grandBlk.RemoveItemsIf(func(it ir.ASTItem) bool { return it.Block == xBlk })
+		if err := xBlk.InsertItemAt(xTail, ir.ASTItem{Block: p.eBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: nesting the element walk inside X: %w", id, err)
+		}
+		if err := p.grandBlk.InsertItemAt(p.xIdx, ir.ASTItem{Block: storeBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting the store walk: %w", id, err)
+		}
+		if err := p.grandBlk.InsertItemAt(p.xIdx, ir.ASTItem{Block: xBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting X at the chunk level: %w", id, err)
+		}
+		if err := p.grandBlk.InsertItemAt(p.xIdx, ir.ASTItem{Block: initBlk}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: inserting the init walk: %w", id, err)
+		}
+	}
+
+	// (e) The Combine-value consumers: value onto the acc load at the
+	// store-walk IV, coordinates rebuilt onto it, relocated into the store
+	// walk after the shared gates.
+	moved, epilogue, err := lr.qualifyCombineConsumers(red, dim, ownerLNT, combineCall)
+	if err != nil {
+		return err
+	}
+	accLoadS := lr.g.NewFragLoad(lowerOrigin, acc, storeIV)
+	for _, m := range moved {
+		for _, u := range append([]ir.SSAUse(nil), ir.UsesOf(combineCall)...) {
+			if usr := u.User(); usr != nil && usr.BasePtr() == m.BasePtr() {
+				if err := lr.mctx.SetDef(u, accLoadS); err != nil {
+					return fmt.Errorf("final-lower: reduce node %d: rewiring a consumer onto the acc load: %w", id, err)
+				}
+			}
+		}
+		if err := lr.rebuildOperands(m, map[ir.Node]ir.Node{p.eIV: storeIV}); err != nil {
+			return fmt.Errorf("final-lower: reduce node %d: rebuilding a consumer onto the store-walk IV: %w", id, err)
+		}
+	}
+	// The store walk must be reachable from the kernel body BEFORE the
+	// enclosure gate runs (the gate reads the AST ancestry — a detached
+	// block would defeat it, the buildElementLoop ordering note).
+	if err := lr.assertConsumerEnclosure(red, moved, storeBlk); err != nil {
+		return err
+	}
+	idx := 0
+	epilogue.RemoveItemsIf(func(it ir.ASTItem) bool {
+		if it.Node != nil && idx < len(moved) && it.Node.BasePtr() == moved[idx].BasePtr() {
+			idx++
+			return true
+		}
+		return false
+	})
+	for _, m := range moved {
+		storeBlk.AppendItem(ir.ASTItem{Node: m})
+		m.BasePtr().SetSched(hostDepth+1, storeBlk)
+	}
+
+	// (g) The ceremony erasures: the Combine call and the SeqReducer
+	// construction (its prologue item first). The orphaned combiner lambda
+	// stays in the sea per the maplower precedent — the emitter emits no
+	// symbol for it (registerLambda runs for surviving constructions only)
+	// — BUT its anchored items die HERE: the scheduler anchored the lambda's
+	// params/body as prologue items, which a surviving construction shields
+	// from emission via the emitter's markClosure; with the construction
+	// erased the shield is gone, so the closure's items are removed
+	// explicitly (P-7 spirit: verb-death only, no sea sweep — the orphaned
+	// nodes themselves are the tail DCE's domain).
+	prologue.RemoveItemsIf(func(it ir.ASTItem) bool {
+		return it.Node != nil && it.Node.BasePtr() == construction.BasePtr()
+	})
+	if err := lr.mctx.Erase(combineCall); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: erasing the Combine call: %w", id, err)
+	}
+	if err := lr.mctx.Erase(construction); err != nil {
+		return fmt.Errorf("final-lower: reduce node %d: erasing the reducer construction: %w", id, err)
+	}
+	if lambda != nil && !lambda.BasePtr().Erased() {
+		orphan := operandClosure(lambda)
+		var strip func(blk *ir.ASTBlock)
+		strip = func(blk *ir.ASTBlock) {
+			blk.RemoveItemsIf(func(it ir.ASTItem) bool {
+				return it.Node != nil && orphan[it.Node]
+			})
+			for _, it := range blk.Items() {
+				if it.Block != nil {
+					strip(it.Block)
+				}
+			}
+		}
+		strip(lr.ast.Body)
+	}
+	return nil
 }
