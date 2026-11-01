@@ -1,0 +1,40 @@
+# fix8 §3 slice-0 — µs vs resident threads (log-x), TWO series
+# per kernel (launched, active), BW line annotated. Sorted by
+# threads ascending within each series.
+
+== row_sum (BW line 24.6 µs at 768 GB/s) ==
+  [launched] row_sum-unpinned:512t/5240us  rs-warpk2-g16:512t/5240us  rs-g16:512t/5241us  rs-g64:2048t/5242us  rs-g128:4096t/5244us  rs-g256:8192t/5511us  rs-g512:16384t/5516us  rs-g512-t2:524288t/7124us
+  [  active] row_sum-unpinned:64t/5240us  rs-warpk2-g16:64t/5240us  rs-g16:64t/5241us  rs-g64:64t/5242us  rs-g128:64t/5244us  rs-g256:64t/5511us  rs-g512:64t/5516us  rs-g512-t2:524288t/7124us
+
+== axpy3 (BW line 12.3 µs at 768 GB/s) ==
+  [launched] axpy3-unpinned:512t/3523us  ax-g16:512t/3524us  ax-g64:2048t/3527us  ax-g128:4096t/3529us  ax-g256:8192t/3575us  ax-g512t256:16384t/3579us  ax-g512:524288t/3731us
+  [  active] axpy3-unpinned:64t/3523us  ax-g16:64t/3524us  ax-g64:64t/3527us  ax-g128:64t/3529us  ax-g256:64t/3575us  ax-g512t256:64t/3579us  ax-g512:524288t/3731us
+
+== dup_expr (BW line 5.8 µs at 768 GB/s) ==
+  [launched] dup_expr-unpinned:512t/1741us  dx-g128:4096t/2379us  dx-g256t256:8192t/2642us  dx-g16:16384t/3749us  dx-g256:262144t/999us
+  [  active] dup_expr-unpinned:32t/1741us  dx-g128:32t/2379us  dx-g256t256:32t/2642us  dx-g16:16384t/3749us  dx-g256:262144t/999us
+
+== honest observations (descriptive, per the plan's expected ==== findings — NOT model interpretation; the STOP rule holds) ==
+
+1. ACTIVE-vs-LAUNCHED: every default-tile row_sum/axpy3 point
+   carries 64 ACTIVE threads (2 CTAs of T=256 over a 512-extent
+   dim x 32 threads) regardless of launched count — the research's
+   2-of-16 prediction measured exactly; dup_expr's default-tile
+   points carry 32 (1 CTA of T=256 over 256).
+2. The launched-threads axis DOES NOT BEND for row_sum/axpy3:
+   512 -> 16,384 launched moves min-µs only 5240.9 -> 5516.2
+   (WORSE at the top end — over-provisioned rounds cost, they do
+   not buy).
+3. The only bend in the whole sweep: dup_expr dx-g256 at 262,144
+   ACTIVE threads (blockDim 1024 warp-K=32 landing) = 998.7 µs,
+   1.74x vs its unpinned 1740.6 µs — active threads buy time when
+   they actually materialize, but via the WarpReducer SMEM path,
+   not the CTA axis.
+4. Fully-active big CTA grids at blockDim 32 are INEXPRESSIBLE on
+   these shapes: full activity needs LoC_d <= ceil(extent/T_d)
+   with Prod LoC = N large -> T small -> T < 32 zeroes the FRAG
+   reuse (ceil(T/32) = 1 trip -> zero traffic) -> the search
+   either stays at T=256 (points 1-2) or the schedule degenerates
+   (warp-ceremony landings; dx-g64/dx-g512 assert the
+   v0-unreachable GlobalReducer — the known D1 defect class).
+

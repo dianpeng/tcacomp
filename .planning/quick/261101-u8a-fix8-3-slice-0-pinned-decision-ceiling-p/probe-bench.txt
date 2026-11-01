@@ -1,0 +1,28 @@
+# fix8 §3 slice-0 bench — --jobs 1 --bench-iters 20, 4 repeats
+# per point, min-µs is the statistic (1b/1c precedent: Chrome GPU
+# spikes inflate avg). UNPINNED baselines benched FIRST, in this
+# session (the STOP rule ratios against the in-session number).
+
+# point | kernel | grid | launched | active | min1..min4 µs | min µs | GB/s | x vs BW-line
+row_sum-unpinned | row_sum | 16 | 512 | 64 | 5243.3,5239.6,5242.3,5241.2 | 5239.6 | 3.60 | 213.2x
+axpy3-unpinned | axpy3 | 16 | 512 | 64 | 3523.3,3524.1,3523.4,3523.8 | 3523.3 | 2.68 | 286.7x
+dup_expr-unpinned | dup_expr | 16 | 512 | 32 | 1741.0,1740.6,1740.6,1740.8 | 1740.6 | 2.56 | 300.0x
+rs-g16 | row_sum | 16 | 512 | 64 | 5244.2,5240.9,5241.6,5244.4 | 5240.9 | 3.60 | 213.3x
+rs-g64 | row_sum | 64 | 2048 | 64 | 5245.8,5243.0,5242.2,5244.5 | 5242.2 | 3.60 | 213.3x
+rs-g128 | row_sum | 128 | 4096 | 64 | 5243.6,5244.6,5247.8,5247.0 | 5243.6 | 3.60 | 213.4x
+rs-g256 | row_sum | 256 | 8192 | 64 | 5511.4,5511.2,5510.7,5514.4 | 5510.7 | 3.43 | 224.2x
+rs-g512 | row_sum | 512 | 16384 | 64 | 5516.4,5516.2,5517.1,5519.1 | 5516.2 | 3.42 | 224.5x
+rs-g512-t2 | row_sum | 512 | 524288 | 524288 | 7125.7,7126.3,7124.0,7125.8 | 7124.0 | 2.65 | 289.9x
+rs-warpk2-g16 | row_sum | 16 | 512 | 64 | 5240.4,5246.1,5245.4,5243.0 | 5240.4 | 3.60 | 213.2x
+ax-g16 | axpy3 | 16 | 512 | 64 | 3525.0,3524.3,3524.1,3525.0 | 3524.1 | 2.68 | 286.8x
+ax-g64 | axpy3 | 64 | 2048 | 64 | 3526.7,3526.6,3527.2,3527.1 | 3526.6 | 2.68 | 287.0x
+ax-g128 | axpy3 | 128 | 4096 | 64 | 3529.5,3530.2,3529.2,3530.6 | 3529.2 | 2.67 | 287.2x
+ax-g256 | axpy3 | 256 | 8192 | 64 | 3586.6,3589.0,3583.9,3575.3 | 3575.3 | 2.64 | 291.0x
+ax-g512 | axpy3 | 512 | 524288 | 524288 | 3731.8,3731.6,3731.0,3732.2 | 3731.0 | 2.53 | 303.6x
+ax-g512t256 | axpy3 | 512 | 16384 | 64 | 3585.2,3587.1,3579.2,3588.1 | 3579.2 | 2.64 | 291.3x
+dx-g16 | dup_expr | 16 | 16384 | 16384 | 3749.2,3750.0,3749.8,3749.1 | 3749.1 | 1.19 | 646.1x
+dx-g64 | dup_expr | 64 | 2048 | 512 | FAILED (runtime/orchestrator): reason: run exited 3: /home/ps/Workspace/cuda/project/tcacomp/.claude/worktrees/agent-a9fb1e24668c045bc/runtime/tca/reducer.h:198: void tca::rt::GlobalReducer<T>::Init() [with T = float]: block: [63,0
+dx-g128 | dup_expr | 128 | 4096 | 32 | 2379.2,2385.4,2383.8,2385.5 | 2379.2 | 1.87 | 410.0x
+dx-g256 | dup_expr | 256 | 262144 | 262144 | 998.7,998.9,999.0,999.2 | 998.7 | 4.46 | 172.1x
+dx-g256t256 | dup_expr | 256 | 8192 | 32 | 2644.1,2642.6,2643.5,2641.6 | 2641.6 | 1.69 | 455.2x
+dx-g512 | dup_expr | 512 | 16384 | 4096 | FAILED (runtime/orchestrator): reason: run exited 3: /home/ps/Workspace/cuda/project/tcacomp/.claude/worktrees/agent-a9fb1e24668c045bc/runtime/tca/reducer.h:198: void tca::rt::GlobalReducer<T>::Init() [with T = float]: block: [294,

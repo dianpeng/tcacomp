@@ -1,0 +1,26 @@
+# fix8 §3 slice-0 emission manifest — every sweep point's .cu,
+# sha256 (manifest discipline: identical hashes share fixtures/
+# memcheck; distinct hashes are distinct schedules).
+
+sha256  518d6d4532b6915864021392475a63e38c3bb9b8e18331f5bcc0db6f7ce58174  row_sum-row_sum-unpinned/row_sum.cu
+sha256  518d6d4532b6915864021392475a63e38c3bb9b8e18331f5bcc0db6f7ce58174  row_sum-rs-g16/row_sum.cu
+sha256  7ed316ad37533a637d02f3657b6397d669690491846ae8d6d07dfb9384485f79  row_sum-rs-g64/row_sum.cu
+sha256  5a8418b9ae1e0165fd9e1df19e62e74afb8847034f6342ada5ca967033fff3be  row_sum-rs-g128/row_sum.cu
+sha256  b950ae9a2c6e4b56d74dbf6129898020097aac8d184af1d367b3a45cae19668a  row_sum-rs-g256/row_sum.cu
+sha256  370dbd6d11fe723564e1fdf96d9be59892f63399fcb52ef5842683e330298f06  row_sum-rs-g512/row_sum.cu
+sha256  24da878d214682e36ebbdf85b18aff4f6509de1eef04e865d59cd90107700754  row_sum-rs-g512-t2/row_sum.cu
+sha256  518d6d4532b6915864021392475a63e38c3bb9b8e18331f5bcc0db6f7ce58174  row_sum-rs-warpk2-g16/row_sum.cu
+sha256  7fea9980a791f650547b8852965a2a612534354b37e13f1aadc6947ce4d0fcb1  axpy3-axpy3-unpinned/axpy3.cu
+sha256  7fea9980a791f650547b8852965a2a612534354b37e13f1aadc6947ce4d0fcb1  axpy3-ax-g16/axpy3.cu
+sha256  c753c5c9e8436db76ae64e6eb789a49f87b7d1b68aa6d82c91f7a5d65b9c619b  axpy3-ax-g64/axpy3.cu
+sha256  73eb58ff8c0f3df32d0d7d4aefb8fd232ddb135c6cc74fad12be380fbcef733b  axpy3-ax-g128/axpy3.cu
+sha256  48c70aa290da29d7c421afadd267bec70a604cd7ba55951f4c3311edb24a5040  axpy3-ax-g256/axpy3.cu
+sha256  2faff54adf1c4f6c4f9e943dc7f894b162ef7ede741ca5f46850f17ee9e64c81  axpy3-ax-g512/axpy3.cu
+sha256  33bae7dafc22d485a28c3e65fb80672d9cde4913f6e91dac6be010b8a9d6b83e  axpy3-ax-g512t256/axpy3.cu
+sha256  190561eb495deaa45eaec5b4d3f232f407eb486aff2c0b802caa0ed842dcf483  dup_expr-dup_expr-unpinned/dup_expr.cu
+sha256  057ca6a6f991a615b94be59e96b4d2b8561021be62a531a3ea848a2dc6243bf9  dup_expr-dx-g16/dup_expr.cu
+sha256  fa5b289d55d6787cc704d7b82f0d5dfcdd34ae04e26ef69f65ed9c997da4bf6e  dup_expr-dx-g64/dup_expr.cu
+sha256  a2a9a2893bd13be1ab24c2940cd54cb43f96d2c48ee388d29456d22253b09b6b  dup_expr-dx-g128/dup_expr.cu
+sha256  54c3beee98c67070c851e67e863362f92bca2da870183c9cbf8789dbc0c38d64  dup_expr-dx-g256/dup_expr.cu
+sha256  d18639bf7db6e330f22e03d1956cd9837fc248f86a45cde4b80afad854956554  dup_expr-dx-g256t256/dup_expr.cu
+sha256  bc6a26b803f0215b258e58a8287ce681659df18149dff598c853c814e102bf92  dup_expr-dx-g512/dup_expr.cu

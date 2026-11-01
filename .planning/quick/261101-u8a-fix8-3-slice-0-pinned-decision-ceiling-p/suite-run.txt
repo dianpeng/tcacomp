@@ -1,0 +1,21 @@
+PASS dup_expr [dedup] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 1.90735e-06
+PASS dup_const [dedup] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 4.76837e-07
+PASS axpy3 [fusion] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 9.53674e-07
+PASS mlp [fusion] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 3.05176e-05
+PASS softmax [fusion] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 1.90735e-06
+PASS mm_small [tiling] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 2.86102e-06
+PASS mm_mid [tiling] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 5.34058e-05
+PASS mm_splitk [tiling] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 3.05176e-05
+PASS transpose [tiling] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 4.76837e-07
+PASS row_sum [runtime] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 4.76837e-07
+PASS scale_copy [runtime] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 2.38419e-07
+PASS gemm [llm] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 2.28882e-05
+PASS qk_score [llm] compile 0.0s build 0.0s run 0.1s (cache) maxdiff 1.19209e-06
+PASS layernorm [llm] compile 0.0s build 0.0s run 0.2s (cache) maxdiff 7.62939e-06
+
+  dedup: 2 passed, 0 failed, 0 skipped (0.4s)
+  fusion: 3 passed, 0 failed, 0 skipped (0.5s)
+  llm: 3 passed, 0 failed, 0 skipped (0.5s)
+  runtime: 2 passed, 0 failed, 0 skipped (0.4s)
+  tiling: 4 passed, 0 failed, 0 skipped (0.7s)
+14 passed, 0 failed, 0 skipped, total 2.5s

@@ -1,0 +1,24 @@
+# fix8 §3 slice-0 memcheck — compute-sanitizer memcheck via the
+# orchestrator on every DISTINCT pinned .cu (sha256-deduped from
+# probe-manifest.txt; unpinned binaries were memcheck-clean in 1c
+# and are not rerun). Identical binaries share the check.
+
+rs-g16 (row_sum, sha 518d6d4532b6): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 4.76837e-07)
+rs-g64 (row_sum, sha 7ed316ad3753): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 4.76837e-07)
+rs-g128 (row_sum, sha 5a8418b9ae1e): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 4.76837e-07)
+rs-g256 (row_sum, sha b950ae9a2c6e): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 4.76837e-07)
+rs-g512 (row_sum, sha 370dbd6d11fe): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 4.76837e-07)
+rs-g512-t2 (row_sum, sha 24da878d2146): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 2.38419e-07)
+rs-warpk2-g16: sha 518d6d4532b6 shared — covered above
+ax-g16 (axpy3, sha 7fea9980a791): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+ax-g64 (axpy3, sha c753c5c9e843): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+ax-g128 (axpy3, sha 73eb58ff8c0f): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+ax-g256 (axpy3, sha 48c70aa290da): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+ax-g512 (axpy3, sha 2faff54adf1c): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+ax-g512t256 (axpy3, sha 33bae7dafc22): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 9.53674e-07)
+dx-g16 (dup_expr, sha 057ca6a6f991): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 1.90735e-06)
+dx-g64 (dup_expr, sha fa5b289d55d6): FAILED under memcheck: reason: sanitizer:memcheck exited 3: /home/ps/Workspace/cuda/project/tcacomp/.claude/worktrees/agent-a9fb1e24668c045bc/runtime/tca/reducer.h:198: void tca::rt::GlobalReducer<T>::In
+dx-g128 (dup_expr, sha a2a9a2893bd1): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 1.90735e-06)
+dx-g256 (dup_expr, sha 54c3beee98c6): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 1.90735e-06)
+dx-g256t256 (dup_expr, sha d18639bf7db6): CLEAN — ERROR SUMMARY: 0 errors (orchestrator-enforced contract + numerics, maxdiff 1.90735e-06)
+dx-g512 (dup_expr, sha bc6a26b803f0): FAILED under memcheck: reason: sanitizer:memcheck exited 3: /home/ps/Workspace/cuda/project/tcacomp/.claude/worktrees/agent-a9fb1e24668c045bc/runtime/tca/reducer.h:198: void tca::rt::GlobalReducer<T>::In

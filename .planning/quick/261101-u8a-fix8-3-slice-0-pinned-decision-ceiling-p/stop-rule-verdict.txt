@@ -1,0 +1,24 @@
+# fix8 §3 STOP rule — best pinned row_sum vs the IN-SESSION
+# unpinned baseline (never the 2026-11-01 table across drift).
+
+STOP threshold: ratio >= 10x -> measured CEILING; below -> STOP (expressibility analysis contradicted).
+
+in-session unpinned row_sum min-µs : 5239.6  (5243.3,5239.6,5242.3,5241.2 µs)
+2026-11-01 table (reference only) : 5238.0 µs
+best pinned row_sum               : rs-warpk2-g16 at 5240.4 µs (5240.4,5246.1,5245.4,5243.0 µs)
+  its schedule                    : grid 16, launched 512, active 64, 3.60 GB/s, 213.2x vs BW-line
+
+arithmetic: 5239.6 / 5240.4 = 1.00x
+
+VERDICT: STOP — ratio 1.00x < 10x.
+
+§1's expressibility analysis is contradicted. §3 candidate
+mechanisms (concrete per the research):
+  1. active-vs-launched CTA accounting (over-provisioned
+     grid-stride maps clamp excess CTAs to zero work)
+  2. fill traffic scaling with grid
+  3. ThrIterator spread: the coupled walk strides blockDim
+     within a T-sized tile, so per-thread MLP ~ T/32 loads
+
+NO further interpretation — slice 1 does not proceed on this
+model; re-derive against the candidates above first.

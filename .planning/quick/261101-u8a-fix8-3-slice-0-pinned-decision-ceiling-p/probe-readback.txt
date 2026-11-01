@@ -1,0 +1,29 @@
+# fix8 §3 slice-0 decision readback — intended vs MEASURED grid.
+# launched = grid x blockDim; active = Prod_d min(LoC_d,
+# ceil(extent_d/T_d)) x blockDim (runner-baked extents). A point
+# the search lands elsewhere on is RE-LABELED from the .cu, never
+# discarded; a compile failure is a recorded finding.
+
+# point | kernel | intend-grid | measured-grid | cta-dims(dim:LoC/T) | block | launched | active | sha256[:12] | status
+row_sum-unpinned | row_sum | - | 16 | R:L16/T256 | 32 | 512 | 64 | 518d6d4532b6 | ok (unpinned baseline)
+rs-g16 | row_sum | 16 | 16 | R:L16/T256 | 32 | 512 | 64 | 518d6d4532b6 | ok
+rs-g64 | row_sum | 64 | 64 | R:L64/T256 | 32 | 2048 | 64 | 7ed316ad3753 | ok
+rs-g128 | row_sum | 128 | 128 | R:L128/T256 | 32 | 4096 | 64 | 5a8418b9ae1e | ok
+rs-g256 | row_sum | 256 | 256 | R:L256/T256 | 32 | 8192 | 64 | b950ae9a2c6e | ok
+rs-g512 | row_sum | 512 | 512 | R:L512/T256 | 32 | 16384 | 64 | 370dbd6d11fe | ok
+rs-g512-t2 | row_sum | 512 | 512 | C:L512/T2 | 1024 | 524288 | 524288 | 24da878d2146 | RE-LABELED (intended 512x32, landed 512x1024)
+rs-warpk2-g16 | row_sum | 16 | 16 | R:L16/T256 | 32 | 512 | 64 | 518d6d4532b6 | RE-LABELED (intended 16x64, landed 16x32)
+axpy3-unpinned | axpy3 | - | 16 | R:L16/T256 | 32 | 512 | 64 | 7fea9980a791 | ok (unpinned baseline)
+ax-g16 | axpy3 | 16 | 16 | R:L16/T256 | 32 | 512 | 64 | 7fea9980a791 | ok
+ax-g64 | axpy3 | 64 | 64 | R:L64/T256 | 32 | 2048 | 64 | c753c5c9e843 | ok
+ax-g128 | axpy3 | 128 | 128 | R:L128/T256 | 32 | 4096 | 64 | 73eb58ff8c0f | ok
+ax-g256 | axpy3 | 256 | 256 | R:L256/T256 | 32 | 8192 | 64 | 48c70aa290da | ok
+ax-g512 | axpy3 | 512 | 512 | R:L32/T16xC:L16/T16 | 1024 | 524288 | 524288 | 2faff54adf1c | RE-LABELED (intended 512x32, landed 512x1024)
+ax-g512t256 | axpy3 | 512 | 512 | R:L512/T256 | 32 | 16384 | 64 | 33bae7dafc22 | ok
+dup_expr-unpinned | dup_expr | - | 16 | R:L16/T256 | 32 | 512 | 32 | 190561eb495d | ok (unpinned baseline)
+dx-g16 | dup_expr | 16 | 16 | C:L16/T16 | 1024 | 16384 | 16384 | 057ca6a6f991 | RE-LABELED (intended 16x32, landed 16x1024)
+dx-g64 | dup_expr | 64 | 64 | R:L4/T16xC:L4/T16xe8:L4/T16 | 32 | 2048 | 512 | fa5b289d55d6 | ok
+dx-g128 | dup_expr | 128 | 128 | R:L128/T256 | 32 | 4096 | 32 | a2a9a2893bd1 | ok
+dx-g256 | dup_expr | 256 | 256 | R:L16/T16xC:L16/T16 | 1024 | 262144 | 262144 | 54c3beee98c6 | RE-LABELED (intended 256x32, landed 256x1024)
+dx-g256t256 | dup_expr | 256 | 256 | R:L256/T256 | 32 | 8192 | 32 | d18639bf7db6 | ok
+dx-g512 | dup_expr | 512 | 512 | R:L8/T4xC:L8/T4xe8:L8/T4 | 32 | 16384 | 4096 | bc6a26b803f0 | ok
