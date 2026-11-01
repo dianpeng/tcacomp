@@ -37,6 +37,7 @@ package tiling
 
 import (
 	"fmt"
+	"strconv"
 
 	"tcacomp/internal/ir"
 )
@@ -141,6 +142,17 @@ func (lr *lowerRun) planSiteChunk(id uint64, sf SiteFacts) error {
 			return fmt.Errorf("tile-lower: site %d covers iter node %d at SoC %d — the chunk plan supports sequential and C1b-warp dims only (a CTA-covered site is refused at surgery)", id, it.BasePtr().ID(), int(d.SoC))
 		}
 	}
+	// fix7 §2 pathology 2, killed by construction: a covered
+	// COMPILE-TIME-CONST dim sizes its chunk by its TRUE extent, never the
+	// nominal tile (an e4-at-T=256 window would allocate 252/256
+	// never-touched elements). The reduction lands BEFORE the halving
+	// loop: const dims are already their true size, so the loop clamps
+	// the dynamic outer dims first.
+	for i, it := range cov {
+		if ext, ok := lr.staticIterExtent(it); ok && ext < chunks[i] {
+			chunks[i] = ext
+		}
+	}
 	// The budget: min(raw, MaxFragPerThread) from the ONE shared source.
 	m := make(map[ir.Node]IterDecision, len(sf.Covered))
 	for _, it := range sf.Covered {
@@ -181,6 +193,52 @@ func (lr *lowerRun) planSiteChunk(id uint64, sf SiteFacts) error {
 		lr.fragChunk[it] = chunks[i]
 	}
 	return nil
+}
+
+// staticIterExtent resolves a covered iter's TRUE compile-time-const
+// extent (pathology 2's kill). Source precedence: (1) the BIV max
+// operand's const payload (the LO-05 extentOfBiv source — the real
+// pipeline's const-dim extents are literal consts); (2) the dim
+// InputParam's canonical "e<extent>" static spelling (build.go dimKey —
+// the c8n identity source, mirrored by staticDimNameExtent). NEVER
+// ir.TypeOf: lower-input nodes carry a NIL computed type cell (the
+// post-typeinfer gotcha is real and load-bearing). A non-const extent
+// reports false — the dim keeps its dynamic tile chunk.
+func (lr *lowerRun) staticIterExtent(iter ir.Node) (int, bool) {
+	if biv, err := bivOf(iter); err == nil {
+		if ops := ir.DataDeps(biv); len(ops) >= 2 && ops[1] != nil {
+			if v, ok := ir.ConstValueOf(ops[1]); ok && v >= 1 {
+				return int(v), true
+			}
+		}
+	}
+	if dim, err := dimOfIter(iter); err == nil && dim != nil {
+		return staticDimNameExtent(ir.InputParamNameOf(dim))
+	}
+	return 0, false
+}
+
+// staticDimNameExtent parses a dim InputParam's canonical static spelling
+// "e<extent>" (build.go dimKey) into its declared compile-time extent —
+// the tiling-package twin of internal/cg/cxx/memory.go's staticDimExtent
+// (the c8n identity source; cg may not be imported from opt). A dynamic
+// name never matches, and extent 0 is dynamic by definition. The parse is
+// 32-bit-bounded: tensor extents are u32, and the rejection keeps the
+// int conversion exact.
+func staticDimNameExtent(name string) (int, bool) {
+	if len(name) < 2 || name[0] != 'e' {
+		return 0, false
+	}
+	for _, c := range name[1:] {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	ext, err := strconv.ParseUint(name[1:], 10, 32)
+	if err != nil || ext == 0 {
+		return 0, false
+	}
+	return int(ext), true
 }
 
 // siteCoveredTensorOrder orders the site's covered iters in tensor
