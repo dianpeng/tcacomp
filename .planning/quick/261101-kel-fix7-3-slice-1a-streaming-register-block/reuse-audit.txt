@@ -1,0 +1,70 @@
+# §3.4 priced-vs-actual reuse audit — quick-261101-kel (fix7 §3 slice 1a)
+#
+# Method (design/fix/fix7.md §3.4 + the plan's Task-3 action):
+# - ACTUAL side: internal/e2e/fix7stream_test.go TestFix7StreamFillAudit —
+#   every schedule-changed suite emitter compiled through the real facade;
+#   LoadTileThread fill sites counted per nest path (textual emission).
+# - PRICED side: the tiling package's OWN pricing functions via the
+#   read-only tiling.PricedSites hook (internal/opt/tiling/audit.go) —
+#   siteWindowBytesRaw / siteWindowBytes / siteReuseCount, the SAME
+#   functions the judge runs; the record is the real decide pass's product
+#   (pipeline.HIRPasses + tiling.New + tiling.VerifyPass on the frontend
+#   graph). No pricing math was re-derived or reimplemented anywhere; the
+#   emitted .cu set is bit-identical to the user path's (sha256 manifest,
+#   after-sha256-manifest.txt).
+# - Chunk decls: emitted .cu, bin/tcacomp compile (binary rebuilt via
+#   scripts/build.sh from HEAD a350e8b).
+#
+# UNIFORM PRICED FACTS (all 8 schedule-changed emitters):
+#   tensor=z class=frag tie=R reuse-dims=[R=cta(T256)]
+#   raw=262,144 B (the old 256 KB/thread window) window=256 B reuse=8
+#   (reuse 8 = R's coupled-walk trips ceil(256/32): the priced model
+#    assumes ONE fill serves all 8 trips; the co-load x is density-evicted
+#    — exactly one promoted site per kernel, the F6 shape)
+#
+# PER-KERNEL ACTUAL STRUCTURE:
+#   Every fill sits INSIDE the per-element bracket: the nest path is
+#   R.between -> C.between -> R.inside -> C.inside -> <innermost covered
+#   dim>.between -> FILL. Two priced-model facts are therefore NOT
+#   realized:
+#     (a) the fill rides R's coupled inside walk (anchor v9/v12/v14/v15
+#         contains the R trip term) — the window is REFILLED PER R TRIP,
+#         so the priced cross-trip sharing (reuse 8) never happens;
+#     (b) the fill sits inside C's inside walk (the bracket) — the window
+#         is REFILLED PER C ELEMENT.
+#   Consumption per refill = the innermost covered dim's inside walk =
+#   its chunk (the walks below the fill consume exactly the elements the
+#   window holds for the current bracket instance).
+#
+# kernel      chunk decl          innermost   consumptions  priced  verdict
+#             [covered dims]      chunk       per refill    reuse
+# dup_expr    [C=8, e8=8]         e8=8        8             8       PARITY
+# dup_const   [C=8, e8=8]         e8=8        8             8       PARITY
+# axpy3       [C=16, e4=4]        e4=4        4             8       GAP (4 < 8)
+# scale_copy  [C=16, e4=4]        e4=4        4             8       GAP (4 < 8)
+# row_sum     [e4=1, C=64]        e4=1        1             8       GAP (1 < 8)
+# softmax     [e8=1, C=64]        e8=1        1             8       GAP (1 < 8)
+# layernorm   [C=1, K=64]         K=64        64            8       NO GAP (64 >= 8)
+# transpose   [C=1, K=64]         K=64        64            8       NO GAP (64 >= 8)
+#
+# FILL SITES PER NEST PATH: exactly 1 LoadTileThread site per kernel (one
+# promoted site each), all at the bracket-level nest path above. Pre-1a
+# the site count was identical — 1a changed the SITE'S FOOTPRINT (256 KB
+# -> 256 B) and the round structure (chunk-stepped betweens), not the
+# placement.
+#
+# VERDICT (§3.4): the placement gap is REAL and matches fix7 §2's
+# pathology-3 prediction ("the emitted nest places the fill inside the
+# per-element reducer bracket ... the judge priced reuse 8"): on the four
+# const-innermost kernels the window is refilled per (R trip, C element)
+# and consumed only its innermost chunk per refill — actual < priced.
+# Per §3.3 this audit RECORDS the gap; it is NEVER patched here (no judge
+# tweak, no fill move, no schedule change). It is the follow-up tracked as
+# the fill-placement task / slice 1b's bracket amortization.
+#
+# GATE CONTEXT: despite the gap, the §3.6 gates are MET (after-bench.txt):
+# the pre-1a state was not 8x off the priced model but ~1024x (a 256 KB
+# window refilled per bracket element from local memory), so realizing
+# even the unfilled placement + the 256 B allocation restores the reduce
+# family 12x/27x past the gate lines. Closing the remaining 8x placement
+# gap is slice 1b's measured payoff, on top of these numbers.

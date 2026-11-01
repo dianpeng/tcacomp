@@ -1,0 +1,33 @@
+# RED/pin-3 evidence — Task 3 (quick-261101-kel, Task-2 GREEN state 4a96144)
+# Command: go test ./internal/e2e/ -run 'TestFix7Stream' -count=1 -v
+# Recorded: 2026-11-01 (UTC)
+#
+# Pin 3 (e2e emission on scale_copy + row_sum through the REAL optimizer)
+# lands GREEN ON ARRIVAL: Tasks 1-2 own the mechanism; this pin guards the
+# real-optimizer path end-to-end. The RED equivalence for the pre-1a
+# state is established by:
+#   - design/fix/fix7.md §2 quoting the actual pre-merge scale_copy
+#     emission: tca::rt::Frag<float, 2u, 256u, 256u> (256 KB/thread);
+#   - red-task1.txt pinning the same raw-window decl at base 6b3d2df.
+#
+# Pre-pin emission actually recorded at the Task-2 state (this run):
+#   scale_copy: tca::rt::Frag<float, 2u, 16u, 4u> tca_f0;   (256 B, was 256 KB)
+#               fill z: TensorWindow(z_v, v14, C_it1.Index(), e4_it4.Index())
+#               C between step 16u, e4 between step 4u — tensor dim order
+#   row_sum:    tca::rt::Frag<float, 2u, 1u, 64u> tca_f0;   (256 B, was 256 KB)
+#               fill z: TensorWindow(z_v, v12, e4_it4.Index(), C_it1.Index())
+#               C between step 64u, e4 between step 1u — const-MIDDLE order
+#   (z is the promoted tensor on both; x stays a GMEM load — the F6
+#    eviction shape, exactly one promoted site per co-traversed pair.)
+#
+# §3.4 audit data (all 8 schedule-changed emitters, priced side via the
+# tiling package's OWN pricing functions — tiling.PricedSites):
+#   every kernel: tensor=z class=frag raw=262144B window=256B reuse=8
+#   covered: [C, e8/e4/K] at T=256 nominal, tie=R, reuse-dims=[R=cta(T256)]
+#   (reuse 8 = R's coupled-walk trips ceil(256/32) — the priced model
+#    assumes one fill serves all 8 trips)
+# Actual side (emission): every fill sits INSIDE the per-element bracket
+# (@C inside walk) — per (R trip, C element, e4 round) — so each fill's
+# window is consumed exactly the innermost covered chunk's elements
+# (e4/e8/K chunk: 4 / 8 / 1 / 64 depending on the kernel), NOT the 8
+# priced R trips. Verdicts per kernel are composed in reuse-audit.txt.
