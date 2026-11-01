@@ -1,0 +1,21 @@
+=== RUN   TestFix7Bracket
+=== RUN   TestFix7Bracket/row_sum
+    fix7bracket_test.go:103: fix7 §4 1b (row_sum): zero reducer ceremony expected (no SeqReducer construction, no Init/Reduce/Combine sites); found "SeqReducer"
+=== RUN   TestFix7Bracket/softmax
+    fix7bracket_test.go:107: fix7 §4 1b (softmax): zero reducer ceremony expected (no SeqReducer construction, no Init/Reduce/Combine sites); found "SeqReducer"
+=== RUN   TestFix7Bracket/layernorm_unchanged
+    fix7bracket_test.go:111: §4 layernorm: fill nest-path=// @R tile-between rounds — CTA, T=256, LoC=16 (map dim 0) -> // @C inside walk (tile elements) — T=256 -> // @R tile-between rounds — thread/warp, T=256, LoC=32 -> // @C inside walk (tile elements) — T=256 -> // @K tile-between rounds — sequential, T=256, LoC=1
+=== RUN   TestFix7Bracket/transpose_unchanged
+    fix7bracket_test.go:115: §4 transpose: fill nest-path=// @R tile-between rounds — CTA, T=256, LoC=16 (map dim 0) -> // @C inside walk (tile elements) — T=256 -> // @R tile-between rounds — thread/warp, T=256, LoC=32 -> // @C inside walk (tile elements) — T=256 -> // @K tile-between rounds — sequential, T=256, LoC=1
+=== RUN   TestFix7Bracket/suite_fill_nest_paths
+    fix7bracket_test.go:135: §4 axpy3.tca: fill nest-path=// @R tile-between rounds — CTA, T=256, LoC=16 (map dim 0) -> // @C tile-between rounds — sequential, T=256, LoC=1 -> // @R tile-between rounds — thread/warp, T=256, LoC=32 -> // @C inside walk (tile elements) — T=256 -> // @e4 tile-between rounds — sequential, T=256, LoC=1
+    fix7bracket_test.go:137: fix7 §4 1b (axpy3.tca): the fill's nest path still contains the @C per-element inside walk — the §3.4 gap is NOT closed (path: // @R tile-between rounds — CTA, T=256, LoC=16 (map dim 0) -> // @C tile-between rounds — sequential, T=256, LoC=1 -> // @R tile-between rounds — thread/warp, T=256, LoC=32 -> // @C inside walk (tile elements) — T=256 -> // @e4 tile-between rounds — sequential, T=256, LoC=1)
+--- FAIL: TestFix7Bracket (0.13s)
+    --- FAIL: TestFix7Bracket/row_sum (0.03s)
+    --- FAIL: TestFix7Bracket/softmax (0.03s)
+    --- PASS: TestFix7Bracket/layernorm_unchanged (0.02s)
+    --- PASS: TestFix7Bracket/transpose_unchanged (0.02s)
+    --- FAIL: TestFix7Bracket/suite_fill_nest_paths (0.03s)
+FAIL
+FAIL	tcacomp/internal/e2e	0.128s
+FAIL

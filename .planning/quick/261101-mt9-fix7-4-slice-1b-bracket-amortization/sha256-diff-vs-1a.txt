@@ -1,0 +1,14 @@
+DIFF axpy3
+DIFF dup_const
+DIFF dup_expr
+DIFF row_sum
+DIFF scale_copy
+DIFF softmax
+SAME gemm
+SAME layernorm
+SAME mlp
+SAME mm_mid
+SAME mm_small
+SAME mm_splitk
+SAME qk_score
+SAME transpose

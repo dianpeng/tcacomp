@@ -1,0 +1,10 @@
+=== RUN   TestReduceShapesEmit
+=== RUN   TestReduceShapesEmit/rank3_multi-between
+    emit_test.go:370: the .cu must construct the SeqReducer (the reduced dim is SEQ under Wave 1)
+=== RUN   TestReduceShapesEmit/minimal-legal-tile_endpoint
+--- FAIL: TestReduceShapesEmit (0.00s)
+    --- FAIL: TestReduceShapesEmit/rank3_multi-between (0.00s)
+    --- PASS: TestReduceShapesEmit/minimal-legal-tile_endpoint (0.00s)
+FAIL
+FAIL	tcacomp/internal/cg/cxx	0.004s
+FAIL
