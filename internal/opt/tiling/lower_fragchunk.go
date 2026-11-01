@@ -24,7 +24,10 @@ package tiling
 // factors (the SAME factors siteWindowBytesRaw prices: SEQ -> effective
 // T_d, C1b WARP -> ceil(T_d/32)) reduced, while sizeof(chunk) exceeds the
 // priced block footprint, by halving the OUTERMOST covered dim whose
-// chunk > 1 (floor 1). Only SEQUENTIAL dims are reducible: a WARP-covered
+// chunk > 1 (floor 1; fix7 §5 slice 1c biases each SEQ halving step toward
+// the loader's 128-bit row unit — snapHalfChunk — where the TRUE extent and
+// the budget allow it, byte-identical otherwise). Only SEQUENTIAL dims are
+// reducible: a WARP-covered
 // dim's per-lane chunk is the lane-chunk walk's fixed width WITHIN a
 // round — halving it would desynchronize the walk (the fix7 §3.3 scope
 // guard: no WARP streaming machinery in 1a). If every sequential dim
@@ -164,7 +167,9 @@ func (lr *lowerRun) planSiteChunk(id uint64, sf SiteFacts) error {
 	}
 	budget := siteWindowBytes(sf, m, ClassFRAG, lr.params)
 	// The halving loop (policy in the file header): outermost reducible
-	// dim first, floor 1, fail closed when nothing can shrink.
+	// dim first, floor 1, fail closed when nothing can shrink. fix7 §5 slice
+	// 1c biases each SEQ halving step toward the loader's 128-bit row unit
+	// (snapHalfChunk) — the budget comparison itself is untouched.
 	elem := elemBytes(e)
 	for fragChunkBytes(elem, chunks) > budget {
 		halved := false
@@ -172,7 +177,7 @@ func (lr *lowerRun) planSiteChunk(id uint64, sf SiteFacts) error {
 			if lr.decisions[cov[i]].SoC != SoCSequential || chunks[i] <= 1 {
 				continue // WARP dims never halve (the lane-chunk walk width is fixed within a round)
 			}
-			chunks[i] = max(1, chunks[i]/2)
+			chunks[i] = lr.snapHalfChunk(cov[i], elem, chunks, i, budget)
 			halved = true
 			break
 		}
@@ -280,4 +285,52 @@ func fragChunkBytes(elem int, chunks []int) int {
 		bytes *= c
 	}
 	return bytes
+}
+
+// snapHalfChunk is one reducible SEQ dim's halving step under the fix7 §5
+// slice 1c vector-width bias: the RAW half, or — when the dim's TRUE static
+// extent is a multiple of the loader's 128-bit row unit (vecWidthElems) —
+// the LARGEST unit multiple at or below the raw half whose whole-chunk
+// footprint stays within the priced budget. A budget-forced chunk that
+// lands off the unit (24 -> 12 -> 6) dead-fires the loader's per-row
+// `trailing % vec == 0` gate on every row; the bias keeps the chunk on the
+// unit so the vec16 path stays reachable by construction. When no unit
+// multiple qualifies — the extent is not unit-compatible, or the budget
+// admits none — the raw half stands EXACTLY: no silent clamp, the budget
+// gate never violated, the floor-1 and fail-closed paths unchanged. The
+// budget comparison reads the same fragChunkBytes arithmetic (others×m);
+// the priced budget value itself is siteWindowBytes's, untouched.
+func (lr *lowerRun) snapHalfChunk(iter ir.Node, elem int, chunks []int, i, budget int) int {
+	half := max(1, chunks[i]/2)
+	vecElems, ok := vecWidthElems(elem)
+	if !ok {
+		return half // the loader's 16 B unit does not divide this element: no bias
+	}
+	if ext, ok := lr.staticIterExtent(iter); !ok || ext%vecElems != 0 {
+		return half // the TRUE extent is not unit-compatible: raw halving stands
+	}
+	others := elem
+	for j, c := range chunks {
+		if j != i {
+			others *= c
+		}
+	}
+	for m := half / vecElems * vecElems; m >= vecElems; m -= vecElems {
+		if others*m <= budget {
+			return m
+		}
+	}
+	return half
+}
+
+// vecWidthElems is the loader's 128-bit copy unit in elements (loader.h
+// copy_row: the vec16 path gates on sizeof(E) == 4 and trailing % 4 == 0 —
+// 16 B / 4 B = 4 for the f32 elements the mechanism covers today). false for
+// every other element size: the mechanism is float-specific and this bias
+// does not extend it.
+func vecWidthElems(elem int) (int, bool) {
+	if elem == 4 {
+		return 4, true
+	}
+	return 0, false
 }

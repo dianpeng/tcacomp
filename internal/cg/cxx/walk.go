@@ -130,7 +130,32 @@ func (e *emitter) kernelTop() (string, error) {
 		for _, d := range dims {
 			ds = append(ds, fmt.Sprintf("%du", d.Extent))
 		}
-		write(fmt.Sprintf("tca::rt::Frag<%s, %du, %s> %s;", ts, uint(len(dims)), strings.Join(ds, ", "), local))
+		// fix7 §5 slice 1c: the loader's 128-bit row path (loader.h copy_row)
+		// gates BOTH endpoints per row — and Frag::data_ carries only the
+		// element's natural alignment (4 B for float), so the dst side fails
+		// on EVERY row unless the DECLARATION carries alignas(16). The rule
+		// is scoped to per-thread fill destinations where the eligibility
+		// chain holds BY CONSTRUCTION: the trailing extent makes the row
+		// 16B-clean (extent*elemBytes % 16 == 0) AND RowMajorShape places
+		// data_ at a 16B-clean object offset (8*Rank bytes — 16 B for the
+		// emitted rank-2 fill windows). A rank-1 fill window (data_ at offset
+		// 8, e.g. the matmul family's Frag<float, 1u, 8u>) can NEVER make
+		// Data() 16B-aligned via the declaration — the spelling would be dead
+		// bytes, so it is excluded fail-closed and prints byte-unchanged (the
+		// matmul-family sha256 bit-identity gate). Everything else — SMEM
+		// views, reducer staging, the 1b accumulator block, chunk-1
+		// layernorm/transpose fills — also prints byte-unchanged.
+		prefix := ""
+		if e.fragFill[f] && 8*len(dims)%16 == 0 {
+			es, err := elemByteSize(ts)
+			if err != nil {
+				return "", err
+			}
+			if es*int(dims[len(dims)-1].Extent)%16 == 0 {
+				prefix = "alignas(16) "
+			}
+		}
+		write(fmt.Sprintf("%stca::rt::Frag<%s, %du, %s> %s;", prefix, ts, uint(len(dims)), strings.Join(ds, ", "), local))
 	}
 	if b.Len() > 0 {
 		b.WriteString("\n")

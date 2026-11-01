@@ -30,6 +30,7 @@ type emitter struct {
 	smemOff   map[ir.Node]int    // SMEM-class MemNew → pool byte offset (v0: disjoint, D8)
 	smemCap   int                // total pool bytes (v0: Σ extents, zero reuse)
 	fillSrc   map[ir.Node]bool   // MemLoads serving as a fill's source (skipped as items)
+	fragFill  map[ir.Node]bool   // FRAG-class MemNew serving as a PER-THREAD fill dst (fix7 §5 1c: the alignas(16) decl rule's classification — the identical FRAG-class branch stmtFill emits as LoadTileThread)
 	bufTensor map[ir.Node]string // tiered MemNew → source tensor name (semantic view names)
 	staging   map[ir.Node]bool   // SMEM-class MemNew nodes serving as reducer staging rows (R1 — inline ctor views, no kernelTop decl)
 	gated     map[ir.Node]bool   // MemStores of a reduced value (R3 — single-owner gated on is_first_in_cta)
@@ -101,6 +102,7 @@ func Emit(g *ir.Graph, opts cg.Options) (*cg.Result, error) {
 		stored:      map[ir.Node]bool{},
 		smemOff:     map[ir.Node]int{},
 		fillSrc:     map[ir.Node]bool{},
+		fragFill:    map[ir.Node]bool{},
 		bufTensor:   map[ir.Node]string{},
 		staging:     map[ir.Node]bool{},
 		gated:       map[ir.Node]bool{},
@@ -336,6 +338,17 @@ func (e *emitter) prescan() error {
 							if _, ok := e.bufTensor[ops[1]]; !ok {
 								e.bufTensor[ops[1]] = ir.InputParamNameOf(src[0])
 							}
+						}
+					}
+					// fix7 §5 slice 1c: the per-thread fill destinations —
+					// the IDENTICAL FRAG-class branch stmtFill emits as
+					// LoadTileThread (sc != StorageSMem under isFillStore's
+					// SMEM/Frag gate), classified here in the SAME walk so the
+					// decl rule (walk.go) can never disagree with the loader
+					// call the body emits.
+					if len(ops) > 1 && ops[1] != nil {
+						if sc, ok := ir.StorageClassOf(it.Node); ok && sc != ir.StorageSMem {
+							e.fragFill[ops[1]] = true
 						}
 					}
 				}

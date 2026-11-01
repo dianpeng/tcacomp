@@ -13,7 +13,7 @@ __global__ void __launch_bounds__(32) Fragchunk(uint32_t R, uint32_t C, uint32_t
   tca::rt::TensorView<const float, 3u> x_v(x, R, C, K);
   tca::rt::TensorView<const float, 3u> z_v(z, R, C, K);
   tca::rt::TensorView<float, 2u> out_v(out, R, C);
-  tca::rt::Frag<float, 2u, 1u, 64u> tca_f0;
+  alignas(16) tca::rt::Frag<float, 2u, 1u, 64u> tca_f0;
 
   tca::rt::KernelInfo kinfo;
   // LNT #0: R=CTA(T=32,LoC=100) C=sequential(T=64,LoC=1) K=sequential(T=64,LoC=1) dim=thread/warp(LoC=32) dim=sequential(LoC=1) K=sequential(T=64,LoC=1)

@@ -8,7 +8,7 @@ __global__ void __launch_bounds__(32) Fragchunkconst(uint32_t R, uint32_t C, uin
   tca::rt::TensorView<const float, 3u> x_v(x, R, C, 4u);
   tca::rt::TensorView<const float, 3u> z_v(z, R, C, 4u);
   tca::rt::TensorView<float, 2u> out_v(out, R, C);
-  tca::rt::Frag<float, 2u, 16u, 4u> tca_f0;
+  alignas(16) tca::rt::Frag<float, 2u, 16u, 4u> tca_f0;
   tca::rt::Frag<float, 1u, 16u> tca_f1;
 
   tca::rt::KernelInfo kinfo;

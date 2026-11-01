@@ -203,6 +203,16 @@ var (
 // RED gate: pre-1a the decl prints the raw window (Frag<float, 2u, 64u,
 // 64u>), the C between loop steps 64u, no hoisted 1u clamp const exists,
 // and the golden file is absent — the subtest fails at every assertion.
+//
+// RE-DERIVED under fix7 §5 slice 1c (quick-261101-oqg): the golden's fill
+// dst decl Frag<float, 2u, 1u, 64u> gains the alignas(16) spelling — rank 2
+// (RowMajorShape<2> = 16 B, data_ at the 16B-clean offset 16) and trailing
+// 64 (256 B rows): the 1c decl rule qualifies it, the loader's vec16
+// dst-side check now holds by construction. Every other line is
+// byte-identical to the 1a golden (the chunk policy is untouched on
+// dynamic dims — snapHalfChunk requires a static TRUE extent, absent
+// here). Chunk facts re-derivation unchanged: raw = 64*64*4 = 16,384 B,
+// budget = 256 B, C 64->16, e4 stays 64 (chunk == T).
 func TestFragChunkStream(t *testing.T) {
 	t.Run("dynamic budget clamp", func(t *testing.T) {
 		g := fragChunkGraph(t, "fragchunk", "dynamic", 64, 64, 256)
@@ -260,6 +270,13 @@ func TestFragChunkStream(t *testing.T) {
 	// The 1a chunk assertions below are UNWEAKENED; red evidence:
 	// red-drift3.txt in the task dir; the amortized shape is byte-pinned
 	// by testdata/bracket_amort.cu.
+	// RE-DERIVED under fix7 §5 slice 1c (quick-261101-oqg): the golden's
+	// fill dst decl Frag<float, 2u, 16u, 4u> gains the alignas(16) spelling —
+	// rank 2 (data_ at the 16B-clean offset 16), trailing 4 (16 B rows).
+	// The chunk itself is UNCHANGED by the 1c bias: the halving loop EXITED
+	// at [16, 4] = 256 B = budget (no further halving step runs, so the bias
+	// is a no-op on this fixture), and the acc block Frag<float, 1u, 16u> is
+	// NOT a fill dst and stays plain.
 	t.Run("const true extent", func(t *testing.T) {
 		g := fragChunkGraph(t, "fragchunkconst", "constextent", 64, 256, 256)
 		res, err := Emit(g, emitOptions())
