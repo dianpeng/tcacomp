@@ -59,6 +59,13 @@ type dimRewrite struct {
 
 	indexExpr ir.Node // the dim's rewritten global index expression
 	roundBase ir.Node // the fill's coordinate for this dim
+	// chunk is the fix7 §3 slice 1a streaming chunk on a covered FRAG dim
+	// (< d.tile when the priced block footprint clamps it): the between
+	// rounds step by it and the inside walk clamps to it. Zero = absent
+	// (SMEM sites, uncovered dims, under-budget FRAG windows keep
+	// step/clamp = d.tile). The WARP C1b dims never carry a clamping
+	// chunk (the plan never halves a WARP dim).
+	chunk int
 	// chunkBase is the C1b forced-FRAG window base on a WARP-covered dim:
 	// roundBase + lane·ceil(T_d/32) — the LANE's chunk origin within the
 	// warp's T_d window. roundBase alone (rank·T + round) names the warp's
@@ -396,9 +403,24 @@ func (lr *lowerRun) generateDimExprs(lw *lntRewrite) error {
 		case SoCSequential:
 			// between for (a = 0; a < A; a += T) — element stride, LoC = 1;
 			// inside sequential, bounded by the materialized tile_max.
-			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(t))
+			//
+			// fix7 §3 slice 1a: on a covered FRAG dim whose priced block
+			// footprint clamps the window (lr.fragChunk), the between
+			// rounds step by the CHUNK — the rounds ARE the chunk loops —
+			// and the inside walk clamps to the chunk. Every other dim
+			// keeps the schedule tile (byte-stable: SMEM sites, uncovered
+			// dims, and under-budget FRAG windows carry no chunk plan).
+			// The loop's "tile" annotation stays d.tile — the SCHEDULE
+			// tile is unchanged (GATE 3 guards it; the chunk is a
+			// lowering realization).
+			step := d.tile
+			if c, ok := lr.fragChunk[d.iter]; ok && c < d.tile {
+				step = c
+				d.chunk = c
+			}
+			d.betweenIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(float64(step)))
 			d.betweenBound = extent
-			d.insideBound = lr.tileMax(d.tile, extent, d.betweenIV)
+			d.insideBound = lr.tileMax(step, extent, d.betweenIV)
 			d.insideIV = lr.g.NewDimVar(lowerOrigin, dim, lr.u32c(0), lr.u32c(1))
 			d.betweenAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}
 			d.insideAttrs = []ir.Node{lr.attr("soc", 0), lr.attr("loc", 1), lr.attr("tile", float64(d.tile))}

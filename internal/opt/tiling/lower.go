@@ -109,6 +109,10 @@ func (LowerPass) Preserved() []string { return []string{ProvenanceName} }
 //   - BUDGET: resolve the SMEM budget against THIS pass's Params
 //     (lower_cache.go) — with matching Params this is a no-op because
 //     tiling-verify already asserted Σ ≤ MaxCache.
+//   - CHUNK PLAN (fix7 §3 slice 1a, lower_fragchunk.go): per promoted FRAG
+//     site, plan the streaming chunk — the priced block footprint realized
+//     per covered dim — BEFORE the rewrite, because the between-IV steps
+//     and the inside-clamp targets are built at rewrite time.
 //   - PHASE 2-3: per LNT (Roots() order) the DoSoC numbering and the loop
 //     rewrite (lower_rewrite.go).
 //   - PHASE 4: per promoted site the buffer/fill/access surgery
@@ -225,12 +229,19 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 		overrides:      overrides,
 		byIter:         make(map[ir.Node]*dimRewrite),
 		launchBlockDim: launchBlockDim,
+		fragChunk:      make(map[ir.Node]int),
 		prov: &Provenance{
 			Dims: make(map[ir.Node]DimProvenance),
 			LNTs: make(map[ir.Node]MappingPlan),
 		},
 	}
 	lr.prov.MaxThreadsPerCTA = launchBlockDim
+	// fix7 §3 slice 1a: plan the FRAG streaming chunks BEFORE any rewrite —
+	// the between-IV steps and the inside-clamp targets are built at
+	// rewrite time and must already honor the priced block footprint.
+	if err := lr.planFragChunks(rec, facts, dropped); err != nil {
+		return err
+	}
 	for _, root := range f.Roots() {
 		if err := lr.rewriteLNT(root); err != nil {
 			return err
@@ -258,8 +269,10 @@ func (p LowerPass) Run(ctx *opt.Context, g *ir.Graph) error {
 // plus any budget override), the derived LAUNCH blockDim (fix4 §5.1: max
 // over LNTs of (Π warp K) × 32 — the coupled walks' stride and the
 // provenance's MaxThreadsPerCTA), the per-dim rewrite products PHASE 4
-// consumes (filled by rewriteLNT), and the provenance record under
-// construction (P-5).
+// consumes (filled by rewriteLNT), the fix7 §3 1a streaming chunk plan
+// (filled by planFragChunks BEFORE any rewrite — the between steps and
+// inside clamps are built at rewrite time), and the provenance record
+// under construction (P-5).
 type lowerRun struct {
 	g              *ir.Graph
 	params         Params
@@ -270,6 +283,7 @@ type lowerRun struct {
 	byIter         map[ir.Node]*dimRewrite
 	rewrites       []*lntRewrite // per-root products, Roots() order
 	fills          []*siteFill   // PHASE 4 products, for the §8 placement/scope checks
+	fragChunk      map[ir.Node]int // fix7 §3 1a: covered iter → chunk factor (unset = the dim keeps d.tile)
 	prov           *Provenance   // the P-5 provenance under construction
 }
 

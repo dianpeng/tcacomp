@@ -62,9 +62,12 @@ package tiling
 // inside walk). A C1b forced-FRAG site sizes its WARP-covered dim at
 // ceil(T_d/32) per lane. SEQ covered dims contribute T_d and index by
 // their plain inside coordinate. FRAG buffers are per-thread: plain i —
-// sized by the RAW window factors (fix6 §3: the budget side chunks the
-// same window to min(raw, MaxFragPerThread); the allocation itself stays
-// the full window).
+// sized by the STREAMED CHUNK under fix7 §3 slice 1a (the allocation IS
+// the priced block footprint min(raw, MaxFragPerThread) realized per
+// covered dim — true const extents, budget-clamped via the ONE shared
+// siteWindowBytes; lower_fragchunk.go plans the chunk BEFORE the rewrite
+// so the between rounds and the inside clamps honor the same factors);
+// SMEM windows stay full-size.
 
 import (
 	"fmt"
@@ -97,6 +100,11 @@ type siteFill struct {
 	// it; the suite pins derivation == this position (the D-i safety net).
 	host    ir.Node
 	variant float64 // the loader variant derived from the class (1 = CTA, 2 = Thread; pass-internal fact)
+	// chunks is the realized buffer extent factor per covered dim
+	// (parallel to covered) — the fix7 §3 1a streaming chunk on clamped
+	// FRAG dims, the raw window factor elsewhere. Recorded for the §8
+	// checks' and the priced-vs-actual reuse audit's visibility.
+	chunks []int
 }
 
 // resolveBudget implements §6's fallback BEFORE any mutation (halving a
@@ -276,37 +284,25 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 	id := sf.Load.BasePtr().ID()
 
 	// Covered dims in tensor-position order (the buffer's dim order — the
-	// fill coordinates and the access coordinates both use it).
+	// fill coordinates and the access coordinates both use it). The
+	// ordering is the shared siteCoveredTensorOrder construction the fix7
+	// §3 1a chunk plan uses, so the plan and the surgery can never
+	// disagree on the dim order.
 	coveredSet := make(map[ir.Node]bool, len(sf.Covered))
 	for _, it := range sf.Covered {
 		coveredSet[it] = true
 	}
+	ordered, err := siteCoveredTensorOrder(sf, id)
+	if err != nil {
+		return err
+	}
 	var covered []*dimRewrite
-	seen := make(map[ir.Node]bool, len(sf.Covered))
-	for _, axisIters := range sf.AxesIters {
-		for _, it := range axisIters {
-			if !coveredSet[it] || seen[it] {
-				continue
-			}
-			d, ok := lr.byIter[it]
-			if !ok {
-				return fmt.Errorf("tile-lower: site %d covers iter node %d, which the rewrite did not produce", id, it.BasePtr().ID())
-			}
-			seen[it] = true
-			covered = append(covered, d)
+	for _, it := range ordered {
+		d, ok := lr.byIter[it]
+		if !ok {
+			return fmt.Errorf("tile-lower: site %d covers iter node %d, which the rewrite did not produce", id, it.BasePtr().ID())
 		}
-	}
-	for _, it := range sf.Covered { // defensive: any covered iter the axes never mention
-		if !seen[it] {
-			d, ok := lr.byIter[it]
-			if !ok {
-				return fmt.Errorf("tile-lower: site %d covers iter node %d, which the rewrite did not produce", id, it.BasePtr().ID())
-			}
-			covered = append(covered, d)
-		}
-	}
-	if len(covered) == 0 {
-		return fmt.Errorf("tile-lower: site %d promotes an empty covered set (M2: filtered at the decide pass)", id)
+		covered = append(covered, d)
 	}
 
 	// Tier re-derivation (R2 + C1b, ruled 2026-10-21/23): classify by the SoC
@@ -378,22 +374,28 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 
 	// Buffer: the fix4 §2.4/§3.3 WINDOW model (R-C1B) — per covered dim,
 	// the SAME RAW factors the decide side's shared siteWindowBytesRaw
-	// prices (the fill/buffer size — the actual allocation, NOT the
-	// budget chunk: fix6 §3 prices the budget as min(raw, MaxFragPerThread)
-	// via siteWindowBytes, but the over-budget remainder still fills and
-	// reads — one budget, both halves; a divergence would break the
-	// fail-closed record agreement): a WARP-covered dim contributes K_d x
-	// T_d under the SMEM class (one window per warp coordinate — 32x
-	// smaller than the old whole-group shard window) and ceil(T_d/32)
-	// under a C1b forced-FRAG site (the lane's consecutive chunk); SEQ
-	// dims contribute T_d either way.
+	// prices, EXCEPT that a covered FRAG dim realizes the fix7 §3 slice 1a
+	// STREAMING CHUNK instead of the raw factor when the priced block
+	// footprint clamps it (d.chunk, planned pre-rewrite by
+	// planFragChunks): the buffer's dims ARE the chunk — the allocation
+	// IS the priced block, and the cxx Frag decl prints these type dims
+	// verbatim (walk.go — one source of truth, no divergence). SMEM
+	// windows stay full-size (their cooperative fills are untouched).
+	// The factors: a WARP-covered dim contributes K_d x T_d under the
+	// SMEM class (one window per warp coordinate — 32x smaller than the
+	// old whole-group shard window) and ceil(T_d/32) under a C1b
+	// forced-FRAG site (the lane's consecutive chunk); SEQ dims
+	// contribute T_d either way, reduced to d.chunk when the 1a plan
+	// clamps them (a WARP dim's chunk never clamps below its lane-chunk
+	// width — the plan never halves WARP dims).
 	// The tile TENSOR TYPE binds via SetType — the typeinfer MemLoadSMem rule's
 	// own message names this pass as the binder ("cache lowering must bind
 	// buffer types first"), the one documented exception to P8's
 	// no-self-typing.
 	bytes := elemBytes(elem)
 	dims := make([]ir.DimRef, 0, len(covered))
-	for _, d := range covered {
+	extents := make([]int, len(covered))
+	for i, d := range covered {
 		extent := d.tile
 		if d.soc == SoCWARP {
 			if class == ClassSMEM {
@@ -402,6 +404,10 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 				extent = ceilDiv(d.tile, 32) // C1b: the lane's chunk (§3.3)
 			}
 		}
+		if class == ClassFRAG && d.chunk > 0 && d.chunk < extent {
+			extent = d.chunk // fix7 §3 1a: the allocation is the priced streaming chunk
+		}
+		extents[i] = extent
 		bytes *= extent
 		name := ""
 		if dimNode, err := dimOfIter(d.iter); err == nil && dimNode != nil {
@@ -600,6 +606,7 @@ func (lr *lowerRun) lowerSite(sf SiteFacts, sd SiteDecision) error {
 		covered: covered,
 		host:    host,
 		variant: variant,
+		chunks:  extents,
 	})
 	return nil
 }
