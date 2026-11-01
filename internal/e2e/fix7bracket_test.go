@@ -83,7 +83,30 @@ var (
 	// (vN = 4u / vN = 8u — the X loop's bound after 1a's true-extent
 	// chunking).
 	trueExtentRe = regexp.MustCompile(`(?m)auto (v\d+) = ([48])u;$`)
+	// cElemWalkRe matches one of the cloned C element walks (E's header:
+	// step 1u against the clamped chunk bound). The init/E/store walks are
+	// textually identical — E is identified POSITIONALLY (the one whose
+	// scope carries the acc update / the Reduce call).
+	cElemWalkRe = regexp.MustCompile(`for \(auto C_it\d+ = tca::rt::SeqIterator\(0u, 1u,`)
+	// accUpdateRe matches the inlined combiner acc update.
+	accUpdateRe = regexp.MustCompile(`tca_f\d+\.Set\(\(tca_f\d+\.Get\(C_it\d+\.Index\(\)\) \+ v\d+\), C_it\d+\.Index\(\)\);`)
+	// reduceCallSiteRe matches a per-element Reduce call (the unqualified
+	// shape's bracket body).
+	reduceCallSiteRe = regexp.MustCompile(`reducer\d+\.Reduce\(v\d+\);`)
 )
+
+// enclosingLoopBefore returns the index of the last cElemWalkRe loop
+// header starting before pos — the innermost cloned-C element walk
+// enclosing the given position.
+func enclosingLoopBefore(cu string, pos int) int {
+	last := -1
+	for _, m := range cElemWalkRe.FindAllStringIndex(cu, -1) {
+		if m[0] < pos {
+			last = m[0]
+		}
+	}
+	return last
+}
 
 // TestFix7Bracket is fix7 §4 slice 1b's e2e pin: the real optimizer emits
 // the amortized bracket on the qualified reduce pair, the fill's nest path
@@ -126,27 +149,41 @@ func TestFix7Bracket(t *testing.T) {
 			{"fusion", "softmax.tca"},
 		} {
 			cu := compileSuiteKernel(t, k.group, k.file)
-			sites := fillSiteRe.FindAllString(cu, -1)
-			if len(sites) == 0 {
-				t.Fatalf("fix7 §4 1b (%s): no LoadTileThread fill site found", k.file)
-			}
-			for _, s := range sites {
-				path := nestPathOf(t, cu, s)
-				t.Logf("§4 %s: fill nest-path=%s", k.file, path)
-				if strings.Contains(path, "@C inside walk") {
-					t.Fatalf("fix7 §4 1b (%s): the fill's nest path still contains the @C per-element inside walk — the §3.4 gap is NOT closed (path: %s)", k.file, path)
-				}
-			}
-			if reducerCeremonyRe.MatchString(cu) {
-				t.Fatalf("fix7 §4 1b (%s): the qualified emission carries reducer ceremony (the amortized shape must have none)", k.file)
-			}
+			assertFillOutsideElementWalk(t, k.file, cu)
 		}
 	})
 }
 
+// assertFillOutsideElementWalk pins the §3.4 closure on one suite kernel:
+// the fill rides OUTSIDE the element walk E (the innermost cloned-C walk
+// enclosing the acc update) and no reducer ceremony survives.
+func assertFillOutsideElementWalk(t *testing.T, file string, cu string) {
+	t.Helper()
+	sites := fillSiteRe.FindAllString(cu, -1)
+	if len(sites) == 0 {
+		t.Fatalf("fix7 §4 1b (%s): no LoadTileThread fill site found", file)
+	}
+	acc := accUpdateRe.FindStringIndex(cu)
+	if acc == nil {
+		t.Fatalf("fix7 §4 1b (%s): the inlined combiner acc update is absent", file)
+	}
+	eAt := enclosingLoopBefore(cu, acc[0])
+	for _, s := range sites {
+		path := nestPathOf(t, cu, s)
+		t.Logf("§4 %s: fill nest-path=%s", file, path)
+		if fillAt := strings.Index(cu, s); fillAt > eAt {
+			t.Fatalf("fix7 §4 1b (%s): the fill rides INSIDE the element walk (fill@%d > e-walk@%d) — the §3.4 gap is NOT closed", file, fillAt, eAt)
+		}
+	}
+	if reducerCeremonyRe.MatchString(cu) {
+		t.Fatalf("fix7 §4 1b (%s): the qualified emission carries reducer ceremony (the amortized shape must have none)", file)
+	}
+}
+
 // assertAmortizedBracket pins the amortized emission contract on one
-// qualified reduce kernel: zero reducer ceremony, one fill site whose nest
-// path excludes the @C element walk, the X loop tripping the true const
+// qualified reduce kernel: zero reducer ceremony, one fill site OUTSIDE
+// the element walk E (the walk whose scope carries the acc update — the
+// §3.4 gap closed structurally), the X loop tripping the true const
 // reduced extent, and the chunk-wide acc block.
 func assertAmortizedBracket(t *testing.T, kernel, cu, wantExtent string) {
 	t.Helper()
@@ -163,8 +200,22 @@ func assertAmortizedBracket(t *testing.T, kernel, cu, wantExtent string) {
 	}
 	path := nestPathOf(t, cu, sites[0])
 	t.Logf("§4 %s: fill nest-path=%s", kernel, path)
-	if strings.Contains(path, "@C inside walk") {
-		t.Fatalf("fix7 §4 1b (%s): the fill's nest path must exclude the @C per-element inside walk (the §3.4 gap closed structurally); path: %s", kernel, path)
+	// The fill must sit OUTSIDE the element walk E — identified
+	// positionally as the innermost cloned-C walk enclosing the acc
+	// update. (The init walk clones E's header, so the raw comment path
+	// cannot distinguish them — the positional check is the structural
+	// assertion.)
+	acc := accUpdateRe.FindStringIndex(cu)
+	if acc == nil {
+		t.Fatalf("fix7 §4 1b (%s): the inlined combiner acc update is absent; the amortized shape is not emitted", kernel)
+	}
+	eAt := enclosingLoopBefore(cu, acc[0])
+	if eAt < 0 {
+		t.Fatalf("fix7 §4 1b (%s): no cloned-C element walk encloses the acc update", kernel)
+	}
+	fillAt := strings.Index(cu, sites[0])
+	if fillAt > eAt {
+		t.Fatalf("fix7 §4 1b (%s): the fill rides INSIDE the element walk (fill@%d > e-walk@%d) — the §3.4 gap is NOT closed", kernel, fillAt, eAt)
 	}
 	// The X loop's trip count equals the emitted true const reduced
 	// extent: a hoisted `auto vN = <extent>u;` feeding an e4/e8 step-1u
@@ -185,26 +236,36 @@ func assertAmortizedBracket(t *testing.T, kernel, cu, wantExtent string) {
 }
 
 // assertPerElementBracketUnchanged is the regression guard for the
-// Q4-failing pair: layernorm/transpose keep today's per-element bracket —
-// one Init site per element walk, the fill riding INSIDE the element walk.
+// Q4d-failing pair: layernorm/transpose keep today's per-element bracket —
+// one Init site per element walk, the fill riding INSIDE the element walk
+// (the walk enclosing the per-element Reduce call).
 func assertPerElementBracketUnchanged(t *testing.T, kernel, cu string) {
 	t.Helper()
 	nInit := len(regexp.MustCompile(`reducer\d+\.Init\(\)`).FindAllString(cu, -1))
 	if nInit != 1 {
-		t.Fatalf("fix7 §4 1b (%s regression guard): the Q4-failing shape must keep exactly one per-element bracket (one Init site); got %d", kernel, nInit)
+		t.Fatalf("fix7 §4 1b (%s regression guard): the Q4d-failing shape must keep exactly one per-element bracket (one Init site); got %d", kernel, nInit)
 	}
-	if reducerCeremonyRe.FindString(cu) == "" || !strings.Contains(cu, "SeqReducer") {
+	if !strings.Contains(cu, "SeqReducer") {
 		t.Fatalf("fix7 §4 1b (%s regression guard): the SeqReducer construction must survive on the unqualified shape", kernel)
 	}
 	sites := fillSiteRe.FindAllString(cu, -1)
 	if len(sites) == 0 {
 		t.Fatalf("fix7 §4 1b (%s regression guard): no fill site found", kernel)
 	}
+	red := reduceCallSiteRe.FindStringIndex(cu)
+	if red == nil {
+		t.Fatalf("fix7 §4 1b (%s regression guard): the per-element Reduce call is absent", kernel)
+	}
+	eAt := enclosingLoopBefore(cu, red[0])
+	if eAt < 0 {
+		t.Fatalf("fix7 §4 1b (%s regression guard): no C element walk encloses the Reduce call", kernel)
+	}
 	for _, s := range sites {
 		path := nestPathOf(t, cu, s)
 		t.Logf("§4 %s: fill nest-path=%s", kernel, path)
-		if !strings.Contains(path, "@C inside walk") {
-			t.Fatalf("fix7 §4 1b (%s regression guard): the unqualified shape must keep the fill inside the per-element walk; path: %s", kernel, path)
+		fillAt := strings.Index(cu, s)
+		if fillAt < eAt {
+			t.Fatalf("fix7 §4 1b (%s regression guard): the unqualified shape must keep the fill inside the per-element walk; the fill escaped it (fill@%d < e-walk@%d)", kernel, fillAt, eAt)
 		}
 	}
 }

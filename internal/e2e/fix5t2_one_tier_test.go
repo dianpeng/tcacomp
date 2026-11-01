@@ -135,11 +135,23 @@ func TestFix5T2OneTierCollapseEmission(t *testing.T) {
 	//    WarpReducer ceremony class lost the search to the honest block
 	//    pricing (was: "must emit WarpReducer" while the collapse was
 	//    F6-declined — that decline is the defect fix6 §3 removes).
+	//    RE-DERIVED under fix7 §4 slice 1b (quick-261101-mt9): the qualified
+	//    one-tier flat-bracket shape is AMORTIZED — the SeqReducer ceremony
+	//    (Init/Reduce/Combine per output element) is replaced by the
+	//    chunk-wide Frag accumulator (init walk + inlined combiner +
+	//    store walk), so the collapse now emits ZERO reducer objects of
+	//    either class; the one-tier fact this pin guards (no WarpReducer
+	//    anywhere) is kept UNWEAKENED, and the zero-ceremony assertion
+	//    pins the amortization (red evidence: red-task2.txt + the
+	//    TestFix7Bracket pin in fix7bracket_test.go).
 	if strings.Contains(cu, "tca::rt::WarpReducer<float>") {
 		t.Fatal("fix6 §3: the honest winner is the all-SEQ collapse (one-tier SeqReducer) — the multi-tier WarpReducer ceremony must not appear")
 	}
-	if !strings.Contains(cu, "tca::rt::SeqReducer") {
-		t.Fatal("fix6 §3: the all-SEQ collapse lowers the per-thread K reduction through the one-tier SeqReducer")
+	if strings.Contains(cu, "tca::rt::SeqReducer") {
+		t.Fatal("fix7 §4 1b: the qualified collapse is amortized — the SeqReducer ceremony must be gone (zero Init/Reduce/Combine sites)")
+	}
+	if !regexp.MustCompile(`tca::rt::Frag<float, 1u, \d+u> tca_f\d+;`).MatchString(cu) {
+		t.Fatal("fix7 §4 1b: the amortized collapse must declare the chunk-wide acc Frag block")
 	}
 
 	// 2. §3.1: a surviving dim carrying thread/warp is the GPU-broken

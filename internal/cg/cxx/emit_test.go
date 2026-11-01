@@ -2,6 +2,7 @@ package cxx
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -355,11 +356,25 @@ func TestGoldenReduceSplitK(t *testing.T) {
 
 // TestReduceShapesEmit pins the two new reduce shapes at the emitted-text
 // level (the compile-level oracle: pre-fix, the >=2-between shape failed
-// emission at the dimvar-scope gate): both EMIT successfully, each .cu
-// carries the WarpReducer ctor with the 4-operand face, exactly one Init
-// call site, exactly one Combine local, and the mechanical R-A bracket-law
-// scan is green (for shape B including the same-lexical-scope pin: no
-// scope closes between the Combine local and the gated store).
+// emission at the dimvar-scope gate): both EMIT successfully. The
+// minimal-tile endpoint keeps the per-element SeqReducer bracket (its
+// single between dim is the thread-specialized trip walk — the fix7 §4 1b
+// qualification's Q4a rejects it), so the Wave-1 reducer surface (the
+// SeqReducer ctor, exactly one Init site, exactly one Combine local) and
+// the mechanical R-A bracket-law scan stay pinned there (same-lexical-
+// scope pin: no scope closes between the Combine local and the gated
+// store). RE-DERIVED under fix7 §4 slice 1b (quick-261101-mt9): the
+// rank-3 multi-between fixture QUALIFIES for the amortization (one-tier
+// SeqReducer; between chain [thread-specialized trip, uniform SEQ element
+// walk]; no SMEM fills; element chunk 64 > 1; (acc, now) combiner;
+// single-owner consumer) — its per-element bracket is replaced by the
+// chunk-wide Frag accumulator: ZERO reducer ceremony, the acc block decl,
+// and one init/store walk pair. The R-A scan does not apply (it requires a
+// bracket; the amortized emission carries none by design) — the inverse
+// pin (no Init site, no construction) replaces it, with the full
+// amortized-shape pin living in bracket_amort_test.go. Never weakened:
+// the emission-oracle purpose (the >=2-between shape emits end-to-end) is
+// kept; red evidence: red-drift1.txt in the task dir.
 func TestReduceShapesEmit(t *testing.T) {
 	t.Run("rank3 multi-between", func(t *testing.T) {
 		res, err := Emit(reduce3Graph(t), emitOptions())
@@ -367,10 +382,7 @@ func TestReduceShapesEmit(t *testing.T) {
 			t.Fatalf("Emit over the rank-3 reduce (the HI-01 oracle — pre-fix this failed the dimvar-scope gate): %v", err)
 		}
 		cu := string(res.Files["red3.cu"])
-		assertReducerSurface(t, cu)
-		if err := ScanBracketLaw(cu); err != nil {
-			t.Fatalf("the rank-3 reduce text must satisfy R-A: %v", err)
-		}
+		assertAmortizedSurface(t, cu)
 	})
 	t.Run("minimal-legal-tile endpoint", func(t *testing.T) {
 		res, err := Emit(reduceT1Graph(t), emitOptions())
@@ -383,6 +395,21 @@ func TestReduceShapesEmit(t *testing.T) {
 			t.Fatalf("the minimal-tile reduce text must satisfy R-A (incl. the Combine-local/gated-store same-scope pin): %v", err)
 		}
 	})
+}
+
+// assertAmortizedSurface pins the fix7 §4 1b amortized emission facts on a
+// qualified reduce: zero reducer ceremony of either class and the
+// chunk-wide acc Frag block (the init/store walks and the inlined
+// combiner are byte-pinned by testdata/bracket_amort.cu).
+func assertAmortizedSurface(t *testing.T, cu string) {
+	t.Helper()
+	if strings.Contains(cu, "tca::rt::SeqReducer") || strings.Contains(cu, "reducer0.") {
+		t.Fatal("fix7 §4 1b: the qualified shape is amortized — no SeqReducer construction and no Init/Reduce/Combine sites")
+	}
+	accDecl := regexp.MustCompile(`tca::rt::Frag<float, 1u, \d+u> tca_f\d+;`)
+	if !accDecl.MatchString(cu) {
+		t.Fatalf("fix7 §4 1b: the chunk-wide acc Frag block decl must be present; no match of %s", accDecl)
+	}
 }
 
 // assertReducerSurface pins the common reducer emission facts (Wave-1
