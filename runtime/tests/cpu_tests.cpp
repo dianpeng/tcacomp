@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstdio>
 #include <initializer_list>
+#include <new>
 
 #include "tca/iterator.h"
 #include "tca/loader.h"
@@ -494,6 +495,51 @@ void test_loader_vector_eligibility() {
   for (unsigned k = 0u; k < 5u; ++k) CHECK(out5[k] == small[k]);
 }
 
+// (iii-b) fix7 §5 slice 1c — the EMISSION-SHAPE eligibility chain: a Frag
+// declared with the EMITTED spelling (alignas(16) on the variable; the class
+// itself gives data_ only alignof(float) = 4) and the EMITTED dims (16B-clean
+// trailing extents — the 1b chunk shapes 4/8/16/64) makes the loader's
+// per-row vec16_ok hold on the DESTINATION side for EVERY row. RowMajorShape<2>
+// is 16 B, so data_ sits at object offset 16: Data() inherits the object's
+// 16B alignment, and Data() + row*trailing stays 16B-clean exactly when
+// trailing*4 % 16 == 0. The runtime per-row check therefore reduces to the
+// source side (checked dynamically, scalar fallback pinned above). Without
+// the spelling (an object at a 4-mod-16 address), the dst side fails from
+// row 0 — the emission-side choice is what makes eligibility reachable at
+// all. PASSES at RED by design (the chain is emitted-spelling + emitted-dims
+// arithmetic, no compiler involvement): recorded honestly in the task's RED
+// evidence as the green chain pin.
+namespace {
+template <unsigned Trailing>
+void check_emitted_shape_rows(const float* src) {
+  static_assert(Trailing % 4u == 0u, "the emitted fill trailing extents are 16B-clean");
+  alignas(16) tca::rt::Frag<float, 2u, 16u, Trailing> frag;
+  for (unsigned row = 0u; row < 16u; ++row) {
+    // dst = Data() + row*trailing (the loader's row destination); src ditto.
+    CHECK(tca::rt::detail::vec16_ok(frag.Data() + row * Trailing, src + row * Trailing) ==
+          true);
+  }
+}
+}  // namespace
+
+void test_loader_vec_eligibility_emitted_shape() {
+  alignas(16) float src[16u * 64u];
+  for (unsigned i = 0u; i < 16u * 64u; ++i) src[i] = static_cast<float>(i);
+  check_emitted_shape_rows<4u>(src);
+  check_emitted_shape_rows<8u>(src);
+  check_emitted_shape_rows<16u>(src);
+  check_emitted_shape_rows<64u>(src);
+
+  // The counterfactual: the SAME Frag type placed at a 4-mod-16 address
+  // (what a plain — non-alignas — declaration may legally get; forced here
+  // deterministically via placement) fails the dst-side check from row 0.
+  alignas(16) unsigned char raw[sizeof(tca::rt::Frag<float, 2u, 16u, 4u>) + 4u] = {};
+  tca::rt::Frag<float, 2u, 16u, 4u>* plain =
+      new (raw + 4u) tca::rt::Frag<float, 2u, 16u, 4u>();
+  CHECK(tca::rt::detail::vec16_ok(plain->Data(), src) == false);  // dst 4-mod-16
+  CHECK(tca::rt::detail::vec16_ok(plain->Data() + 16u, src + 16u) == false);
+}
+
 // (iv) The per-thread entry point end-to-end (portable, dual-compiled): a
 // Frag fill over a rank-2 window with a clamped tail.
 void test_loader_frag_thread() {
@@ -759,6 +805,7 @@ int main() {
   test_loader_row_clamping();
   test_loader_striping();
   test_loader_vector_eligibility();
+  test_loader_vec_eligibility_emitted_shape();
   test_loader_frag_thread();
   test_seq_reducer();
   test_warp_reducer_host_branch();
