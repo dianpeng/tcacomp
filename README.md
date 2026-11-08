@@ -1,415 +1,310 @@
-# tcacomp — the TCA tensor-kernel compiler
+# TCA
 
-**tcacomp** is an optimizing compiler that turns a deliberately simple, C++-style
-tensor kernel language (the TCA frontend, [doc/syntax.md](doc/syntax.md)) into
-high-performance CUDA C++, via a single-tier SSA IR called **TCA** (Tensor
-Computation Algebra, [doc/tca.md](doc/tca.md)). The generated code links
-against a small header-only C++20 runtime ([doc/rt.md](doc/rt.md)) that owns
-synchronization, iteration, and communication.
+- An experimental project to
+  - Compile a high level DSL to nvidia CUDA/c++
+  - Learning an end to end compiler by implementing one
 
-The core value, demonstrated end-to-end on the target GPU: the documented
-example kernels (e.g. `matmul_scale`) compile from frontend source through the
-TCA IR and its optimization passes to CUDA C++, and run correctly on an NVIDIA
-A6000 (sm_86, CUDA 12.2) with numerical results matching a CPU reference — in
-one automated flow, with zero manual kernel authoring.
+- NOTES: this is not for production usage, its performance is not good  :(
+  - It is designed for me to familiarize with general cuda DSL compilation
+  - It is 90% written by LLM (GLM-5.3) and the very small part of IR is written by me
+    - But LLM has modified them in a unrecognized way
 
-- **Compiler**: pure Go 1.26, standard library only — no cgo, no external
-  modules (`go list -m all` is a single line, by design; [doc/design.md](doc/design.md)).
-- **Runtime**: C++20 header-only CMake INTERFACE library.
-- **Target**: A6000 / sm_86; default launch envelope 100 CTAs x 512 threads;
-  the async-copy ceiling on this part is `cp.async` (Ampere) — no TMA.
+# What it is
 
-## Why this design
+- This is a exploration/experimental side project to compile a DSL into cuda/c++
+  - (1) a full self-contained compiler suits design for quick adoption and learning of cuda compiler
+    - I design it to be a **fast compilation pipeline**
+    - operator fusion
+    - classical optimization
+    - loop based lower
+      - tiling
+    - auto parallisation via combinatory optimization
+    - code generation
+  - (2) problem purposely not addressed
+    - GPU memory optimization: ie access pattern optimization
+      - layout optimization typically called
+    - expression level optimization
+      - folding, algrebra reassociation, ...
+    - **block/tile** style assignment carried by typical CUDA compiler
+      - want to explore why a per dimension one is painful
+  - (3) trying to use an AI agent to fully write code
+    - I write all detail design doc, but just ask AI to implement them
+    - I write a simple skeleton of IR to let AI start with
 
-Most CUDA DSL compilers put the burden in the wrong place: the user annotates
-parallelism, hand-tunes fusion boundaries, or the compiler leans on polyhedral
-dependence analysis over loop nests. TCA takes the opposite position
-([doc/tca.md](doc/tca.md) §1):
+# Exprientation Assesment
 
-- **No explicit control flow.** Loops are *iteration spaces*, not branches and
-  back edges. The frontend is a chain of `map`/`reduce` stages over tensor
-  index spaces, piped with `|`.
-- **Compiler-owned parallelization.** The user never binds iterations to CUDA
-  threads or blocks. Every thread group the compiler assigns is a whole number
-  of physical warps. Tiling and parallelization are *searched*, not annotated.
-- **A single IR for everything.** Fusion, tiling, caching, scheduling, and
-  parallelization all operate on one node suite — there is no high/mid/low IR
-  conversion machinery. Lowering introduces new node *kinds* into the same
-  suite ([doc/design.md](doc/design.md), [doc/ir.md](doc/ir.md) §3).
-- **Race freedom by construction.** Correctness comes from structural
-  invariants the verifier checks after *every* pass — not from runtime
-  sanitizers alone.
+- What works good
+  - code generation is sane and valid, easy to reason
+    - optinioned structural IR for code generation
+    - prefer mechanical resolution instead of complicated lowering rules
+    - top - bottom method
+  - sea-of-nodes is a good candidate for GPU IR
+    - GVN can be extreamly expressable
+      - loop fusion via GVN
+      - cse obviously
+    - GPU code is rarely control flow dominant
+      - no need to enforce strict control flow by default, ie CFG later on
+    - LICM by scheduling
+      - ie finalize sea-of-nodes back to CFG
+  - high level control flow structure
+    - Classical scalar compiler's denormalized SSA/CFG just does not work ver well
+      - high level information lost, cannot perform high level optimization
+      - messy to work with
+        - classical scalar compiler algorithm requires very complicated graph algorithm to perform sparse analysis
+          - for example 
+            - algorithm to find loop and loop induction variable then form loop nests tree/forests
+    - try to express control flow dependency as data dependency
+      - iteration becomes induction variable of iteration's data dependency
+      - allows flexible scheduling and global optimization
+  - scheduling
+    - backtrace algorithm to make SMEM cache sane is good
+      - like Chatin && Briggis color graph RA
+  - immutable is good
+    - mutability can be viewed as a RA/liveness analysis problem
+    - immutability exclude us to use any complicated loop transformation can solve data dependency
+      - ie ployhedral optimization
+        - It can be used ONLY as a preluded before scheduling assignment, since it only rewrite the loop to explose parallisation opporunity, not worth it
 
-The frontend kernel is small enough to state in one example
-([doc/syntax.md](doc/syntax.md)):
+- What does not work
+  - scheduling formulation: **BIGGEST ISSUE**
+    - Axis per assignment auto scheduling formulation is bad
+      - 1) cannot express **K d tiling** (K >= 2)
+      - 2) searching space is too narrow
+        - do not contain optimal point
+      - 3) it is impossible to express tensorization
+        - tensorization requires K = 2 tiling
+    - Objective function
+      - The implementation of objective function has bug: (wont fix)
+        - LLM always mess it up :(
+        - In short, it does not properly measure **velocity** but only respect reuse
+          - Which prefer **serialization
+      - Finding a valid proxy is not as easy as expected :(
+  - structural control flow is good, but not with classical control flow structure
+    - loop inside of the cuda IR scheduling is almost not useful at all
+      - until very late, if classical optimization needs to kick in
+    - In short, the optimization happens at level of highly structural nodes
+      - it works on combination of
+        - tile
+        - vectorization
+        - parallization layer: cta/warp/thread
+        - sequential
+      - it almost never needs a single loop
+    - A normalized classical CFG is almost useless
+      - the optimization never happens on loop
+      - the lowering almost never happens on loop except the final one
+    - no need to support branch
+      - simplify everything: ternary expression, logical combinated expression
 
-```
-@name(cxx="MatMul")
-kernel matmul(
-  lhs: tensor<dtype=f32, shape=[M, N]>,
-  rhs: tensor<dtype=f32, shape=[N, Q]>,
-) -> tensor<dtype=f32, shape=[M, Q]>
-{
-  dimvar (a, b, c);
-  let output = map on(lhs[a][b], rhs[b][c]) as (a, b, c)
-                 (l: f32, r: f32) -> f32: l * r |
-               reduce(init=0.0f)
-                 (current: f32, %0: f32) -> f32: current + %0;
-  return output;
-}
-```
+  - top-down lowering rules + runtime object is bad:
+    - you cannot optimize stuff that is not expressed in IR
+      - the reason I go for this is because I don't knwo how complicated a cuda compiler is, I thought it is easy :)
+      - barrier cannot be hidden, since not optimizable
+    - a waterfall style lowering simply not work
+      - we ends up having lots of corner cases handling inside of the code of lower
+      - and also this makes us very tenative to design simple lower rules instead of performant lowering rules
+      - what we try to lower is
+        - 1) high level => no lowering
+        - 2) auto parallisation (tiling) => directly lower the map + reduce -> for loops
+        - 3) final lowering
+          - lower map + reduce mechanically
+            - based on dimension's assigned parallisation object
+            - all into loops or fused expression
+          - lowering **memory load** based on storage class
+    - it is too inflexible and very hard to scale
+      - This lowering method will force us to map high level instruction to low level construct almost 1:1
+        - since each new mapping will result in a rework of lowering
+      - Not scalable if we add tensorization or factor in instruction selection
+        - it works only for opinioned instruction selection
+    - what should be done ?
+      - constraints resolution by rewriting
+      - lowering becomes a mechanical rewriting problem
+        - 1) high level instruction mapps to different alternative low level instruction/construct
+          - this allows more point into optimization feasiable area for optimization
+          - we can setup a universal model for optimization
+        - 2) instruction has constraints to be satisfied such that it can be lowered/materialized
+        - 3) constraints satisfaction by mechanical rewriting
 
-Locals are immutable (no in-place mutation in v0), types are optional but
-strongly checked, and the `|` pipe chains producer stages into fused kernels.
+  - design hardware specific optimization day 1 is simpler, though u dont have to implement them
+    - (1) tensorization instruction selection
+    - (2) GMEM coalescense optimization strategy
+    - (3) SMEM bank conflicts avoidance strategy
+    - Notes:
+      - each problem can have different model
+        - 1) GMEM/SMEM access optimization can be setup as a searching problem OR heuristic method
+          - combinatory optimization vs heuristic method
+        - 2) tensorization
+          - model as instruction selection
+            - HIGH lower to multiple MIR with objective function evaluation
+          - constraint satisfication
+            - HIGH lower to dedicated tensor instruction with constraint been resolved by rewriting
 
-## Architecture overview
+- Overall
+  - The dimensional/axis based parallisation is a dead end
+    - Simple to implement but have limitation
+  - AI driven backend implementation may be fine in a relative small/dedicated scope
+    - Overall AI's implementation is fine with very limited scope
+      - Pros
+        - 1) Well specified algorithm can be trusted
+          - I ask AI to implement several analysis and transformation with detail pesudo-code
+        - 2) Debugging and troubleshooting is good
+          - AI is good to help u to do legging work, like setting up benchmark suits for performance evaluation
+      - Cons
+        - 1) It cannot design
+        - 2) It prefers to generating ad-hoc solution
+          - If a problem has combinatory tuple (M, N)
+            - It tends to solve it with combinatory complexity M * N
+            - While an elegant one could be introducing another reduction system to merge cominatory into a smaller system for resolution
+          - For example:
+            - Optimization that requires synergy of multiple passes, AI just cannot figure that out
+        - 3) For IR graph, not very suitable
+          - IR graph typically is used to mimic some algebra rules, which is by designed to be compositive
+          - AI can easily break that design
+    - My thought
+      - I believe with very precise definition and verbal language description, AI can design a very sophiscated software
+      - However it is just too costy for human to do that
+      - Additionally, human coding involves discovery of new solutions and new problems, which are something cannot be offload to AI
+        - In short, u cannot design a good system without acutally implementing it
 
-```
-frontend source (.tca)
-      |
-      v
-internal/syntax            hand-rolled lexer, recursive-descent parser,
-  (lexer/parser/ast/       untyped AST + go/ast-shaped visitor,
-   semacheck/build)        semacheck rule catalog, module loader (@include)
-      |
-      v                    AST lowered onto the public rungs
-pkg/                       public graph-builder API (Builder, Local, Root)
-      |                    Graph.Dematerialize -> Level-1 sea
-      v
-internal/ir                single-tier SSA node suite (sea-of-nodes L1 +
-      |                    scheduled AST CFG L2), verifier, mutation choke points
-      v
-internal/pipeline          THREE EXPLICIT WINDOWS over the pass registry
-  + internal/opt           (dce, simplify, typeinfer, gvn, memopt, tiling,
-      |                    tile-lower, schedule, final-lower, ...)
-      v
-internal/cg/cxx            deterministic CUDA C++ emitter
-      |                    (internal/cg: backend-neutral options/result)
-      v
-<kernel>.cu + CMakeLists.txt     ----links----> runtime/ (tcacomp_runtime)
-```
+# Next Design
 
-`internal/compiler` is the facade — the single syntax-to-backend API
-(`CompileKernel`/`CompileFile`) that `cmd/tcacomp` and the e2e harness call.
-Codegen is **not** a pipeline pass: it is a pure consumer invoked after the
-manager returns, and it never mutates the graph.
+- With all experience given, I think overall the design of a CUDA compiler can be elobrated as
+  - Also learn through TVM/MLIR/Triton
 
-### The pass pipeline (exact, from `internal/pipeline/pipeline.go`)
+## Overall Design
 
-The orchestrator composes three windows; every window is an explicit pass-ID
-list resolved through the registry factories — fail-closed on an unknown ID,
-never inheriting whatever else happens to be registered.
+- Optimization must be tired
+  - HIR (tensor operator) like expression
+    - (1) tensor related algebra operator optimization needs high level representation
+      - Breaking down into loop will mess up everything
+      - Operator optimization is more like a single expression pass
+        - Fusion
+        - Simplification, elimination redundancy, ...
+        - CSE/GVN
+    - (2) tensor operation by default is branchless
+    - (3) operation can have code block
+      - MLIR allow block inside of operation
+      - TCA V1.0's map/reduce verb is essentially operator + customized lambda (BLOCK)
+    - (4) structual operators are better
+      - Easy to be compositive
+        - Besides expressiveness issue, map + reduce works extreamly good
+          - Highly compositive
+          - Shape/type is easy to infer
+          - Constraints/character can be easily compositive
+      - Otherwise u will have to maintain operator list + its combinatory optimization pass
+        - Pattern rewritting database
 
-| Window | Priority | Pass | Role |
-|--------|----------|------|------|
-| HIR | 100 | `dce` | early cleanup before anything observes the graph |
-| | 101 | `dce-verify` | post-sweep invariant check |
-| | 102 | `simplify-lower` | IterCluster format to Iter format |
-| | 103 | `simplify-inline` | lambda parameter inlining |
-| | 104 | `simplify-verify` | post-simplify invariant check |
-| | 105 | `typeinfer` | every node typed after simplification |
-| | 110 | `gvn` | global CSE — and **loop fusion, free** |
-| | 111 | `gvn-verify` | post-dedup invariant check |
-| | 112 | `memopt` | store-to-load forwarding + dead-store elimination |
-| | 113 | `memopt-verify` | post-memopt invariant/fixpoint check |
-| LOWER | 114 | `tiling` | overlap analysis + combinatorial search + decision record |
-| | 115 | `tiling-verify` | decision-record consistency check |
-| | 116 | `tile-lower` | tiled loop nests + SMEM/FRAG cache insertion |
-| | 900 | `schedule` | sea-of-nodes to AST-style CFG (LICM here) |
-| | 950 | `final-lower` | reducers, maps, runtime objects over the AST CFG |
-| TAIL | — | `const-dedup` | pipeline-owned literal const dedup |
-| | — | `memopt` (2nd instance) | fill-liveness cleanup over the lowered graph |
-| | — | `dce` (AST-roots) | collects dead non-item nodes + swept items |
+  - MIR (tensor operator construct lowering) needs **specialized control flow structure**
+    - DO not directly lower to loop
+      - Otherwise u need complicated loop transformation
+        - For example: TVM formulate the problem as a list of parametrized transformation operation
+          - Where each operation is semantic preserve for the loop nests
+    - Instead, modeling the MIR with specialized control flow structure
+      - For example, mapping NV GPU as series of parallel operator
+        - NV GPU's hardware demands it, NOT optional but mandatory
+          - Heirachy style of parallization
+        - Grid/CTA/Warp/Thread besides loop
+        - Heirachy style memory can be linked/assigned correspondingly
+        - All becomes constraints
+          - For example in parallel node X, memory MUST BE Y storage class
+            - WARP must be SMEM memory
 
-One `opt.Manager` runs the concatenated windows, so declarative preconditions
-(`Pass.Requires`) are enforced across window boundaries. A verifier check
-follows every transformation pass — the `*-verify` IDs above are the explicit
-instances; the IR verifier itself also runs per pass
-([doc/design.md](doc/design.md): "verification pass per transformation pass").
+    - Formally formulate scheduling problem with domain design
+      - For example, a possible design will be:
+        - (1) A map + reduce cluster 1:1 decides a iteration space, ie polytope of points
+          - NOTES they are not memory access, pattern but potential spaces of points
+          - Memory access becomes an affine transformation of sub-space of points
+        - (2) paralle IR node x iteration space tiling
+          - Parallel IR node
+            - For NV
+              - Grid         <- operation happened in root grid
+              - CTA          <- operation happened in a single CTA
+              - Warp         <- operation happened in warp level
+              - Thread       <- operation happened inside of a single thread, ie raw loop
+            - Highlevel flexible for any heirchay style hardware
+              - Ie, it is very trival to introduce a new parallel IR node, called Warp group
+          - Partition becomes layout alegebra rewrite
+            - Input polytope's shape [N0][N1][N2] = (N0, N1, N2)  <- HTuple(X) / X = {N0, N1, N2}
+              - Rewrite is really
+                - (N0, N1, N2) => ((I0 I1 I2), (J0 J1 J2), (V0 V1 V2))
+                - This means tile the input polytope as
+                  - Grid: [I0, J0, V0]
+                  - CTA:  [I1, J1, V1]
+                  - THR:  [I2, J2, V2]
+                - Another way to partition is to exclude GRID, but only start from CTA level
+                  - Directly choose a per cta sub-space from input polytope
+                    - This avoids lots of issue and effectively generate a device function with wrapper cuda dispatcher for mapping input to CTA
+            - We can easily and compactly represent arbitary loop nests by having denormalized Htuple
+              - And assignment set of dimension to be responsbile for certain control flow/parallel operator
 
-## IR design
+        - (3) A operator/operation is viewed cooperatively spreading into different layers of parallel node
+          - For example on NV GPU:
+            - (1) SIMT requires multiple layer's composition to form a semantic consistent code
+            - (2) tensor instruction requires certain level of dispatch
+              - WARP or WARP GROUP
+          - Conceptually a HIR instruction is equally to mutliple small portion of mapping from different layer
+        - (4) Data dependency will explicitly glue the operator together
+        - (5) The searching space becomes
+          - 1) For each HIR, its potentital set of MIR mapping, along with each parallel operator mapping
+          - 2) For each parallel operator, its iteration space partition, ie tiling
+          - 3) Gapped constraints are inserted/resolved on the fly by rewritting
+            - NO top-down method, resolve on the fly
+            - IF cannot resolve, it is a point that excludes from feasiable area
+        - (6) Overall can be compactly represented as algebra layout + operation
+      - Model as combinatory problem
+        - 1) Feasiable area definition
+          - Ie generator permute/enumerate point in feasiable area
+        - 2) Constraints definition
+          - TABOO:
+            - certain operator CANNOT work with certain operators
+            - certain MIR cannot be lowered
+          - MEMORY:
+            - smem size
+        - 3) Objective function
+          - Develope proxy to measure performance
+            - FLOPs
+      - Solver
+        - Can write multiple solvers for evlauation
+        - (1) Heuristic
+          - 1) based on HIR/MIR expression to decide
+            - For example, MIR contain possible route for tensorization, enumerate corresponding tile size
+        - (2) Brutle force
+        - ...
 
-The IR ([doc/ir.md](doc/ir.md)) is a **single-tier, versioned node suite** —
-21 HIR kinds (the abstract kernel graph the builder produces: `map`, `reduce`,
-`iter`, the three memory verbs, scalar expressions, ...) and 15 LIR kinds
-(lowered `forloop`/`dimvar`/IVs, launch-map queries, runtime-object
-constructions; `KindVersion = 7`). There are no separate high/mid/low IR
-systems; lowering introduces LIR kinds into the same suite, and the pass
-manager rejects kinds it does not know (`>= KindEnd`) — forward compatibility
-inside our own pipeline.
+    - Constarints resolution by rewritting
+      - During the HIR -> MIR lowering, constraints must be resolved
+        - For example a ldmatrx + mma may require input to be of certain layout and in certain storage class
+          - However the HIR represents the input as single element access using GMEM
+          - view materialization code must be inserted to materialize it
+      - The constraints are mapped on Type set
+        - Each operation defines its Input and Output paretemter type set
+        - Constraints resolution goal is to insert padding IR node to bridge target MIR requirements with current existed HIR operand
+        - This design enforce the memory access to be also structural
+          - This is desired since on normal GPU memory is structural
+            - (1) memory class tight to a parallel node
+            - (2) memory access index mapping
+              - 1) GLOBAL memory mapping is specified by user, assuming to be affine mapping
+              - 2) NONE global memory mapping MUST BE pure mapping
+                - Can be assumed as polytope from global coordinate to local coordinate
+                - This pure mapping is needed for tensorization
+              - 3) Flatten memory
+                - For tensorization, memory access sometimes must be 1D array ready
+              - 4) Layout transformation can be separated
+                - Memory node: shape + address + column/row + flatten, ie actual memory site
+                - Memory access: reference memory node + stride mapping
+                  - Mapping natural coordinate by stride to offset (codomain)
+                  - Optimization can be done on Memory access
 
-**Two levels, one suite.** Between construction and codegen the graph moves
-between two forms:
+# Summary
 
-- **Level 1 — sea-of-nodes.** During construction and between passes there is
-  no statement list and no implicit program order. Dependencies are explicit
-  edges forming a poset: data edges (`Input` operand slots) and effect edges
-  (`ImpactBy`). Passes rewrite the sea in place.
-- **Level 2 — scheduled AST-style CFG.** Exactly one basic block per kernel
-  (v0 has no control flow, hence no PHI nodes), holding an intrusive statement
-  list — produced by the `schedule` pass before codegen. Statement order is an
-  observable, golden-pinned artifact; *choosing* a good order is an
-  optimization decision that belongs to a pass, not to construction.
-
-**SSA handles over one pointee.** Every node owns exactly one `SSAVar`
-carrying its def and its live use records; `SSADef`/`SSAUse` are value-type
-handles over that shared pointee. Because a use handle points at the *record*
-rather than the var, rewiring the record propagates to every handle copy —
-and `MutContext` funnels all chain edits through eight choke points
-(`ReplaceAllUsesWith`, `Erase`, `SetDef`, ...) that stamp the responsible pass
-on every touched node.
-
-**Input/ImpactBy-only convention.** Every reference in the graph lives in
-exactly one of two places: the node's Input operand list, or the `ImpactBy`
-payload of the three effect bearers (`memload`, `memstore`, `return`). This is
-machine-checked by the verifier with a reflect sweep — a new field carrying
-hidden SSA references fails verification, not code review.
-
-**Effect model.** A GMEM `memstore` and the kernel's single `return` node are
-the only fully effectful kinds; the lowered SMEM/FRAG tier is in-program
-memory and therefore dead-code-eligible. Per-tensor side-effect order is
-carried by explicit `ImpactBy` chains (reads chained with writes), maintained
-by a construction-time `Env` — sound because kernel tensors never alias (the
-restrict-alias rule, which also puts `__restrict__` on every tensor parameter
-in generated code). The **one end node** (`return`) carries every tensor's
-final chain state, so the whole store chain stays live through it.
-
-**Two-root-set DCE.** Liveness at Level 1 means: reachable from the
-`RoleTensor` params or the end node. Stores are never roots themselves — an
-unreachable store is construction debris, wiped by the first `dce`.
-
-**The verifier.** After every pass: use-def/def-use chain integrity, node
-shape checks per kind (fail-closed), loop-scope (a dimvar used only inside
-its loop's subtree) and positive-step invariants, the convention sweep, and
-the single-end-node rule. Rich violation reports name nodes, slots, and the
-last pass that touched a node.
-
-## Optimization passes — the specialized choices
-
-This is where tcacomp deliberately diverges from common CUDA DSL compilers.
-([doc/opt.md](doc/opt.md) is the pass-goal overview; deeper specs live in
-[doc/optana/](doc/optana).)
-
-### Loop fusion via GVN — there is no fusion pass
-
-`Iter` nodes are **side-effect free**: control-flow regularity is represented
-as data dependency, so loop headers are values like any other
-([doc/optana/loop_fusion.md](doc/optana/loop_fusion.md)). GVN at priority 110
-value-numbers identical loop headers — and two stages over identical headers
-with identical operands are the same value. Identical loop nests deduplicate;
-**fusion falls out for free**, with no dependence analysis and no dedicated
-pass. What fusion makes redundant (the intermediate store/load pair through
-GMEM) is then cleaned by `memopt`'s store-to-load forwarding at 112
-([doc/optana/memory_opt.md](doc/optana/memory_opt.md)). Producer-to-consumer
-data inside a fused kernel flows through pipes (`|`), never through memory.
-
-### LICM via scheduling — there is no standalone LICM pass
-
-The `schedule` pass (priority 900) brings the sea-of-nodes back into an
-AST-style CFG by placing every node at a computed scheduling number
-([doc/optana/schedule.md](doc/optana/schedule.md)). Invariant code — including
-cache fills — is hoisted as a **derived consequence** of placement, not by a
-mandated rule: a fill's position is *dominated-by-operand-scope* and is
-re-derived after any reshape, so any pass may reorder the graph and the
-scheduler still lands every fill inside the scope of its consumers.
-
-### Loop tiling as combinatorial search — not polyhedral
-
-The `tiling` decide pass (114) formulates tile-shape and parallelization
-assignment as a **discrete search** over a traffic-avoided objective —
-explicitly *not* a polyhedral model, because the IR carries no loop-carried
-data dependences that a dependence analyzer would need
-([doc/optana/loop_tiling.md](doc/optana/loop_tiling.md)). The search runs
-over the innermost-K window of each loop-nest tree; feasibility gates cover
-the SMEM byte budget and thread/CTA envelopes; the decision lands in a
-side-table record consumed by `tile-lower` (116), which rewrites the nests
-and inserts the caches ([doc/optana/loop_tile_lower.md](doc/optana/loop_tile_lower.md)).
-The compiler never generates a non-tiling schedule — a legal tile of at least
-2 is enforced fail-closed at four gates.
-
-### Compiler-owned parallelization
-
-Users never write thread bindings. The tiling decision assigns iteration
-dimensions to the CTA grid and the warp/lanes of a CTA through a **portion
-model**: CTA dimensions sum to `PortionCTA = 10`, warp portions sum to
-`PortionWARP = 8`, so **every thread group is a whole number of physical
-warps** (default envelope 100 CTAs x 512 threads). The mapping is carried by
-per-LNT `GridMapping`/`ThreadMapping` runtime objects — the compiler emits
-queries (`index`, `dimension`), never inlined linearization arithmetic.
-
-### Structural race-freedom by construction
-
-Parallelism assignment cannot introduce data races because both the program
-and the assignment are structural ([doc/tca.md](doc/tca.md) §5.7.8):
-
-1. each structural store indexes its target with exactly the live induction
-   variables, each once — distinct iteration points write distinct addresses;
-2. values along a reduced dimension meet only inside a **reducer**, whose
-   lowering owns all cross-thread communication;
-3. in-kernel data flows through pipes, not memory;
-4. shared caches are written only by the runtime's cooperative loaders;
-5. collectives run at CTA-uniform scope (uniform trip counts + predicated
-   tails, never divergent barriers).
-
-The verifier checks these invariants after every pass — the compiler proves
-its own output race-free structurally; `compute-sanitizer`
-(memcheck/racecheck) in the e2e harness is the confirmation gate, not the
-defense.
-
-### Memory IR = three verbs + a storage class
-
-All memory is expressed with exactly **three verbs — `MemNew`, `MemLoad`,
-`MemStore` — parameterized by a storage class** (GMEM / SMEM / FRAG). Caches
-are not IR primitives: a cache fill is a *composition* of the verbs (an
-allocation + a GMEM tile load + a class store), which is precisely what makes
-fill placement a re-derivable scheduling decision rather than hardcoded IR.
-Hardware-specific instruction selection — mapping a cooperative fill
-composition to one `tca::rt::LoadTileCta(...)` or
-`tca::rt::LoadTileThread(...)` call — happens **only at codegen**. This
-unification (IR kind version 7) deleted the previous six per-tier memory
-kinds.
-
-### Explicit storage tiers
-
-The tier model — **GMEM / SMEM / FRAG** — is first-class. The tiling decision
-selects which loads are promoted to a cooperative SMEM tile (one CTA-owned
-window, filled by a collective loader) or a per-thread FRAG fragment
-(registers, filled per-thread), and `tile-lower` materializes the tiered
-buffers and rewrites the accesses. Tier selection is driven by the
-traffic-avoided objective, thread-varying coordinate analysis, and per-thread
-byte budgets — never by user annotation.
-
-## Code generation
-
-The backend ([doc/cg.md](doc/cg.md)) lives in `internal/cg/cxx`:
-
-- **Deterministic, on-the-fly SSA naming** — a counter-based symbol table
-  assigns `tca_v<N>` locals at first use; repeated uses reuse the local (SSA
-  identity *is* the C++ identity). Twin runs over twin graphs are
-  byte-identical — the repo carries determinism tests and golden `.cu`
-  fixtures under `internal/cg/cxx/testdata/`.
-- **Fail-closed node whitelist** — any HIR verb surviving to codegen is a
-  pipeline bug and a hard error, not best-effort emission.
-- **All memory access through the runtime view shim** — generated code never
-  touches raw memory. Every tensor/buffer/fragment is a `tca::rt` wrapper
-  (`TensorView`/`SmemView`/`Frag`) carrying logical coordinates plus a
-  compiler-emitted layout descriptor; future coalescing/swizzle passes change
-  descriptors, never call sites.
-- **One dynamic `__shared__` pool** — every SMEM cache (including reducer
-  staging rows) is a view at a compiler-assigned offset into one
-  `extern __shared__` pool; the launcher opts into dynamic shared memory via
-  `cudaFuncSetAttribute` (the 64 KB design budget exceeds the 48 KB static
-  ceiling).
-- **Host launcher with the Tensor contract** — the user-facing signature
-  speaks `tca::Tensor<T, Rank>` (device pointer + shape + layout in one
-  object). Every dim parameter is derived from its first tensor occurrence
-  and cross-validated with named **`TCA_REQUIRE`** checks; mismatched shapes
-  are a named hard error at launch. `tca::rt::ValidateLaunch` checks the
-  launch envelope against *queried* device attributes — the smem opt-in
-  ceiling is never hardcoded.
-- **The split: the compiler emits, the user builds.** tcacomp writes
-  `<kernel>.cu` plus a `CMakeLists.txt` (arch pinned to sm_86, C++20, linking
-  `tcacomp_runtime` and `CUDA::cudart`) — it never drives nvcc. The build
-  belongs to the user ([doc/design.md](doc/design.md)).
-
-## Runtime
-
-`runtime/` is a **header-only INTERFACE CMake library** (`tcacomp_runtime`,
-`runtime/tca/`, CMake >= 3.24, C++20/CUDA 20; [doc/rt.md](doc/rt.md)) — the
-scalfold-lineage design ([doc/runtime_objects.md](doc/runtime_objects.md)):
-
-- **`KernelInfo`** — dual-compile CTA/thread-count queries.
-- **`GridMapping` / `ThreadMapping`** — the portion decomposition; maps are
-  opaque, the compiler never inlines their arithmetic.
-- **Iterators** (`Seq`/`Cta`/`Thr`) — one uniform `Has()/Next()/Index()`
-  round walk; the compiler emits zero branches around them.
-- **Bounds-predicated views** — `TensorView`/`SmemView`/`Frag` clamp or
-  predicate out-of-range access; validity is enforced inside the views, not
-  by emitted control flow.
-- **Cooperative loaders** — `LoadTileCta` (CTA-cooperative, **runtime-owned
-  synchronization and tail clamping**, `cp.async`-backed on sm_86) and
-  `LoadTileThread` (per-thread, barrier-free).
-- **Reducers** — the scalar protocol (`Init()` / `Reduce(value)` /
-  `Combine()` returning `T`); warp staging is a row of the *compiler's*
-  dynamic-SMEM pool handed in as a `SmemView`, never a runtime-static scratch.
-- **Host side** — `Tensor`, `TCA_REQUIRE`, `TCA_CUDA_CHECK`, and
-  `ValidateLaunch` with device-attribute queries.
-
-The design principles: the runtime owns **all** synchronization and guards
-("predicated, not exited" — collective calls stay uniformly reached), maps
-are opaque, no allocation or host calls on device paths, and every accessor
-is O(1).
-
-## Getting started
-
-```sh
-# build the compiler (pure Go, stdlib only)
-scripts/build.sh                 # -> bin/tcacomp
-
-# format Go sources (cmd/, internal/, pkg/)
-scripts/format.sh
-
-# compile a kernel: emits <name>.cu + CMakeLists.txt into tcacomp-out/
-./bin/tcacomp compile path/to/kernel.tca
-./bin/tcacomp compile -o outdir path/to/kernel.tca
-./bin/tcacomp help
-```
-
-The emitted directory is user-buildable as-is: point CMake at it (the
-generated `CMakeLists.txt` links `tcacomp_runtime`), and the runtime headers
-come from `runtime/`.
-
-### Tests
-
-```sh
-go test ./...                    # hermetic: unit + pipeline + goldens, no GPU
-TCACOMP_E2E=1 go test ./internal/e2e/   # GPU e2e: compile, run, compare vs CPU reference
-```
-
-The e2e harness is gated behind `TCACOMP_E2E=1` so ordinary test runs stay
-hermetic; GPU fixtures are content-addressed under the OS temp dir and the
-numerical comparison runs against a Go-computed CPU reference, with
-`compute-sanitizer` memcheck/racecheck modes.
-
-## Repository layout
-
-| Path | Responsibility |
-|------|----------------|
-| `cmd/tcacomp/` | compiler CLI (`compile`, `help`) |
-| `cmd/astdot/` | IR-to-Graphviz dump tool |
-| `pkg/` | public TCA graph-builder API (Builder rungs, `Dematerialize`) |
-| `internal/syntax/` | frontend: hand-rolled lexer, recursive-descent parser, AST, semacheck, module loader, AST-to-IR lowering |
-| `internal/ir/` | the single-tier SSA node suite, verifier, mutation choke points, two-level graph |
-| `internal/opt/` | optimization + lowering passes (dce, simplify, typeinfer, gvn, memopt, tiling, tile-lower, schedule, final-lower) and the pass manager |
-| `internal/pipeline/` | pass orchestrator: the three explicit windows + tail composition |
-| `internal/analysis/` | analysis registry (side-effect verdicts, loop-forest) |
-| `internal/compiler/` | the single syntax-to-backend facade over parse/build/pipeline/codegen |
-| `internal/cg/` | codegen driver surface + options |
-| `internal/cg/cxx/` | the CUDA C++ emitter (deterministic naming, fail-closed gates) |
-| `internal/e2e/` | GPU e2e harness (TCACOMP_E2E-gated, content-addressed fixtures) |
-| `internal/golden/` | golden-test helpers (IR prints, emitted `.cu`) |
-| `internal/diagnostic/` | position-attributed diagnostics |
-| `internal/flags/` | global compiler flags |
-| `internal/log/` | logging facade over `log/slog` |
-| `internal/visualization/` | DOT emission for IR graphs |
-| `runtime/` | header-only C++20 runtime library (`tcacomp_runtime`) + CPU tests |
-| `doc/` | design docs: requirements, frontend, TCA algebra, IR, passes, codegen, runtime |
-
-## Documentation index
-
-- [doc/design.md](doc/design.md) — project requirements and constraints
-- [doc/syntax.md](doc/syntax.md) — frontend language and sample
-- [doc/syntax-design.md](doc/syntax-design.md) — implementation-ready frontend spec (lexer/parser/semacheck/lowering)
-- [doc/tca.md](doc/tca.md) — the TCA algebra: motivation, syntax, rewrite rules, pipeline by example
-- [doc/ir.md](doc/ir.md) — implementation-faithful IR reference (two-level design, catalog, SSA, effects, DCE, scheduling)
-- [doc/opt.md](doc/opt.md) — optimization pass goals
-- [doc/optana/loop_fusion.md](doc/optana/loop_fusion.md) — loop fusion via GVN
-- [doc/optana/loop_tiling.md](doc/optana/loop_tiling.md) — tiling as combinatorial search
-- [doc/optana/loop_tile_lower.md](doc/optana/loop_tile_lower.md) — tile rewrite + cache insertion
-- [doc/optana/schedule.md](doc/optana/schedule.md) — sea-of-nodes to AST CFG scheduling
-- [doc/optana/final_lower.md](doc/optana/final_lower.md) — final lowering before codegen
-- [doc/optana/memory_opt.md](doc/optana/memory_opt.md) — store-to-load forwarding + dead-store elimination
-- [doc/optana/type_inf.md](doc/optana/type_inf.md) — type inference
-- [doc/cg.md](doc/cg.md) — CUDA C++ codegen design
-- [doc/rt.md](doc/rt.md) — C++ runtime library design
-- [doc/runtime_objects.md](doc/runtime_objects.md) — emitted runtime-object trace
+- Overall a good testify for myself
+- Hard lesson for scheduling/tile parition
+- IR level design experience
+- High ROI optimization pass
+  - Memory access related, ie layout, tiling shape
+- Working LLM for compiler
+  - (1) Writing version 1 by myself
+  - (2) Asking LLM to give incremental patches
+    - LLM is very familiar with detail of well known compiler backend algorithm
+    - Notes, lots of compiler algorithm is very detail oriented, but LLM can finish a very specific pass easily
+  - (3) Design must be done by human and give very **specific instructions**
+    - ie give pseudo-code
