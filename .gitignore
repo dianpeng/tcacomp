@@ -28,3 +28,4 @@ cmake-build-*/
 *.o
 testing/__pycache__/
 testing/.build/
+*.swp
